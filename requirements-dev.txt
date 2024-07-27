@@ -1,0 +1,12 @@
+bandit
+flake8==7.1.0
+flake8-builtins==2.5.0
+flake8-docstrings==1.7.0
+flake8-import-order==0.18.2
+flake8-quotes==3.4.0
+lxml
+mypy
+pytest
+pytest-cov
+sphinx
+sphinx-rtd-theme

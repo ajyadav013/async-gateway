@@ -1,0 +1,9 @@
+aiohttp~=3.9.5
+orjson~=3.10.6
+requests~=2.32.3
+aioboto3==13.1.1
+aiofiles~=24.1.0
+pyfailsafe==0.6.0
+pytz==2024.1
+aioftp==0.22.3
+asyncssh==2.15.0
