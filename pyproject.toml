@@ -149,7 +149,7 @@ junit_family = "legacy"
 # package. The rise is concentrated there rather than spread thin, which is why
 # it is the largest single-wave jump of the run so far.
 # Raised 82.89 -> 89.88, truncated for the reason above.
-fail_under = 89.88
+fail_under = 92.37
 # `fail_under` is compared against the total *rounded to `precision`*, so a
 # two-decimal ratchet needs two-decimal precision or the comparison silently
 # degrades to whole percents. Latent until now: earlier floors happened to round

@@ -1,6 +1,6 @@
 {
   "prefix": "AGW",
-  "next": 36,
+  "next": 39,
   "spec": "docs/specs/v1_release_spec.md",
   "stories": "docs/specs/v1_release_stories.md",
   "note": "One ticket per story, 1:1 and positional — AGW-n is story Sn. Spec Step 21 is vacated and carries no story; the numbering is never reused or renumbered. Relations are the story breakdown's §6 edge list (depends_on = blockedBy) and its inverse (blocks).",

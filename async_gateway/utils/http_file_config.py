@@ -1,10 +1,9 @@
 """Http file config utils."""
 
-import os
 from typing import Text
 
 import aioboto3
-import aiofiles
+import aiofiles.os
 import aiohttp
 
 from .constants import STATUS_CODE_403
@@ -66,10 +65,21 @@ async def download_file_from_url(
                 await file_obj.write(contents)
 
 
-async def delete_local_file_path(local_filepath: Text, **kwargs):
+async def delete_local_file_path(local_filepath: Text, **kwargs) -> None:
     """Deletes downloaded file.
+
+    The unlink goes through ``aiofiles.os`` rather than ``os.remove``:
+    a synchronous unlink is a blocking filesystem call, and on an async
+    path it stalls the whole event loop for the duration of the syscall
+    (R20/C3). ``aiofiles.os.remove`` runs it in a thread, so the loop
+    stays free while the directory entry is removed.
+
+    Note the import is ``import aiofiles.os``: importing ``aiofiles``
+    alone does not bind the ``os`` submodule.
 
     :param local_filepath: file to be deleted
     :param kwargs
+    :raises FileNotFoundError: if the file is already gone. Making the
+        delete idempotent is R22's change, not this one.
     """
-    os.remove(local_filepath)
+    await aiofiles.os.remove(local_filepath)

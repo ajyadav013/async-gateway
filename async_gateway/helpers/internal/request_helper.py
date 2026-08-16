@@ -12,7 +12,9 @@ silently dropping the url, payload and timestamp the entry point had already
 put there.
 """
 
+import mimetypes
 from collections.abc import Collection
+from pathlib import PurePath
 from typing import Any, Dict, List, Optional, Text, TypedDict
 
 import aiofiles
@@ -32,6 +34,28 @@ from async_gateway.utils.redaction import redact_url
 #: the config has to be usable without it rather than reading it with a
 #: bare ``.get()`` and handing None to ``open()`` (M10).
 DEFAULT_DOWNLOAD_FILEPATH = 'response.txt'
+
+#: What a file part declares when its name yields no media-type guess.
+#: Named rather than inlined because aiohttp injects this exact value
+#: itself when no ``content_type`` is passed, and telling the two apart is
+#: the whole point of :func:`build_upload_form` passing one.
+DEFAULT_UPLOAD_MEDIA_TYPE = 'application/octet-stream'
+
+# Populate the mimetypes tables here, at import, rather than letting the
+# first `guess_type` call do it. `guess_type` initialises lazily, and that
+# initialisation stats every path in `mimetypes.knownfiles` and reads the
+# ones that exist (on macOS, `/etc/apache2/mime.types`) -- blocking
+# filesystem I/O, which `build_upload_form` would otherwise perform on the
+# event loop during the first upload of the process. That is exactly what
+# R20 bans, and it is invisible to the AST scan in
+# `tests/test_no_blocking_io.py` because the read is lazy and indirect.
+# Import is where synchronous I/O is legitimate, on the expectation that
+# the consuming process imports this package while starting up rather than
+# from inside a coroutine -- an expectation about the consumer, not a
+# guarantee this module can make: a lazy `import async_gateway` inside a
+# running coroutine pays this read on the loop, once. Afterwards
+# `guess_type` is an in-memory dict lookup either way.
+mimetypes.init()
 
 
 class _HttpResultOptional(TypedDict, total=False):
@@ -126,6 +150,10 @@ async def handle_multipart_response(
     ``response_data = response_data + ...`` inside a ``while True``, which
     is quadratic in the body size.
 
+    The file is opened and written through ``aiofiles``, so a part arriving
+    while other requests are in flight suspends this coroutine rather than
+    the whole event loop (R20).
+
     Args:
         resp: The response to read the multipart body from.
         http_file_download_config: The caller's download config, or None.
@@ -142,7 +170,7 @@ async def handle_multipart_response(
         config.get('download_filepath') or DEFAULT_DOWNLOAD_FILEPATH)
     reader = aiohttp.MultipartReader.from_response(resp)
     parts: List[bytes] = []
-    with open(response_file_name, 'wb') as response_file:
+    async with aiofiles.open(response_file_name, 'wb') as response_file:
         while not reader.at_eof():
             part = await reader.next()
             if part is None:
@@ -152,7 +180,7 @@ async def handle_multipart_response(
                 if not chunk:
                     break
                 parts.append(chunk)
-                response_file.write(chunk)
+                await response_file.write(chunk)
     return b''.join(parts).decode(errors='replace')
 
 
@@ -223,9 +251,13 @@ async def make_http_request(
             chunk_size = (
                 http_file_download_config.get('file_download_chunk_size')
                 or CHUNK_SIZE_CONSTANT)
-            with open(filepath, 'wb') as read_file:
+            # `aiofiles`, and awaited per chunk: a synchronous `write()` here
+            # blocked the event loop once for every chunk of the download, so
+            # one large transfer stalled every other request the consuming
+            # process had in flight (R20).
+            async with aiofiles.open(filepath, 'wb') as read_file:
                 async for chunk in resp.content.iter_chunked(chunk_size):
-                    read_file.write(chunk)
+                    await read_file.write(chunk)
         # resp.content is a StreamReader. After a streamed download it is
         # already exhausted, so this is `b''` rather than a second copy.
         body = await resp.content.read()
@@ -277,6 +309,63 @@ async def make_http_filters_with_stream_file_upload(
         **kwargs)
 
 
+def build_upload_form(
+    local_filepath: Text,
+    file_key: Text,
+) -> aiohttp.FormData:
+    """Build a multipart form that streams ``local_filepath`` as it sends.
+
+    A *fresh* form every call, and that is the point rather than a detail.
+    The body is an async generator over the file, which the attempt that
+    sends it consumes; one body reused across attempts uploads the file
+    once and then nothing at all.
+
+    ``filename`` is derived here instead of being left to aiohttp, which
+    read it off the synchronous file object's ``.name`` -- there is no such
+    object any more, and a file part that lost its filename is a different
+    request on the wire. ``PurePath`` is the pure-string half of
+    ``pathlib``: it has no filesystem methods at all, so naming the part
+    cannot touch the disk (R20).
+
+    The part's ``Content-Type`` has to be derived here for the same reason
+    and is the easier half to miss. ``AsyncIterablePayload`` supplies
+    :data:`DEFAULT_UPLOAD_MEDIA_TYPE` itself when the caller passes no
+    ``content_type``, and doing so short-circuits the filename-based guess
+    the old file handle reached -- so an unqualified streaming body
+    declares every upload as octet-stream, and a ``.pdf`` or ``.jpg`` is
+    refused by any endpoint that validates the declared part type.
+    ``mimetypes`` guesses from the *name*, so restoring the old value costs
+    no filesystem access.
+
+    Accepted consequence of streaming: the request carries
+    ``Transfer-Encoding: chunked`` and no ``Content-Length``, where the
+    synchronous handle let aiohttp size the body. The body bytes are
+    unchanged. There is no way to keep both -- ``AsyncIterablePayload``
+    fixes its ``_size`` at None with no constructor knob -- and a length
+    derived from a ``stat()`` would be a *lying* ``Content-Length`` if the
+    file changed under the upload, which is worse than chunked framing.
+
+    Args:
+        local_filepath: Path of the file to upload.
+        file_key: Form field name to send the file under.
+
+    Returns:
+        A single-field :class:`aiohttp.FormData` whose value streams the
+        file in ``CHUNK_SIZE_CONSTANT`` chunks, so the whole file is never
+        held in memory.
+    """
+    name = PurePath(local_filepath).name
+    form = aiohttp.FormData()
+    form.add_field(
+        file_key,
+        file_upload(file_name=local_filepath),
+        filename=name,
+        content_type=(
+            mimetypes.guess_type(name)[0] or DEFAULT_UPLOAD_MEDIA_TYPE),
+    )
+    return form
+
+
 async def make_http_filters_without_stream_uploads(
     session,
     url: Text,
@@ -290,21 +379,60 @@ async def make_http_filters_without_stream_uploads(
     :param url - url to hit the api
     :param request_type - type of request
     :param circuit_breaker - circuit breaker object.
+
+    The body is built *inside* the retried callable, once per attempt. It
+    used to be a synchronous file handle opened outside
+    ``failsafe.run``: aiohttp read it with blocking calls while the upload
+    was in flight, and -- because a handle at EOF still reads cleanly --
+    every retry after the first uploaded zero bytes and reported success
+    (R14, R20).
+
+    :raises FileNotFoundError: If ``local_filepath`` does not exist, or
+    ``OSError`` for any other reason it cannot be read. Raised here, from
+    outside ``failsafe.run``, which is where the old ``open()`` raised it.
+    Inside the retried callable it would be wrapped in
+    ``RetriesExhausted`` and classified as a ``ConnectError``, reporting a
+    caller-side path typo as a 502 from an endpoint that was never
+    dialled. It is not an ``AsyncGatewayError``, so it propagates past the
+    entry point's one conversion point, which is the contract for a bug in
+    the calling code. The guard reports the file's state at check time and
+    nothing later: a file removed, replaced or made unreadable between it
+    and an attempt's own open raises inside ``failsafe.run`` instead, and
+    surfaces as ``RetriesExhausted`` -> ``ConnectError`` -> a 502
+    ``CONNECT`` envelope carrying the local path -- the very shape this
+    guard exists to avoid. That window is *new*, not inherited: the old
+    ``open()`` held one handle across the whole of ``failsafe.run``, so a
+    mid-flight deletion could not reach the upload. It is the accepted
+    cost of building the body once per attempt, which is what makes a
+    retry send the file rather than zero bytes.
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
-    with open(http_file_upload_config['local_filepath'], 'rb') as read_file:
-        filters = {
-            'data': {
-                http_file_upload_config['file_key']: read_file}
-        }
-        response: HttpResult = await circuit_breaker.failsafe.run(
-            make_http_request,
+    local_filepath = http_file_upload_config['local_filepath']
+    file_key = http_file_upload_config['file_key']
+    # Opened and closed, rather than `stat`ed: the contract above is that
+    # every reason the file cannot be *read* raises here, and `stat`
+    # succeeds on a directory and on a mode-000 file. Those two reached
+    # `aiohttp` inside the retried callable instead and came back as a 502
+    # from an endpoint that was never dialled, with the caller's absolute
+    # local path in the message. An open asks the same question the upload
+    # itself asks, which is what makes the errnos match.
+    async with aiofiles.open(local_filepath, 'rb'):
+        pass
+
+    async def attempt() -> HttpResult:
+        """Run one upload attempt against a body built for it alone.
+
+        Returns:
+            The ``HttpResult`` this attempt produced.
+        """
+        return await make_http_request(
             session,
             url,
-            filters,
+            {'data': build_upload_form(local_filepath, file_key)},
             request_type,
             **kwargs)
-    return response
+
+    return await circuit_breaker.failsafe.run(attempt)
 
 
 async def make_http_filters_without_file(

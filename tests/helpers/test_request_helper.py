@@ -1,4 +1,4 @@
-"""Tests for the HTTP transport boundary (spec R13, Step 11).
+"""Tests for the HTTP transport boundary (spec R13/R20, Steps 11-12).
 
 Multipart handling, the body decode, and the download-config defaults --
 the three places ``make_http_request`` used to lose or corrupt what the
@@ -10,19 +10,32 @@ with a real ``aiohttp`` object rather than in this library's own
 arithmetic: ``MultipartReader.next()`` really does return None before
 ``at_eof()`` goes True on an ordinary well-formed body, and a stub reader
 that did not would have let the ``AttributeError`` ship.
+
+Step 12 adds R20's two behavioural proofs for this module: that a streamed
+download hands the loop back between chunks, and that a retried upload
+sends the whole file on every attempt rather than the file once and
+nothing afterwards. The package-wide ban that keeps blocking I/O out of
+every other ``async def`` lives in ``tests/test_no_blocking_io.py``.
 """
 
 import ast
+import asyncio
+from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
+from typing import Any, Dict, Text
 
 import aiohttp
 
+from async_gateway.async_gateway import request
 from async_gateway.helpers.internal.request_helper import (
     DEFAULT_DOWNLOAD_FILEPATH,
     HttpResult,
+    file_upload,
     handle_multipart_response,
+    make_http_filters_without_stream_uploads,
     make_http_request,
 )
+from async_gateway.utils.constants import CHUNK_SIZE_CONSTANT
 
 import pytest
 
@@ -501,3 +514,509 @@ async def test_the_multipart_helper_defaults_its_own_path(
 
     assert text == 'direct'
     assert (tmp_path / DEFAULT_DOWNLOAD_FILEPATH).read_bytes() == b'direct'
+
+
+# --- R20: the download hands the loop back between chunks -----------------
+
+#: Chunks in the mocked download, and therefore the floor the observer
+#: has to clear. Named because the assertion is "one round-trip per
+#: chunk", not "some arbitrary number of round-trips".
+DOWNLOAD_CHUNK_COUNT = 256
+
+CHUNK_BYTES = b'chunk'
+
+
+class _ChunkedContent:
+    """A ``resp.content`` double that yields a fixed chunk sequence.
+
+    A real loopback download would work too, but the number of chunks it
+    produces is decided by TCP rather than by the test, and the assertion
+    below counts them.
+    """
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        """Record the chunks this content will yield.
+
+        Args:
+            chunks: The chunks to emit, in order.
+        """
+        self._chunks = chunks
+
+    async def iter_chunked(self, size: int) -> AsyncIterator[bytes]:
+        """Yield the recorded chunks.
+
+        Args:
+            size: Requested chunk size, ignored -- the chunking is fixed
+                so that the count is the test's to state.
+
+        Yields:
+            Each recorded chunk in turn.
+        """
+        for chunk in self._chunks:
+            yield chunk
+
+    async def read(self) -> bytes:
+        """Return the body left after the stream was drained.
+
+        Returns:
+            ``b''``: a streamed download exhausts the reader.
+        """
+        return b''
+
+
+class _ChunkedResponse:
+    """A response double exposing just what the transport reads off it."""
+
+    status = 200
+    headers = {'Content-Type': 'application/octet-stream'}
+    cookies: Dict[Text, Any] = {}
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        """Attach a content stream yielding ``chunks``.
+
+        Args:
+            chunks: The chunks the download will receive.
+        """
+        self.content = _ChunkedContent(chunks)
+
+    async def __aenter__(self) -> '_ChunkedResponse':
+        """Enter the ``async with`` the transport opens.
+
+        Returns:
+            This response.
+        """
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        """Leave the context without suppressing anything.
+
+        Args:
+            exc_info: The exception triple, ignored.
+
+        Returns:
+            False, so any exception propagates.
+        """
+        return False
+
+
+class _ChunkedSession:
+    """A session double whose verb methods return one canned response."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        """Build the response this session will hand out.
+
+        Args:
+            chunks: The chunks the download will receive.
+        """
+        self._response = _ChunkedResponse(chunks)
+
+    def get(self, url: Text, **filters: object) -> _ChunkedResponse:
+        """Return the canned response.
+
+        Args:
+            url: Ignored; nothing is dialled.
+            filters: Transport keyword arguments, ignored.
+
+        Returns:
+            The response double, ready to be entered.
+        """
+        return self._response
+
+
+async def test_a_streamed_download_yields_to_the_loop_between_chunks(
+    tmp_path: Path,
+) -> None:
+    """The observer completes at least one round-trip per chunk.
+
+    Stated as a count rather than a duration: no clock is read and no
+    delay is waited on, so the test says exactly the thing R20 cares
+    about -- the download suspends between chunks -- and says it
+    deterministically.
+
+    With the synchronous ``read_file.write(chunk)`` this replaces, the
+    whole loop ran without a single suspension point: ``async for`` over
+    an already-buffered stream does not yield by itself, so a concurrent
+    coroutine in the consuming process got no turn at all until the last
+    byte had landed.
+    """
+    target = tmp_path / 'streamed.bin'
+    session = _ChunkedSession([CHUNK_BYTES] * DOWNLOAD_CHUNK_COUNT)
+    finished = asyncio.Event()
+
+    async def download() -> None:
+        """Run the streamed download, then release the observer."""
+        try:
+            await make_http_request(
+                session,
+                'http://download.test/file',
+                {},
+                'GET',
+                redact_params=frozenset(),
+                http_file_download_config={
+                    'download_filepath': str(target),
+                    'file_download_chunk_size': len(CHUNK_BYTES),
+                },
+            )
+        finally:
+            finished.set()
+
+    async def observe() -> int:
+        """Count loop round-trips until the download reports it is done.
+
+        Returns:
+            The number of times the loop came back to this coroutine.
+        """
+        ticks = 0
+        while not finished.is_set():
+            await asyncio.sleep(0)
+            ticks += 1
+        return ticks
+
+    _, ticks = await asyncio.gather(download(), observe())
+
+    assert target.read_bytes() == CHUNK_BYTES * DOWNLOAD_CHUNK_COUNT
+    assert ticks >= DOWNLOAD_CHUNK_COUNT
+
+
+# --- R14/R20: the upload body is built per attempt ------------------------
+
+#: Deliberately free of ``\r\n--`` so the part extractor below cannot be
+#: fooled by the payload containing a boundary-shaped sequence.
+UPLOAD_BYTES = b'upload-payload-' * 64
+
+
+class _RepeatingBreaker:
+    """A circuit-breaker double running the callable a fixed no. of times.
+
+    ``failsafe.run`` retries on failure; from the callable's point of
+    view an unconditional second call is the same shape, and it needs no
+    failing transport to provoke. Both attempts hit a server that answers
+    200, which is the point: the defect this guards against is silent, so
+    the *response* cannot be what reveals it.
+    """
+
+    def __init__(self, attempts: int) -> None:
+        """Configure how many times each call is run.
+
+        Args:
+            attempts: Number of times to invoke the callable.
+        """
+        self.failsafe = self
+        self.attempts = attempts
+
+    async def run(
+        self,
+        call: Callable[..., Coroutine[Any, Any, HttpResult]],
+        *args: object,
+        **kwargs: object,
+    ) -> HttpResult:
+        """Invoke ``call`` ``attempts`` times and return the last result.
+
+        Args:
+            call: The coroutine function under retry.
+            args: Positional arguments forwarded to it.
+            kwargs: Keyword arguments forwarded to it.
+
+        Returns:
+            The result of the final attempt.
+        """
+        result: HttpResult = HttpResult(
+            status_code=0, headers={}, cookies={}, text='')
+        for _ in range(self.attempts):
+            result = await call(*args, **kwargs)
+        return result
+
+
+def _uploaded_part(body: bytes) -> bytes:
+    """Return the single file part's bytes from a multipart form body.
+
+    Args:
+        body: The whole request body as the server received it.
+
+    Returns:
+        Everything between the part's header separator and the closing
+        boundary -- the file content, and nothing else.
+    """
+    _, _, after_headers = body.partition(b'\r\n\r\n')
+    payload, _, _ = after_headers.rpartition(b'\r\n--')
+    return payload
+
+
+async def _upload(
+    server: RecordingHTTPServer,
+    source: Path,
+    *,
+    attempts: int,
+) -> None:
+    """Upload ``source`` through the non-streaming filter method.
+
+    Args:
+        server: The loopback server to upload to.
+        source: The file to send.
+        attempts: How many times the breaker double runs the attempt.
+
+    Returns:
+        None.
+    """
+    async with aiohttp.ClientSession() as session:
+        await make_http_filters_without_stream_uploads(
+            session,
+            server.url_for('/upload'),
+            'POST',
+            _RepeatingBreaker(attempts=attempts),
+            redact_params=frozenset(),
+            http_file_upload_config={
+                'local_filepath': str(source),
+                'file_key': 'attachment',
+            },
+        )
+
+
+async def test_a_retried_upload_sends_the_whole_file_every_attempt(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """Attempt two carries the file's real byte length, not zero.
+
+    This is the defect the conversion had to avoid rather than one it
+    fixes incidentally. A single file handle -- or any one-shot body --
+    opened outside ``failsafe.run`` is consumed by the first attempt, and
+    every attempt after it uploads an empty part while the server answers
+    200: a wrong-content upload that reports success. The assertion is
+    against ``len(UPLOAD_BYTES)`` and not against "non-zero", because
+    zero is the correct answer for an empty file and a "non-zero" guard
+    would therefore be satisfied by a single stray byte.
+
+    It closes the defect on one of the two upload paths only.
+    ``make_http_filters_with_stream_file_upload``, reached from the same
+    dispatcher on the ``file_upload_chunk_size`` config key, still hands
+    a single ``file_upload(...)`` generator to ``failsafe.run``: it is a
+    live instance of the same one-shot-body shape and still sends zero
+    bytes on attempt two. That is pre-existing and untouched here; it is
+    ticket **AGW-38 (High)** -- the sibling-path instance of registered
+    finding **H9**, whose severity it takes -- owned by story **S15**,
+    whose R14/H9 criterion is exactly a body built by a factory invoked
+    per attempt.
+    """
+    source = tmp_path / 'attachment.bin'
+    source.write_bytes(UPLOAD_BYTES)
+    http_server.respond('/upload', body=b'stored')
+
+    await _upload(http_server, source, attempts=2)
+
+    received = [r for r in http_server.requests if r.path == '/upload']
+    assert len(received) == 2
+    for attempt in received:
+        assert len(_uploaded_part(attempt.body)) == len(UPLOAD_BYTES)
+        assert _uploaded_part(attempt.body) == UPLOAD_BYTES
+
+
+async def test_an_empty_file_uploads_as_an_empty_part_every_attempt(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """Zero bytes is the right answer here, and stays right on retry."""
+    source = tmp_path / 'empty.bin'
+    source.write_bytes(b'')
+    http_server.respond('/upload', body=b'stored')
+
+    await _upload(http_server, source, attempts=2)
+
+    received = [r for r in http_server.requests if r.path == '/upload']
+    assert len(received) == 2
+    for attempt in received:
+        assert _uploaded_part(attempt.body) == b''
+
+
+async def test_the_upload_part_keeps_the_name_and_type_it_used_to_carry(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """The streaming body must cost the part neither name nor type.
+
+    aiohttp derived the ``filename`` from the synchronous file object's
+    ``.name``. An async generator has no name, so dropping the handle
+    without naming the part would have silently turned a file field into
+    a plain one -- a different request, for any server that looks for a
+    filename.
+
+    The part's own ``Content-Type`` is the half this test used to stop
+    short of, and it is the half that broke: aiohttp's
+    ``AsyncIterablePayload`` injects ``application/octet-stream`` when the
+    caller passes no ``content_type``, which short-circuits the
+    filename-based guess the file handle used to reach. A ``.json`` source
+    is used rather than the ``.bin`` the other upload tests share
+    precisely so the guess is *not* octet-stream and the assertion is
+    capable of failing.
+    """
+    source = tmp_path / 'attachment.json'
+    source.write_bytes(UPLOAD_BYTES)
+    http_server.respond('/upload', body=b'stored')
+
+    await _upload(http_server, source, attempts=1)
+
+    sent = http_server.requests[-1]
+    assert b'filename="attachment.json"' in sent.body
+    assert b'name="attachment"' in sent.body
+    assert b'Content-Type: application/json' in sent.body
+    assert b'application/octet-stream' not in sent.body
+    assert sent.headers['Content-Type'].startswith('multipart/form-data')
+
+
+def _missing_file(tmp_path: Path) -> Path:
+    """Return a path nothing was ever written to.
+
+    Args:
+        tmp_path: The test's private directory.
+
+    Returns:
+        A path that does not exist -- the caller's plain path typo.
+    """
+    return tmp_path / 'never-written.bin'
+
+
+def _a_directory(tmp_path: Path) -> Path:
+    """Return a directory where the caller meant to name a file.
+
+    Args:
+        tmp_path: The test's private directory.
+
+    Returns:
+        A path that exists and is a directory. ``stat`` succeeds on it, so
+        only actually opening it tells the two apart.
+    """
+    target = tmp_path / 'a-directory'
+    target.mkdir()
+    return target
+
+
+def _an_unreadable_file(tmp_path: Path) -> Path:
+    """Return a real file whose mode denies this process every access.
+
+    ``stat`` succeeds here too -- the mode bits are part of what it
+    returns rather than something it enforces -- which makes this the
+    second errno a presence check silently lets through.
+
+    Args:
+        tmp_path: The test's private directory.
+
+    Returns:
+        A path to an existing, mode-``000`` file.
+
+    Raises:
+        Skipped: Via :func:`pytest.skip` when the mode bits do not in fact
+            deny this process -- root bypasses them, and a row that cannot
+            fail must say so rather than pass.
+    """
+    target = tmp_path / 'unreadable.bin'
+    target.write_bytes(UPLOAD_BYTES)
+    target.chmod(0o000)
+    try:
+        with open(target, 'rb'):
+            pass
+    except PermissionError:
+        return target
+    pytest.skip('mode 000 does not deny this process (running as root?)')
+
+
+@pytest.mark.parametrize(
+    'make_local_filepath, expected',
+    [
+        pytest.param(_missing_file, FileNotFoundError, id='missing'),
+        pytest.param(_a_directory, IsADirectoryError, id='directory'),
+        pytest.param(_an_unreadable_file, PermissionError, id='unreadable'),
+    ],
+)
+async def test_an_unopenable_upload_file_raises_rather_than_reporting_502(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+    make_local_filepath: Callable[[Path], Path],
+    expected: type[OSError],
+) -> None:
+    """A caller-side file problem is not a remote transport failure.
+
+    Asserted at the entry point, because that is the only layer where the
+    distinction is observable: ``request()`` is the one conversion point,
+    and a test one layer down would pass while the contract was broken.
+
+    Building the body inside the retried callable put the file open inside
+    ``failsafe.run``, where an ``OSError`` is wrapped in
+    ``RetriesExhausted`` and classified as a ``ConnectError`` -- an
+    ``ok=False`` envelope with status 502 and code ``CONNECT``, telling
+    the caller the remote endpoint refused a connection that was never
+    dialled, with their absolute local path in the message. The
+    zero-requests assertion is what pins that: nothing may reach the wire.
+
+    Three rows, not one, because "the file cannot be opened" has three
+    ordinary spellings and only the first of them is a missing file. A
+    guard written as a presence check passes the ``missing`` row and
+    reports the other two as that same 502, which is the defect verbatim.
+    Each row asserts its *exact* errno type, so a guard that collapsed
+    them into one class would fail rather than look green.
+    """
+    http_server.respond('/upload', body=b'stored')
+    local_filepath = make_local_filepath(tmp_path)
+
+    with pytest.raises(expected):
+        await request(
+            url=http_server.url_for('/upload'),
+            protocol='HTTP',
+            protocol_info={
+                'request_type': 'POST',
+                'http_file_upload_config': {
+                    'local_filepath': str(local_filepath),
+                    'file_key': 'attachment',
+                },
+            },
+        )
+
+    assert http_server.requests == []
+
+
+async def test_a_large_upload_is_not_buffered_whole_in_memory(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file larger than one chunk arrives whole, in counted pieces.
+
+    The received bytes alone cannot say this. A body that did
+    ``yield await f.read()`` -- the whole file resident in memory, sent in
+    one piece -- produces a byte-identical part, so an assertion on the
+    part content is satisfied by exactly the defect R20 names. What
+    distinguishes the two is *how many times the body yielded*, so that is
+    what is counted.
+
+    ``CHUNK_SIZE_CONSTANT * 2 + 7`` gives three yields: two whole chunks
+    and a short remainder. Two would mean the tail was dropped, one means
+    the file was read whole.
+    """
+    payload = b'L' * (CHUNK_SIZE_CONSTANT * 2 + 7)
+    source = tmp_path / 'large.bin'
+    source.write_bytes(payload)
+    http_server.respond('/upload', body=b'stored')
+    yield_counts: list[int] = []
+
+    async def counting_file_upload(**kwargs: Any) -> AsyncIterator[bytes]:
+        """Delegate to the real body, recording how often it yielded.
+
+        Args:
+            kwargs: Forwarded verbatim to the real ``file_upload``.
+
+        Yields:
+            Every chunk the real body produced, unmodified.
+        """
+        yielded = 0
+        async for chunk in file_upload(**kwargs):
+            yielded += 1
+            yield chunk
+        yield_counts.append(yielded)
+
+    monkeypatch.setattr(
+        'async_gateway.helpers.internal.request_helper.file_upload',
+        counting_file_upload)
+
+    await _upload(http_server, source, attempts=1)
+
+    assert _uploaded_part(http_server.requests[-1].body) == payload
+    assert yield_counts == [3]
