@@ -138,7 +138,18 @@ junit_family = "legacy"
 # `logic/sftp_client` 66.250000% -> 82.500000%, and
 # `helpers/internal/filters_helper` 85.106383% -> 93.617021%.
 # Raised 79.35 -> 82.89, truncated for the reason above.
-fail_under = 82.89
+#
+# Re-measured after wave W10 / stories S12 (SFTP operations) and S13 (HTTP
+# request construction and response handling)
+# (`coverage report --precision=6`): 89.892665%, stable across three
+# randomised orders.
+# Both stories brought substantial suites of their own -- S12 took
+# `logic/sftp_client` to 100.000000%, and S13 added the first real coverage of
+# the four `helpers/internal` modules, which were the least-tested part of the
+# package. The rise is concentrated there rather than spread thin, which is why
+# it is the largest single-wave jump of the run so far.
+# Raised 82.89 -> 89.88, truncated for the reason above.
+fail_under = 89.88
 # `fail_under` is compared against the total *rounded to `precision`*, so a
 # two-decimal ratchet needs two-decimal precision or the comparison silently
 # degrades to whole percents. Latent until now: earlier floors happened to round
