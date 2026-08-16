@@ -13,19 +13,43 @@ put there.
 """
 
 from collections.abc import Collection
-from typing import Dict, Optional, Text, TypedDict
+from typing import Any, Dict, List, Optional, Text, TypedDict
 
 import aiofiles
 import aiohttp
 from async_gateway.helpers.common.file_helper import download_file_from_s3
-from async_gateway.helpers.internal import header_filter_mapping
+from async_gateway.helpers.internal import (
+    MULTIPART_MEDIA_PREFIX,
+    filter_for_media_type,
+    media_type_of,
+)
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.constants import CHUNK_SIZE_CONSTANT
-from async_gateway.utils.exceptions import SerializationError
 from async_gateway.utils.redaction import redact_url
 
+#: Where a download lands when the caller names no path. The README
+#: documents ``download_filepath`` as part of an *optional* config block, so
+#: the config has to be usable without it rather than reading it with a
+#: bare ``.get()`` and handing None to ``open()`` (M10).
+DEFAULT_DOWNLOAD_FILEPATH = 'response.txt'
 
-class HttpResult(TypedDict):
+
+class _HttpResultOptional(TypedDict, total=False):
+    """The keys of :class:`HttpResult` that are present only sometimes.
+
+    Split into its own base because ``typing.NotRequired`` is 3.11+ and
+    this package supports 3.10.
+
+    Attributes:
+        decode_error: Why the body could not be decoded as text. Present
+            *only* when it could not, so its absence is the success
+            signal and there is no None to confuse with "no error".
+    """
+
+    decode_error: Text
+
+
+class HttpResult(_HttpResultOptional):
     """One HTTP exchange, as data.
 
     Attributes:
@@ -33,18 +57,17 @@ class HttpResult(TypedDict):
         headers: Response headers, exactly as received and unredacted --
             redaction happens where this is copied into the envelope.
         cookies: Response cookie values by name.
-        text: The decoded body; ``''`` when there was none.
-        body: The raw body bytes, or None when the body was streamed to
-            disk rather than held in memory.
-        redirect_chain: Every hop actually followed, in order.
+        text: The decoded body; ``''`` when there was none. When
+            ``decode_error`` is present this is the *lossily* decoded body
+            rather than nothing at all, because a caller who cannot have
+            the exact bytes is still better served by what can be salvaged
+            than by a key that was never set (M9).
     """
 
     status_code: int
     headers: Dict[Text, Text]
     cookies: Dict[Text, Text]
     text: Text
-    body: Optional[bytes]
-    redirect_chain: list[Text]
 
 
 async def fetch_file(file_config: Dict):
@@ -86,32 +109,51 @@ async def file_upload(
 
 
 async def handle_multipart_response(
-    resp: aiohttp.ClientResponse, http_file_download_config: dict
-) -> str:
-    """Iter multipart responses.
+    resp: aiohttp.ClientResponse,
+    http_file_download_config: Optional[Dict[Text, Any]],
+) -> Text:
+    r"""Write a multipart response to disk and return what was written.
 
-    this function handles multipart responses sent by server,
-    by reading the chunks of data and terminates when eof is reached.
-    The response is saved in the file path of http_file_download_config
-    else in response file of the current path.
-    :param resp - response object of aiohttp.
-    :param http_file_download_config - file download config
-    containing the file download location.
+    Three things this does that its predecessor did not (M7). It writes the
+    part **bytes** to a binary file, where ``response_file.write(str(data))``
+    wrote the literal text ``b'\x89PNG'`` into a text file and corrupted
+    every download. It reads each part **to completion**, where a single
+    ``read_chunk()`` silently truncated any part over 8 KiB. And it stops
+    when ``reader.next()`` returns None, which happens before ``at_eof()``
+    goes True and used to raise ``AttributeError`` on the very next line.
+
+    The bytes are accumulated in a list joined once, not with
+    ``response_data = response_data + ...`` inside a ``while True``, which
+    is quadratic in the body size.
+
+    Args:
+        resp: The response to read the multipart body from.
+        http_file_download_config: The caller's download config, or None.
+            ``download_filepath`` defaults to
+            :data:`DEFAULT_DOWNLOAD_FILEPATH`.
+
+    Returns:
+        Everything written, decoded with errors replaced. Multipart carries
+        arbitrary binary, so a ``str`` rendering of it is best-effort by
+        construction; the file on disk is the faithful copy.
     """
+    config = http_file_download_config or {}
+    response_file_name = (
+        config.get('download_filepath') or DEFAULT_DOWNLOAD_FILEPATH)
     reader = aiohttp.MultipartReader.from_response(resp)
-    response_file_name = http_file_download_config.get(
-        'download_filepath', 'response.txt') if \
-        http_file_download_config else 'response.txt'
-    response_data = ''
-    with open(response_file_name, 'w') as response_file:
-        while True:
-            if reader.at_eof():
-                break
+    parts: List[bytes] = []
+    with open(response_file_name, 'wb') as response_file:
+        while not reader.at_eof():
             part = await reader.next()
-            data = await part.read_chunk()
-            response_data = response_data + str(data)
-            response_file.write(str(data))
-    return response_data
+            if part is None:
+                break
+            while True:
+                chunk = await part.read_chunk()
+                if not chunk:
+                    break
+                parts.append(chunk)
+                response_file.write(chunk)
+    return b''.join(parts).decode(errors='replace')
 
 
 async def make_http_request(
@@ -137,13 +179,10 @@ async def make_http_request(
     about what is a secret. Required rather than defaulted, so a filter
     method that dropped it fails loudly instead of quietly falling back
     to the built-in names and leaking the caller's.
-    :returns HttpResult - the status, headers, cookies, decoded text and
-    raw body. The caller copies these into the envelope it owns; this
-    function never sees an envelope.
-    :raises SerializationError - if the body is not decodable text. Its
-    message carries the URL redacted with ``redact_params``, because the
-    message reaches the caller through ``error['message']`` and the log
-    through ``exc_info``.
+    :returns HttpResult - the status, headers, cookies and decoded text,
+    plus a ``decode_error`` when the body was not decodable text. The
+    caller copies these into the envelope it owns; this function never sees
+    an envelope.
     """
     http_file_download_config = kwargs.get('http_file_download_config')
     ssl_filters: Dict = await get_ssl_config(
@@ -165,38 +204,43 @@ async def make_http_request(
                 name: morsel.value for name, morsel in resp.cookies.items()
             },
             text='',
-            body=None,
-            redirect_chain=[str(hop.url) for hop in resp.history],
         )
 
-        content_type = str(headers.get('content-type'))
-
-        # handling multipart response.
-        if content_type.startswith('multipart'):
+        if media_type_of(headers).startswith(MULTIPART_MEDIA_PREFIX):
             result['text'] = await handle_multipart_response(
                 resp,
                 http_file_download_config
             )
             return result
 
-        elif http_file_download_config:
-            with open(
-                http_file_download_config.get('download_filepath'), 'wb'
-            )as read_file:
-                async for chunk in resp.content.iter_chunked(
-                    http_file_download_config.get('file_download_chunk_size')
-                ):
+        # `is not None`, not truthiness: an empty config is a caller asking
+        # for a download on every default, and the defaults exist so that
+        # it works (M10).
+        if http_file_download_config is not None:
+            filepath = (
+                http_file_download_config.get('download_filepath')
+                or DEFAULT_DOWNLOAD_FILEPATH)
+            chunk_size = (
+                http_file_download_config.get('file_download_chunk_size')
+                or CHUNK_SIZE_CONSTANT)
+            with open(filepath, 'wb') as read_file:
+                async for chunk in resp.content.iter_chunked(chunk_size):
                     read_file.write(chunk)
-        # resp.content is a StreamReader
+        # resp.content is a StreamReader. After a streamed download it is
+        # already exhausted, so this is `b''` rather than a second copy.
         body = await resp.content.read()
-        result['body'] = body
         try:
             result['text'] = body.decode()  # convert to str
         except UnicodeDecodeError as err:
-            raise SerializationError(
+            # Both, per R13. Raising here would lose the body entirely and
+            # would be retried by the breaker as though the network had
+            # failed; recording it lets `http_client` put the salvageable
+            # text on the envelope *and then* report the failure.
+            result['text'] = body.decode(errors='replace')
+            result['decode_error'] = (
                 f'Response body from '
                 f'{redact_url(url, extra_params=redact_params)} is not '
-                f'decodable text: {err}') from err
+                f'decodable text: {err}')
 
     return result
 
@@ -279,12 +323,12 @@ async def make_http_filters_without_file(
     """
     headers = kwargs.get('headers')
     payload = kwargs.get('payload')
-    content_type = headers.get('Content-Type', 'default').lower()
-    filters = await header_filter_mapping.get(
-        content_type)(
-        payload,
-        request_type=request_type
-    )
+    # Bound, then called. The dispatch it replaces was
+    # `header_filter_mapping.get(content_type)(...)`, which called whatever
+    # the lookup returned -- including None, for every `Content-Type` that
+    # carried a `charset` parameter (H14).
+    request_filter = filter_for_media_type(media_type_of(headers), payload)
+    filters = await request_filter(payload, request_type=request_type)
     return await circuit_breaker.failsafe.run(
         make_http_request,
         session,
@@ -319,6 +363,13 @@ async def handle_http_request(
     ``redact_params``, which ``make_http_request`` requires; a caller that
     omits it gets a ``TypeError`` rather than a URL redacted with the
     built-in names only.
+
+    A file upload combined with a GET is refused, but not here: the pair is
+    rejected by ``logic.http_client.validated_upload_config`` when the
+    request object is constructed, which is before dispatch and outside the
+    entry point's ``AsyncGatewayError`` conversion. Raising it at this depth
+    turned a configuration error into an ``ok=False`` envelope. This
+    function acts on what it is handed and does not check it again (R11).
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
     if http_file_upload_config:

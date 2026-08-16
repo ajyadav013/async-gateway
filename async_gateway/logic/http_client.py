@@ -10,13 +10,26 @@ the caller the body (invariant E11).
 import asyncio
 import ssl
 from collections.abc import Collection
-from typing import Any, Callable, ClassVar, Dict, List, Sequence, Text, Tuple
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Text,
+    Tuple,
+)
 
 import aiohttp
-from async_gateway.helpers.internal import header_response_mapping
+from async_gateway.helpers.internal import is_json_media_type, media_type_of
 from async_gateway.helpers.internal.base import BaseRequestClass
+from async_gateway.helpers.internal.filters_helper import is_get
 from async_gateway.helpers.internal.request_helper import \
-    handle_http_request, HttpResult
+    HttpResult, handle_http_request
+from async_gateway.helpers.internal.response_helper import \
+    application_json_response
 from async_gateway.utils.constants import HTTP_ERROR_STATUS
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
@@ -27,6 +40,7 @@ from async_gateway.utils.exceptions import (
     DnsError,
     GatewayTimeoutError,
     HttpStatusError,
+    SerializationError,
     TlsError,
     TransportError,
     unwrap_cause,
@@ -110,6 +124,47 @@ def validated_json_serializer(serialization: JsonSerializer) -> JsonSerializer:
     return serialization
 
 
+def validated_upload_config(
+    http_file_upload_config: Dict,
+    request_type: Text,
+) -> Dict:
+    """Return ``http_file_upload_config`` once proven usable on this verb.
+
+    A file upload on a GET had no defined behaviour: a dead ``if ...: pass``
+    in the JSON filter suggested the file was meant to be dropped, while the
+    code that actually ran attached it as a GET body. Rejecting the pair is
+    the explicit decision R12 asks for -- dropping a file the caller asked
+    to send is the one outcome that is silently wrong (L8).
+
+    Checked here, at the construction boundary, and not in the transport
+    helper that consumes the config: R11's rule is that a caller's
+    configuration is validated once, where the caller's values are first
+    read. It is also the only placement that satisfies the entry point's
+    documented contract, which the transport helper cannot -- see
+    :meth:`HttpRequest.__init__`.
+
+    Args:
+        http_file_upload_config: The caller's upload config; ``{}`` when
+            they configured no upload, which is the case this permits.
+        request_type: The verb the call will be dispatched on, matched
+            case-insensitively.
+
+    Returns:
+        The same config, unmodified.
+
+    Raises:
+        ConfigurationError: If a non-empty upload config is combined with
+            a GET.
+    """
+    if http_file_upload_config and is_get(request_type):
+        raise ConfigurationError(
+            'http_file_upload_config cannot be combined with '
+            f'request_type {request_type!r}: a GET has no body to '
+            'upload a file in. Use POST or PUT, or remove the upload '
+            'config.')
+    return http_file_upload_config
+
+
 def transport_error_for(
     err: BaseException,
     *,
@@ -163,7 +218,19 @@ class HttpRequest(BaseRequestClass):
         {'request_type'})
 
     def __init__(self, *args, **kwargs) -> None:
-        """Initializing the http request class."""
+        """Initializing the http request class.
+
+        Raises:
+            ConfigurationError: If ``protocol_info`` cannot form a valid
+                call: a "serialization" that is not callable or does not
+                return str, or an ``http_file_upload_config`` combined with
+                a GET. Both are raised here, in the constructor, because
+                the entry point builds the protocol object *outside* the
+                block that converts an ``AsyncGatewayError`` into an
+                envelope -- so a configuration error raised here escapes to
+                the caller unlogged and before anything is dispatched,
+                which is the contract ``request()`` documents.
+        """
         super(HttpRequest, self).__init__(*args, **kwargs)
 
         self.request_type: Text = self.info['request_type']
@@ -172,8 +239,13 @@ class HttpRequest(BaseRequestClass):
         self.verify_ssl: bool = self.info.get('verify_ssl', True)
         self.trace_config: List[aiohttp.TraceConfig()] = self.info.get(
             'trace_config', [request_tracer()])
-        self.http_file_upload_config: Dict = self.info.get('http_file_upload_config', {})
-        self.file_download_config: Dict = self.info.get('http_file_download_config', {})
+        self.http_file_upload_config: Dict = validated_upload_config(
+            self.info.get('http_file_upload_config', {}), self.request_type)
+        # No `{}` default: an empty config is a caller asking for a
+        # download on every documented default, and absence is the only
+        # way left to say "no download at all" (M10).
+        self.file_download_config: Optional[Dict] = self.info.get(
+            'http_file_download_config')
         self.serialization: JsonSerializer = validated_json_serializer(
             self.info.get('serialization', default_json_serialize))
         self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(
@@ -196,7 +268,10 @@ class HttpRequest(BaseRequestClass):
             DnsError: When the host name does not resolve.
             ConnectError: When the connection is refused or reset.
             TransportError: For any other client-side transport failure.
-            SerializationError: When the body is not decodable text.
+            SerializationError: When the body is not decodable text, or is
+                announced as JSON and is not valid JSON -- raised *after*
+                the status has been judged, so a malformed body on a 404
+                is still reported as the 404 it was.
         """
         async with aiohttp.ClientSession(
             trace_configs=self.trace_config, cookies=self.cookies,
@@ -230,7 +305,7 @@ class HttpRequest(BaseRequestClass):
                 raise transport_error_for(
                     err, redact_params=self.redact_params) from err
 
-            await self._copy_into_envelope(result)
+            body_error = await self._copy_into_envelope(result)
 
             status: int = result['status_code']
             if status >= HTTP_ERROR_STATUS:
@@ -239,34 +314,62 @@ class HttpRequest(BaseRequestClass):
                     f'{redact_url(self.url, extra_params=self.redact_params)}'
                     f' returned HTTP {status}',
                     status)
+            if body_error is not None:
+                raise body_error
 
             return finalise_ok(
                 self.response, status_code=status, started=self.start_time)
 
-    async def _copy_into_envelope(self, result: HttpResult) -> None:
+    async def _copy_into_envelope(
+        self,
+        result: HttpResult,
+    ) -> Optional[SerializationError]:
         """Copy a transport result into the envelope, redacting as it goes.
 
-        Called before any status error is raised, which is what invariant
-        E11 requires: a 404 carrying a JSON error body must still reach the
+        Called before any error is raised, which is what invariant E11
+        requires: a 404 carrying a JSON error body must still reach the
         caller with that body, its headers and its status intact.
+
+        A body failure is *returned* rather than raised for the same
+        reason. ``SerializationError`` carries its own 502, so raising it
+        from here would overwrite the status the remote side actually sent
+        -- a 404 with a truncated body would reach the caller as a 502 and
+        the real answer would be gone. The caller raises it once the status
+        has been judged.
+
+        The response's media type is read with the same matcher the request
+        side uses, so ``application/json; charset=utf-8`` parses and
+        nothing else is parsed by accident. A body the response does not
+        announce as JSON is left in ``text`` alone; ``json`` stays None,
+        which is not an error.
 
         Args:
             result: What the transport boundary returned.
 
         Returns:
-            None. The envelope is filled in place.
+            The body failure to report, or None when there was none. The
+            envelope itself is filled in place.
         """
         self.response['status_code'] = result['status_code']
         self.response['headers'] = redact_headers(result['headers'])
         self.response['cookies'] = redact_cookies(result['cookies'])
         self.response['text'] = result['text']
-
-        res_content_type: Text = result['headers'].get(
-            'Content-Type', 'default').lower()
-        for content_type_value, parse in header_response_mapping.items():
-            if content_type_value in res_content_type:
-                self.response['json'] = await parse(result['text'])
-
         self.response['request_tracer'] = [
             tc.results_collector for tc in self.trace_config
         ]
+
+        decode_error: Optional[Text] = result.get('decode_error')
+        if decode_error is not None:
+            return SerializationError(decode_error)
+
+        if not is_json_media_type(media_type_of(result['headers'])):
+            return None
+        try:
+            self.response['json'] = await application_json_response(
+                result['text'])
+        except SerializationError as err:
+            # Caught to be re-raised by the caller, not suppressed: `json`
+            # stays None and the caller reports SERIALIZATION, which is
+            # what makes a malformed body distinguishable from `{}`.
+            return err
+        return None
