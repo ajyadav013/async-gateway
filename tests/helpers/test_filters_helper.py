@@ -10,7 +10,9 @@ and every one of these sites feeds something that treats the two
 differently. The assertions are therefore made on what actually reaches the
 wire -- read off the loopback recording server -- not on the shape of the
 intermediate object, because the failure mode being guarded against is
-precisely one that a shape assertion would wave through.
+precisely one that a shape assertion would wave through. For the same
+reason the ``json_serialize=`` wiring is asserted through a dispatched
+request and not only through a constructed object.
 """
 
 import json
@@ -253,3 +255,108 @@ async def test_an_explicit_stdlib_serializer_keeps_working(
     # `json.dumps` spaces its separators where `orjson` does not; the point
     # is that the caller's choice survives, byte for byte.
     assert recorded.body == b'{"a": 1}'
+
+
+# --- site 4, the kwarg itself: FI-6's guard -------------------------------
+
+def _sentinel_serializer(obj: object) -> str:
+    """Serialise anything to one fixed, unmistakable JSON document.
+
+    Args:
+        obj: Ignored -- the output has to be recognisable, not correct.
+
+    Returns:
+        A JSON object no default serialiser could ever produce.
+    """
+    return '{"sentinel":"caller"}'
+
+
+async def _dispatch_json(
+    http_server: RecordingHTTPServer,
+    payload: dict,
+    **info: object,
+) -> object:
+    """Drive a whole ``HttpRequest.handle_request`` at the loopback server.
+
+    Args:
+        http_server: The loopback recording server fixture.
+        payload: The JSON body to post.
+        info: Extra ``protocol_info`` keys, e.g. ``serialization``.
+
+    Returns:
+        The single ``RecordedRequest`` the server received.
+    """
+    http_server.respond('/json', body=b'{}')
+    request = HttpRequest(
+        http_server.url_for('/json'),
+        None,
+        {'payload': payload},
+        info={
+            'request_type': 'POST',
+            'headers': {'Content-Type': 'application/json'},
+            **info,
+        },
+    )
+    await request.handle_request()
+
+    recorded, = http_server.requests
+    return recorded
+
+
+async def test_the_session_serialises_the_body_with_the_wired_default(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """``handle_request`` hands its own serialiser to the session.
+
+    The guard on ``json_serialize=self.serialization``. Drop that kwarg and
+    ``aiohttp`` silently falls back to ``json.dumps``, whose spaced
+    separators put different bytes on the wire -- a misconfigured session
+    that every construction-time assertion in this file would wave through,
+    because none of them dispatches anything.
+    """
+    recorded = await _dispatch_json(http_server, {'a': 1, 'b': 'two'})
+
+    assert recorded.body == b'{"a":1,"b":"two"}'
+
+
+async def test_the_session_serialises_the_body_with_the_callers_choice(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """A caller's serialiser is the one that reaches ``ClientSession``.
+
+    The validated callable, and only the validated callable, encodes the
+    body: the sentinel output can arrive on the wire by no other route. So
+    a ``bytes``-returning serialiser cannot reach the session either -- it
+    is rejected at construction, and nothing else is wired in its place.
+    """
+    recorded = await _dispatch_json(
+        http_server,
+        {'a': 1},
+        serialization=_sentinel_serializer,
+    )
+
+    assert recorded.body == b'{"sentinel":"caller"}'
+
+
+@pytest.mark.parametrize(
+    'serializer',
+    [
+        pytest.param('orjson.dumps', id='str'),
+        pytest.param(None, id='none'),
+        pytest.param(17, id='int'),
+    ],
+)
+def test_a_non_callable_serializer_is_rejected_at_the_boundary(
+    serializer,
+) -> None:
+    """A non-callable fails as a configuration error, not a ``TypeError``.
+
+    Same class of caller mistake as a ``bytes``-returning callable, so it
+    gets the same treatment: named at the boundary rather than surfacing as
+    a bare ``'str' object is not callable`` from the constructor.
+    """
+    with pytest.raises(ConfigurationError) as raised:
+        _http_request(serialization=serializer)
+
+    assert 'must be callable' in str(raised.value)
+    assert type(serializer).__name__ in str(raised.value)

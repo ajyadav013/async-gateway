@@ -157,6 +157,56 @@ dev venv used for the suite had `ujson` **uninstalled** before the final runs fo
    untouched; needs assignment. (My own new comments deliberately avoid the literal token so the grep
    isolates exactly this one line.)
 
+## Work Log — fix round (code review: CHANGES REQUESTED)
+
+**2026-08-16 — four reviewer findings fixed in one follow-up commit.** No rebase, no amend:
+`2d7bf40` was no longer HEAD. Orchestrator ratified the `ConfigurationError` addition (escalation 1
+above) and granted a **scoped boundary extension to `async_gateway/async_gateway.py` for docstring
+corrections only** — AGW-8 still owns that file's dispatch logic.
+
+*Change:* `~async_gateway/async_gateway.py` (docstrings only),
+`~async_gateway/logic/http_client.py`, `~tests/helpers/test_filters_helper.py`.
+
+| # | Reviewer finding | Fix | Evidence |
+|---|---|---|---|
+| 1 | **Medium** `async_gateway.py:41` — the stale docstring example is now *wrong*, not merely stale, and it is the last thing keeping R3-AC1 red | the `protocol_info` example describes a `str`-returning callable and names the orjson-wrapper default | `grep -rn "ujson" async_gateway/` → **exit 1, zero matches**. R3-AC1 closed |
+| 2 | **Medium** `async_gateway.py` — `validated_json_serializer` makes `protocol_class(...)` at `:104` raise `ConfigurationError` *synchronously*, outside `handle_request`'s try; `request()` documented no `:raises:`, so a new public-API escape path shipped undocumented (`documentation.md` §3) | added `:raises ConfigurationError:` in the file's existing reST style, saying it escapes at construction *before dispatch* rather than landing in the response dict | docstring only — control flow untouched; whether that escape is *correct* stays AGW-8's question |
+| 3 | **Low (FI-6's guard)** nothing covered `json_serialize=self.serialization`; deleting the kwarg broke zero tests — a control that cannot fire (C8/H19) | two tests drive a whole `HttpRequest.handle_request()` at the loopback recording server and assert the **bytes on the wire**: the default's compact encoding, and a caller sentinel serialiser's output | see the guard proof below |
+| 4 | **Low** `http_client.py:55` — a non-callable `serialization` raised a bare `TypeError`, though R3's AC calls for rejection *at the boundary* and a non-callable is the same class of caller error as a bytes-returning one | `validated_json_serializer` rejects a non-callable with `ConfigurationError` naming the offending value's type; three-case parametrised test (`str`, `None`, `int`) | `test_a_non_callable_serializer_is_rejected_at_the_boundary` |
+
+### Guard proof — fix 3 fails when the kwarg is removed
+
+An untested guard is not a guard, so it was tested by deleting what it guards. Scratch edit removing
+`json_serialize=self.serialization` from `handle_request`, then restore:
+
+```
+kwarg removed  -> pytest -k session_serialises   2 failed, exit 1
+  E  assert b'{"a": 1, "b": "two"}' == b'{"a":1,"b":"two"}'      (default serialiser)
+  E  assert b'{"a": 1}'             == b'{"sentinel":"caller"}'  (caller serialiser)
+kwarg restored -> pytest -k session_serialises   2 passed, exit 0
+```
+
+Both failures are aiohttp silently falling back to `json.dumps` — the misconfigured session FI-6
+predicts, invisible to every construction-time assertion in the file because none of them dispatches.
+The caller-sentinel case is also why a `bytes`-returning serialiser cannot reach `ClientSession`: the
+validated callable is provably the one that encodes the body, and no other is wired in its place.
+
+### Evidence — commands and exit codes
+
+| Check | Result |
+|---|---|
+| `grep -rn "ujson" async_gateway/` | **exit 1, 0 matches** (was 1) — R3-AC1 now closed |
+| `pytest` | **32 passed, exit 0** (27 before this round, 5 added) |
+| `mypy async_gateway` | `Success: no issues found in 21 source files`, exit 0 |
+| `flake8` on the three touched files | `async_gateway.py` **0**, `test_filters_helper.py` **0**, `http_client.py` **8 — byte-identical finding set to HEAD** (all pre-existing, owned by AGW-25). No violation added |
+
+### Not fixed here — recorded, owned elsewhere
+
+`README.md:37,98,130` still say `ujson` (**AGW-29**) · `ci.yml` action SHA pinning and missing
+`timeout-minutes` (Lows carried to the security/DevOps gate) · `test_packaging.py:32` vs
+`ci.yml:255-258` duplicated matrix regex (Cosmetic, accepted) · `MANIFEST.in:6-7` (routed to a later
+story).
+
 ### Out of scope, deliberately
 
 The spec's second R3 edge case — *"serialisation failures surface as a `ConfigurationError`, not a

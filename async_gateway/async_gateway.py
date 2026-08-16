@@ -38,7 +38,9 @@ async def request(
             "file_key": "required",
             "delete_local_file": "boolean Optional"
         }, #optional,
-        "serialization": ujson.dumps, #Optional
+        "serialization": callable taking an object and returning str,
+            #Optional default serialises with orjson and decodes to str.
+            A callable that returns bytes is rejected, see :raises: below
         "circuit_breaker_config": {
             "maximum_failures": "int optional",
             "timeout": "int optional",
@@ -77,6 +79,12 @@ async def request(
     } Optional
     :param post_processor_config: Expects Dict
     {"function": function_address, "params": {"param1": value1}} Optional
+    :raises ConfigurationError: If protocol_info cannot form a valid call --
+        currently a "serialization" value that is not callable, or one that
+        returns anything other than str. The protocol object validates its
+        configuration while it is constructed, before any request is
+        dispatched, so this escapes synchronously to the caller instead of
+        being reported inside the returned response dict.
     """
     if data is None:
         data = {}

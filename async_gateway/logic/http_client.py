@@ -35,13 +35,15 @@ def default_json_serialize(obj: Any) -> Text:
 
 
 def validated_json_serializer(serialization: JsonSerializer) -> JsonSerializer:
-    """Return ``serialization`` once proven to return ``str``.
+    """Return ``serialization`` once proven callable and ``str``-returning.
 
     ``aiohttp`` calls ``json_serialize`` deep inside payload construction and
     a ``bytes`` return surfaces there as an opaque failure, long after the
     caller's mistake. Probing it here — with an empty mapping, the cheapest
     input every JSON serialiser accepts — turns that into a rejection at the
-    boundary. The commonest mistake is passing ``orjson.dumps`` itself.
+    boundary. The commonest mistake is passing ``orjson.dumps`` itself; a
+    value that is not callable at all is the same class of caller error and
+    is rejected the same way, rather than as a bare ``TypeError``.
 
     Args:
         serialization: The caller-supplied JSON serialiser, or the default.
@@ -50,8 +52,16 @@ def validated_json_serializer(serialization: JsonSerializer) -> JsonSerializer:
         The same callable, unwrapped and unmodified.
 
     Raises:
-        ConfigurationError: If the callable does not return ``str``.
+        ConfigurationError: If the value is not callable, or does not
+            return ``str``.
     """
+    if not callable(serialization):
+        raise ConfigurationError(
+            f'protocol_info["serialization"] must be callable, but '
+            f'{serialization!r} is of type '
+            f'{type(serialization).__name__}',
+            {'received': type(serialization).__name__},
+        )
     probe = serialization({})
     if not isinstance(probe, str):
         raise ConfigurationError(
