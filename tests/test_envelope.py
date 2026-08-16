@@ -91,16 +91,6 @@ EXPECTED_KEYS = frozenset({
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent / 'async_gateway'
 
-# The two protocol clients Step 5's file boundary excludes. Their rewrite
-# belongs to the FTP and SFTP stories, so the package-wide bans below are
-# split into a strict-xfail scan (which those stories turn green by
-# deleting their own lines) and a containment test that fails the moment a
-# banned pattern appears anywhere else.
-NOT_YET_REWRITTEN = {
-    'logic/ftp_client.py',
-    'logic/sftp_client.py',
-}
-
 JSON_HEADERS = {'Content-Type': 'application/json'}
 
 
@@ -299,20 +289,7 @@ CONTRACT_ROWS = [
     pytest.param('HTTP', id='HTTP'),
     pytest.param('HTTPS', id='HTTPS'),
     pytest.param('FTP', id='FTP'),
-    pytest.param(
-        'SFTP',
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason='logic/sftp_client.py returns True rather than the '
-                   'envelope it was handed, and swallows every failure in '
-                   'a blanket `except Exception` that leaves ok=False with '
-                   'error=None and status_code=999. It does not even reach '
-                   'the `return True` here: its string-parse of the lstat '
-                   'result succeeds but produces no `type` key, so the '
-                   'lookup of that key raises KeyError first. S12 '
-                   '(Step 10) rewrites the client and takes this row '
-                   'with it.'),
-        id='SFTP'),
+    pytest.param('SFTP', id='SFTP'),
     pytest.param(
         'SOAP',
         marks=pytest.mark.xfail(
@@ -556,12 +533,6 @@ def test_e7_no_failure_reports_the_fabricated_status(
     assert 100 <= envelope['status_code'] <= 599
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='logic/ftp_client.py and logic/sftp_client.py are outside Step '
-           "5's file boundary; the FTP and SFTP stories delete their own "
-           'occurrences and this marker with them.',
-)
 def test_e7_the_fabricated_status_appears_nowhere_in_the_package() -> None:
     """The whole package is free of the invented status code (E7)."""
     assert files_containing(r'999') == []
@@ -576,18 +547,24 @@ def test_e7_the_fabricated_status_appears_nowhere_in_the_package() -> None:
         pytest.param(r'time\.time\(\)', 'R9-AC4', id='wall-clock-duration'),
     ],
 )
-def test_the_banned_patterns_are_confined_to_the_unrewritten_clients(
+def test_the_banned_patterns_appear_nowhere_in_the_package(
     pattern: str,
     criterion: str,
 ) -> None:
-    """No banned pattern may appear outside the two pending clients.
+    """No banned pattern appears in any module of the package.
 
-    Step 5 cannot delete the FTP and SFTP occurrences -- those files belong
-    to later stories -- but it can guarantee that nothing it touched
-    reintroduces one, and that the residue is exactly the two known files
-    rather than a growing set.
+    This began as a *containment* check: Step 5 could not delete the FTP
+    and SFTP occurrences -- those files belonged to later stories -- so it
+    guaranteed only that the residue was exactly those two files rather
+    than a growing set. Both have now been rewritten (S10, S11, S12), the
+    residue is empty, and the allowance goes with it. A subset assertion
+    against an empty set is a ban, but an *implicit* one: it would have
+    kept reading as an allowance to any reader, and it left ``'tat'``,
+    ``except Exception`` and ``time.time()`` reintroducible into either
+    client with the suite still green. The release-level criterion was
+    always zero; this is where it is stated as zero.
     """
-    assert set(files_containing(pattern)) <= NOT_YET_REWRITTEN, criterion
+    assert files_containing(pattern) == [], criterion
 
 
 def test_the_transport_boundary_no_longer_invents_a_response(

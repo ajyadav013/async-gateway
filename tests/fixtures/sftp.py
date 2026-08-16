@@ -35,12 +35,41 @@ through the **real** ``SSHClientConnectionOptions``, so what a test
 asserts about identities is what the shipped library will do, not a
 restatement of its rules that can drift from it.
 
-The operation surface (:class:`StubSFTPClient`) is the minimum the
-host-key tests need to reach a session. R17 owns extending it for the
-transfer and mutation modes its own tests drive; grow it there rather
-than here, for operations no test exercises yet.
+The operation surface (:class:`StubSFTPClient`) covers the modes R17
+drives -- ``get``, ``put`` and ``remove`` -- and records each one with the
+keyword options it was handed. Recording the *options* is what R17's M28
+needs: the claim there is that a keyword is **absent**, and a log of
+positional arguments alone cannot see a ``recurse=True`` that leaked in
+from an earlier call sharing the same ``protocol_info``.
+
+That surface is signature-faithful for the same reason ``client_keys`` is
+resolved through the real options object: a double that accepts more than
+the library does certifies calls the library refuses. Every operation
+takes ``*args, **kwargs`` and :func:`bind_to_real_signature` binds them
+against the **real** ``asyncssh.SFTPClient`` method before the call is
+recorded, so the check is on the seam rather than restated per method --
+which is what keeps it true for the wider mode set R21's allowlist
+admits. ``remove`` is the case that made it necessary: it takes a path
+and nothing else, so a ``recurse=True`` sent to it is a ``TypeError``
+from the library, and a double that swallowed the keyword reported a
+broken directory deletion as a completed one.
+
+The double also models the one server rule that decides an R17 row:
+``remove`` removes *a file or a symbolic link*, and asyncssh's directory
+operation is the separate ``rmtree``, so a ``remove`` aimed at a
+directory earns an ``SSH_FX_FAILURE`` from the server rather than a
+success.
+
+``lstat`` is configurable rather than fixed for the same reason
+``client_keys`` is resolved through the real options object above: the
+file type drives the whole directory branch, and asyncssh carries it in
+the typed ``SFTPAttrs.type`` field, not in the ``str()`` fragment the
+client used to parse. A test therefore hands the double a **real**
+``SFTPAttrs`` -- including the two shapes that used to crash the parse --
+rather than a mapping shaped like what the client hoped to find.
 """
 
+import inspect
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +91,34 @@ OTHER_HOST_KEY = 'ssh-ed25519 AAAAOTHERKEY'
 # "offers only an algorithm the client rejects" edge case is reached.
 SERVER_KEY_ALGORITHM = 'ssh-ed25519'
 ACCEPTED_KEY_ALGORITHMS = frozenset({'ssh-ed25519', 'rsa-sha2-256'})
+
+# One recorded SFTP operation: the method name, its positional arguments
+# and the keyword options it was given. The options are recorded because
+# M28's claim is about a keyword that must *not* be there.
+SFTPCall = tuple[str, tuple[Any, ...], dict[str, Any]]
+
+# What ``lstat`` reports for each kind of target. Real ``SFTPAttrs``, and
+# the ``type`` field carries the answer: asyncssh fills it from the mode
+# bits when it decodes an SFTPv3 reply and reads it off the wire from v4
+# on, so it is the field a client is meant to branch on.
+FILE_ATTRS = asyncssh.SFTPAttrs(
+    type=asyncssh.FILEXFER_TYPE_REGULAR, size=12, permissions=0o100644)
+DIRECTORY_ATTRS = asyncssh.SFTPAttrs(
+    type=asyncssh.FILEXFER_TYPE_DIRECTORY, size=4096, permissions=0o40755)
+SYMLINK_ATTRS = asyncssh.SFTPAttrs(
+    type=asyncssh.FILEXFER_TYPE_SYMLINK, size=7, permissions=0o120777)
+
+# The two attribute shapes that used to crash the client before it had
+# transferred anything. ``SFTPAttrs()`` stringifies to the empty string,
+# so the old ``str(...).split(',')`` produced one fragment with no ``':'``
+# in it and the fragment's ``split(':')[1]`` raised ``IndexError``. The
+# second stringifies to ``'size: 12, permissions: 100644'`` -- a parse
+# that *succeeds* and yields no ``type`` key, so the lookup of that key
+# raised ``KeyError``. Both are ordinary answers from a real server: the
+# first is a server that sent no attributes, the second is any server at
+# all, since ``SFTPAttrs.__str__`` omits an unknown file type.
+UNPARSEABLE_ATTRS = asyncssh.SFTPAttrs()
+TYPELESS_ATTRS = asyncssh.SFTPAttrs(size=12, permissions=0o100644)
 
 
 @dataclass(frozen=True)
@@ -178,33 +235,150 @@ def read_trusted_keys(path: Optional[Path]) -> list[str]:
     ]
 
 
+def bind_to_real_signature(
+    name: str,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+) -> None:
+    """Refuse a call the real ``asyncssh.SFTPClient`` would refuse.
+
+    A stub whose methods take ``*args, **kwargs`` accepts every keyword
+    ever offered to it, including the ones the library rejects, so a test
+    driven through it can report a broken operation as a working one --
+    which is what a ``recurse=True`` sent to ``remove`` did. Binding
+    against the real method's signature moves that judgement back to the
+    library: the double decides nothing, it only replays the arguments to
+    the object that owns the rules.
+
+    Args:
+        name: The operation being invoked, which must be a real method of
+            ``asyncssh.SFTPClient``.
+        args: The positional arguments the client passed.
+        kwargs: The keyword arguments the client passed.
+
+    Returns:
+        None, when the real method would have accepted this call.
+
+    Raises:
+        AttributeError: If ``name`` is not a method of the real client at
+            all, which no ``getattr`` in the client under test could have
+            resolved either.
+        TypeError: If the real method would refuse these arguments -- an
+            unexpected keyword, a missing or surplus positional. Raised
+            from the same call the client made, so it lands exactly where
+            the library would have raised it.
+    """
+    method = getattr(asyncssh.SFTPClient, name)
+    # `None` stands in for `self`: the signature is read off the class,
+    # so the bound receiver is still a parameter of it.
+    inspect.signature(method).bind(None, *args, **kwargs)
+
+
 class StubSFTPClient:
     """The slice of ``asyncssh``'s SFTP client an SFTP session uses.
 
-    Records every operation it was asked to perform so a test can assert
-    what actually happened on the remote side -- including that a
-    destructive operation ran exactly once.
+    Records every operation it was asked to perform, with the keyword
+    options it was handed, so a test can assert what actually happened on
+    the remote side -- that a destructive operation ran exactly once, and
+    that no option leaked into it from an earlier call. Every operation is
+    bound against the real method's signature first, so an argument the
+    library would refuse is refused here too.
     """
 
-    def __init__(self) -> None:
-        """Start with an empty operation log."""
-        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+    def __init__(
+        self,
+        *,
+        attrs: asyncssh.SFTPAttrs = FILE_ATTRS,
+        entries: Sequence[str] = ('f',),
+        lstat_error: Optional[BaseException] = None,
+        operation_error: Optional[BaseException] = None,
+    ) -> None:
+        """Build an SFTP client double.
+
+        Args:
+            attrs: What :meth:`lstat` reports for the target. The file
+                type in it is what selects the directory branch, so this
+                is the one knob a test turns to cover both sides of it.
+            entries: What :meth:`listdir` reports. The default is one
+                file; the empty tuple is the empty-directory edge case,
+                which must stay distinguishable from "not a directory".
+            lstat_error: Raised by :meth:`lstat`, so a test can drive a
+                failure that happens *before* the transfer. Raised
+                unwrapped, unlike the operation below, which the
+                resilience layer wraps -- and the two travel different
+                branches of the error classifier.
+            operation_error: Raised by whichever operation is invoked, so
+                a test can drive a failure during the transfer or the
+                mutation itself.
+        """
+        self.calls: list[SFTPCall] = []
+        self.attrs = attrs
+        self.entries = entries
+        self.lstat_error = lstat_error
+        self.operation_error = operation_error
+
+    def names(self) -> list[str]:
+        """Return the operations invoked, in order.
+
+        Returns:
+            One name per recorded call, so a test that cares only about
+            *which* operations ran -- and how many times -- does not have
+            to restate their arguments to say so.
+        """
+        return [name for name, _, _ in self.calls]
+
+    async def _invoked(
+        self,
+        name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Record one operation and fail if configured to.
+
+        The call is bound against the real signature *before* it is
+        recorded, because a call the library refuses never reaches the
+        server: recording it would leave a test able to assert that an
+        impossible operation was issued.
+
+        Args:
+            name: The operation the client called.
+            args: The positional arguments it passed.
+            kwargs: The transfer options it passed.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If the real ``asyncssh.SFTPClient`` method would
+                refuse these arguments. See :func:`bind_to_real_signature`.
+            BaseException: ``operation_error``, when one was configured.
+        """
+        bind_to_real_signature(name, args, kwargs)
+        self.calls.append((name, args, kwargs))
+        if self.operation_error is not None:
+            raise self.operation_error
 
     async def lstat(self, path: str) -> asyncssh.SFTPAttrs:
         """Return the attributes ``asyncssh`` reports for a remote path.
 
-        The real ``asyncssh.SFTPAttrs`` is returned rather than a
-        stand-in, so a client reading it is held to the type the library
-        actually hands back.
+        A real ``asyncssh.SFTPAttrs`` is returned rather than a stand-in,
+        so a client reading it is held to the type the library actually
+        hands back -- which is the whole of M4: the field is typed and
+        the client used to go looking for it in a ``str()``.
 
         Args:
             path: The remote path being described.
 
         Returns:
-            Attributes describing a regular file.
+            The configured attributes.
+
+        Raises:
+            BaseException: ``lstat_error``, when one was configured.
         """
-        self.calls.append(('lstat', (path,)))
-        return asyncssh.SFTPAttrs(size=12, permissions=0o100644)
+        self.calls.append(('lstat', (path,), {}))
+        if self.lstat_error is not None:
+            raise self.lstat_error
+        return self.attrs
 
     async def listdir(self, path: str) -> list[str]:
         """Return the entries ``asyncssh`` reports for a remote directory.
@@ -213,46 +387,60 @@ class StubSFTPClient:
             path: The remote directory being listed.
 
         Returns:
-            One file name.
+            The configured entries.
         """
-        self.calls.append(('listdir', (path,)))
-        return ['f']
+        self.calls.append(('listdir', (path,), {}))
+        return list(self.entries)
 
     async def get(self, *args: Any, **kwargs: Any) -> None:
         """Accept a download and report success by not raising.
 
         Args:
             args: The remote and local paths.
-            kwargs: Transfer options such as ``recurse``, unused.
+            kwargs: Transfer options such as ``recurse``.
 
         Returns:
             None, as ``asyncssh`` does.
         """
-        self.calls.append(('get', args))
+        await self._invoked('get', args, kwargs)
 
     async def put(self, *args: Any, **kwargs: Any) -> None:
         """Accept an upload and report success by not raising.
 
         Args:
             args: The local and remote paths.
-            kwargs: Transfer options such as ``recurse``, unused.
+            kwargs: Transfer options such as ``recurse``.
 
         Returns:
             None, as ``asyncssh`` does.
         """
-        self.calls.append(('put', args))
+        await self._invoked('put', args, kwargs)
 
     async def remove(self, *args: Any, **kwargs: Any) -> None:
-        """Accept a deletion and report success by not raising.
+        """Delete a remote file, or refuse a directory the way a server does.
+
+        ``asyncssh.SFTPClient.remove`` removes *a file or a symbolic
+        link* -- the directory operation is the separate ``rmtree`` -- so
+        a server answers a ``remove`` aimed at a directory with
+        ``SSH_FX_FAILURE``. Modelling that here is what makes R17-AC1's
+        sixth row report an honest typed failure rather than a success
+        the real remote side would never have granted.
 
         Args:
             args: The remote path being removed.
-            kwargs: Options, unused.
+            kwargs: Options, of which the real method accepts none.
 
         Returns:
-            None, as ``asyncssh`` does.
+            None, as ``asyncssh`` does, for a file or a symlink.
+
+        Raises:
+            asyncssh.SFTPFailure: When the target is a directory.
+            BaseException: ``operation_error``, when one was configured.
         """
-        self.calls.append(('remove', args))
+        await self._invoked('remove', args, kwargs)
+        if self.attrs.type == asyncssh.FILEXFER_TYPE_DIRECTORY:
+            raise asyncssh.SFTPFailure(
+                'the remove target is a directory, not a file')
 
 
 class StubSSHConnection:

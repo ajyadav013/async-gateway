@@ -1,4 +1,4 @@
-"""SFTP transport security: host-key verification and key auth (R16).
+"""SFTP: host keys and key auth (R16), and honest reporting (R17).
 
 Every test here guards one half of C4 -- ``logic/sftp.py:32`` hardcoded
 ``known_hosts=None``, so asyncssh accepted **any** server key on **every**
@@ -18,37 +18,70 @@ drive ``request()`` end to end and read ``error['code']``, because a
 guard that fails safely but reports nothing a caller can branch on is
 half a guard.
 
-What is *not* asserted here: the success envelope. R17 owns the SFTP
-client's envelope mapping, which today reaches neither finaliser, so a
-test in this module that asserted ``ok is True`` would be asserting R17's
-work and would have to be rewritten by it. The ``opened`` counter on the
-double is read instead, which stays true across that rewrite.
+The R16 tests deliberately still read the double's ``opened`` counter
+rather than the envelope: "this host-key policy was accepted" is a claim
+about the handshake, and reading it off the transport keeps it true
+however the envelope below the handshake is later shaped.
+
+The R17 half asserts the envelope, because that is precisely what R17 is
+about. Three defects lived between the completed operation and the
+caller. ``remote_files`` was bound only inside the directory branch and
+read unconditionally, so **every single-file target raised
+``UnboundLocalError`` after the transfer or the deletion had already
+happened** (H2) -- and a blanket ``except Exception`` turned that into
+``ok=False``, ``error=None``, ``status_code=999``, which a caller
+following the documented retry policy re-ran. On ``mode='remove'`` that
+means deleting the file twice and being told, both times, that nothing
+happened. Metadata came from string-parsing an undocumented ``str()`` of
+``SFTPAttrs`` and crashed before the transfer was even attempted (M4),
+and ``recurse=True`` was written into the caller's own
+``additional_arguments`` dict, so it was inherited by every later call
+sharing that ``protocol_info`` (M28).
 """
 
 import logging
 import re
+import socket
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional, Text
 
 from aiohttp import BasicAuth
 
 from async_gateway.async_gateway import request
-from async_gateway.utils.envelope import GatewayResponse
+from async_gateway.logic.sftp_client import SFTPRequest
+from async_gateway.utils.envelope import GatewayResponse, new_envelope
 from async_gateway.utils.exceptions import ConfigurationError
+
+import asyncssh
 
 import pytest
 
 from tests.fixtures.sftp import (
     ACCEPTED_KEY_ALGORITHMS,
+    DIRECTORY_ATTRS,
+    FILE_ATTRS,
     OTHER_HOST_KEY,
     SERVER_HOST_KEY,
     SSHTransportDouble,
+    SYMLINK_ATTRS,
+    StubSFTPClient,
+    TYPELESS_ATTRS,
+    UNPARSEABLE_ATTRS,
     plant_ambient_key,
 )
 
 HOST = 'sftp.example.invalid'
 REMOTE_PATH = '/remote/f'
+LOCAL_PATH = '/local/f'
 AUTH = BasicAuth('user', 'password')
+
+# A retry policy with retries actually armed. The destructive-success
+# criterion is that a completed `remove` is not re-run, and a breaker
+# configured to retry nothing would satisfy it without proving anything.
+RETRYING_BREAKER: dict[Text, Any] = {
+    'maximum_failures': 3,
+    'retry_config': {'name': 'delay', 'allowed_retries': 2, 'delay': 0},
+}
 
 SFTP_LOGGER = 'async_gateway.logic.sftp_client'
 
@@ -594,3 +627,585 @@ async def test_r16_a_password_and_client_keys_are_both_offered(
     assert double.options['client_keys'] == ['/keys/id_ed25519']
     assert double.options['password'] == AUTH.password
     assert double.options['username'] == AUTH.login
+
+
+# --- R17-AC1: the operation that succeeded is reported as a success --------
+
+
+def trusting_double(
+    monkeypatch: pytest.MonkeyPatch,
+    sftp: Optional[StubSFTPClient] = None,
+) -> SSHTransportDouble:
+    """Install a double whose host key this call already trusts.
+
+    R17 is about what happens *after* the handshake, so every test below
+    pins the server's own key: a session that never opened would satisfy
+    "no stale ``recurse`` was passed" by having passed nothing at all.
+
+    Args:
+        monkeypatch: The pytest patcher.
+        sftp: The SFTP client the session yields, or None for one
+            describing a single regular file.
+
+    Returns:
+        The installed double, for its recorded connections and client.
+    """
+    double = SSHTransportDouble(sftp=sftp or StubSFTPClient())
+    double.install(monkeypatch)
+    return double
+
+
+def sftp_request(**info: Any) -> tuple[SFTPRequest, GatewayResponse]:
+    """Build an ``SFTPRequest`` over an envelope the test can identify.
+
+    Args:
+        info: ``protocol_info`` overrides; ``mode`` and ``remote_path``
+            have defaults.
+
+    Returns:
+        The client and the exact envelope object it was handed.
+    """
+    envelope = new_envelope(url=HOST, protocol='SFTP', payload={})
+    client = SFTPRequest(
+        HOST, AUTH, envelope,
+        info={'mode': 'get', 'remote_path': REMOTE_PATH, **info},
+        redact_params=frozenset())
+    return client, envelope
+
+
+@pytest.mark.parametrize(
+    'mode, local_path',
+    [
+        pytest.param('get', LOCAL_PATH, id='get'),
+        pytest.param('put', LOCAL_PATH, id='put'),
+        pytest.param('remove', None, id='remove'),
+    ],
+)
+@pytest.mark.parametrize(
+    'attrs, target',
+    [
+        pytest.param(FILE_ATTRS, 'file', id='file'),
+        pytest.param(DIRECTORY_ATTRS, 'directory', id='directory'),
+    ],
+)
+async def test_r17_ac1_every_mode_against_either_target_reports_the_truth(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: Text,
+    local_path: Optional[Text],
+    attrs: asyncssh.SFTPAttrs,
+    target: Text,
+) -> None:
+    """H2: what the remote side did is what the envelope says, on all six.
+
+    ``remote_files`` was assigned only inside ``if 'directory' in
+    lstat['type']`` and read unconditionally two statements later, so the
+    three single-file rows raised ``UnboundLocalError`` *after* the
+    transfer or the deletion had already happened on the server. The
+    directory rows are here as the control: they were the only path that
+    ever worked, and a fix that initialises the name but breaks the
+    branch would be invisible without them.
+
+    Both dimensions are parametrised rather than folded into one list
+    because the defect is the product of the two -- mode decides what was
+    already done to the remote side when the crash lands, and target
+    decides whether it lands at all.
+
+    Five rows report ``ok=True``. The sixth cannot, and asserting that it
+    did was this table's own defect: ``asyncssh.SFTPClient.remove``
+    *"removes a remote file or symbolic link"* and takes a path and
+    nothing else -- the directory operation is the separate ``rmtree`` --
+    so a directory ``remove`` earns ``SSH_FX_FAILURE`` from the server.
+    R17-AC1's "``ok=True`` for all six" was unachievable against the real
+    library, and the row is asserted as the honest typed failure it is
+    (spec amendment, review iteration 2). Routing it to ``rmtree``
+    instead would escalate a caller's ``remove`` into a recursive tree
+    deletion they never named, which is the class of implicit behaviour
+    this release exists to remove.
+    """
+    double = trusting_double(monkeypatch, StubSFTPClient(attrs=attrs))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        mode=mode,
+        local_path=local_path)
+
+    assert mode in double.sftp.names(), 'the operation never went out'
+    if mode == 'remove' and target == 'directory':
+        assert envelope['ok'] is False
+        assert envelope['error']['code'] == 'SFTP_STATUS'
+        assert envelope['status_code'] == 500
+    else:
+        assert envelope['ok'] is True, target
+        assert envelope['error'] is None
+        assert envelope['status_code'] == 200
+
+
+async def test_r17_ac2_a_completed_deletion_is_never_re_attempted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The finding in one test: delete once, report success, stop.
+
+    Deleting is not idempotent from the caller's point of view, and the
+    old client reported a *successful* deletion as ``ok=False`` with
+    ``status_code: 999`` -- the shape the documented retry policy exists
+    to re-run. The breaker here has retries armed precisely so that the
+    call count means something: with ``allowed_retries=0`` the row would
+    pass against a client that had no idea whether it had succeeded.
+
+    The count is asserted on the double's own log, so a client that
+    reported success without ever issuing the ``remove`` fails it too.
+    """
+    double = trusting_double(monkeypatch)
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        mode='remove',
+        circuit_breaker_config=RETRYING_BREAKER)
+
+    assert envelope['ok'] is True
+    assert envelope['error'] is None
+    assert envelope['status_code'] == 200
+    assert double.sftp.names().count('remove') == 1
+
+
+# --- R17-AC3: the dead attribute that looked like the fix ------------------
+
+
+def test_r17_ac3_the_dead_remote_files_attribute_is_gone() -> None:
+    """L6: the thing that looks like H2's missing initialisation.
+
+    ``self.remote_files`` was assigned the *remote path* -- a string
+    where the envelope wanted a list of names -- and then never read.
+    Anyone fixing H2 by initialising "the obvious attribute" would have
+    published a path string as ``files`` for every single-file call and
+    passed every test that only checked ``ok``. It is asserted on the
+    constructed object rather than by reading the source, because an
+    attribute reintroduced under any spelling of the assignment is the
+    regression, not the literal line.
+    """
+    client, _ = sftp_request()
+
+    assert not hasattr(client, 'remote_files')
+
+
+# --- R17-AC4: metadata from the typed fields, not from a repr --------------
+
+
+@pytest.mark.parametrize(
+    'attrs, crash',
+    [
+        pytest.param(UNPARSEABLE_ATTRS, 'IndexError', id='no-colon-fragment'),
+        pytest.param(TYPELESS_ATTRS, 'KeyError', id='no-type-key'),
+    ],
+)
+async def test_r17_ac4_attrs_that_used_to_crash_the_parse_now_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+    attrs: asyncssh.SFTPAttrs,
+    crash: Text,
+) -> None:
+    """M4: the metadata read no longer decides whether the call happens.
+
+    Both rows are ordinary answers from a real server, and both used to
+    raise -- ``IndexError`` on a fragment of ``str(attrs)`` with no
+    ``':'`` in it, ``KeyError`` on a parse that succeeded and yielded no
+    ``type`` key -- **before the transfer was attempted**, landing as a
+    fabricated ``999`` for a call that never reached the remote side at
+    all. The second row is not an exotic server: ``SFTPAttrs.__str__``
+    omits the file type whenever asyncssh reports it as unknown.
+
+    The transfer itself is asserted, not just ``ok``: the point of the
+    finding is that a metadata read was standing between the caller and
+    the operation they asked for.
+    """
+    double = trusting_double(monkeypatch, StubSFTPClient(attrs=attrs))
+
+    envelope = await sftp_call(host_key=SERVER_HOST_KEY)
+
+    assert envelope['ok'] is True, crash
+    assert envelope['error'] is None
+    assert 'get' in double.sftp.names()
+
+
+async def test_r17_ac4_file_stats_carry_the_typed_attrs_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The metadata a caller gets is the metadata asyncssh reported.
+
+    Asserted field by field against the ``SFTPAttrs`` the server
+    answered with, because "it did not crash" is not the criterion --
+    the criterion is that the values come from the typed fields. The
+    string parse it replaces silently produced ``' 12'`` with a leading
+    space for the size and dropped every field whose value contained a
+    comma.
+    """
+    trusting_double(monkeypatch, StubSFTPClient(attrs=FILE_ATTRS))
+
+    envelope = await sftp_call(host_key=SERVER_HOST_KEY)
+
+    assert envelope['protocol_details']['file_stats'] == {
+        'type': 'file',
+        'size': FILE_ATTRS.size,
+        'permissions': FILE_ATTRS.permissions,
+        'uid': None,
+        'gid': None,
+        'owner': None,
+        'group': None,
+        'atime': None,
+        'mtime': None,
+    }
+
+
+# --- R17-AC5 / M28: the caller's dict is never mutated ---------------------
+
+
+async def test_r17_ac5_a_shared_protocol_info_does_not_leak_recurse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M28: the cross-request state leak, in its documented shape.
+
+    ``self.additional_arguments.update({'recurse': True})`` wrote into
+    the caller's own dict, which reaches the client by reference through
+    three layers. One directory ``get`` therefore left
+    ``protocol_info['additional_arguments']`` permanently
+    ``{'recurse': True}``, and the next call sharing that config -- the
+    ``asyncio.gather`` with one shared config this library documents --
+    inherited it. A single-file ``remove`` with ``recurse=True`` is a
+    keyword the caller never wrote, sent to a server, on the one
+    operation that cannot be undone.
+
+    One ``additional_arguments`` object is deliberately reused rather
+    than copied between the calls: copying it is what the caller is *not*
+    required to do, and a test that copied would prove nothing.
+
+    The second call carries no ``additional_arguments`` of its own,
+    because ``asyncssh.SFTPClient.remove`` accepts none: it takes a path
+    and nothing else, so a ``preserve`` handed to it is a ``TypeError``
+    from the library and driving one would only assert that a stub
+    swallowed it. Asserting the deletion went out with an **empty**
+    option mapping is the stricter claim anyway -- it fails on any
+    keyword leaking in, not merely on ``recurse``.
+    """
+    shared_arguments: dict[Text, Any] = {'preserve': True}
+    protocol_info: dict[Text, Any] = {
+        'host_key': SERVER_HOST_KEY,
+        'remote_path': REMOTE_PATH,
+    }
+    double = trusting_double(
+        monkeypatch, StubSFTPClient(attrs=DIRECTORY_ATTRS))
+
+    await request(
+        HOST, data={}, auth=AUTH, protocol='SFTP',
+        protocol_info={
+            **protocol_info,
+            'mode': 'get',
+            'additional_arguments': shared_arguments,
+        })
+    double.sftp.attrs = FILE_ATTRS
+    await request(
+        HOST, data={}, auth=AUTH, protocol='SFTP',
+        protocol_info={**protocol_info, 'mode': 'remove'})
+
+    options = {name: kwargs for name, _, kwargs in double.sftp.calls}
+    assert options['get'] == {'preserve': True, 'recurse': True}
+    assert options['remove'] == {}
+    assert shared_arguments == {'preserve': True}
+
+
+async def test_r17_ac5_the_callers_additional_arguments_reach_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copying the dict must not mean discarding what was in it.
+
+    The cheapest way to pass the leak test above is to stop forwarding
+    ``additional_arguments`` at all, which would silently drop every
+    option a caller configured. This is the counterweight.
+    """
+    double = trusting_double(monkeypatch)
+
+    await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        additional_arguments={'block_size': 4096})
+
+    assert dict(
+        (name, kwargs) for name, _, kwargs in double.sftp.calls
+    )['get'] == {'block_size': 4096}
+
+
+# --- R17-AC6 / H10-sftp: the session is bounded ----------------------------
+
+
+async def test_r17_ac6_the_connect_and_the_login_are_both_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H10-sftp: SFTP was the protocol that never used ``self.timeout``.
+
+    ``base.py`` computes it for every protocol and SFTP ignored it, so a
+    server that completed the TCP handshake and then went silent held the
+    coroutine open forever. The breaker cannot help: a hang raises
+    nothing for it to count, so no failure is ever recorded and the
+    circuit never opens. Both keywords are asserted because they bound
+    different halves -- the TCP connect, and the SSH authentication that
+    follows it.
+    """
+    double = trusting_double(monkeypatch)
+
+    await sftp_call(host_key=SERVER_HOST_KEY, timeout=7)
+
+    assert double.options['connect_timeout'] == 7
+    assert double.options['login_timeout'] == 7
+
+
+# --- R17-AC8: the envelope contract ----------------------------------------
+
+
+async def test_r17_ac8_the_client_returns_the_envelope_it_was_handed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E1's other half: one object is filled and returned, not replaced.
+
+    ``return True`` is what the old client did. The entry point assigns
+    what ``handle_request`` returns straight back over its own envelope,
+    so the caller of an SFTP call received the bare literal ``True`` --
+    no keys, no ``ok``, nothing the documented ``result['ok']`` check
+    could even be applied to. Identity rather than equality, because a
+    client that built an equal dict of its own would discard everything
+    the entry point had already written into the envelope.
+    """
+    trusting_double(monkeypatch)
+    client, envelope = sftp_request(host_key=SERVER_HOST_KEY)
+
+    returned = await client.handle_request()
+
+    assert returned is envelope
+    assert returned['ok'] is True
+
+
+async def test_r17_ac8_the_protocol_extras_live_under_protocol_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R8: SFTP's own keys stop leaking into the top-level key set.
+
+    ``mode``, ``files``, ``file_stats`` and ``tat`` were written at the
+    top level, so the envelope's shape depended on which protocol had
+    answered -- the exact thing R8 exists to remove. ``latency`` is
+    asserted too: ``tat`` was not renamed in place, it was a *different*
+    number, computed from ``time.time()`` and therefore able to go
+    backwards across a clock step.
+    """
+    trusting_double(monkeypatch, StubSFTPClient(attrs=DIRECTORY_ATTRS))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY, local_path=LOCAL_PATH)
+
+    assert envelope['protocol_details'] == {
+        'mode': 'get',
+        'remote_path': REMOTE_PATH,
+        'local_path': LOCAL_PATH,
+        'file_stats': envelope['protocol_details']['file_stats'],
+        'files': ['f'],
+    }
+    assert 'tat' not in envelope
+    assert envelope['latency'] >= 0
+    for leaked in ('mode', 'files', 'file_stats'):
+        assert leaked not in envelope
+
+
+def test_r17_ac9_no_docstring_in_the_module_calls_it_an_ftp_class() -> None:
+    """L5: the SFTP module described itself as FTP.
+
+    Copy-paste provenance left in the one place a reader looks to find
+    out what the class is. It matters more than a typo usually would:
+    this package has both protocols, they take different
+    ``protocol_info`` keys, and the docstring sent the reader to the
+    wrong one.
+    """
+    docstrings = [
+        SFTPRequest.__doc__,
+        SFTPRequest.__init__.__doc__,
+        SFTPRequest.handle_request.__doc__,
+    ]
+
+    # A word boundary, so that the fix cannot be read as "say `sftp
+    # request class` and the substring is still in there".
+    calls_itself_ftp = re.compile(r'\bftp request class\b')
+    for docstring in docstrings:
+        assert docstring is not None
+        assert not calls_itself_ftp.search(docstring.lower())
+
+
+# --- R17 edge cases --------------------------------------------------------
+
+
+async def test_r17_a_missing_mode_is_a_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``None.lower()`` is not a diagnosis (R17 edge case).
+
+    ``mode`` has no default, so a caller who omitted it used to open a
+    connection, run ``lstat`` against the server, and only then raise
+    ``AttributeError`` from ``self.mode_.lower()`` -- swallowed into the
+    same ``999`` as everything else, which says nothing about whose
+    mistake it was or whether retrying could help.
+
+    Reported as an envelope rather than raised synchronously, unlike the
+    host-key policy errors above: ``protocol_info`` is optional for this
+    protocol at the entry point (R11-AC3), so the check cannot live in
+    the constructor. It still runs before the connect, which is what the
+    empty connection log asserts.
+    """
+    double = trusting_double(monkeypatch)
+
+    envelope = await request(
+        HOST, data={}, auth=AUTH, protocol='SFTP',
+        protocol_info={'remote_path': REMOTE_PATH})
+
+    assert envelope['ok'] is False
+    assert envelope['error'] is not None
+    assert envelope['error']['code'] == 'CONFIG'
+    assert envelope['status_code'] == 400
+    assert 'mode' in envelope['error']['message']
+    assert double.connections == []
+
+
+@pytest.mark.parametrize(
+    'attrs, entries, files',
+    [
+        pytest.param(FILE_ATTRS, ('f',), None, id='file'),
+        pytest.param(SYMLINK_ATTRS, ('f',), None, id='symlink'),
+        pytest.param(DIRECTORY_ATTRS, (), [], id='empty-directory'),
+        pytest.param(DIRECTORY_ATTRS, ('a', 'b'), ['a', 'b'], id='directory'),
+    ],
+)
+async def test_r17_files_distinguishes_an_empty_directory_from_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+    attrs: asyncssh.SFTPAttrs,
+    entries: tuple[Text, ...],
+    files: Optional[list[Text]],
+) -> None:
+    """``files: []`` and ``files: None`` are different answers.
+
+    An empty directory really has no entries; a file has no entry list at
+    all. Collapsing them -- which ``files = remote_files or []`` would --
+    tells a caller that a file they just downloaded is an empty
+    directory. The symlink row is the third state the old ``'directory'
+    in lstat['type']`` substring test never had a name for.
+    """
+    double = trusting_double(
+        monkeypatch, StubSFTPClient(attrs=attrs, entries=entries))
+
+    envelope = await sftp_call(host_key=SERVER_HOST_KEY)
+
+    assert envelope['protocol_details']['files'] == files
+    assert ('listdir' in double.sftp.names()) is (files is not None)
+
+
+# --- failure translation ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'error, code, status',
+    [
+        pytest.param(
+            asyncssh.SFTPNoSuchFile('no such file'),
+            'SFTP_STATUS', 404, id='no-such-file'),
+        pytest.param(
+            asyncssh.SFTPPermissionDenied('denied'),
+            'SFTP_STATUS', 403, id='permission-denied'),
+        pytest.param(
+            asyncssh.SFTPFailure('it went wrong'),
+            'SFTP_STATUS', 500, id='other-sftp-error'),
+        pytest.param(
+            ConnectionRefusedError('refused'), 'CONNECT', 502, id='refused'),
+        pytest.param(
+            socket.gaierror('name not known'), 'DNS', 502, id='dns'),
+        pytest.param(
+            TimeoutError('too slow'), 'TIMEOUT', 504, id='timeout'),
+        pytest.param(
+            asyncssh.PermissionDenied('authentication failed'),
+            'TRANSPORT', 502, id='ssh-error-with-no-family'),
+    ],
+)
+@pytest.mark.parametrize('during', ['lstat', 'operation'])
+async def test_a_failure_maps_to_its_typed_error_wherever_it_is_raised(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    code: Text,
+    status: int,
+    during: Text,
+) -> None:
+    """Every failure carries a code and a status a consumer can read.
+
+    The blanket ``except Exception`` reported all of these identically:
+    ``ok=False``, ``error=None``, ``status_code=999`` and the exception
+    *object* in ``text``, which is not even serialisable. A caller could
+    not tell a missing file from a dead host, so no retry decision was
+    possible -- and 404 versus 502 is exactly that decision.
+
+    The last row is an SSH-level failure -- a rejected password -- that
+    belongs to no transport family and is not an ``SFTPError`` either. It
+    is here because the classifier's fallthrough is the branch a library
+    bug also reaches, and the two must part company: an ``asyncssh.Error``
+    is a failed call and becomes an envelope, while anything else is this
+    library's bug and propagates (the test below).
+
+    Both raise sites are parametrised because they take different routes
+    through the classifier: the operation runs inside the resilience
+    layer, which wraps whatever it raised in a ``FailsafeError`` whose
+    own ``str()`` is empty, so both the class and the message have to be
+    recovered from the cause. ``lstat`` is not wrapped. A classifier that
+    only unwrapped would report the unwrapped case as a bare type name.
+    """
+    trusting_double(monkeypatch, StubSFTPClient(**{f'{during}_error': error}))
+
+    envelope = await sftp_call(host_key=SERVER_HOST_KEY, mode='remove')
+
+    assert envelope['ok'] is False
+    assert envelope['error'] is not None
+    assert envelope['error']['code'] == code
+    assert envelope['status_code'] == status
+    assert envelope['error']['message']
+
+
+async def test_an_open_circuit_is_reported_as_an_open_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The breaker's own refusal is not a transport failure.
+
+    ``CircuitOpen`` is a ``FailsafeError`` with nothing under it that the
+    generic unwrap can classify, so without its own clause it would land
+    as a 502 the caller would retry -- into a circuit that is open
+    precisely to stop them. 503 says "not now" instead.
+    """
+    trusting_double(
+        monkeypatch,
+        StubSFTPClient(operation_error=ConnectionResetError('reset')))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        circuit_breaker_config={
+            'maximum_failures': 1,
+            'retry_config': {'name': 'delay', 'allowed_retries': 2,
+                             'delay': 0},
+        })
+
+    assert envelope['ok'] is False
+    assert envelope['error'] is not None
+    assert envelope['error']['code'] == 'CIRCUIT_OPEN'
+    assert envelope['status_code'] == 503
+
+
+async def test_a_library_bug_propagates_instead_of_becoming_an_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rule the blanket ``except Exception`` broke for this package.
+
+    A ``KeyError`` raised inside the session is this library's bug, not a
+    failed request. Reporting it as a ``999`` envelope is what hid it --
+    and hid most of this audit -- for the life of the package.
+    Reinstate any blanket handler and this test stops raising.
+    """
+    trusting_double(
+        monkeypatch, StubSFTPClient(operation_error=KeyError('library bug')))
+
+    with pytest.raises(KeyError):
+        await sftp_call(host_key=SERVER_HOST_KEY)
