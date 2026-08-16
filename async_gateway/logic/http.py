@@ -8,8 +8,59 @@ from async_gateway.helpers.internal import header_response_mapping
 from async_gateway.helpers.internal.base import BaseRequestClass
 from async_gateway.helpers.internal.request_helper import \
     handle_http_request
+from async_gateway.utils.exceptions import ConfigurationError
 from async_gateway.utils.request_tracer import request_tracer
-import ujson
+import orjson
+
+JsonSerializer = Callable[[Any], Text]
+
+
+def default_json_serialize(obj: Any) -> Text:
+    """Serialise ``obj`` to a JSON string.
+
+    The default for ``ClientSession(json_serialize=...)``, which requires a
+    ``str``-returning callable. ``orjson.dumps`` returns ``bytes``, so it can
+    never be passed bare; this wrapper is what makes the migration safe.
+
+    Args:
+        obj: Any object ``orjson`` can serialise.
+
+    Returns:
+        The JSON encoding of ``obj`` as text.
+
+    Raises:
+        TypeError: If ``orjson`` cannot serialise ``obj``.
+    """
+    return orjson.dumps(obj).decode()
+
+
+def validated_json_serializer(serialization: JsonSerializer) -> JsonSerializer:
+    """Return ``serialization`` once proven to return ``str``.
+
+    ``aiohttp`` calls ``json_serialize`` deep inside payload construction and
+    a ``bytes`` return surfaces there as an opaque failure, long after the
+    caller's mistake. Probing it here — with an empty mapping, the cheapest
+    input every JSON serialiser accepts — turns that into a rejection at the
+    boundary. The commonest mistake is passing ``orjson.dumps`` itself.
+
+    Args:
+        serialization: The caller-supplied JSON serialiser, or the default.
+
+    Returns:
+        The same callable, unwrapped and unmodified.
+
+    Raises:
+        ConfigurationError: If the callable does not return ``str``.
+    """
+    probe = serialization({})
+    if not isinstance(probe, str):
+        raise ConfigurationError(
+            f'protocol_info["serialization"] must return str, but '
+            f'{getattr(serialization, "__name__", serialization)!r} '
+            f'returned {type(probe).__name__}',
+            {'returned': type(probe).__name__},
+        )
+    return serialization
 
 
 class HttpRequest(BaseRequestClass):
@@ -27,7 +78,8 @@ class HttpRequest(BaseRequestClass):
             'trace_config', [request_tracer()])
         self.http_file_upload_config: Dict = self.info.get('http_file_upload_config', {})
         self.file_download_config: Dict = self.info.get('http_file_download_config', {})
-        self.serialization: Callable = self.info.get('serialization', ujson.dumps)
+        self.serialization: JsonSerializer = validated_json_serializer(
+            self.info.get('serialization', default_json_serialize))
         self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(
             total=self.timeout)
 

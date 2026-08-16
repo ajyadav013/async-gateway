@@ -43,9 +43,6 @@ classifiers = [
 dependencies = [
     "aiohttp>=3.14.3,<4",
     "orjson>=3.12.0,<4",
-    # Imported by zero modules (MG2). Declared until R3 (Step 4) migrates the
-    # remaining ujson call sites and drops this line in the same commit.
-    "requests~=2.32.3",
     "aioboto3>=15.5.0,<16",
     "aiofiles>=25.1.0,<26",
     # The one deliberate exact pin: 0.6.0 is the latest release of a dormant

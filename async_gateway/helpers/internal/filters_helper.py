@@ -5,7 +5,7 @@ import aiohttp
 import ssl
 from typing import Dict, Optional, Text, Tuple, Union
 
-import ujson
+import orjson
 
 
 async def get_ssl_config(
@@ -42,7 +42,12 @@ async def form_x_www_form_urlencoded_filters(data: Dict, **kwargs) -> Dict:
     """
     form_data = aiohttp.FormData()
     for form_key, form_value in data.items():
-        value = ujson.dumps(form_value) if \
+        # `.decode()` is load-bearing: `orjson.dumps` returns `bytes`, and
+        # `FormData.add_field` accepts bytes but then emits the part without
+        # a text content type -- which forces the whole request to
+        # multipart. Decoding keeps the field, and therefore the request
+        # encoding, byte-identical to what the previous serialiser produced.
+        value = orjson.dumps(form_value).decode() if \
             isinstance(form_value, dict) else form_value
         form_data.add_field(form_key, value)
     filters = {'data': form_data}
@@ -75,6 +80,8 @@ async def application_json_filters(
             filters = {'json': data}
         else:
             if not isinstance(data, str):
-                data = ujson.dumps(data)
+                # Decoded for the same reason as above: `filters['data']`
+                # must stay a `str`, as it was under the previous serialiser.
+                data = orjson.dumps(data).decode()
             filters = {'data': data}
     return filters
