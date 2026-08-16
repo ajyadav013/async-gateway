@@ -1,6 +1,6 @@
 # AGW-3: Declarative PEP 621 packaging
 
-- **Status:** OPEN
+- **Status:** IN REVIEW
 - **Story:** S3 — spec Step 2, size M (`docs/specs/v1_release_stories.md` §4, Phase 0)
 - **Spec:** `docs/specs/v1_release_spec.md` — R4-AC1,2,3,4,6,7,8 (Group A — Scaffolding and quality-gate infrastructure)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; File structure — current vs target

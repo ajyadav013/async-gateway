@@ -1,0 +1,14 @@
+# flake8 configuration, migrated verbatim from the deleted setup.cfg.
+#
+# flake8 does not read pyproject.toml, so this is the only place its settings
+# can live once setup.cfg is gone. Values are carried across unchanged:
+# `application_import_names` is not a legal module name (H19) and is corrected
+# by R27, not here.
+
+[flake8]
+exclude =
+    docs,
+    env,
+    src
+max_doc_length = 79
+application_import_names = async-gateway, tests
