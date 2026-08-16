@@ -7,6 +7,17 @@ flake8-quotes==3.4.0
 lxml
 mypy
 pytest
+pytest-asyncio
 pytest-cov
+pytest-randomly
+# flake8-import-order 0.18.2 still imports pkg_resources, so setuptools must
+# keep providing it: setuptools 81 removed pkg_resources outright and flake8
+# cannot start at all in a clean venv without a ceiling.
+# The ceiling is 76, not the 81 that setuptools' own warning text implies,
+# because 76+ still ships pkg_resources but warns on every import of it:
+# five UserWarnings on each flake8 invocation. R27-AC2 requires `flake8 .`
+# to produce *no output*, not merely exit 0, so <81 is unachievable by
+# construction; <76 is a strict subset of it.
+setuptools<76
 sphinx
 sphinx-rtd-theme
