@@ -53,6 +53,7 @@ def _http_request(**info: object) -> HttpRequest:
         None,
         {'payload': {}},
         info={'request_type': 'POST', **info},
+        redact_params=frozenset(),
     )
 
 
@@ -296,6 +297,7 @@ async def _dispatch_json(
             'headers': {'Content-Type': 'application/json'},
             **info,
         },
+        redact_params=frozenset(),
     )
     await request.handle_request()
 

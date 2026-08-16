@@ -1,6 +1,19 @@
-"""Request Helper."""
+"""Request Helper -- the HTTP transport boundary.
 
-from typing import Dict, Text
+Everything here returns **data**, never a response shape: an
+:class:`HttpResult` that ``logic/http_client.py`` copies into the envelope
+it was handed. Only ``utils/envelope.py`` ever constructs a
+``GatewayResponse``.
+
+That boundary is the fix for FI-7. ``make_http_request`` used to start from
+a response dict pulled out of an optional keyword no caller ever passed, so
+it built a *fresh* dict and returned it as if it were the caller's envelope,
+silently dropping the url, payload and timestamp the entry point had already
+put there.
+"""
+
+from collections.abc import Collection
+from typing import Dict, Optional, Text, TypedDict
 
 import aiofiles
 import aiohttp
@@ -8,6 +21,30 @@ from async_gateway.helpers.common.file_helper import download_file_from_s3
 from async_gateway.helpers.internal import header_filter_mapping
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.constants import CHUNK_SIZE_CONSTANT
+from async_gateway.utils.exceptions import SerializationError
+from async_gateway.utils.redaction import redact_url
+
+
+class HttpResult(TypedDict):
+    """One HTTP exchange, as data.
+
+    Attributes:
+        status_code: The status the remote side returned.
+        headers: Response headers, exactly as received and unredacted --
+            redaction happens where this is copied into the envelope.
+        cookies: Response cookie values by name.
+        text: The decoded body; ``''`` when there was none.
+        body: The raw body bytes, or None when the body was streamed to
+            disk rather than held in memory.
+        redirect_chain: Every hop actually followed, in order.
+    """
+
+    status_code: int
+    headers: Dict[Text, Text]
+    cookies: Dict[Text, Text]
+    text: Text
+    body: Optional[bytes]
+    redirect_chain: list[Text]
 
 
 async def fetch_file(file_config: Dict):
@@ -82,15 +119,32 @@ async def make_http_request(
         url: Text,
         filters: Dict,
         request_type: Text,
-        **kwargs) -> Dict:
-    """Make the API call.
+        *,
+        redact_params: Collection[Text],
+        **kwargs) -> HttpResult:
+    """Make the API call and return what came back, as data.
 
-    :param session - Sqlalchemy session object
+    :param session - aiohttp.ClientSession session object
     :param url - url to hit the api
     :param filters - filters to include in the api
     :param request_type - type of request
+    :param redact_params - the caller's additional sensitive
+    query-parameter names, normalised once in ``request()`` and handed
+    down through the filter methods. This module has no ``protocol_info``
+    to read and must not grow one: deriving the set here would be a
+    second normalisation, and the point of the shared redactor is that
+    the envelope, the log and this exception message cannot disagree
+    about what is a secret. Required rather than defaulted, so a filter
+    method that dropped it fails loudly instead of quietly falling back
+    to the built-in names and leaking the caller's.
+    :returns HttpResult - the status, headers, cookies, decoded text and
+    raw body. The caller copies these into the envelope it owns; this
+    function never sees an envelope.
+    :raises SerializationError - if the body is not decodable text. Its
+    message carries the URL redacted with ``redact_params``, because the
+    message reaches the caller through ``error['message']`` and the log
+    through ``exc_info``.
     """
-    response = kwargs.get('response', {})
     http_file_download_config = kwargs.get('http_file_download_config')
     ssl_filters: Dict = await get_ssl_config(
         certificate=kwargs.get('certificate'),
@@ -101,20 +155,29 @@ async def make_http_request(
     session_obj = request_obj(url, **filters)
 
     async with session_obj as resp:
-        response['status_code'] = resp.status
-        response['headers'] = dict(resp.headers)
-        response['cookies'] = dict(resp.cookies)
+        headers = dict(resp.headers)
+        result = HttpResult(
+            status_code=resp.status,
+            headers=headers,
+            # `.value`, not the Morsel: a live Morsel is not JSON
+            # serialisable, and the envelope must be (invariant E5).
+            cookies={
+                name: morsel.value for name, morsel in resp.cookies.items()
+            },
+            text='',
+            body=None,
+            redirect_chain=[str(hop.url) for hop in resp.history],
+        )
 
-        content_type = str(response['headers'].get('content-type'))
+        content_type = str(headers.get('content-type'))
 
         # handling multipart response.
         if content_type.startswith('multipart'):
-            response['content'] = await handle_multipart_response(
+            result['text'] = await handle_multipart_response(
                 resp,
                 http_file_download_config
             )
-            response['text'] = response['content']
-            return response
+            return result
 
         elif http_file_download_config:
             with open(
@@ -124,15 +187,18 @@ async def make_http_request(
                     http_file_download_config.get('file_download_chunk_size')
                 ):
                     read_file.write(chunk)
+        # resp.content is a StreamReader
+        body = await resp.content.read()
+        result['body'] = body
         try:
-            response['content'] = await resp.content.read()
-            # resp.content is a StreamReader
-            response['text'] = response['content'].decode()  # convert to str
+            result['text'] = body.decode()  # convert to str
         except UnicodeDecodeError as err:
-            response['error_message'] = \
-                f'Error occurred while converting bytes to string - {err}'
+            raise SerializationError(
+                f'Response body from '
+                f'{redact_url(url, extra_params=redact_params)} is not '
+                f'decodable text: {err}') from err
 
-    return response
+    return result
 
 
 async def make_http_filters_with_stream_file_upload(
@@ -141,7 +207,7 @@ async def make_http_filters_with_stream_file_upload(
     request_type: Text,
     circuit_breaker,
     **kwargs
-) -> Dict:
+) -> HttpResult:
     """Make filters for http call involving file upload in chunks.
 
     :param session - aiohttp.ClientSession session object
@@ -173,7 +239,7 @@ async def make_http_filters_without_stream_uploads(
     request_type: Text,
     circuit_breaker,
     **kwargs
-) -> Dict:
+) -> HttpResult:
     """Make filters for file upload over http.
 
     :param session - aiohttp.ClientSession session object
@@ -187,7 +253,7 @@ async def make_http_filters_without_stream_uploads(
             'data': {
                 http_file_upload_config['file_key']: read_file}
         }
-        response: Dict = await circuit_breaker.failsafe.run(
+        response: HttpResult = await circuit_breaker.failsafe.run(
             make_http_request,
             session,
             url,
@@ -203,7 +269,7 @@ async def make_http_filters_without_file(
     request_type: Text,
     circuit_breaker,
     **kwargs
-) -> Dict:
+) -> HttpResult:
     """Make filters to make http call.
 
     :param session - aiohttp.ClientSession session object
@@ -241,13 +307,18 @@ async def handle_http_request(
     request_type: Text,
     circuit_breaker: object,
     **kwargs
-) -> Dict:
+) -> HttpResult:
     """Identify filter metods to be called before http request.
 
     :param session - aiohttp.ClientSession session object
     :param url - url to hit the api
     :param request_type - type of request
     :param circuit_breaker - circuit breaker object.
+    :param kwargs - per-call configuration forwarded verbatim through the
+    chosen filter method to ``make_http_request``. It must include
+    ``redact_params``, which ``make_http_request`` requires; a caller that
+    omits it gets a ``TypeError`` rather than a URL redacted with the
+    built-in names only.
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
     if http_file_upload_config:

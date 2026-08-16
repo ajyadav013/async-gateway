@@ -48,11 +48,6 @@ dependencies = [
     # The one deliberate exact pin: 0.6.0 is the latest release of a dormant
     # project, and R7 (Step 22) owns the keep / replace / vendor decision.
     "pyfailsafe==0.6.0",
-    # async_gateway/helpers/common/date_helper.py binds pytz.timezone() at
-    # import time, so the declaration cannot be dropped before R9 (Step 5)
-    # removes the import; import and declaration must go together or the
-    # clean-venv import breaks.
-    "pytz>=2026.3.post1,<2027",
     "aioftp>=0.28.0,<1",
     "asyncssh>=2.24.0,<3",
 ]
@@ -120,4 +115,12 @@ junit_family = "legacy"
 # Coverage ratchet floor (R28): the value measured at this step, and it may
 # only ever be raised. Every later step re-measures and raises it; a CI job
 # fails any commit whose value is below the base branch.
-fail_under = 0
+#
+# Measured at Step 5 (`coverage report --precision=6`): 72.900763%, after the
+# third review-fix iteration moved redaction into `unwrap_cause` itself -- the
+# seam at which foreign exception text becomes a caller-visible string -- and
+# added the transport-error leak guards that cover it (72.657253% before;
+# 72.551546% and 71.936759% before the two earlier iterations). The floor is
+# truncated to two decimals rather than rounded, because rounding up would put
+# it above the value it was measured from and fail the run that set it.
+fail_under = 72.90

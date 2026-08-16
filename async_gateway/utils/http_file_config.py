@@ -8,7 +8,7 @@ import aiofiles
 import aiohttp
 
 from .constants import STATUS_CODE_403
-from .exceptions import CustomGlobalException
+from .exceptions import HttpStatusError
 
 
 async def download_file_from_s3(bucket_name: Text,
@@ -59,12 +59,9 @@ async def download_file_from_url(
         async with session_obj as response:
             contents = await response.content.read()
             if response.status == STATUS_CODE_403:
-                raise CustomGlobalException(
-                    contents, STATUS_CODE_403,
-                    error_data={
-                        'error_message':
-                            'Access to the requested file is forbidden.'
-                    })
+                raise HttpStatusError(
+                    'Access to the requested file is forbidden.',
+                    STATUS_CODE_403)
             async with aiofiles.open(local_filepath, 'wb') as file_obj:
                 await file_obj.write(contents)
 

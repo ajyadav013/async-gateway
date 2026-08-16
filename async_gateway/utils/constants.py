@@ -1,9 +1,10 @@
 """Constants."""
 
 HTTP_TIMEOUT = 15
-TIMEZONE = 'Asia/Kolkata'
 
 STATUS_CODE_403 = 403
+# The lowest status a protocol treats as the remote side reporting failure.
+HTTP_ERROR_STATUS = 400
 
 CIRCUIT_BREAKER_RETRY = 5
 CIRCUIT_BREAKER_TIMEOUT = 60
