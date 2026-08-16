@@ -641,6 +641,162 @@ def test_redact_text_leaves_a_string_with_no_url_alone() -> None:
         'connection reset by peer')
 
 
+def test_redact_text_masks_a_sensitive_pair_that_carries_no_scheme(
+) -> None:
+    """The seam of S8-H1: masking may not depend on URL-ness at all.
+
+    A caller who writes ``host/p?api_key=...`` hands this function a
+    string with no ``scheme://`` anywhere in it, and an embedded-URL pass
+    matches nothing there. Its three consumers therefore carried the
+    secret in the clear: ``error['message']``, ``error['cause']`` and the
+    log record's ``extra['traceback']``, all of which are masked by
+    ``redact_text`` alone. The end-to-end guard further down proves the
+    symptom is gone; this one names the seam, so reinstating a pass that
+    asks whether the text is a URL fails here first.
+
+    The insensitive pair is asserted *present* in the same breath. It is
+    what separates this rule from a blanket that blanks every query
+    string, and it is why the accepted cost is over-masking prose rather
+    than losing the diagnostics the envelope exists for.
+    """
+    masked = redact_text('host/p?api_key=SECRETVALUE&page=2')
+
+    assert masked == f'host/p?api_key={REDACTED}&page=2'
+
+
+def test_redact_text_masks_a_scheme_less_url_exactly_as_a_schemed_one(
+) -> None:
+    """Symmetry is the contract; the absence of one secret is not.
+
+    A predicate deciding "is this a URL?" has been narrowed three times on
+    this module -- scheme *and* netloc, then scheme alone -- and each
+    narrowing still left a shape it classified wrongly. Each also passed a
+    test that asserted only that some particular secret was gone, which is
+    a bar a fourth predicate could clear while disagreeing about the next
+    shape along. Asserting that the two strings mask *identically* leaves
+    no such room: the only way to satisfy it is to stop asking.
+    """
+    schemeless = redact_text('host/p?api_key=SECRETVALUE')
+    schemed = redact_text('https://host/p?api_key=SECRETVALUE')
+
+    assert schemeless == f'host/p?api_key={REDACTED}'
+    assert schemed == f'https://{schemeless}'
+
+
+def test_redact_text_applies_caller_supplied_names_without_a_scheme_too(
+) -> None:
+    """The extension point cannot be narrower than the built-in set.
+
+    ``redact_query_params`` is the only way a caller names a secret this
+    library could not guess, and on the ``cause`` and ``traceback``
+    surfaces it is honoured by ``redact_text`` alone. A scheme-less URL
+    that masked ``api_key`` but not the caller's own ``session_id`` would
+    leak precisely the name the caller took the trouble to declare.
+    """
+    masked = redact_text(
+        'host/p?session_id=SESSIONSECRET&api_key=DEFAULTSECRET',
+        extra_params=('session_id',))
+
+    assert masked == f'host/p?session_id={REDACTED}&api_key={REDACTED}'
+
+
+def test_redact_text_is_idempotent_on_a_string_it_has_already_masked(
+) -> None:
+    """``redact_value`` composes maskers, so passes must not compound.
+
+    A rule that treated the sentinel as a fresh value to rewrite would
+    make the *number* of passes observable, and the number of passes is an
+    implementation detail no caller of the envelope can see.
+    """
+    once = redact_text('host/p?api_key=SECRETVALUE&page=2')
+
+    assert once == f'host/p?api_key={REDACTED}&page=2'
+    assert redact_text(once) == once
+
+
+def test_redact_text_runs_the_pair_pass_before_the_embedded_url_pass(
+) -> None:
+    """Order is load-bearing, so it is pinned rather than left to reading.
+
+    Both passes mask the same secret here, so the secret's absence proves
+    nothing about which ran first. The caller's own rendering does.
+    ``redact_url`` rebuilds a query only when its own masking changed
+    something, so with the pair pass first it finds nothing left to change
+    and every untouched character survives. Run the other way round,
+    ``urlsplit`` normalises the scheme and ``urlencode`` re-encodes the
+    remainder -- ``HTTP`` becomes ``http`` and ``a%20b`` becomes ``a+b``
+    -- rewriting text this library did not author and was asked only to
+    mask.
+    """
+    masked = redact_text('HTTP://H/p?api_key=SECRETVALUE&x=a%20b')
+
+    assert masked == f'HTTP://H/p?api_key={REDACTED}&x=a%20b'
+
+
+def test_redact_text_masks_a_sensitive_pair_in_prose_that_is_not_a_url(
+) -> None:
+    """The ratified cost of the rule, asserted rather than assumed.
+
+    Matching on the ``?``/``&`` structure alone cannot tell a URL from a
+    sentence that merely contains one, so a sentence like this loses its
+    ``hunter2`` as well. That is the accepted trade: the alternative is a
+    predicate deciding where URL-ness begins, and three of those have now
+    failed open here. Pinning the cost means the next reader meets it as a
+    decision with a reason behind it rather than as a surprise.
+    """
+    masked = redact_text('try the form at /login?password=hunter2 first')
+
+    assert masked == f'try the form at /login?password={REDACTED} first'
+
+
+def test_redact_text_masks_a_percent_encoded_sensitive_name() -> None:
+    """The same seam as S8-H1, one layer down: an encoded name.
+
+    ``api%5Fkey`` is ``api_key`` to every server that will parse it, and
+    a caller who wrote it that way has named exactly the secret this
+    module already knows. Comparing the raw run of characters against the
+    sensitive set sees two different names and masks neither, so the
+    value reached ``error['message']``, ``error['cause']`` and
+    ``extra['traceback']`` in the clear -- the three surfaces
+    ``redact_text`` masks alone. Decoding the name before the lookup
+    closes that without reinstating any predicate about the surrounding
+    text: it normalises a key, and asks nothing about what the key is
+    embedded in.
+
+    The malformed ``%zz`` rides along because the docstring claims
+    decoding cannot fail. ``unquote`` returns it verbatim rather than
+    raising, so the pair is simply left alone -- a redactor that could
+    raise on a caller's own text would turn a logging call into an
+    outage, which is the one thing this module promises never to do.
+    """
+    assert redact_text(
+        'Traceback: host/p?api%5Fkey=SECRETVALUE in prose'
+    ) == f'Traceback: host/p?api%5Fkey={REDACTED} in prose'
+
+    assert redact_text('host/p?api%zzkey=NOTASECRET') == (
+        'host/p?api%zzkey=NOTASECRET')
+
+
+def test_redact_text_masks_a_declared_name_spelled_with_a_percent(
+) -> None:
+    """Decoding may widen the sensitive set; it may not narrow it.
+
+    ``redact_query_params`` is the only way a caller names a secret this
+    library could not guess, and ``normalise_param_names`` is careful to
+    never return fewer names than it was handed. A lookup that tested
+    *only* the decoded name would quietly break that promise for a caller
+    whose parameter genuinely contains a ``%``: the declared ``x%5Fy``
+    would be decoded to ``x_y``, match nothing, and leak the one value
+    the caller took the trouble to declare. Testing the name both as
+    written and decoded can only ever mask more, which is the direction
+    every other bound in this module errs in.
+    """
+    masked = redact_text(
+        'host/p?x%5Fy=SECRETVALUE', extra_params=('x%5Fy',))
+
+    assert masked == f'host/p?x%5Fy={REDACTED}'
+
+
 def test_redact_url_honours_caller_supplied_parameter_names() -> None:
     """``protocol_info['redact_query_params']`` extends the name set."""
     redacted = redact_url(
@@ -1439,18 +1595,17 @@ async def test_r10_a_scheme_less_url_reaches_the_log_url_field_masked(
 
     Under ``'HTTP'`` a scheme-less URL is dispatched as the caller wrote
     it, so it is the string ``log_failure`` puts in ``extra['url']``.
-    ``redact_text`` does not match it at all (it requires ``scheme://``),
-    which is precisely why ``redact_value`` must not gate its
-    ``redact_url`` pass behind a predicate.
+    Nothing about that string carries a ``scheme://``, which is precisely
+    why ``redact_value`` must not gate its ``redact_url`` pass behind a
+    predicate.
 
-    The assertion is deliberately **scoped to that one field** rather than
-    to the whole rendered record, and the scoping is a known gap, not a
-    stylistic choice: the same scheme-less URL still reaches
-    ``extra['traceback']`` in the clear, because that field is masked by
-    ``redact_text`` alone. That is a separate leak on a separate seam,
-    documented in the ``redaction`` module docstring and tracked as its
-    own open finding. Nobody should read this test as a claim that the
-    record as a whole is clean -- it is not.
+    The assertion is deliberately **scoped to that one field**, because
+    that field alone is masked by ``redact_value``. The surfaces masked by
+    ``redact_text`` alone -- ``error['message']``, ``error['cause']`` and
+    ``extra['traceback']`` -- reach the caller through a different route
+    and are covered by the whole-record guard immediately below. Read this
+    test as pinning the ``redact_value`` composition, not as a claim about
+    the record as a whole.
     """
     caplog.set_level(logging.DEBUG, logger='async_gateway')
 
@@ -1474,6 +1629,144 @@ async def test_r10_a_scheme_less_url_reaches_the_log_url_field_masked(
     assert 'APIKEYSECRET' not in logged_url
     assert logged_url == (
         f'host/p?session_id={REDACTED}&api_key={REDACTED}')
+
+
+async def test_r10_a_scheme_less_url_leaks_on_no_surface_at_all(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The whole envelope and the whole record, not one field (S8-H1).
+
+    The test above is scoped to ``extra['url']`` because ``redact_value``
+    composes ``redact_url`` over that field unconditionally. Three
+    surfaces get no such second pass: ``error['message']``,
+    ``error['cause']`` and ``extra['traceback']`` are masked by
+    ``redact_text`` alone. While that function matched only strings
+    carrying an explicit ``scheme://``, a caller who wrote
+    ``host/p?api_key=...`` had the secret echoed into all three in the
+    clear -- masked in the ``url`` sitting right beside them, which is
+    what made it survive a green suite for so long.
+
+    So this asserts the *whole* rendered record and the *whole* envelope
+    rather than any one attribute: a per-field assertion is exactly the
+    shape that let the leak hide. Both a built-in name and a
+    caller-declared one ride along, because the two halves of the
+    sensitive set reach ``redact_text`` by different routes and only one
+    of them is this library's own.
+    """
+    caplog.set_level(logging.DEBUG, logger='async_gateway')
+
+    result = await request(
+        'host/p?api_key=APIKEYSECRET&session_id=SESSIONSECRET',
+        data={},
+        protocol='HTTP',
+        protocol_info={
+            'request_type': 'GET',
+            'redact_query_params': ['session_id'],
+        },
+    )
+
+    records = [
+        record for record in caplog.records
+        if record.name.startswith('async_gateway')
+    ]
+    assert len(records) == 1
+    error = result['error']
+    assert error is not None
+    # The chain really did reach aiohttp, so the strings under test are
+    # foreign text rather than a message this library wrote and redacted
+    # at the point it authored it.
+    assert 'InvalidUrlClientError' in str(error['cause'])
+
+    surfaces = {
+        'repr(result)': repr(result),
+        "envelope['url']": result['url'],
+        "error['message']": error['message'],
+        "error['cause']": str(error['cause']),
+        "extra['traceback']": records[0].traceback,
+        'log record': render_record(records[0]),
+    }
+    for surface_name, rendered in surfaces.items():
+        for secret in ('APIKEYSECRET', 'SESSIONSECRET'):
+            assert secret not in rendered, f'{secret} in {surface_name}'
+
+    # Masked, not merely absent: a redactor that dropped the query string
+    # would satisfy every assertion above and lose the diagnostic the
+    # operator reading this record actually needs.
+    for surface_name in (
+        "error['message']", "error['cause']", "extra['traceback']",
+    ):
+        assert REDACTED in surfaces[surface_name], surface_name
+
+
+async def test_r10_a_percent_encoded_secret_leaks_on_no_surface_either(
+    http_server: RecordingHTTPServer,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recurring seam, re-checked end to end on an encoded name.
+
+    S8-H1 was a leak into ``error['message']``, ``error['cause']`` and
+    ``extra['traceback']`` -- the three surfaces no second masking pass
+    ever reaches. Its first fix compared the parameter name exactly as it
+    was written, so ``api%5Fkey`` was a name this module had never heard
+    of, and the same three surfaces carried the secret again for the same
+    reason as before.
+
+    The failure is injected rather than driven through a real URL, and
+    the reason is the point of the test. Hand ``request()`` an encoded
+    name and *yarl* normalises ``%5F`` back to ``_`` long before any
+    exception text is built, so aiohttp's own errors never carry the
+    encoded spelling and a test written that way passes whether the name
+    is decoded before the lookup or not. But ``describe_failure``
+    redacts whatever the chain stringifies to, and that text is mostly
+    *not* this library's: a client that echoes the request line it was
+    given, or a protocol whose stack never parses a URL at all, hands
+    these surfaces the caller's own encoding intact. This raises exactly
+    such a foreign exception so the guard covers the case yarl happens to
+    hide on the HTTP path.
+
+    The whole record and the whole envelope are asserted, not one field
+    of each, because a per-field assertion is the shape that let the
+    original leak survive a green suite.
+    """
+    async def leaky(self: HttpRequest) -> GatewayResponse:
+        cause = RuntimeError(
+            'upstream rejected GET host/p?api%5Fkey=APIKEYSECRET')
+        # An empty wrapper message is the shape that puts foreign text on
+        # `message` as well as on `cause`: `describe_failure` falls back
+        # to the deepest link when the wrapper has nothing of its own.
+        raise ConnectError('') from cause
+
+    monkeypatch.setattr(HttpRequest, 'handle_request', leaky)
+    caplog.set_level(logging.DEBUG, logger='async_gateway')
+
+    result = await http_call(http_server.url_for('/anything'))
+
+    records = [
+        record for record in caplog.records
+        if record.name.startswith('async_gateway')
+    ]
+    assert len(records) == 1
+    error = result['error']
+    assert error is not None
+
+    surfaces = {
+        'repr(result)': repr(result),
+        "error['message']": error['message'],
+        "error['cause']": str(error['cause']),
+        "extra['traceback']": records[0].traceback,
+        'log record': render_record(records[0]),
+    }
+    for surface_name, rendered in surfaces.items():
+        assert 'APIKEYSECRET' not in rendered, surface_name
+
+    # Masked, not merely absent: a redactor that dropped the query string
+    # would satisfy every assertion above and lose the diagnostic the
+    # operator reading this record actually needs.
+    for surface_name in (
+        "error['message']", "error['cause']", "extra['traceback']",
+    ):
+        assert REDACTED in surfaces[surface_name], surface_name
 
 
 async def test_r10_cancellation_propagates_rather_than_becoming_an_envelope(

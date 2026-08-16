@@ -11,27 +11,32 @@ returns its input unchanged instead.
 
 The masking this module performs is deliberately bounded and the bound is
 part of the contract (invariant E9): header and cookie values, URL userinfo
-and sensitive-named query parameters, URLs embedded anywhere inside a
-free-text string, and payload values whose *key name* is sensitive down to
+and sensitive-named query parameters, sensitive-named ``name=value`` pairs
+anywhere after a ``?`` or ``&`` -- whose names are matched percent-decoded,
+so ``api%5Fkey`` is the ``api_key`` every server will read it as -- URLs
+embedded anywhere inside a free-text string, and payload values whose
+*key name* is sensitive down to
 :data:`PAYLOAD_REDACTION_DEPTH`. Below that depth, and for a payload that
 is not a mapping, the caller's own data is echoed verbatim.
 
-One further bound is measured rather than assumed. ``redact_text`` only
-matches URLs carrying an explicit ``scheme://``, so a scheme-less URL --
-``host/p?api_key=...`` -- passes through it completely unchanged. Its
-consumers therefore still carry that URL's query secrets:
-``error['message']``, ``error['cause']`` and the log record's
-``extra['traceback']``. The log record's ``extra['url']`` does not,
-because ``redact_value`` composes ``redact_url`` over the result. The
-remaining three are an open finding tracked separately: widening the
-pattern to scheme-less strings would also mask arbitrary prose, so it is
-a contract decision rather than a bug fix.
+That query-pair rule asks nothing about the string around it, and the
+asking is what it replaces. A predicate classifying "is this a URL?"
+failed open three times on one leak: it first demanded a scheme *and* a
+netloc, then only a scheme, and a caller who wrote ``host/p?api_key=...``
+has neither -- so ``redact_text`` was a total no-op on that URL and its
+secret reached ``error['message']``, ``error['cause']`` and the log
+record's ``extra['traceback']`` in the clear. Each narrowing was a
+further guess at where URL-ness begins. Masking on the ``?``/``&``
+structure alone needs no such predicate, so no fourth guard exists to
+fail open. Its cost is over-masking prose that happens to read
+``...?password=hunter2``, which is the direction every other bound here
+errs in too.
 """
 
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any, Final
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from aiohttp import BasicAuth
 
@@ -79,6 +84,41 @@ PAYLOAD_REDACTION_DEPTH: Final[int] = 4
 # registered scheme, so the bound costs no match.
 _EMBEDDED_URL: Final[re.Pattern[str]] = re.compile(
     r'[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s<>"\'`]+')
+
+# One `name=value` pair introduced by `?` or `&`, wherever it sits. There
+# is deliberately no test of what surrounds it: see the module docstring
+# for why URL-ness is not a question this module is willing to ask again.
+#
+# Linear overall, which the measurement above makes non-optional -- but
+# not because nothing backtracks. A `?` with no `=` after it does make
+# the greedy name run give back one character at a time before the match
+# fails. What bounds it is that the retries cannot compound: every class
+# excludes the delimiter that ends it -- a name cannot hold `=`, a value
+# cannot hold `?` or `&` -- so a run is capped by its own length, the
+# runs after two different delimiters cannot overlap, and only `?` and
+# `&` can start a match at all. The work therefore sums to O(n) across
+# the string rather than multiplying the way the scheme run above did.
+_QUERY_PAIR: Final[re.Pattern[str]] = re.compile(
+    r'([?&])([^?&=\s]+)=([^?&\s]*)')
+
+
+def _sensitive_names(extra_params: Collection[str]) -> frozenset[str]:
+    """Combine the built-in sensitive names with the caller's own.
+
+    Both string maskers resolve their set through here rather than each
+    building one, because a log record and an envelope that disagreed
+    about which names are secret would leak on whichever surface held the
+    smaller set.
+
+    Args:
+        extra_params: Further query-parameter names to treat as
+            sensitive, already normalised by
+            :func:`normalise_param_names`.
+
+    Returns:
+        The casefolded names whose query values are masked.
+    """
+    return SENSITIVE_NAMES.union(name.casefold() for name in extra_params)
 
 
 def normalise_param_names(raw: Any) -> frozenset[str]:
@@ -186,8 +226,7 @@ def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
 
     query = parts.query
     if query:
-        sensitive = SENSITIVE_NAMES.union(
-            name.casefold() for name in extra_params)
+        sensitive = _sensitive_names(extra_params)
         pairs = parse_qsl(query, keep_blank_values=True)
         masked = [
             (name, REDACTED if name.casefold() in sensitive else value)
@@ -206,7 +245,7 @@ def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
 
 
 def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
-    """Mask every URL embedded anywhere inside a free-text string.
+    """Mask sensitive query values and embedded URLs inside free text.
 
     :func:`redact_url` needs the whole string to be a URL. This one does
     not, which is what it exists for: the strings that reach a caller
@@ -215,9 +254,30 @@ def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
     ``'RetriesExhausted: ftpx://host/p?api_key=...'`` -- and a
     whole-string test does not see that URL at all.
 
-    Text that contains no URL is returned unchanged, so this is safe to
-    apply to any message rather than only to ones suspected of carrying
-    one.
+    Two passes run, in this order.
+
+    The first masks the value of every ``name=value`` pair introduced by
+    ``?`` or ``&`` whose *name* is sensitive -- as written or
+    percent-decoded, so ``?api%5Fkey=`` is masked exactly as
+    ``?api_key=`` is -- wherever the pair appears.
+    It never asks whether the text around the pair is a URL, so a
+    scheme-less ``host/p?api_key=...`` is masked exactly as
+    ``https://host/p?api_key=...`` is. That symmetry is the whole point:
+    the predicate that used to decide it was this module's
+    longest-lived leak, and the module docstring records how it failed.
+
+    The second redacts each embedded ``scheme://`` URL whole, which the
+    first cannot -- userinfo carries no ``?``, so ``user:pw@`` is
+    invisible to a query-pair rule. It runs *second* because the first
+    then leaves it nothing to rewrite: :func:`redact_url` rebuilds a
+    query only when its own masking changed something, so an
+    already-masked query keeps the caller's percent-encoding rather than
+    being normalised through :func:`urllib.parse.urlencode`.
+
+    Text carrying neither is returned unchanged, so this is safe to apply
+    to any message rather than only to ones suspected of carrying a
+    secret, and masking is idempotent -- a value already
+    :data:`REDACTED` is replaced by itself.
 
     Args:
         text: Any human-readable string about to reach a caller.
@@ -228,9 +288,51 @@ def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
             adds to them.
 
     Returns:
-        ``text`` with each embedded URL replaced by its redacted form.
+        ``text`` with every sensitive query value and every embedded URL
+        replaced by its redacted form. A masked value ends where the
+        pair does, and whitespace ends a pair: ``?api_key=my secret
+        key`` comes back as ``?api_key=***redacted*** secret key``,
+        because a value permitted to run past a space would swallow the
+        rest of the sentence. :func:`redact_value` rescues that case for
+        the fields it serves by composing :func:`redact_url` over the
+        result, but the three surfaces masked by this function alone --
+        ``error['message']``, ``error['cause']`` and the logged
+        traceback -- get no such second pass and keep the tail.
     """
-    def mask(match: 're.Match[str]') -> str:
+    sensitive = _sensitive_names(extra_params)
+
+    def mask_pair(match: 're.Match[str]') -> str:
+        """Redact the one query value this match spans, if it is secret.
+
+        The name is tested both as written and percent-decoded, because
+        ``api%5Fkey`` is ``api_key`` to every server that will read it
+        and a raw-text comparison sees two different names. Testing both
+        rather than only the decoded form keeps the extension point from
+        being the narrower of the two: a caller who declared a name
+        containing a literal ``%`` means that name, and decoding it away
+        would drop a secret the caller took the trouble to declare.
+        :func:`urllib.parse.unquote` never raises -- a malformed ``%zz``
+        comes back verbatim -- so this adds no way for a redactor to
+        fail. ``+`` is left alone deliberately: it means a space only
+        under the form-encoding convention, no sensitive name contains a
+        space, and decoding it could only ever lose a caller's literal
+        ``+``.
+
+        Args:
+            match: The matched ``?``/``&``, name and value.
+
+        Returns:
+            The pair with its value masked, or the match unchanged when
+            the name is not a sensitive one. A masked pair keeps the
+            caller's own spelling of the name, encoding and all.
+        """
+        delimiter, name, _value = match.groups()
+        if (name.casefold() not in sensitive
+                and unquote(name).casefold() not in sensitive):
+            return match.group(0)
+        return f'{delimiter}{name}={REDACTED}'
+
+    def mask_url(match: 're.Match[str]') -> str:
         """Redact the one URL this match spans.
 
         Args:
@@ -241,7 +343,7 @@ def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
         """
         return redact_url(match.group(0), extra_params=extra_params)
 
-    return _EMBEDDED_URL.sub(mask, text)
+    return _EMBEDDED_URL.sub(mask_url, _QUERY_PAIR.sub(mask_pair, text))
 
 
 def redact_payload(
@@ -312,10 +414,13 @@ def redact_value(
     :func:`redact_url` finds nothing to do and returns it unchanged.
 
     :func:`redact_url` earns its second pass on the strings
-    :func:`redact_text` masks only partly: the pattern ends each match at
-    the first character that cannot appear unescaped in a URL, so a secret
-    value containing a space, a quote, a backtick or an angle bracket has
-    its tail left outside the match and echoed. Its cost is that a
+    :func:`redact_text` masks only partly. Its query-pair pass ends a
+    value at whitespace -- a value permitted to run past a space would
+    swallow the rest of the sentence -- so ``?api_key=my secret key``
+    comes back from it with two thirds of the secret still attached. The
+    other characters that end its *URL* pass, the ones that cannot appear
+    unescaped in a URL, no longer need rescuing here: a quote, a backtick
+    or an angle bracket does not end a query-pair value. Its cost is that a
     whole-string parse reads any prose *after* a URL as part of the query
     it is masking and swallows it, and that :func:`urllib.parse.urlsplit`
     strips every tab, carriage return and newline from the whole string
