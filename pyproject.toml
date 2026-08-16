@@ -126,16 +126,19 @@ junit_family = "legacy"
 # up would put it above the value it was measured from and fail the very run
 # that set it.
 #
-# Re-measured at Step 7 / story S9 (`coverage report --precision=6`):
-# 79.359431%, stable across three randomised orders. S9 adds no production
-# code; the rise is the five-protocol contract table driving the
-# `handle_request` of `logic/ftp_client` and `logic/sftp_client` for the first
-# time. Neither module was untouched before it: with the contract rows
-# deselected both are already at 47.06% and 43.24% of statements -- their
-# constructors, reached via `capture_dispatch` -- and the missed lines are
-# exactly the two request bodies. Raised 76.44 -> 79.35, truncated for the
-# reason above.
-fail_under = 79.35
+# Re-measured after wave W9 / stories S10 (FTP) and S11 (SFTP)
+# (`coverage report --precision=6`): 82.896118%, stable across three
+# randomised orders, and unchanged under all five seeds the shuffled-order CI
+# job commits (1, 20250816, 424242, 99991, 2147483647).
+# Both stories grew production code *and* brought their own tests, and it is
+# the tests that carry the rise, not the new code: deselect the two suites W9
+# added (`tests/logic/`, 60 tests) and this same tree measures 78.069255% --
+# below the 79.35 floor S9 set. Their effect is concentrated in the three
+# modules W9 touched: `logic/ftp_client` 67.889908% -> 94.495413%,
+# `logic/sftp_client` 66.250000% -> 82.500000%, and
+# `helpers/internal/filters_helper` 85.106383% -> 93.617021%.
+# Raised 79.35 -> 82.89, truncated for the reason above.
+fail_under = 82.89
 # `fail_under` is compared against the total *rounded to `precision`*, so a
 # two-decimal ratchet needs two-decimal precision or the comparison silently
 # degrades to whole percents. Latent until now: earlier floors happened to round
