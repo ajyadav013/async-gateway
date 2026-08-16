@@ -1,8 +1,8 @@
 """Logic."""
 
-from async_gateway.logic.ftp import FTPRequest
-from async_gateway.logic.http import HttpRequest
-from async_gateway.logic.sftp import SFTPRequest
+from async_gateway.logic.ftp_client import FTPRequest
+from async_gateway.logic.http_client import HttpRequest
+from async_gateway.logic.sftp_client import SFTPRequest
 
 protocol_mapping = {
     'HTTP': HttpRequest,

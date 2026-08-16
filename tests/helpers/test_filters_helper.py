@@ -2,7 +2,7 @@
 
 Covers three of the four former ``ujson`` call sites: the two in
 ``filters_helper`` that build a request body, and the ``json_serialize``
-wiring in ``logic/http.py`` that hands a serialiser to ``aiohttp``. (The
+wiring in ``logic/http_client.py`` that hands a serialiser to ``aiohttp``. (The
 fourth, the response decoder, is in ``test_response_helper.py``.)
 
 ``orjson.dumps`` returns ``bytes`` where ``ujson.dumps`` returned ``str``,
@@ -22,7 +22,7 @@ from async_gateway.helpers.internal.filters_helper import (
     application_json_filters,
     form_x_www_form_urlencoded_filters,
 )
-from async_gateway.logic.http import (
+from async_gateway.logic.http_client import (
     HttpRequest,
     default_json_serialize,
 )
@@ -152,7 +152,7 @@ async def test_a_dict_json_body_still_takes_the_json_branch() -> None:
     assert filters == {'json': {'a': 1}}
 
 
-# --- site 4: logic/http.py, the `json_serialize` wiring -------------------
+# --- site 4: logic/http_client.py, the `json_serialize` wiring ------------
 
 def test_the_default_serializer_returns_text_not_bytes() -> None:
     """The default is the decoding wrapper, never bare ``orjson.dumps``."""
