@@ -1,0 +1,294 @@
+# Continuous integration for async-gateway (release spec R1 / Step 3, R28-AC7).
+#
+# The defect class this release exists to close is the one a CI that never
+# installs the built package cannot see: `async_gateway` imported an
+# undeclared dependency, so every check passed in a tree that already had it
+# and the published artifact was unusable. Every job below therefore gates the
+# *real artifact* or the *real interpreter set*, not a convenient stand-in:
+#
+#   lint-type-test      flake8 / mypy / pytest / bandit on the committed
+#                       interpreter matrix (3.10 - 3.14).
+#   build-and-install   build, then import the submodule out of a clean venv
+#                       from the wheel and again from the sdist.
+#   shuffled-order      the suite under five committed pytest-randomly seeds.
+#   coverage-ratchet    head's `fail_under` may never drop below base's.
+#   newer-python-minor  monthly: fails once CPython ships a minor newer than
+#                       the highest committed matrix entry.
+#
+# No step carries `continue-on-error`: every one of them is a required check.
+#
+# Known-red until later stories land (this is correct, not a misconfiguration):
+# `build-and-install` fails today because `async_gateway` imports `ujson`,
+# which is not declared (finding C1) -- R3/Step 4 closes it. `flake8 .`
+# reports the pre-existing violation baseline that R27/Step 24 drives to zero.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # 03:17 UTC on the 1st of every month -- for `newer-python-minor`.
+    - cron: '17 3 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # A pip wheel cached from an earlier run must never be able to satisfy the
+  # clean-venv installs below; that would hide exactly the packaging defect
+  # these jobs exist to catch.
+  PIP_NO_CACHE_DIR: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+
+  lint-type-test:
+    name: lint + types + tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # THE COMMITTED INTERPRETER MATRIX. This is a literal list, never
+        # derived from an interpreter probe or a metadata query: a derived
+        # matrix silently shrinks when a runner image changes, and the shrink
+        # is invisible in review. `tests/test_packaging.py` parses this exact
+        # line and asserts every entry is at or above `requires-python` and
+        # that the minors are contiguous, so an edit here that skips or
+        # deletes a version fails the suite.
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the project and its dev extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: flake8
+        run: flake8 .
+
+      - name: mypy
+        # `ignore_errors = true` is still set in pyproject.toml; R27/Step 24
+        # removes it and drives the ~44 hidden errors to zero.
+        run: mypy async_gateway
+
+      - name: pytest
+        run: pytest
+
+      - name: bandit
+        # `-c pyproject.toml` is load-bearing: bandit reads only `.bandit`
+        # files or an explicit `-c`, so without it `[tool.bandit]` is ignored
+        # and the scanner runs unconfigured.
+        run: bandit -c pyproject.toml -r async_gateway -ll
+
+  build-and-install:
+    name: build + clean-venv install of the real artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the build front-end
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Assert the checkout is clean before building
+        run: |
+          test -z "$(git status --porcelain)"
+          test ! -e dist
+          test ! -e async_gateway.egg-info
+
+      - name: Build the wheel and the sdist
+        # Deliberately an *isolated* build. `--no-isolation` would reuse the
+        # ambient environment, and the dev extra pins `setuptools<76` (so that
+        # flake8-import-order's pkg_resources import stays warning-free) while
+        # `build` requires `setuptools>=77.0.3` -- the two cannot coexist in
+        # one interpreter. Isolation gives the build its own pinned setuptools
+        # and the conflict never arises.
+        run: python -m build
+
+      - name: Install the wheel into a clean venv and import the submodule
+        # `cd /tmp` first: with the repo as the working directory the source
+        # tree shadows the installed package on sys.path and the import proves
+        # nothing. Importing bare `async_gateway` also proves nothing --
+        # `__init__.py` is empty, so it succeeds even when every submodule is
+        # broken. The documented entry point is the submodule.
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install --no-cache-dir dist/*.whl
+          cd /tmp
+          /tmp/wheel-venv/bin/python -c \
+            'from async_gateway.async_gateway import request; print(request)'
+
+      - name: Install the sdist into a clean venv and import the submodule
+        run: |
+          python -m venv /tmp/sdist-venv
+          /tmp/sdist-venv/bin/pip install --no-cache-dir --no-binary :all: \
+            dist/*.tar.gz
+          cd /tmp
+          /tmp/sdist-venv/bin/python -c \
+            'from async_gateway.async_gateway import request; print(request)'
+
+      - name: twine check
+        run: twine check dist/*
+
+  shuffled-order:
+    name: shuffled test order (seed ${{ matrix.seed }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Five committed seeds. Committed rather than random so a failure is
+        # reproducible: the seed that broke the suite is in the job name and
+        # `pytest -p randomly --randomly-seed=<n>` replays it exactly.
+        seed: [1, 20250816, 424242, 99991, 2147483647]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the project and its dev extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: pytest in shuffled order
+        run: pytest -p randomly --randomly-seed=${{ matrix.seed }}
+
+  coverage-ratchet:
+    name: coverage ratchet (head fail_under >= base fail_under)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch the base branch's pyproject.toml
+        env:
+          BASE_REF: >-
+            ${{ github.event_name == 'pull_request'
+                && github.event.pull_request.base.ref
+                || github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          # A base branch predating declarative packaging has no
+          # pyproject.toml; an absent file means an absent floor, which the
+          # comparison below reads as 0.
+          git show "origin/$BASE_REF:pyproject.toml" \
+            > /tmp/base-pyproject.toml || : > /tmp/base-pyproject.toml
+
+      - name: Compare head's fail_under against the base branch's
+        env:
+          BASE_PYPROJECT: /tmp/base-pyproject.toml
+          HEAD_PYPROJECT: pyproject.toml
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          def fail_under(path: str) -> float:
+              """Read `tool.coverage.report.fail_under`, 0.0 when absent."""
+              try:
+                  with open(path, 'rb') as handle:
+                      data = tomllib.load(handle)
+              except (FileNotFoundError, tomllib.TOMLDecodeError):
+                  return 0.0
+              report = data.get('tool', {}).get('coverage', {}).get('report', {})
+              return float(report.get('fail_under', 0))
+
+          base = fail_under(os.environ['BASE_PYPROJECT'])
+          head = fail_under(os.environ['HEAD_PYPROJECT'])
+          print(f'base fail_under = {base}')
+          print(f'head fail_under = {head}')
+          if head < base:
+              sys.exit(
+                  f'coverage ratchet broken: head {head} < base {base}. '
+                  'fail_under may only ever be raised.'
+              )
+          print('coverage ratchet holds.')
+          PY
+
+  newer-python-minor:
+    name: fail when a newer stable CPython minor exists
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compare python.org's stable releases against the matrix
+        env:
+          CI_WORKFLOW: .github/workflows/ci.yml
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          RELEASES = (
+              'https://www.python.org/api/v2/downloads/release/'
+              '?is_published=true'
+          )
+          MATRIX = re.compile(
+              r"^\s*python-version:\s*\[(?P<entries>[^\]]+)\]\s*$",
+              re.MULTILINE,
+          )
+          NAMED = re.compile(r'Python\s+(?P<major>\d+)\.(?P<minor>\d+)')
+
+          source = open(os.environ['CI_WORKFLOW'], encoding='utf-8').read()
+          found = MATRIX.findall(source)
+          if len(found) != 1:
+              sys.exit(f'expected exactly one matrix, found {len(found)}')
+          committed = max(
+              tuple(int(part) for part in entry.strip().strip('\'"').split('.'))
+              for entry in found[0].split(',')
+          )
+
+          with urllib.request.urlopen(RELEASES, timeout=60) as response:
+              payload = json.load(response)
+
+          released = set()
+          for release in payload:
+              if release.get('pre_release'):
+                  continue
+              match = NAMED.match(release.get('name', ''))
+              if match:
+                  released.add(
+                      (int(match['major']), int(match['minor'])),
+                  )
+          if not released:
+              sys.exit('python.org returned no stable releases; check the API')
+
+          newest = max(released)
+          print(f'highest committed matrix entry = {committed}')
+          print(f'highest stable CPython minor   = {newest}')
+          if newest > committed:
+              sys.exit(
+                  f'CPython {newest[0]}.{newest[1]} is stable but the CI '
+                  f'matrix stops at {committed[0]}.{committed[1]}. Add it to '
+                  'the matrix and to the pyproject classifiers.'
+              )
+          print('the matrix covers every stable CPython minor.')
+          PY
