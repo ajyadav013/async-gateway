@@ -125,7 +125,17 @@ junit_family = "legacy"
 # The floor is truncated to two decimals rather than rounded, because rounding
 # up would put it above the value it was measured from and fail the very run
 # that set it.
-fail_under = 76.44
+#
+# Re-measured at Step 7 / story S9 (`coverage report --precision=6`):
+# 79.359431%, stable across three randomised orders. S9 adds no production
+# code; the rise is the five-protocol contract table driving the
+# `handle_request` of `logic/ftp_client` and `logic/sftp_client` for the first
+# time. Neither module was untouched before it: with the contract rows
+# deselected both are already at 47.06% and 43.24% of statements -- their
+# constructors, reached via `capture_dispatch` -- and the missed lines are
+# exactly the two request bodies. Raised 76.44 -> 79.35, truncated for the
+# reason above.
+fail_under = 79.35
 # `fail_under` is compared against the total *rounded to `precision`*, so a
 # two-decimal ratchet needs two-decimal precision or the comparison silently
 # degrades to whole percents. Latent until now: earlier floors happened to round

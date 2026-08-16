@@ -62,6 +62,10 @@ from failsafe import RetriesExhausted
 import pytest
 
 from tests.fixtures.http_server import RecordingHTTPServer
+from tests.fixtures.protocol_transports import (
+    contract_call,
+    install_transport,
+)
 
 # The envelope's public key set. Named here so that adding a key is a
 # deliberate edit to this list rather than something a test silently
@@ -277,6 +281,132 @@ async def test_e1_a_transport_failure_returns_the_same_key_set() -> None:
     assert set(envelope) == EXPECTED_KEYS
     assert envelope['headers'] == {}
     assert envelope['cookies'] == {}
+
+
+# --- R8-AC2: one key set, five protocols, both paths -----------------------
+
+# The five contract rows, shared by the success and the failure test below
+# so that a protocol's marker is one line to remove rather than two.
+#
+# Three of them are `xfail(strict=True)`, because their clients do not
+# satisfy the contract yet -- which is the whole reason for writing these
+# before the protocol work rather than after it. `strict` is what makes a
+# marker a ratchet instead of a note: the moment a protocol story fixes its
+# client, both of that protocol's rows pass unexpectedly, the suite fails,
+# and the marker has to come off in the same story that earned it. Each
+# story removes exactly the one row naming its own protocol and no other.
+CONTRACT_ROWS = [
+    pytest.param('HTTP', id='HTTP'),
+    pytest.param('HTTPS', id='HTTPS'),
+    pytest.param(
+        'FTP',
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason='logic/ftp_client.py reads `verify_ssl` before it is '
+                   'assigned and swallows the resulting UnboundLocalError '
+                   'in a blanket `except Exception`, returning an envelope '
+                   'no finaliser ever closed: ok=False with error=None, '
+                   'status_code=999 and an exception object in `text`. '
+                   'S10 (Step 8) rewrites the client and takes this row '
+                   'with it.'),
+        id='FTP'),
+    pytest.param(
+        'SFTP',
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason='logic/sftp_client.py returns True rather than the '
+                   'envelope it was handed, and swallows every failure in '
+                   'a blanket `except Exception` that leaves ok=False with '
+                   'error=None and status_code=999. It does not even reach '
+                   'the `return True` here: its string-parse of the lstat '
+                   'result succeeds but produces no `type` key, so the '
+                   'lookup of that key raises KeyError first. S12 '
+                   '(Step 10) rewrites the client and takes this row '
+                   'with it.'),
+        id='SFTP'),
+    pytest.param(
+        'SOAP',
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason='there is no logic/soap_client.py, so `SOAP` is absent '
+                   'from protocol_mapping and the call is rejected as an '
+                   'unknown protocol before an envelope exists. Registering '
+                   'it early would be worse than the gap -- an entry that '
+                   'dispatches nothing. S22 (Step 20) writes the client and '
+                   'takes this row with it.'),
+        id='SOAP'),
+]
+
+
+@pytest.mark.parametrize('protocol', CONTRACT_ROWS)
+async def test_r8_ac2_every_protocol_returns_one_key_set_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+) -> None:
+    """One shape for a success, whichever protocol produced it (R8-AC2).
+
+    The criterion a caller actually feels: one handler, written once,
+    works for every protocol this library dispatches. Without it each
+    protocol is free to invent its own success shape, and the uniform
+    envelope this release exists to deliver is uniform only for the
+    protocol whoever last touched the code happened to run.
+
+    No socket is opened. Each row drives ``request()`` with only its own
+    transport seam doubled, so everything between that seam and the
+    caller -- the protocol client's envelope mapping, the entry point's
+    single conversion point -- is the real code under test.
+
+    The key set is asserted first because it is the criterion verbatim,
+    but it cannot be the only assertion. A client that swallows its own
+    failure and returns the skeleton it was handed satisfies
+    ``set(result.keys()) == EXPECTED_KEYS`` exactly, while having reached
+    neither finaliser -- which is what both currently-broken clients do,
+    and what would let their rows pass this test while claiming success
+    for a call that failed. So ``ok``/``error`` are asserted too: E1's
+    other half is that exactly one of ``finalise_ok`` and
+    ``finalise_error`` closes every envelope, and "the success path"
+    means nothing if the call never took it.
+    """
+    install_transport(monkeypatch, protocol, succeeds=True)
+
+    result = await request(**contract_call(protocol))
+
+    assert set(result.keys()) == EXPECTED_KEYS
+    assert result['ok'] is True
+    assert result['error'] is None
+
+
+@pytest.mark.parametrize('protocol', CONTRACT_ROWS)
+async def test_r8_ac2_every_protocol_returns_one_key_set_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+) -> None:
+    """The same shape for a failure, whichever protocol failed (R8-AC2).
+
+    The half that rots first. A success path is exercised by every
+    example anyone writes, so it stays honest on its own; a refused
+    connection over SFTP is exercised by nobody until it happens in
+    production, which is where a protocol that reports its failures in a
+    shape of its own devising is discovered.
+
+    Every row's transport refuses the connection, so each protocol
+    reaches its own failure path rather than a shared pre-dispatch
+    rejection -- and reaches it without a socket, because the refusal is
+    the double's.
+
+    ``error is not None`` carries the same weight here as ``ok is True``
+    does in the success test above, and for the same reason: an envelope
+    both broken clients return has the whole key set and a null ``error``
+    on a call that failed, so a caller reading ``error`` to find out what
+    went wrong learns nothing. The key set alone would accept that.
+    """
+    install_transport(monkeypatch, protocol, succeeds=False)
+
+    result = await request(**contract_call(protocol))
+
+    assert set(result.keys()) == EXPECTED_KEYS
+    assert result['ok'] is False
+    assert result['error'] is not None
 
 
 # --- E2: ok is False exactly when error is set -----------------------------
