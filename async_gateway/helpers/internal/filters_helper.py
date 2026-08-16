@@ -24,7 +24,14 @@ async def get_ssl_config(
     # usage in aiohttp session_obj contradict each other
     # thereby raising a ValueError Exception
     if certificate:
-        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        # `SERVER_AUTH` is the purpose of the peer being *authenticated*,
+        # which on an outbound call is the server. `CLIENT_AUTH` reads as
+        # "we are the client" and means the opposite: it is what a server
+        # builds with to authenticate its clients, and it yields
+        # `verify_mode=CERT_NONE` with `check_hostname` off. Supplying a
+        # client certificate therefore negotiated TLS against an entirely
+        # unauthenticated peer (M2).
+        ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ssl_context.load_cert_chain(certificate[0], certificate[1])
         return {
             'ssl_context': ssl_context

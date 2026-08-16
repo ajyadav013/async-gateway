@@ -298,18 +298,7 @@ async def test_e1_a_transport_failure_returns_the_same_key_set() -> None:
 CONTRACT_ROWS = [
     pytest.param('HTTP', id='HTTP'),
     pytest.param('HTTPS', id='HTTPS'),
-    pytest.param(
-        'FTP',
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason='logic/ftp_client.py reads `verify_ssl` before it is '
-                   'assigned and swallows the resulting UnboundLocalError '
-                   'in a blanket `except Exception`, returning an envelope '
-                   'no finaliser ever closed: ok=False with error=None, '
-                   'status_code=999 and an exception object in `text`. '
-                   'S10 (Step 8) rewrites the client and takes this row '
-                   'with it.'),
-        id='FTP'),
+    pytest.param('FTP', id='FTP'),
     pytest.param(
         'SFTP',
         marks=pytest.mark.xfail(
