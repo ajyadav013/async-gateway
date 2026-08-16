@@ -1,9 +1,16 @@
-aiohttp~=3.9.5
-orjson~=3.10.6
+aiohttp>=3.14.3,<4
+orjson>=3.12.0,<4
+# Imported by zero modules (MG2). Declared until R3 (Step 4) migrates the
+# remaining ujson call sites and drops this line in the same commit.
 requests~=2.32.3
-aioboto3==13.1.1
-aiofiles~=24.1.0
+aioboto3>=15.5.0,<16
+aiofiles>=25.1.0,<26
+# The one deliberate exact pin: 0.6.0 is the latest release of a dormant
+# project, and R7 (Step 22) owns the keep / replace / vendor decision.
 pyfailsafe==0.6.0
-pytz==2024.1
-aioftp==0.22.3
-asyncssh==2.15.0
+# helpers/common/date_helper.py binds pytz.timezone() at import time, so the
+# declaration cannot be dropped before R9 (Step 5) removes the import; import
+# and declaration must go together or the clean-venv import breaks.
+pytz>=2026.3.post1,<2027
+aioftp>=0.28.0,<1
+asyncssh>=2.24.0,<3
