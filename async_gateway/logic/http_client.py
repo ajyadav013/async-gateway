@@ -10,7 +10,7 @@ the caller the body (invariant E11).
 import asyncio
 import ssl
 from collections.abc import Collection
-from typing import Any, Callable, Dict, List, Sequence, Text, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Sequence, Text, Tuple
 
 import aiohttp
 from async_gateway.helpers.internal import header_response_mapping
@@ -155,6 +155,12 @@ def transport_error_for(
 
 class HttpRequest(BaseRequestClass):
     """Implements Aiohttp Request to make http/https calls."""
+
+    # There is no default verb to fall back on: a GET assumed for a caller
+    # who meant DELETE is worse than a rejected call, so the key is
+    # required and `BaseRequestClass` rejects the call without it.
+    REQUIRED_INFO_KEYS: ClassVar[frozenset[Text]] = frozenset(
+        {'request_type'})
 
     def __init__(self, *args, **kwargs) -> None:
         """Initializing the http request class."""

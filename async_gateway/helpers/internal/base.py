@@ -4,27 +4,89 @@ One envelope, created by the entry point, is handed to the subclass, which
 fills it and returns the same object. A subclass never builds a response
 shape and never returns ``True``: the shape is owned by
 ``utils/envelope.py`` and nothing else constructs one.
+
+Which keys a protocol *requires* is the protocol's own knowledge, so each
+subclass declares them in :attr:`BaseRequestClass.REQUIRED_INFO_KEYS` --
+that is what lets the entry point check them without naming a single
+protocol. The check itself runs there, at the boundary, and not again here:
+this class acts on configuration that has already been validated.
 """
 
 import abc
-from collections.abc import Collection
-from typing import Text, Tuple
+from collections.abc import Collection, Mapping
+from typing import Any, ClassVar, Optional, Text, Tuple
 
 import aiohttp
 from async_gateway.helpers.common.date_helper import monotonic_now
 from async_gateway.helpers.internal.circuit_breaker_helper import CircuitBreakerHelper
 from async_gateway.utils.constants import HTTP_TIMEOUT
 from async_gateway.utils.envelope import GatewayResponse
+from async_gateway.utils.exceptions import ConfigurationError
+
+
+def validated_protocol_info(
+    info: Optional[Mapping[Text, Any]],
+    *,
+    required: Collection[Text] = (),
+) -> dict[Text, Any]:
+    """Return ``protocol_info`` as a dict once its shape is known good.
+
+    The one implementation of "is this ``protocol_info`` usable", called
+    once, at the one boundary caller data enters through: ``request()``,
+    which has to read ``redact_query_params`` off it and check the chosen
+    protocol's required keys before anything is dispatched or the caller's
+    pre-processor runs. :class:`BaseRequestClass` does not call it again --
+    a second check on already-validated data is how one of them comes to
+    accept what the other rejects.
+
+    ``None`` is the documented "no protocol_info" call and reads as an
+    empty mapping rather than as an error -- the crash it replaces was an
+    ``AttributeError`` on ``None.get`` (H5). Empty is not a bypass, though:
+    it is still held to ``required``, because a protocol that cannot run
+    without a key cannot run without it when the caller passed nothing
+    either.
+
+    Args:
+        info: ``protocol_info`` exactly as the caller supplied it, or None.
+        required: Key names this protocol cannot run without, from the
+            protocol class's own :attr:`BaseRequestClass.REQUIRED_INFO_KEYS`.
+
+    Returns:
+        A new dict of the caller's configuration, empty when they supplied
+        nothing.
+
+    Raises:
+        ConfigurationError: If ``info`` is neither None nor a mapping, or if
+            any required key is absent. Both are the caller's own
+            configuration failing to form a valid call, so both are reported
+            as configuration rather than as an ``AttributeError`` or a
+            ``KeyError`` from somewhere further in.
+    """
+    if info is None:
+        info = {}
+    elif not isinstance(info, Mapping):
+        raise ConfigurationError(
+            f'protocol_info must be a mapping or None, got '
+            f'{type(info).__name__}')
+    missing = sorted(set(required) - set(info))
+    if missing:
+        raise ConfigurationError(
+            f'protocol_info is missing required key(s) {missing}')
+    return dict(info)
 
 
 class BaseRequestClass(abc.ABC):
     """Base class for handling json requests."""
 
+    #: Keys this protocol cannot run without. The default requires nothing,
+    #: so a protocol whose every key has a default inherits it untouched.
+    REQUIRED_INFO_KEYS: ClassVar[frozenset[Text]] = frozenset()
+
     def __init__(
         self, url: Text,
         auth: aiohttp.BasicAuth,
         response: GatewayResponse,
-        info: dict,
+        info: Optional[Mapping[Text, Any]],
         *,
         redact_params: Collection[Text]
     ) -> None:
@@ -35,7 +97,13 @@ class BaseRequestClass(abc.ABC):
         :param response: the ``GatewayResponse`` skeleton created by the
         entry point. The subclass fills it and returns it; it never
         replaces it with a dict of its own.
-        :param info: protocol_info passed in request function
+        :param info: protocol_info as ``validated_protocol_info`` returned
+        it at the entry point, or None for the documented "no
+        protocol_info" call. Copied into ``self.info``; every read below
+        this line goes through that and never through the raw parameter,
+        which is the defect (H5) that made ``protocol_info=None`` an
+        ``AttributeError``. It is *not* re-validated: the required-key and
+        shape checks belong at the boundary, which has already run them.
         :param redact_params: the caller's additional sensitive
         query-parameter names, already normalised by
         ``normalise_param_names``. Required rather than defaulted, and
@@ -49,16 +117,16 @@ class BaseRequestClass(abc.ABC):
         self.url = url
         self.auth = auth
         self.response = response
-        self.info = info if info else {}
+        self.info: dict[Text, Any] = {} if info is None else dict(info)
         self.redact_params: frozenset[Text] = frozenset(redact_params)
         # Monotonic, so a wall-clock step cannot make `latency` negative,
         # and float, because that is what a clock reading is (L4).
         self.start_time: float = monotonic_now()
-        self.timeout: int = info.get('timeout', HTTP_TIMEOUT)
-        self.certificate: Tuple[Text] = info.get('certificate')
+        self.timeout: int = self.info.get('timeout', HTTP_TIMEOUT)
+        self.certificate: Tuple[Text] = self.info.get('certificate')
 
         self.circuit_breaker_config: dict = self._get_circuit_breaker_config(
-            info.get('circuit_breaker_config', {}))
+            self.info.get('circuit_breaker_config', {}))
         self.circuit_breaker = CircuitBreakerHelper(**self.circuit_breaker_config)
 
     def _get_circuit_breaker_config(self, circuit_breaker_config: dict) -> dict:

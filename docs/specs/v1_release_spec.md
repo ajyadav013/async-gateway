@@ -832,9 +832,10 @@ the error message, so that I can retry intelligently instead of guessing at a `9
       inside an `except` block omits `from`. A lint rule (`B904`) enforces it.
 - [ ] A module logger exists: `async_gateway/__init__.py` attaches a `logging.NullHandler()` to the
       `async_gateway` logger (library discipline — the library never configures the root logger), each
-      module uses `logging.getLogger(__name__)`, and every error path logs at `error` level with
-      `exc_info=True` and structured `extra={}`. A test using `caplog` asserts one error record per
-      failure with the exception attached.
+      module uses `logging.getLogger(__name__)`, and every error path logs at `error` level with a
+      **redacted `extra['traceback']`** (**not** `exc_info=True` — Revision 4 / Ruling I) and structured
+      `extra={}`. A test using `caplog` asserts one error record per failure carrying the redacted
+      traceback string.
 - [ ] **The logger leaks nothing.** A test asserts that no log record emitted during a request carries
       a password, an `Authorization` value, or a `Set-Cookie` value, using the same redaction helper as
       R8.
@@ -3780,8 +3781,11 @@ started = time.monotonic()
 try:
     envelope = await protocol_obj.handle_request()
 except AsyncGatewayError as exc:
-    logger.error("gateway request failed", exc_info=True,
-                 extra={"protocol": protocol, "url": redact_url(url), "code": exc.code})
+    # Ruling I / Rev 4: NO exc_info. A redacted traceback string instead — exc_info hands the
+    # live chained exception to the app's handler, where no redactor of ours can run.
+    logger.error("gateway request failed",
+                 extra={"protocol": protocol, "url": redact_url(url), "code": exc.code,
+                        "traceback": redact_text(format_exception(exc))})
     # finalise_error ADDS error + flips ok. It never clears status_code, headers,
     # cookies, text or json — the protocol populated those before raising (E11).
     envelope = finalise_error(envelope, exc, started=started)
@@ -3812,15 +3816,15 @@ test, which only checks that the *keys* are present. Hence E11, and hence R8's n
 
 | Failure | Raised by | Type | `status_code` | `ok` | Logged | Retryable? |
 |---|---|---|---|---|---|---|
-| Unknown / `None` / non-string protocol | `request()` | `ConfigurationError` | — (**raises**) | — | `error` | No |
-| Missing required `protocol_info` key | `BaseRequestClass.__init__` | `ConfigurationError` | — (**raises**) | — | `error` | No |
-| `HTTPS` + `http://` URL | `request()` | `ConfigurationError` | — (**raises**) | — | `error` | No |
-| Unknown verb / unknown breaker key | allowlist / config parser | `ConfigurationError` | — (**raises**) | — | `error` | No |
-| DNS failure | `http_client` | `DnsError` | 502 | False | `error` + `exc_info` | Yes (transient) |
-| Connect refused / reset | `http_client`, `ftp_client`, `sftp_client` | `ConnectError` | 502 | False | `error` + `exc_info` | Yes |
-| TLS handshake / cert failure | `filters_helper`, protocol clients | `TlsError` | 502 | False | `error` + `exc_info` | No (config) |
-| SSH host-key mismatch | `sftp_client` | `HostKeyError` | 495 | False | `error` + `exc_info` | No (config) |
-| Connect / read / total timeout | all protocols | `GatewayTimeoutError` | 504 | False | `error` + `exc_info` | Yes |
+| Unknown / `None` / non-string protocol | `request()` | `ConfigurationError` | — (**raises**) | — | — *(raises; never logged — single-report principle, Rev 4)* | No |
+| Missing required `protocol_info` key | `BaseRequestClass.__init__` | `ConfigurationError` | — (**raises**) | — | — *(raises; never logged — single-report principle, Rev 4)* | No |
+| `HTTPS` + `http://` URL | `request()` | `ConfigurationError` | — (**raises**) | — | — *(raises; never logged — single-report principle, Rev 4)* | No |
+| Unknown verb / unknown breaker key | allowlist / config parser | `ConfigurationError` | — (**raises**) | — | — *(raises; never logged — single-report principle, Rev 4)* | No |
+| DNS failure | `http_client` | `DnsError` | 502 | False | `error` + redacted `traceback` | Yes (transient) |
+| Connect refused / reset | `http_client`, `ftp_client`, `sftp_client` | `ConnectError` | 502 | False | `error` + redacted `traceback` | Yes |
+| TLS handshake / cert failure | `filters_helper`, protocol clients | `TlsError` | 502 | False | `error` + redacted `traceback` | No (config) |
+| SSH host-key mismatch | `sftp_client` | `HostKeyError` | 495 | False | `error` + redacted `traceback` | No (config) |
+| Connect / read / total timeout | all protocols | `GatewayTimeoutError` | 504 | False | `error` + redacted `traceback` | Yes |
 | Circuit open | breaker | `CircuitOpenError` | 503 | False | `warning` | Later |
 | HTTP 4xx / 5xx | `http_client` | `HttpStatusError` | the real status | False | `warning` | Depends |
 | SOAP Fault (incl. HTTP 200) | `soap_client` | `SoapFaultError` | the real status | False | `warning` | Depends |
@@ -3833,23 +3837,31 @@ test, which only checks that the *keys* are present. Hence E11, and hence R8's n
 | Request body will not serialise | `filters_helper` | `SerializationError` | 400 | False | `error` | No |
 | XML with a `DOCTYPE` | `soap_client` | `UnsafeXmlError` | 502 | False | `error` | No |
 | Path escapes the target directory | `utils/paths.py` | `PathContainmentError` | 400 | False | `error` | No |
-| Pre/post-processor raises | `request()` | wrapped `ConfigurationError` | 400 | False | `error` + `exc_info` | No |
+| Pre/post-processor raises | `request()` | wrapped `ConfigurationError` | 400 | False | `error` + redacted `traceback` | No |
 | **Library bug** (`KeyError`, `TypeError`, `UnboundLocalError`, …) | anywhere | **propagates unchanged** | — | — | not caught | — |
 | `asyncio.CancelledError` | anywhere | **propagates unchanged** | — | — | not caught | — |
 
 ### Logging contract
 
 - One logger tree, `async_gateway.*`, with a `NullHandler` on the root of it and **no other handler**.
-- Every failure logs exactly once, at the conversion point, with `exc_info=True` and structured
-  `extra={'protocol', 'url', 'code', 'status_code', 'latency'}` — never f-string interpolation into
-  the message.
+- Every failure logs exactly once, at the conversion point, with a **redacted `extra['traceback']`
+  string** (**not** `exc_info=True` — see Revision 4 / Ruling I) and structured
+  `extra={'protocol', 'url', 'code', 'status_code', 'latency', 'traceback'}` — never f-string
+  interpolation into the message.
+- **An error is reported exactly once** (Revision 4 / OQ14, single-report principle): either it
+  escapes to the caller as a `raise` — the four pre-dispatch `(raises)` rows below, which log
+  **nothing** — or it is converted to an envelope inside `handle_request`, and *that* conversion
+  point logs it. There is no third behaviour: a path never both raises and logs.
 - `warning` for a remote-side failure the caller may legitimately expect (4xx, a Fault, an open
   circuit); `error` for a transport or configuration failure.
-- Every value passing through `extra` goes through `redact_value` first — which dispatches by type to
+- Every **scalar** value passing through `extra` goes through `redact_value` first — which dispatches by type to
   `redact_url` for the URL, `redact_headers` for a header mapping, and `redact_payload` for the payload
   — so the logger and the envelope cannot disagree about what is a secret. In particular the `url` key
   is `redact_url(url)`, not the raw string: a URL carrying `?api_key=` in the envelope but in the clear
-  in the log would defeat the whole point of sharing one redactor.
+  in the log would defeat the whole point of sharing one redactor. The one exception is `traceback`,
+  which goes through `redact_text` alone: `redact_value` adds a whole-string `redact_url` pass, and that
+  pass would read the prose *after* the first URL in a multi-line trace as part of the query it is
+  masking and truncate the trace there.
 
 ### Consolidated edge-case mapping
 
@@ -4104,6 +4116,16 @@ and OQ10 asks the question directly rather than assuming the answer.
 ---
 
 ## Revision history
+
+### Revision 4 — 2026-08-16 · implementation-phase rulings on the logging contract (OQ13, OQ14)
+
+Two amendments made **during Phase 2**, both ratified by the human main session before S8 was
+dispatched. Neither changes a requirement id, a step, or the acceptance-criterion count (still 258).
+
+| Ruling | Change | Where |
+|---|---|---|
+| **OQ13 RATIFIED — Ruling I stands. The redacted traceback stays; `exc_info=True` does not return.** Rationale of record: the shared redactor is a spec deliverable *precisely because* the audit proved secrets reach logs. `exc_info=True` hands the **live chained exception** to arbitrary application handlers, where no redactor of ours can run — a bare `logging.basicConfig()` prints the raw aiohttp `str()`, secret included. `raise … from None` was implemented and empirically **rejected**: `traceback.format_exception` hides the text but `__context__` survives on the object, so chain-walking APMs (Sentry et al.) still read it. Only removal is unconditionally safe. **Accepted cost:** loses ecosystem-standard exception grouping/fingerprinting; `extra['traceback']` is invisible to most handlers. *Owner:* the maintainer. *Revisit trigger:* a redaction-aware handler ships, or a consumer reports APM grouping loss. *Reversal:* one line in `log_failure` + two guard tests — a two-way door. **S29 must document `extra['traceback']`, the loss of native APM exception grouping, and the one-line revert as a documented consumer choice.** The two guard tests stay. | §Logging contract · R9's logger acceptance criterion (:833-838) · the `async_gateway.py` conversion-point sketch · the six `error` + `exc_info` rows of the failure table |
+| **OQ14 RESOLVED — the single-report principle.** The failure table marked the four pre-dispatch `(raises)` rows `Logged: error`, contradicting "every failure logs exactly once, **at the conversion point**" — a path that raises before dispatch never reaches that point. Resolved in favour of the conversion-point rule: **an error is reported exactly once.** Either it escapes to the caller as a `raise` (the four `(raises)` rows — these do **not** log; the caller holds the exception object, and reporting it twice is the defect) or it is converted to an envelope inside `handle_request` and logged at that conversion point. There is no third behaviour. If an implementation surfaces a concrete reason this reading is wrong, the story **stops and reports** rather than improvising one. | The four `(raises)` rows' **Logged** column → `—` (:3815-3818) · a new single-report bullet in §Logging contract |
 
 ### Revision 3 — against the Devil's Advocate plan critique (`.claude/state/gate-evidence/devils-advocate-plan-critique.md`)
 

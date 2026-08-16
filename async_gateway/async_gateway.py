@@ -11,8 +11,13 @@ failed network call.
 import logging
 import traceback
 from collections.abc import Collection
-from typing import Dict, Optional, Text, Union
+from typing import Any, Dict, Final, Optional, Text, Tuple, Union
+from urllib.parse import urlsplit
 
+from async_gateway.helpers.internal.base import (
+    BaseRequestClass,
+    validated_protocol_info,
+)
 from async_gateway.logic import protocol_mapping
 from async_gateway.utils.envelope import (
     GatewayResponse,
@@ -26,11 +31,115 @@ from async_gateway.utils.exceptions import (
 from async_gateway.utils.redaction import (
     normalise_param_names,
     redact_text,
+    redact_url,
     redact_value,
 )
 from async_gateway.utils.status_map import WARNING_CODES
 
 logger = logging.getLogger(__name__)
+
+# Which URL schemes each protocol will dispatch on. Only the HTTP family
+# appears: an FTP or SFTP `url` is a bare host name and has no scheme to
+# check, so imposing one would reject every correct call.
+#
+# `'HTTPS'` allowing only `https` is the whole of H6: the two names used to
+# map to the same class with nothing distinguishing them, so a caller who
+# explicitly asked for TLS and passed an `http://` URL got silent plaintext.
+HTTP_FAMILY_SCHEMES: Final[dict[Text, frozenset[Text]]] = {
+    'HTTP': frozenset({'http', 'https'}),
+    'HTTPS': frozenset({'https'}),
+}
+
+
+def resolve_protocol(
+    protocol: object,
+) -> Tuple[Text, type[BaseRequestClass]]:
+    """Normalise a caller's protocol name once and find its strategy.
+
+    Once, and in one place: the guard and the registry lookup read the same
+    normalised value, rather than the guard normalising and the lookup not
+    (H4) -- which let ``protocol='http'`` pass the guard and then die with
+    an uncaught ``KeyError`` from a function whose contract is to return a
+    dict.
+
+    Args:
+        protocol: The caller's ``protocol`` argument, of whatever type they
+            actually passed. The signature says ``str``; None and ``123``
+            are what arrive in practice, and both are rejected here rather
+            than crashing on ``.upper()``.
+
+    Returns:
+        The normalised protocol name and the class that implements it.
+
+    Raises:
+        ConfigurationError: If ``protocol`` is not a string, or names no
+            registered protocol. The message lists what is supported.
+    """
+    if isinstance(protocol, str):
+        name = protocol.strip().upper()
+        protocol_class = protocol_mapping.get(name)
+        if protocol_class is not None:
+            return name, protocol_class
+    raise ConfigurationError(
+        f'protocol must be one of {sorted(protocol_mapping)}, '
+        f'got {protocol!r}')
+
+
+def dispatch_url_for(
+    protocol: Text,
+    url: Text,
+    *,
+    redact_params: Collection[str] = (),
+) -> Text:
+    """Return the URL this call will be dispatched to, scheme enforced.
+
+    A schemeless URL under ``'HTTPS'`` is upgraded rather than rejected:
+    the caller named the protocol explicitly and there is exactly one
+    scheme that can satisfy it. Under ``'HTTP'`` it is left alone, because
+    either scheme would satisfy that and guessing which is not this
+    function's call.
+
+    A URL whose scheme parses to something else -- ``ftp://`` under
+    ``'HTTP'``, ``file://``, ``javascript:`` -- is rejected rather than
+    dispatched. So is ``host:8080/p``, whose ``host`` reads as a scheme:
+    the URL is malformed for every protocol here, and rejecting it says so
+    where guessing at an intended scheme would not.
+
+    Args:
+        protocol: The normalised protocol name from :func:`resolve_protocol`.
+        url: The URL the call is about to be dispatched to.
+        redact_params: The caller's additional sensitive query-parameter
+            names, so a rejected URL is named in the exception message
+            without its credentials.
+
+    Returns:
+        The URL to dispatch, upgraded to ``https://`` where that was the
+        only reading. Protocols outside the HTTP family get theirs back
+        unchanged.
+
+    Raises:
+        ConfigurationError: If the URL's scheme is one this protocol will
+            not dispatch on, or if the URL cannot be parsed at all.
+    """
+    allowed = HTTP_FAMILY_SCHEMES.get(protocol)
+    if allowed is None:
+        return url
+
+    try:
+        scheme = urlsplit(url).scheme.lower()
+    except ValueError as err:
+        raise ConfigurationError(
+            f'url is not parseable: '
+            f'{redact_url(url, extra_params=redact_params)}') from err
+
+    if not scheme:
+        return f'https://{url}' if protocol == 'HTTPS' else url
+    if scheme not in allowed:
+        raise ConfigurationError(
+            f'protocol {protocol!r} dispatches only on '
+            f'{sorted(allowed)}, but the url has scheme {scheme!r}: '
+            f'{redact_url(url, extra_params=redact_params)}')
+    return url
 
 
 def log_failure(
@@ -44,9 +153,12 @@ def log_failure(
 
     ``warning`` for a remote-side failure a caller may legitimately expect
     -- a 4xx, a Fault, an open circuit -- and ``error`` for a transport or
-    configuration failure. Every value in ``extra`` goes through
-    ``redact_value`` first, so a URL carrying ``?api_key=`` cannot be masked
-    in the envelope and in the clear in the log.
+    configuration failure. The scalar values in ``extra`` go through
+    ``redact_value``, so a URL carrying ``?api_key=`` cannot be masked in the
+    envelope and in the clear in the log. ``traceback`` goes through
+    ``redact_text`` instead, because it is prose containing URLs rather than a
+    bare URL: ``redact_value``'s whole-string pass would truncate it at its
+    first URL, discarding the rest of the trace.
 
     The traceback is rendered here and carried as a redacted string rather
     than emitted with ``exc_info=True``. A live ``exc_info`` is formatted by
@@ -60,7 +172,9 @@ def log_failure(
 
     Args:
         protocol: The protocol the call was dispatched on.
-        url: The URL as the caller supplied it.
+        url: The URL the call was actually dispatched to, which is the one
+            the failure is about -- it may carry a scheme the caller left
+            off.
         envelope: The finalised envelope, read for its measured latency.
         exc: The failure being reported.
         redact_query_params: The caller's additional sensitive
@@ -109,7 +223,12 @@ async def request(
      calls with pre-processor, post processor and retry support.
     :param url: URL to call
     :param data: Data to be sent in calls
-    :param protocol: values HTTP/HTTPS
+    :param protocol: one of the names registered in
+        ``async_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP,
+        SFTP. Matched with surrounding whitespace stripped and without
+        regard to case, so 'http', ' HTTP ' and 'Http' are the same
+        protocol. HTTPS additionally requires that the call go out over
+        TLS; see :raises: below
     :param auth: aiohttp.BasicAuth(username, password)
         Optional field any auth abject is accepted supported by aiohttp
     :param protocol_info: {
@@ -177,15 +296,33 @@ async def request(
         the success and the failure path. Check ``result['ok']`` -- it is
         the only success predicate, and it is False for every failure.
     :raises ConfigurationError: If the caller's own configuration cannot
-        form a valid call -- an unknown protocol, or a "serialization"
-        value that is not callable or does not return str. These are
-        programming errors on the caller's side and are not retryable, so
-        they escape synchronously rather than becoming an envelope a retry
-        loop would re-attempt forever. Both are raised before dispatch: the
-        protocol guard here, and the protocol object's own validation while
-        it is constructed. Every *remote* or *transport* failure, by
-        contrast, is reported as an ``ok=False`` envelope.
+        form a valid call. That is: a protocol that is not a string, is
+        empty, or names nothing registered; a ``protocol_info`` that is
+        neither None nor a mapping, or that omits a key the chosen
+        protocol requires, such as HTTP's "request_type"; a URL whose
+        scheme the chosen protocol will not dispatch on, which for
+        ``protocol='HTTPS'`` includes a plain ``http://`` URL; and a
+        "serialization" value that is not callable or does not return str.
+        These are programming errors on the caller's side and are not
+        retryable, so they escape synchronously rather than becoming an
+        envelope a retry loop would re-attempt forever -- and, escaping,
+        they are reported to the caller exactly once and are not also
+        logged. Every one of them is raised before anything is dispatched.
+        Every *remote* or *transport* failure, by contrast, is reported as
+        an ``ok=False`` envelope.
     """
+    # `protocol` and `protocol_info` -- including the keys the chosen
+    # protocol requires -- are validated here, at the boundary, before an
+    # envelope exists and before the caller's own pre-processor is given
+    # anything to do. Layers below this one act on what they are handed and
+    # do not check it again.
+    #
+    # The URL's *scheme* is the one exception and is deliberately not
+    # checked here; see FI-14 below.
+    protocol_name, protocol_class = resolve_protocol(protocol)
+    info: Dict[Text, Any] = validated_protocol_info(
+        protocol_info, required=protocol_class.REQUIRED_INFO_KEYS)
+
     if data is None:
         data = {}
 
@@ -194,19 +331,14 @@ async def request(
     # messages and the failure log then share the same set by construction
     # rather than by three call sites agreeing.
     redact_query_params = normalise_param_names(
-        (protocol_info or {}).get('redact_query_params'))
+        info.get('redact_query_params'))
 
     response: GatewayResponse = new_envelope(
         url=url,
-        protocol=protocol,
+        protocol=protocol_name,
         payload=data,
         redact_query_params=redact_query_params,
     )
-
-    if not protocol_mapping.get(protocol.upper()):
-        raise ConfigurationError(
-            f'protocol must be one of {sorted(protocol_mapping)}, '
-            f'got {protocol!r}')
 
     if pre_processor_config:
         response['pre_processor_response'] = await \
@@ -215,9 +347,26 @@ async def request(
                                                  'params',
                                                  {}))
 
-    protocol_class = protocol_mapping[protocol]
+    # FI-14. The scheme check runs *after* the pre-processor and against
+    # the value that is then handed to the protocol object -- one variable,
+    # so the URL checked and the URL dispatched cannot differ. A
+    # pre-processor mutating `response['url']` therefore cannot downgrade
+    # an HTTPS call to plaintext. If a later story lets a pre-processor
+    # rewrite the dispatched URL, this check moves with it: it has to stay
+    # the last thing that touches the URL before dispatch.
+    target_url = dispatch_url_for(
+        protocol_name, url, redact_params=redact_query_params)
+
+    # The envelope was seeded with the caller's `url`, which under
+    # `'HTTPS'` may have carried no scheme. It reports what was dispatched,
+    # not what was asked for, or a caller reading `result['url']` would see
+    # `host/p` for a call that went to `https://host/p` -- and would
+    # disagree with the failure log, which is written from `target_url`.
+    response['url'] = redact_url(
+        target_url, extra_params=redact_query_params)
+
     protocol_obj = protocol_class(
-        url, auth, response, info=protocol_info,
+        target_url, auth, response, info=info,
         redact_params=redact_query_params)
 
     # The protocol object's own reference point, so `latency` is measured
@@ -234,7 +383,8 @@ async def request(
         response = finalise_error(
             response, exc, started=started,
             redact_query_params=redact_query_params)
-        log_failure(protocol, url, response, exc, redact_query_params)
+        log_failure(
+            protocol_name, target_url, response, exc, redact_query_params)
 
     if post_processor_config:
         response['post_processor_response'] = \

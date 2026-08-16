@@ -113,14 +113,21 @@ junit_family = "legacy"
 
 [tool.coverage.report]
 # Coverage ratchet floor (R28): the value measured at this step, and it may
-# only ever be raised. Every later step re-measures and raises it; a CI job
-# fails any commit whose value is below the base branch.
+# only ever be raised, never lowered. Every later step re-measures and raises
+# it; a CI job fails any commit whose value is below the base branch.
 #
-# Measured at Step 5 (`coverage report --precision=6`): 72.900763%, after the
-# third review-fix iteration moved redaction into `unwrap_cause` itself -- the
-# seam at which foreign exception text becomes a caller-visible string -- and
-# added the transport-error leak guards that cover it (72.657253% before;
-# 72.551546% and 71.936759% before the two earlier iterations). The floor is
-# truncated to two decimals rather than rounded, because rounding up would put
-# it above the value it was measured from and fail the run that set it.
-fail_under = 72.90
+# Measured at Step 6 / story S8 (`coverage report --precision=6`): 76.442308%
+# line+branch. This raises the floor 72.90 -> 76.44 against the committed
+# baseline at af16cf6, the only value in history; the 76.69 seen mid-story was
+# never committed. It fell to 76.44 when the final `redact_value` security fix
+# deleted 7 covered statements and 2 covered branches: missed statements stayed
+# at 159, so no line lost coverage -- a smaller denominator lowered the ratio.
+# The floor is truncated to two decimals rather than rounded, because rounding
+# up would put it above the value it was measured from and fail the very run
+# that set it.
+fail_under = 76.44
+# `fail_under` is compared against the total *rounded to `precision`*, so a
+# two-decimal ratchet needs two-decimal precision or the comparison silently
+# degrades to whole percents. Latent until now: earlier floors happened to round
+# favourably, so the integer comparison agreed with the intended one by luck.
+precision = 2

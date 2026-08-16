@@ -15,6 +15,17 @@ and sensitive-named query parameters, URLs embedded anywhere inside a
 free-text string, and payload values whose *key name* is sensitive down to
 :data:`PAYLOAD_REDACTION_DEPTH`. Below that depth, and for a payload that
 is not a mapping, the caller's own data is echoed verbatim.
+
+One further bound is measured rather than assumed. ``redact_text`` only
+matches URLs carrying an explicit ``scheme://``, so a scheme-less URL --
+``host/p?api_key=...`` -- passes through it completely unchanged. Its
+consumers therefore still carry that URL's query secrets:
+``error['message']``, ``error['cause']`` and the log record's
+``extra['traceback']``. The log record's ``extra['url']`` does not,
+because ``redact_value`` composes ``redact_url`` over the result. The
+remaining three are an open finding tracked separately: widening the
+pattern to scheme-less strings would also mask arbitrary prose, so it is
+a contract decision rather than a bug fix.
 """
 
 import re
@@ -60,8 +71,14 @@ PAYLOAD_REDACTION_DEPTH: Final[int] = 4
 # URL. Deliberately greedy about what it swallows: over-capturing trailing
 # punctuation folds it into the query value that is about to be masked, so
 # the bound can only ever mask more, never less.
+#
+# The scheme repetition is bounded because it is unbounded backtracking
+# otherwise: on a long string carrying no `://` the engine retries the
+# scheme run from every offset, which measured 35s on 200KB -- inside
+# `log_failure`, on the event loop. 32 characters is far longer than any
+# registered scheme, so the bound costs no match.
 _EMBEDDED_URL: Final[re.Pattern[str]] = re.compile(
-    r'[A-Za-z][A-Za-z0-9+.\-]*://[^\s<>"\'`]+')
+    r'[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s<>"\'`]+')
 
 
 def normalise_param_names(raw: Any) -> frozenset[str]:
@@ -262,13 +279,61 @@ def redact_value(
     each call site is what keeps a value in a log record and the same value
     in the envelope masked identically.
 
+    A string gets *both* string maskers, unconditionally. There is no test
+    of whether it "looks like a URL" first, because that predicate is
+    itself the defect: it has now failed open twice, on two different
+    strings. It first demanded a scheme *and* a netloc, so
+    ``http:///p?api_key=...`` was echoed; narrowed to demanding only a
+    scheme, ``host/p?api_key=...`` was echoed. Composing both maskers
+    instead makes this mask **whatever the envelope masks, by
+    construction** -- the envelope masks its ``url`` with
+    :func:`redact_url`, and so, always, does this -- rather than only on
+    the strings some predicate happened to classify correctly. The claim
+    is about *what is masked*, not about byte-identical rendering: where
+    :func:`redact_text` masks first, :func:`redact_url` finds nothing left
+    to mask and returns the string untouched, so
+    ``'http://h/p?api_key=S&x=<tag>'`` comes back from here as
+    ``'http://h/p?api_key=***redacted***&x=<tag>'`` where
+    :func:`redact_url` alone would re-encode the tail to
+    ``'...&x=%3Ctag%3E'``. Both mask the same secret; only the
+    percent-encoding of the untouched remainder differs. Neither masker
+    needs the guard: :func:`redact_text`
+    substitutes nothing when it matches nothing, and :func:`redact_url`
+    returns its input unchanged when it has nothing to mask or cannot
+    parse it.
+
+    The *order* remains load-bearing. :func:`redact_text` runs first
+    because it is the only one of the two that can find a URL buried in
+    prose. Running :func:`redact_url` first on a traceback line would mask
+    nothing: ``'ValueError: http://host/p?api_key=S'`` has the truthy
+    scheme ``valueerror``, so the whole string parses as one URL whose
+    query is empty -- and would then have consumed the real URL. With the
+    text pass first that same line comes back already masked, after which
+    :func:`redact_url` finds nothing to do and returns it unchanged.
+
+    :func:`redact_url` earns its second pass on the strings
+    :func:`redact_text` masks only partly: the pattern ends each match at
+    the first character that cannot appear unescaped in a URL, so a secret
+    value containing a space, a quote, a backtick or an angle bracket has
+    its tail left outside the match and echoed. Its cost is that a
+    whole-string parse reads any prose *after* a URL as part of the query
+    it is masking and swallows it, and that :func:`urllib.parse.urlsplit`
+    strips every tab, carriage return and newline from the whole string
+    while it is at it -- ``'multi'``, a newline and ``'line ?api_key=S'``
+    come back joined as ``'multiline ?api_key=***redacted***'``. Both are
+    the fail-closed
+    direction, both fire only when masking does, and both are harmless for
+    the single-line ``url`` and ``protocol`` fields this entry point
+    serves. They are also confined to it: the one field that is genuinely
+    multi-line prose, the traceback, is masked by :func:`redact_text`
+    alone.
+
     Args:
         value: Anything about to be written to a log record.
         extra_params: The caller's additional sensitive query-parameter
-            names, forwarded to :func:`redact_url` when ``value`` turns out
-            to be a URL. It must be the *same* set the envelope was built
-            with, or the log and the envelope would disagree about what a
-            secret is.
+            names, forwarded to both string passes. It must be the *same*
+            set the envelope was built with, or the log and the envelope
+            would disagree about what a secret is.
 
     Returns:
         The redacted equivalent, or ``value`` itself when no redactor
@@ -277,10 +342,9 @@ def redact_value(
     if isinstance(value, BasicAuth):
         return REDACTED
     if isinstance(value, str):
-        return (
-            redact_url(value, extra_params=extra_params)
-            if _is_absolute_url(value) else value
-        )
+        return redact_url(
+            redact_text(value, extra_params=extra_params),
+            extra_params=extra_params)
     return _redact_recursive(
         value, _ALL_SENSITIVE_NAMES, PAYLOAD_REDACTION_DEPTH)
 
@@ -320,20 +384,3 @@ def _redact_recursive(
     if isinstance(value, Sequence):
         return [_redact_recursive(item, names, depth - 1) for item in value]
     return value
-
-
-def _is_absolute_url(value: str) -> bool:
-    """Report whether ``value`` parses as an absolute URL.
-
-    Args:
-        value: The string to inspect.
-
-    Returns:
-        True when it has both a scheme and a network location, which is
-        what distinguishes a URL from an arbitrary logged string.
-    """
-    try:
-        parts = urlsplit(value)
-    except ValueError:
-        return False
-    return bool(parts.scheme and parts.netloc)
