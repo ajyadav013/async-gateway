@@ -184,9 +184,9 @@ def validated_request_type(request_type: Any) -> Text:
 
 
 def validated_upload_config(
-    http_file_upload_config: Dict,
+    http_file_upload_config: Dict[Text, Any],
     request_type: Text,
-) -> Dict:
+) -> Dict[Text, Any]:
     """Return ``http_file_upload_config`` once proven usable on this verb.
 
     A file upload on a GET had no defined behaviour: a dead ``if ...: pass``

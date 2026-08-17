@@ -979,6 +979,8 @@ async def make_http_filters_with_stream_file_upload(
     ``RetriesExhausted``, classified as a ``ConnectError``, and reported
     as a 502 from an endpoint that was never dialled -- with the caller's
     absolute local path in the message.
+    :returns HttpResult: what the final hop answered, as
+    :func:`make_http_request` assembled it.
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
     local_filepath = http_file_upload_config['local_filepath']
@@ -1104,6 +1106,9 @@ async def make_http_filters_without_stream_uploads(
     mid-flight deletion could not reach the upload. It is the accepted
     cost of building the body once per attempt, which is what makes a
     retry send the file rather than zero bytes.
+
+    :returns HttpResult: what the final hop answered, as
+    :func:`make_http_request` assembled it.
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
     local_filepath = http_file_upload_config['local_filepath']
@@ -1156,6 +1161,9 @@ async def make_http_filters_without_file(
     consumed. Re-running the filter is cheap and takes this path out of
     that class of defect entirely rather than leaving it depending on
     which body shape the caller's ``Content-Type`` happened to select.
+
+    :returns HttpResult: what the final hop answered, as
+    :func:`make_http_request` assembled it.
     """
     headers = kwargs.get('headers')
     payload = kwargs.get('payload')
@@ -1214,6 +1222,10 @@ async def handle_http_request(
     entry point's ``AsyncGatewayError`` conversion. Raising it at this depth
     turned a configuration error into an ``ok=False`` envelope. This
     function acts on what it is handed and does not check it again (R11).
+
+    :returns HttpResult: whatever the selected filter method returned --
+    ultimately what the final hop answered, as :func:`make_http_request`
+    assembled it.
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
     if http_file_upload_config:
