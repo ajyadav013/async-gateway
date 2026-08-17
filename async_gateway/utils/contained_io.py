@@ -236,9 +236,19 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
         """Create a directory, inside the base or not at all.
 
         The directory half of the escape, and it lands *before* the
-        file half: a hostile entry name that is a directory gets
-        ``mkdir`` first and the write second, so refusing here stops
+        file half: a hostile entry name that is a directory is
+        ``mkdir``'d first and written second, so refusing here stops
         the tree being created at all rather than only its leaves.
+
+        One path outside the base is permitted, by **exact match**: the
+        base's own parent. ``aioftp.Client.download`` creates the
+        destination's parent before writing a single file, and for a
+        file download the destination *is* the base -- so refusing its
+        parent would refuse every single-file download. The exception is
+        safe because it is not a prefix rule: a server-derived name can
+        satisfy it only by naming exactly the one directory the caller
+        already named the inside of, where ``exist_ok`` makes it a
+        no-op. ``base/../victimdir`` is a different path and is refused.
 
         Args:
             path: The directory to create.
@@ -248,6 +258,10 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
         Returns:
             None.
         """
+        if Path(_shown(path)).absolute() == self.base.parent:
+            await aioftp.pathio.AsyncPathIO.mkdir(
+                self, self.base.parent, parents=parents, exist_ok=True)
+            return
         await super().mkdir(
             self.contained(path), parents=parents, exist_ok=exist_ok)
 
@@ -784,20 +798,27 @@ def _require_begin_copy(sftp: Any) -> Any:
     return begin_copy
 
 
-def local_root(path: PathLike) -> Tuple[Path, PurePath]:
-    """Split a local transfer operand into the directory and the name.
+def local_base(path: PathLike) -> Path:
+    """Return the directory a transfer's local side is confined to.
 
-    A caller naming ``/downloads/report.pdf`` has named both the
-    directory a transfer may write in and the file it should produce.
-    The two are needed separately: the directory is what containment is
-    measured against, and it must already exist for the transfer to be
-    confined to anything.
+    The caller's own local operand, made absolute -- **not** its
+    parent. That path is the whole local side of the transfer as the
+    caller described it: the tree's root for a directory download, the
+    file itself for a single-file one. Either way it is the boundary
+    they named, and a name the *server* supplied has no business
+    resolving outside it.
+
+    Taking the parent instead would be a level too generous, and
+    measurably so: with the parent as the base, a hostile entry name
+    of ``../victimdir/OWNED`` landed as ``downloads/victimdir/OWNED``
+    -- outside the tree the caller named, inside the check.
 
     Args:
         path: The local operand from ``protocol_info``.
 
     Returns:
-        The absolute parent directory and the final component.
+        The absolute path, uncanonicalised. Canonicalisation happens
+        inside :func:`~async_gateway.utils.paths.resolve_within`, which
+        is where the base and the candidate are compared as locations.
     """
-    absolute = Path(path).absolute()
-    return absolute.parent, PurePath(absolute.name)
+    return Path(path).absolute()

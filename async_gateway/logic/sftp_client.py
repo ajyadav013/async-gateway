@@ -115,7 +115,7 @@ from typing import (
 )
 
 from async_gateway.helpers.internal.base import BaseRequestClass
-from async_gateway.utils.contained_io import contained_download, local_root
+from async_gateway.utils.contained_io import contained_download, local_base
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
@@ -683,14 +683,13 @@ class SFTPRequest(BaseRequestClass):
             # `contained_download` runs the same transfer through a
             # local filesystem view that refuses to leave the
             # directory `local_path` names.
-            base, _ = local_root(self.local_path)
             await self.circuit_breaker.failsafe.run(
                 contained_download,
                 sftp,
                 mode,
                 self.remote_path,
                 self.local_path,
-                base=base,
+                base=local_base(self.local_path),
                 overwrite=self.overwrite,
                 **options)
             return

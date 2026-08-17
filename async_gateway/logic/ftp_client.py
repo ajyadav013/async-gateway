@@ -42,7 +42,7 @@ from async_gateway.helpers.internal.base import BaseRequestClass
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.contained_io import (
     contained_path_io_factory,
-    local_root,
+    local_base,
 )
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
@@ -387,6 +387,16 @@ class FTPRequest(BaseRequestClass):
         directory the caller's ``client_path`` names, and every write
         goes out with ``O_NOFOLLOW`` and mode 0600.
 
+        The base is ``client_path`` **itself**, not its parent. The
+        caller named that path as the whole local side of the transfer
+        -- for a directory download it is the tree's root, for a single
+        file it is the file -- so it is the boundary they asked for.
+        Confining to the parent instead lets a hostile entry name climb
+        one level and still count as contained, which is a real escape
+        from the directory that was named: measured,
+        ``../victimdir/OWNED`` landed as ``downloads/victimdir/OWNED``
+        beside the target tree.
+
         Returns:
             The bound path-IO factory when the call names a local path,
             or ``aioftp``'s own default when it does not -- a command
@@ -395,8 +405,8 @@ class FTPRequest(BaseRequestClass):
         """
         if not self.client_path:
             return aioftp.pathio.PathIO
-        base, _ = local_root(self.client_path)
-        return contained_path_io_factory(base, overwrite=self.overwrite)
+        return contained_path_io_factory(
+            local_base(self.client_path), overwrite=self.overwrite)
 
     async def _tls_value(self) -> Union[ssl.SSLContext, bool]:
         """Return what this session hands ``aioftp`` as its ``ssl``.

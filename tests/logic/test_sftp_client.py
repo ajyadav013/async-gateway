@@ -60,13 +60,19 @@ from tests.fixtures.sftp import (
     ACCEPTED_KEY_ALGORITHMS,
     DIRECTORY_ATTRS,
     FILE_ATTRS,
+    HARMLESS_CONTENT,
+    LOCAL_CONTENT,
     OTHER_HOST_KEY,
+    REMOTE_CONTENT,
+    REMOTE_TREE_ROOT,
     SERVER_HOST_KEY,
     SSHTransportDouble,
     SYMLINK_ATTRS,
     StubSFTPClient,
     TYPELESS_ATTRS,
+    TransferringSFTPClient,
     UNPARSEABLE_ATTRS,
+    hostile_tree,
     plant_ambient_key,
 )
 
@@ -1209,3 +1215,273 @@ async def test_a_library_bug_propagates_instead_of_becoming_an_envelope(
 
     with pytest.raises(KeyError):
         await sftp_call(host_key=SERVER_HOST_KEY)
+
+
+# --- AGW-33: the operand order, per mode -----------------------------------
+
+
+@pytest.mark.parametrize(
+    'mode, expected',
+    [
+        pytest.param('put', (LOCAL_PATH, REMOTE_PATH), id='put'),
+        pytest.param('mput', (LOCAL_PATH, REMOTE_PATH), id='mput'),
+    ],
+)
+async def test_agw33_an_upload_mode_passes_local_first(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: Text,
+    expected: tuple[Text, Text],
+) -> None:
+    """asyncssh's signatures disagree on order, so one order cannot serve.
+
+    ``get(remotepaths, localpath)`` against
+    ``put(localpaths, remotepath)``. The client passed
+    ``(remote_path, local_path)`` positionally to **every** mode, which
+    is correct for ``get``/``mget`` and inverted for ``put``/``mput``.
+
+    ``mput`` is a row rather than an afterthought: R21's allowlist (S19)
+    admits it carrying the identical defect, so a table covering only
+    the mode dispatched today would leave it live the day it lands.
+    """
+    double = trusting_double(monkeypatch)
+
+    await sftp_call(
+        host_key=SERVER_HOST_KEY, mode=mode, local_path=LOCAL_PATH)
+
+    passed = {name: args for name, args, _ in double.sftp.calls}
+    assert passed[mode] == expected
+
+
+async def test_agw33_a_download_keeps_remote_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``get`` was already right, and swapping the shared order breaks it.
+
+    The regression the fix could introduce: replacing one universal
+    order with the *other* universal order fixes ``put`` and silently
+    inverts ``get``. Pinning both directions is what makes the per-mode
+    table demonstrably a table.
+    """
+    double = trusting_double(monkeypatch)
+
+    await sftp_call(
+        host_key=SERVER_HOST_KEY, mode='get', local_path=LOCAL_PATH)
+
+    passed = {name: args for name, args, _ in double.sftp.calls}
+    assert passed['get'] == (REMOTE_PATH, LOCAL_PATH)
+
+
+async def test_agw33_a_put_sends_the_local_file_the_caller_named(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The mirrored-tree case, asserted on content and not on arguments.
+
+    S12's double is signature-faithful, which catches a refused keyword
+    or a wrong arity -- but both operands here are path-like
+    positionals, so a transposition binds cleanly and it cannot see
+    this. Nor can a double that merely records the argument (the
+    standing S11 learning). Only a modelled filesystem can.
+
+    The setup is the deployment that makes AGW-33 High: a local file
+    exists at the remote path, so the transposed ``put`` finds
+    something, uploads it, and reports ``ok=True`` -- the wrong file, at
+    the wrong destination, under a success envelope.
+    """
+    local = tmp_path / 'local' / 'report.pdf'
+    local.parent.mkdir()
+    local.write_bytes(LOCAL_CONTENT)
+    mirrored = tmp_path / 'mirror' / 'report.pdf'
+    mirrored.parent.mkdir()
+    mirrored.write_bytes(REMOTE_CONTENT)
+    double = trusting_double(monkeypatch, TransferringSFTPClient())
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        mode='put',
+        remote_path=str(mirrored),
+        local_path=str(local))
+
+    assert envelope['ok'] is True
+    assert double.sftp.uploaded == LOCAL_CONTENT
+    assert double.sftp.uploaded != REMOTE_CONTENT
+    assert double.sftp.upload_destination == str(mirrored)
+
+
+# --- R22: containment on the recursive download ----------------------------
+
+
+async def test_r22_a_hostile_entry_name_cannot_write_outside_local_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """M17's vector on SFTP, driven through asyncssh's real ``_copy``.
+
+    Testing ``resolve_within`` directly is exactly what lets this hide:
+    **none of the filename arithmetic happens in this library**.
+    ``_copy`` filters a ``scandir`` entry name that is ``.`` or ``..``
+    *exactly*, then ``posixpath.join``s it onto the destination -- so a
+    single name that **contains** a separator, ``../victimdir/OWNED``,
+    is not filtered and composes straight through.
+
+    Only the remote side is faked; the recursion, the filter and the
+    join are asyncssh's own. Measured against the unfixed path, the
+    hostile entry landed outside the target at mode 0644.
+
+    The claim is about the **filesystem**: the victim directory stays
+    empty, and the transfer is known to have really run because the
+    operation reached the server exactly once rather than being refused
+    before it started.
+    """
+    target = tmp_path / 'downloads'
+    victim = tmp_path / 'victimdir'
+    victim.mkdir()
+    double = trusting_double(
+        monkeypatch,
+        StubSFTPClient(
+            attrs=DIRECTORY_ATTRS,
+            remote_tree=hostile_tree(escape=f'../{victim.name}/OWNED')))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        mode='get',
+        remote_path=REMOTE_TREE_ROOT,
+        local_path=str(target))
+
+    assert envelope['ok'] is False
+    assert envelope['error']['code'] == 'PATH'
+    assert envelope['status_code'] == 400
+    assert list(victim.iterdir()) == [], (
+        'a server-supplied entry name escaped the download directory')
+    assert double.sftp.names().count('get') == 1
+
+
+async def test_r22_an_ordinary_tree_still_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The control: a well-behaved recursive download still works.
+
+    Without it, refusing every download would satisfy the row above.
+    Bytes *and* mode are asserted -- the mode because M18's other half
+    is that a download landed at whatever ``umask`` allowed, which in
+    the measured escape was 0644.
+    """
+    target = tmp_path / 'downloads'
+    trusting_double(
+        monkeypatch,
+        StubSFTPClient(attrs=DIRECTORY_ATTRS, remote_tree=hostile_tree()))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        mode='get',
+        remote_path=REMOTE_TREE_ROOT,
+        local_path=str(target))
+
+    landed = target / 'harmless.txt'
+    assert envelope['ok'] is True
+    assert landed.read_bytes() == HARMLESS_CONTENT
+    assert landed.stat().st_mode & 0o777 == 0o600
+
+
+async def test_r22_a_server_supplied_symlink_is_not_recreated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A link the *server* describes is refused rather than created.
+
+    ``_copy`` answers a remote symlink by creating a local one with the
+    **server's** target string. Containing the link's own path would
+    keep it inside the base and would not stop it *pointing* out -- and
+    a link inside the download directory aimed at ``/etc/passwd`` is an
+    escape the next write would have to catch. Refusing is the narrower
+    guarantee and the one R22 asks for.
+    """
+    target = tmp_path / 'downloads'
+    trusting_double(
+        monkeypatch,
+        StubSFTPClient(
+            attrs=DIRECTORY_ATTRS,
+            remote_tree=hostile_tree(symlink='/etc/passwd')))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        mode='get',
+        remote_path=REMOTE_TREE_ROOT,
+        local_path=str(target))
+
+    assert envelope['ok'] is False
+    assert envelope['error']['code'] == 'PATH'
+    assert not (target / 'link').is_symlink()
+
+
+async def test_r22_the_containment_seam_is_required_not_optional(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """If the asyncssh seam disappears, the download is refused.
+
+    Containment is installed at ``SFTPClient._begin_copy``, which is
+    private -- a real cost, and this is the guard on it. A future
+    asyncssh that renames or removes the method must produce a refused
+    call, never a download quietly running through the uncontained
+    ``local_fs`` again. That failure would otherwise be completely
+    silent, which is the property this whole mechanism exists to remove.
+    """
+    double = trusting_double(monkeypatch)
+    monkeypatch.delattr(type(double.sftp), '_begin_copy')
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY, mode='get', local_path=str(tmp_path / 'f'))
+
+    assert envelope['ok'] is False
+    assert envelope['error']['code'] == 'PATH'
+    assert '_begin_copy' in envelope['error']['message']
+
+
+async def test_r22_a_downloads_caller_options_still_reach_asyncssh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Routing through the private seam does not drop the caller's options.
+
+    ``contained_download`` binds ``additional_arguments`` against the
+    **public** ``get`` signature and forwards the result positionally.
+    Two things must hold: an option the caller set arrives, and
+    ``recurse`` -- which the client adds for a directory target --
+    arrives with it.
+    """
+    double = trusting_double(
+        monkeypatch, StubSFTPClient(attrs=DIRECTORY_ATTRS))
+
+    await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        mode='get',
+        local_path=str(tmp_path / 'f'),
+        additional_arguments={'preserve': True})
+
+    options = {name: kwargs for name, _, kwargs in double.sftp.calls}
+    assert options['get'] == {'preserve': True, 'recurse': True}
+
+
+async def test_r22_an_option_asyncssh_would_refuse_is_still_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reaching a private method does not widen what the public one takes.
+
+    The risk in calling ``_begin_copy`` is that it takes its options
+    **positionally**, so it would accept anything placed in the right
+    slot. ``contained_download`` binds the caller's options against the
+    real public ``get`` signature first, so a keyword asyncssh does not
+    have is refused with asyncssh's own ``TypeError`` -- which has a
+    library bug's shape and propagates rather than becoming an envelope.
+    """
+    trusting_double(monkeypatch)
+
+    with pytest.raises(TypeError):
+        await sftp_call(
+            host_key=SERVER_HOST_KEY,
+            mode='get',
+            local_path=str(tmp_path / 'f'),
+            additional_arguments={'no_such_option': True})
