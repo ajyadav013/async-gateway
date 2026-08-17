@@ -49,7 +49,6 @@ from urllib.parse import urljoin, urlsplit
 
 import aiofiles
 import aiohttp
-from async_gateway.helpers.common.file_helper import download_file_from_s3
 from async_gateway.helpers.internal import (
     MULTIPART_MEDIA_PREFIX,
     filter_for_media_type,
@@ -59,7 +58,6 @@ from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.constants import (
     CHUNK_SIZE_CONSTANT,
     CREDENTIAL_HEADERS,
-    HTTP_TIMEOUT,
     MAX_RESPONSE_BYTES,
     POST_TO_GET_REDIRECTS,
     REDIRECT_STATUSES,
@@ -177,61 +175,6 @@ class HttpResult(_HttpResultOptional):
     headers: Dict[Text, Text]
     cookies: Dict[Text, Text]
     text: Text
-
-
-async def fetch_file(file_config: Dict):
-    """Download file from s3 or from given link or.
-
-    just read from the local pod file path.
-
-    The HTTP branch writes through
-    :func:`~async_gateway.utils.paths.safe_writer` (R22): the path is
-    canonicalised before the open, ``O_NOFOLLOW`` refuses a symlink at
-    it, the mode is 0600, an existing file is refused unless
-    ``overwrite`` is True, and a failure part-way leaves no partial
-    file. The S3 branch writes inside ``aioboto3`` and is not reachable
-    from here.
-
-    :param file_config: Dict contains s3 config,
-    download link, local filepath etc.
-    file_config[local_filepath] is mandatory
-    :param file_config['overwrite']: optional, default False.
-    :raises PathContainmentError: if ``local_filepath`` is a symbolic
-    link, or names a directory rather than a file.
-    :raises ConfigurationError: if it exists and ``overwrite`` is False.
-    :raises UnsupportedVerbError: If ``request_type`` names no verb in
-    ``HTTP_VERBS``.
-    """
-    if file_config.get('s3_config'):
-        await download_file_from_s3(
-            file_config['local_filepath'],
-            **file_config['s3_config'],
-        )
-    elif file_config.get('file_download_path'):
-        # Add separate aio params when required
-        request_type = file_config.get('request_type', 'get')
-        target = await resolve_caller_path(file_config['local_filepath'])
-        async with aiohttp.ClientSession(
-                headers=file_config.get('headers'),
-                timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as session:
-            # R21 covers this site too, even though R25 deletes the whole
-            # function one story later. Leaving the *last* unbounded
-            # `getattr` behind on the grounds that it is scheduled for
-            # removal is how the grep this criterion is written against
-            # comes back non-empty, and it would make the story's own
-            # claim -- that no caller-named verb reaches an attribute
-            # unchecked -- false for as long as the deletion is pending.
-            request_obj = resolve_verb(
-                session, request_type, allowed=HTTP_VERBS,
-                setting='request_type')
-            session_obj = request_obj(file_config['file_download_path'])
-            async with session_obj as response:
-                contents = await response.content.read()
-                async with safe_writer(
-                    target,
-                    overwrite=file_config.get('overwrite') is True,
-                ) as file_obj:
-                    await file_obj.write(contents)
 
 
 async def file_upload(

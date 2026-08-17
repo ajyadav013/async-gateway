@@ -6,8 +6,11 @@ from typing import Final, FrozenSet
 
 HTTP_TIMEOUT = 15
 
-STATUS_CODE_403 = 403
 # The lowest status a protocol treats as the remote side reporting failure.
+# The URL download reads it too: it used to test one hand-named status
+# (``STATUS_CODE_403 = 403``, a constant named after its own value -- L13),
+# which meant every other failing status wrote its body to disk as the
+# requested file.
 HTTP_ERROR_STATUS = 400
 
 #: How many consecutive failures against one destination open its circuit.
