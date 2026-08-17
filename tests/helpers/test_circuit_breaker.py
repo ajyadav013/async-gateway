@@ -727,22 +727,27 @@ def test_m15_a_typo_is_refused_on_every_call_not_just_the_first(
 
     Validating only on a cache miss made ``{'max_failures': 3}`` -- R24's
     own named example -- raise on the first call to a destination and
-    pass in silence on every call after it. A caller who retried after
-    the error would find it "fixed itself", with the breaker running on
-    defaults they never chose.
+    pass in silence on every call after it, because the second call
+    returned early on the hit and never looked at the config at all.
+
+    The ordering matters and is the whole test. A destination is warmed
+    with a *valid* config first, so every call after it is a cache hit;
+    the typo is then offered to that hit. An implementation that returns
+    early on a hit accepts it silently, and the caller runs on defaults
+    they never chose against a contract that now depends on cache state.
     """
     destination = ('https', 'typo.example', 443)
+    warm = get_breaker(*destination, {'maximum_failures': 3})
 
     for _ in range(3):
-        with pytest.raises(ConfigurationError):
+        with pytest.raises(ConfigurationError) as raised:
             get_breaker(*destination, {'max_failures': 3})
+        assert 'max_failures' in str(raised.value)
 
-    # And a *valid* config for the same destination still returns one
-    # cached breaker, so the fix did not cost the caching it protects.
-    first = get_breaker(*destination, {'maximum_failures': 3})
-    second = get_breaker(*destination, {'maximum_failures': 3})
-
-    assert first is second
+    # Rejecting the typo did not cost the caching it protects: the
+    # warmed breaker, and its accumulated state, is still the one
+    # returned for a valid config.
+    assert get_breaker(*destination, {'maximum_failures': 3}) is warm
 
 
 def test_a_cache_hit_keeps_the_first_caller_s_settings() -> None:
@@ -923,9 +928,11 @@ async def test_m12_two_requests_sharing_one_config_leave_it_unchanged(
 
 
 async def test_the_three_callbacks_are_invoked_by_the_facade() -> None:
-    """Ruling D: the callbacks are configured on the policy but the
-    facade invokes them, because ``Failsafe.run`` -- the only thing that
-    would otherwise do so -- is the loop this facade replaced.
+    """Ruling D: the facade invokes the callbacks, not the dependency.
+
+    They are *configured* on the ``RetryPolicy`` but *invoked* by
+    ``Failsafe.run`` -- the only thing that would otherwise do so, and
+    the loop this facade replaced.
     """
     seen: list[str] = []
     retry_config = {
@@ -1095,9 +1102,11 @@ def test_eviction_is_by_least_recent_use_not_by_insertion() -> None:
 
 
 def test_reset_clears_the_registry() -> None:
-    """The seam a long-lived registry needs so tests do not leak into
-    each other. Without it, one test's open circuit decides whether an
-    unrelated later test's first request is dispatched at all.
+    """The seam a long-lived registry needs so tests cannot leak.
+
+    Without it, one test's open circuit decides whether an unrelated
+    later test's first request is dispatched at all -- and which tests
+    fail depends on the order ``pytest-randomly`` happens to pick.
     """
     first = get_breaker('https', 'resettable.example', 443)
     assert registry_size() == 1

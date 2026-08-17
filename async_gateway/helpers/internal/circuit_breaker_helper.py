@@ -45,8 +45,6 @@ import aioftp
 
 import aiohttp
 
-import asyncssh
-
 from async_gateway.utils.constants import (CIRCUIT_BREAKER_BACKOFF,
                                            CIRCUIT_BREAKER_DELAY,
                                            CIRCUIT_BREAKER_JITTER,
@@ -56,6 +54,8 @@ from async_gateway.utils.constants import (CIRCUIT_BREAKER_BACKOFF,
 from async_gateway.utils.exceptions import (AsyncGatewayError,
                                             ConfigurationError,
                                             ResponseTooLargeError)
+
+import asyncssh
 
 from failsafe import (Backoff, CircuitOpen, Delay, RetriesExhausted,
                       RetryPolicy)
