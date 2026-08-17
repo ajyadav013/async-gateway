@@ -597,16 +597,29 @@ async def test_delete_local_file_path_removes_the_file(
     assert not target.exists()
 
 
-async def test_delete_local_file_path_reports_a_missing_file(
+async def test_delete_local_file_path_is_idempotent(
     tmp_path: Path,
 ) -> None:
-    """A file that is already gone still raises, exactly as before.
+    """R22-AC4/M19: deleting what is already gone succeeds silently.
 
-    R22 (story S18) owns making this idempotent. Pinning today's
-    behaviour keeps the ``aiofiles`` swap from quietly changing it in
-    either direction ahead of that story.
+    The inverse of the assertion it replaces, which pinned
+    ``FileNotFoundError`` and said in its own docstring that R22 owned
+    changing it. This is that change.
+
+    Asserted the way the criterion states it -- *called twice, no
+    exception* -- and deliberately **not** by deleting only an absent
+    path: a delete that had quietly stopped deleting anything would
+    pass that weaker version. So the first call must really remove the
+    file, the second must tolerate its absence, and the file must be
+    gone at the end. That is what makes this callable from a
+    ``finally``, which is the documented cleanup shape and the point of
+    the finding: the download path's own ``try/finally`` now removes a
+    partial file, so a caller's cleanup routinely arrives second.
     """
-    missing = tmp_path / 'never-existed.bin'
+    target = tmp_path / 'downloaded.bin'
+    target.write_bytes(b'delete me twice')
 
-    with pytest.raises(FileNotFoundError):
-        await delete_local_file_path(str(missing))
+    await delete_local_file_path(str(target))
+    await delete_local_file_path(str(target))
+
+    assert not target.exists()

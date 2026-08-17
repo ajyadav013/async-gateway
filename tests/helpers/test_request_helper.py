@@ -29,6 +29,7 @@ received invalidates every assertion built on it.
 
 import ast
 import asyncio
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
@@ -110,6 +111,37 @@ async def _no_body() -> Dict[Text, Any]:
         An empty mapping of transport keyword arguments.
     """
     return {}
+
+
+def accepted_bytes(error: ResponseTooLargeError) -> int:
+    """Return how many bytes a mid-stream refusal says it had read.
+
+    The download cap used to be asserted by measuring the file on disk.
+    R22-AC5 removes a partial download, so there is no file left to
+    measure -- and the refusal's own count is the better witness anyway:
+    it reports what the *process* accepted, where a file size reports
+    only what reached disk. A read that buffered a whole body in memory
+    before writing a capped prefix of it would pass a size assertion and
+    fails this one.
+
+    Args:
+        error: The refusal ``response_too_large`` built. Its wording is
+            the one this parses, and the two are deliberately in the
+            same package: a change to the message that this cannot read
+            fails the tests rather than silently weakening them.
+
+    Returns:
+        The byte count named in the message.
+
+    Raises:
+        AssertionError: If the message carries no such count, which
+            would otherwise make every caller's comparison vacuous.
+    """
+    found = re.search(r'abandoned after (\d+) bytes', str(error))
+    assert found is not None, (
+        f'the refusal names no byte count, so nothing can be asserted '
+        f'about what was accepted: {error}')
+    return int(found.group(1))
 
 
 def _multipart_body(*parts: bytes) -> bytes:
@@ -1494,17 +1526,30 @@ async def test_a_chunked_download_never_writes_more_than_the_cap(
     http_server: RecordingHTTPServer,
     tmp_path: Path,
 ) -> None:
-    """The streamed-to-disk path is bounded too, and the file proves it.
+    """The streamed-to-disk path is bounded too, and it leaves nothing.
 
-    Two megabytes are offered against an eight-kilobyte cap. The bytes on
-    disk are what the process actually accepted, so a file no larger than
-    the cap is direct evidence that the full body was never taken -- an
-    assertion the raised error on its own cannot make.
+    Two megabytes are offered against an eight-kilobyte cap, and two
+    separate claims are made about the outcome.
+
+    The **cap held**: the refusal names how many bytes had been read
+    when it fired, and that is what the process actually accepted. The
+    count is read off the error rather than off the file's size because
+    R22-AC5 now *removes* the partial file, so the ``st_size`` this used
+    to assert on raises ``FileNotFoundError`` before it can be compared.
+    Taking it from the refusal is the stricter reading anyway: a file
+    size measures what reached *disk*, so a read that buffered the whole
+    body in memory and wrote eight kilobytes of it would have satisfied
+    the old assertion while accepting two megabytes. Verified by
+    mutation -- ``iter_capped`` rewritten to accumulate the whole body
+    and raise at the end fails this assertion and passes the old one.
+
+    And **nothing was orphaned**: the partial file a failed download
+    used to leave behind is gone (M19). Neither claim implies the other.
     """
     target = tmp_path / 'capped.bin'
     http_server.respond('/chunked', chunks=[b'y' * 4096] * 512)
 
-    with pytest.raises(ResponseTooLargeError):
+    with pytest.raises(ResponseTooLargeError) as caught:
         await _fetch(
             http_server.url_for('/chunked'),
             max_response_bytes=8192,
@@ -1514,7 +1559,8 @@ async def test_a_chunked_download_never_writes_more_than_the_cap(
             },
         )
 
-    assert target.stat().st_size <= 8192
+    assert accepted_bytes(caught.value) <= 8192 + 1024
+    assert not target.exists()
 
 
 async def test_a_multipart_body_over_the_cap_is_refused(
@@ -2200,11 +2246,19 @@ async def test_a_url_download_over_the_cap_is_refused(
     http_server: RecordingHTTPServer,
     tmp_path: Path,
 ) -> None:
-    """The same ceiling, reported the same way, on the second read path."""
+    """The same ceiling, reported the same way, on the second read path.
+
+    And the same two claims as its sibling above: the cap held, counted
+    off the refusal rather than off a file R22-AC5 no longer leaves
+    behind, and the partial download was removed. See
+    :func:`test_a_chunked_download_never_writes_more_than_the_cap` for
+    why the count is the stricter of the two available assertions and
+    for the mutation that proves it.
+    """
     target = tmp_path / 'downloaded.bin'
     http_server.respond('/file', chunks=[b'w' * 1024] * 64)
 
-    with pytest.raises(ResponseTooLargeError):
+    with pytest.raises(ResponseTooLargeError) as caught:
         await download_file_from_url(
             http_server.url_for('/file'),
             str(target),
@@ -2212,7 +2266,8 @@ async def test_a_url_download_over_the_cap_is_refused(
             chunk_size=1024,
         )
 
-    assert target.stat().st_size <= 2048
+    assert accepted_bytes(caught.value) <= 2048 + 1024
+    assert not target.exists()
 
 
 async def test_a_forbidden_url_download_raises_before_it_reads_a_byte(

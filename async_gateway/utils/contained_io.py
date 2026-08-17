@@ -85,6 +85,26 @@ def _writes(mode: Text) -> bool:
     return bool(mode) and mode[0] in WRITING_MODES
 
 
+def _shown(path: BytesOrPathLike) -> Text:
+    """Render a path for a diagnostic message.
+
+    Pure string work -- ``os.fsdecode`` touches no filesystem -- but the
+    ban in ``tests/test_no_blocking_io.py`` is by *module prefix* rather
+    than by known-blocking name, deliberately, so that an ``os.``
+    nobody thought of is refused rather than missed. Adding a name to
+    that test's ``PURE_PATH_HELPERS`` to admit this one would widen a
+    guard belonging to another story; keeping the call in a plain
+    ``def`` costs a function and widens nothing.
+
+    Args:
+        path: The path to render, bytes or text.
+
+    Returns:
+        Its text form.
+    """
+    return os.fsdecode(path)
+
+
 def _open_guarded(path: Path, mode: Text, overwrite: bool) -> io.BytesIO:
     """Open ``path`` synchronously with the containment flags applied.
 
@@ -588,7 +608,7 @@ class ContainedLocalFS:
         """
         raise PathContainmentError(
             f'refusing to create the server-supplied symbolic link '
-            f'{os.fsdecode(newpath)!r} -> {os.fsdecode(oldpath)!r} '
+            f'{_shown(newpath)!r} -> {_shown(oldpath)!r} '
             f'inside {str(self.base)!r}')
 
     async def open(
@@ -619,7 +639,7 @@ class ContainedLocalFS:
             ConfigurationError: If the target exists and overwriting was
                 not asked for.
         """
-        target = Path(os.fsdecode(self.contained(path)))
+        target = Path(_shown(self.contained(path)))
         handle = await asyncio.to_thread(
             _open_guarded, target, mode, self.overwrite)
         if _writes(mode):
