@@ -46,7 +46,7 @@ import os
 import ssl
 from collections.abc import Sequence
 from datetime import date, datetime, time
-from typing import Any, Dict, List, Optional, Text, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 
@@ -58,25 +58,25 @@ logger = logging.getLogger(__name__)
 
 #: ``aiohttp`` query parameters as pairs rather than as a mapping: a list
 #: value means a repeated parameter and a mapping cannot express one.
-QueryParams = List[Tuple[Text, Text]]
+QueryParams = List[Tuple[str, str]]
 
 #: The keyword arguments a filter contributes to the transport call.
-RequestFilters = Dict[Text, Any]
+RequestFilters = Dict[str, Any]
 
 #: What a payload may be by the time it reaches a filter.
-Payload = Optional[Union[Dict[Text, Any], Text, bytes]]
+Payload = Optional[Union[Dict[str, Any], str, bytes]]
 
 #: What :func:`get_ssl_config` answers with. Always exactly one key --
 #: ``'ssl'``, the keyword ``aiohttp`` supports -- carrying either a
 #: verifying client context or the bare flag. The deprecated
 #: ``ssl_context=`` key this replaces is emitted by no branch (R23-AC3).
-SslFilters = Dict[Text, Union[bool, ssl.SSLContext]]
+SslFilters = Dict[str, Union[bool, ssl.SSLContext]]
 
 #: One end of the caller's ``certificate`` pair, before normalisation.
 #: ``os.PathLike`` is accepted because ``load_cert_chain`` takes one
 #: natively, so refusing a ``pathlib.Path`` would invent a restriction
 #: OpenSSL does not have.
-CertificatePath = Union[Text, os.PathLike]
+CertificatePath = Union[str, os.PathLike]
 
 
 class _PassphraseProtectedKey(Exception):
@@ -93,7 +93,7 @@ class _PassphraseProtectedKey(Exception):
     """
 
 
-def _refuse_passphrase() -> Text:
+def _refuse_passphrase() -> str:
     """Report that a passphrase-protected key was supplied.
 
     Returns:
@@ -109,7 +109,7 @@ def _refuse_passphrase() -> Text:
 
 def normalised_certificate(
     certificate: Any,
-) -> Tuple[Text, Text]:
+) -> Tuple[str, str]:
     """Return the caller's ``certificate`` value as a ``(cert, key)`` pair.
 
     Every rejection here is the caller's typo rather than a transport
@@ -138,7 +138,7 @@ def normalised_certificate(
             pair, is not a sequence at all, does not hold exactly two
             elements, or holds an element that is not a path.
     """
-    if isinstance(certificate, (Text, bytes, os.PathLike)):
+    if isinstance(certificate, (str, bytes, os.PathLike)):
         raise ConfigurationError(
             "protocol_info['certificate'] must be a (certificate path, "
             f'key path) pair, not a single '
@@ -152,9 +152,9 @@ def normalised_certificate(
             "protocol_info['certificate'] must be a (certificate path, "
             f'key path) pair; got {len(certificate)} value(s)')
 
-    paths: List[Text] = []
+    paths: List[str] = []
     for label, value in zip(('certificate path', 'key path'), certificate):
-        if not isinstance(value, (Text, os.PathLike)):
+        if not isinstance(value, (str, os.PathLike)):
             raise ConfigurationError(
                 f"protocol_info['certificate'] {label} must be a path, "
                 f'not a {type(value).__name__}')
@@ -163,8 +163,8 @@ def normalised_certificate(
 
 
 def build_client_ssl_context(
-    certificate_path: Text,
-    key_path: Text,
+    certificate_path: str,
+    key_path: str,
 ) -> ssl.SSLContext:
     """Build the verifying client context that carries a client cert.
 
@@ -298,7 +298,7 @@ async def get_ssl_config(
     return {'ssl': True}
 
 
-def is_get(request_type: Text) -> bool:
+def is_get(request_type: str) -> bool:
     """Report whether ``request_type`` names the GET verb.
 
     Case-insensitively, and with surrounding whitespace ignored, because
@@ -315,7 +315,7 @@ def is_get(request_type: Text) -> bool:
     return request_type.strip().lower() == 'get'
 
 
-def coerce_query_value(value: Any) -> Text:
+def coerce_query_value(value: Any) -> str:
     """Render one query-parameter value as the text an API expects.
 
     ``str(True)`` is ``'True'``; APIs expect ``'true'``, and ``aiohttp``
@@ -353,7 +353,7 @@ def coerce_query_value(value: Any) -> Text:
     return str(value)
 
 
-def build_query_params(data: Dict[Text, Any]) -> QueryParams:
+def build_query_params(data: Dict[str, Any]) -> QueryParams:
     """Render a payload mapping as ``aiohttp`` query-parameter pairs.
 
     A *top-level* list or tuple becomes a repeated parameter
@@ -380,9 +380,9 @@ def build_query_params(data: Dict[Text, Any]) -> QueryParams:
 
 
 async def form_x_www_form_urlencoded_filters(
-        data: Dict[Text, Any],
+        data: Dict[str, Any],
         *,
-        request_type: Text) -> RequestFilters:
+        request_type: str) -> RequestFilters:
     """Encode the payload as ``application/x-www-form-urlencoded``.
 
     Args:
@@ -411,7 +411,7 @@ async def form_x_www_form_urlencoded_filters(
 async def application_json_filters(
         data: Payload,
         *,
-        request_type: Text) -> RequestFilters:
+        request_type: str) -> RequestFilters:
     """Encode the payload as JSON, or as query parameters on a GET.
 
     Args:
@@ -445,7 +445,7 @@ async def application_json_filters(
 async def raw_body_filters(
         data: Payload,
         *,
-        request_type: Text) -> RequestFilters:
+        request_type: str) -> RequestFilters:
     """Attach the payload as the request body, verbatim.
 
     The filter the XML media types dispatch to, and the default for an

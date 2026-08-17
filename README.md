@@ -78,6 +78,18 @@ own `serialization` callable it must return `str`.
 Every example below is executed against a live server by this project's own
 test suite (`tests/test_docs.py`), so an example that stops working fails CI.
 
+<a id="runnable-example-scripts"></a>
+**Complete runnable scripts live in the repository, not in the package.** The
+five end-to-end programs under
+[`examples/`](https://github.com/ajyadav013/async-gateway/tree/main/examples) —
+`http_example.py`, `ftp_example.py`, `sftp_example.py`, `soap_example.py` and
+`error_handling_example.py` — are deliberately **not** shipped in the wheel or
+the sdist, so `pip install async-gateway` does not place them on your disk.
+That is a decision rather than an oversight: a second copy of the API's
+documentation inside every install is a copy that drifts against this README.
+Read them on GitHub or in a clone; the snippets below are self-contained and
+are what the test suite executes.
+
 ### HTTP / HTTPS
 
 ```python
@@ -87,12 +99,15 @@ from async_gateway.async_gateway import request
 result = await request(
     url='https://api.example.com/v1/items',
     data={'name': 'widget', 'quantity': 3},
-    auth=aiohttp.BasicAuth('svc-orders', 'not-a-real-password'),
     protocol='HTTPS',
     protocol_info={
         'request_type': 'post',
         'timeout': 10,
-        'headers': {'Content-Type': 'application/json'},
+        'headers': {
+            'Content-Type': 'application/json',
+            'Authorization': aiohttp.encode_basic_auth(
+                'svc-orders', 'not-a-real-password'),
+        },
     },
 )
 assert result['ok'] is True
@@ -105,18 +120,29 @@ difference between it and `protocol='HTTP'`, which accepts either scheme. A
 schemeless URL under `'HTTPS'` is upgraded to `https://`, because there is
 exactly one scheme that can satisfy the protocol the caller named.
 
+<a id="http-basic-auth"></a>
+**HTTP credentials go in an `Authorization` header, not `auth=`.** aiohttp
+deprecated `BasicAuth` in 3.14: constructing one emits a `DeprecationWarning`
+and it is removed in aiohttp 4.0. This library pins `aiohttp<4`, so the class
+still works today — but the warning is raised in *your* code, at the line that
+constructs it, which is why the example above does not use it.
+`aiohttp.encode_basic_auth(user, password)` is the replacement aiohttp's own
+warning names; it returns the ready-made `'Basic <base64>'` header value. The
+`Authorization` header is redacted from logs and from the response envelope
+just as a `BasicAuth` object was, so nothing is given up by moving to it.
+
 ### FTP
 
 FTP speaks TLS by default (`verify_ssl` defaults to `True`) and never silently
 downgrades to plaintext.
 
 ```python
-import aiohttp
+from types import SimpleNamespace
 from async_gateway.async_gateway import request
 
 result = await request(
     url='ftp.example.com',
-    auth=aiohttp.BasicAuth('deploy', 'not-a-real-password'),
+    auth=SimpleNamespace(login='deploy', password='not-a-real-password'),
     protocol='FTP',
     protocol_info={
         'port': 21,
@@ -134,6 +160,26 @@ assert result['protocol_details']['command'] == 'download'
 `url` is a **bare host name** for FTP and SFTP, not a URL with a scheme; the
 port comes from `protocol_info['port']`.
 
+**FTP and SFTP need only `.login` and `.password`.** Any object carrying those
+two attributes works — the example uses `types.SimpleNamespace` from the
+standard library. `aiohttp.BasicAuth` also has them and is still accepted, but
+constructing one now emits a `DeprecationWarning` (see
+[HTTP credentials](#http-basic-auth) above), so it is no longer what this
+README recommends.
+
+> **⚠️ FTP names its paths differently from SFTP.** FTP uses
+> **`server_path`/`client_path`**; SFTP uses **`remote_path`/`local_path`**.
+> They mean the same two things — the server side and this machine's side — and
+> the difference is deliberate: each pair mirrors the vocabulary of the library
+> underneath (`aioftp` for FTP, `asyncssh` for SFTP). **The pairs are not
+> interchangeable**, but mixing them fails loudly rather than silently: an FTP
+> call given `remote_path` is refused with
+> `error['code'] == 'CONFIG'` and the message
+> `protocol_info['server_path'] must be a non-empty string naming the path on
+> the server, got None` — the unexpected key is ignored and the missing one is
+> named. Check the table for the protocol you are actually calling — the two
+> tables are [FTP](#protocol_info-ftp) and [SFTP](#protocol_info-sftp).
+
 `server_path` is always the path *on the server* and `client_path` the path *on
 this machine*, whichever direction the transfer goes: a `download` reads
 `server_path` and writes `client_path`, an `upload` reads `client_path` and
@@ -145,12 +191,12 @@ SFTP verifies the server's SSH host key. By default that is asyncssh's own
 `~/.ssh/known_hosts` resolution; here the trusted set is pinned explicitly.
 
 ```python
-import aiohttp
+from types import SimpleNamespace
 from async_gateway.async_gateway import request
 
 result = await request(
     url='sftp.example.com',
-    auth=aiohttp.BasicAuth('deploy', 'not-a-real-password'),
+    auth=SimpleNamespace(login='deploy', password='not-a-real-password'),
     protocol='SFTP',
     protocol_info={
         'port': 22,
@@ -298,7 +344,7 @@ async def request(
 |---|---|
 | `url` | An absolute URL for HTTP/HTTPS/SOAP; a **bare host name** for FTP/SFTP. |
 | `data` | The request payload. For SOAP it is the XML body (`str` or `Element`). Defaults to `{}`. |
-| `auth` | Any auth object aiohttp accepts, e.g. `aiohttp.BasicAuth(user, password)`. FTP and SFTP read `.login` and `.password` off it. |
+| `auth` | **FTP and SFTP only** — any object carrying `.login` and `.password`, e.g. `SimpleNamespace(login=..., password=...)`. For HTTP/HTTPS/SOAP, put credentials in an `Authorization` header instead (see [HTTP credentials](#http-basic-auth)); `auth` is still forwarded to aiohttp untouched, but `aiohttp.BasicAuth` is deprecated in aiohttp 3.14. |
 | `protocol` | One of `'HTTP'`, `'HTTPS'`, `'FTP'`, `'SFTP'`, `'SOAP'`. Matched with surrounding whitespace stripped and without regard to case, so `'http'`, `' HTTP '` and `'Http'` are one protocol. |
 | `protocol_info` | Per-protocol configuration; see the tables below. `None` is a valid call for every protocol that requires no key. |
 | `pre_processor_config` | `{'function': async_callable, 'params': {...}}`. Awaited before dispatch with `response=<envelope>` plus `params`; its return value lands in `pre_processor_response`. |
@@ -959,12 +1005,12 @@ process's `~/.ssh/id_*` files *and* every identity its ssh-agent holds. Do
 key-based authentication by naming your keys:
 
 ```python
-import aiohttp
+from types import SimpleNamespace
 from async_gateway.async_gateway import request
 
 result = await request(
     url='sftp.example.com',
-    auth=aiohttp.BasicAuth('deploy', 'not-a-real-password'),
+    auth=SimpleNamespace(login='deploy', password='not-a-real-password'),
     protocol='SFTP',
     protocol_info={
         'mode': 'get',

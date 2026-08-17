@@ -14,9 +14,8 @@ falsy ``verify_ssl`` does not do it for you.
 
 import asyncio
 import sys
+from types import SimpleNamespace
 from typing import Any, Dict
-
-import aiohttp
 
 from async_gateway.async_gateway import request
 
@@ -35,7 +34,7 @@ async def download(host: str = DEFAULT_HOST) -> Dict[str, Any]:
     result = await request(
         url=host,
         protocol='SFTP',
-        auth=aiohttp.BasicAuth('user', 'password'),
+        auth=SimpleNamespace(login='user', password='password'),
         protocol_info={
             'port': 22,
             'mode': 'get',                     # get, put or remove

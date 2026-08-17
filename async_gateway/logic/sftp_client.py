@@ -110,7 +110,6 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
-    Text,
     Tuple,
 )
 
@@ -160,7 +159,7 @@ SFTP_STATUS_BY_FX_CODE: Final[Mapping[int, int]] = MappingProxyType({
 # `str(SFTPAttrs)` happened to contain, asyncssh's leading space included
 # (`' regular'` for a plain file), on the occasions it recovered one at
 # all.
-FILE_TYPE_NAMES: Final[Mapping[int, Text]] = MappingProxyType({
+FILE_TYPE_NAMES: Final[Mapping[int, str]] = MappingProxyType({
     asyncssh.FILEXFER_TYPE_REGULAR: 'file',
     asyncssh.FILEXFER_TYPE_DIRECTORY: 'directory',
     asyncssh.FILEXFER_TYPE_SYMLINK: 'symlink',
@@ -169,12 +168,12 @@ FILE_TYPE_NAMES: Final[Mapping[int, Text]] = MappingProxyType({
 
 # What asyncssh reports when it cannot classify the target, which is also
 # what a v3 server that sent no permission bits leaves behind.
-UNKNOWN_FILE_TYPE: Final[Text] = 'unknown'
+UNKNOWN_FILE_TYPE: Final[str] = 'unknown'
 
 # The `SFTPAttrs` fields `file_stats` carries. Listed explicitly because
 # this is the envelope's documented shape: it should change when someone
 # decides to change it, not because asyncssh added a field.
-FILE_STAT_FIELDS: Final[Tuple[Text, ...]] = (
+FILE_STAT_FIELDS: Final[Tuple[str, ...]] = (
     'size',
     'permissions',
     'uid',
@@ -208,7 +207,7 @@ TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
 # `getattr` lookup in `_run_operation`, so a set naming only `get` and
 # `put` would leave the same defect live under `mget` the day R21's
 # allowlist admits it.
-RECURSING_MODES: Final[frozenset[Text]] = frozenset(
+RECURSING_MODES: Final[frozenset[str]] = frozenset(
     {'copy', 'get', 'mcopy', 'mget', 'mput', 'put'})
 
 # The SFTP operations this library will dispatch, and the whole of what
@@ -231,7 +230,7 @@ RECURSING_MODES: Final[frozenset[Text]] = frozenset(
 # `rmtree`, `chmod`, `symlink`, `exit` and every other attribute of an
 # open `asyncssh.SFTPClient` were reachable through the unbounded
 # `getattr` this replaces (M25).
-SFTP_MODES: Final[frozenset[Text]] = frozenset({'get', 'put', 'remove'})
+SFTP_MODES: Final[frozenset[str]] = frozenset({'get', 'put', 'remove'})
 
 # Which way round each transfer mode's two operands go (AGW-33). The
 # real asyncssh signatures do **not** agree on one order:
@@ -254,7 +253,7 @@ SFTP_MODES: Final[frozenset[Text]] = frozenset({'get', 'put', 'remove'})
 # remote, so neither is local and the question does not arise; whether
 # they are dispatchable at all is R21's allowlist, at S19.
 # True means the caller's LOCAL path is the source.
-LOCAL_IS_SOURCE: Final[Mapping[Text, bool]] = MappingProxyType({
+LOCAL_IS_SOURCE: Final[Mapping[str, bool]] = MappingProxyType({
     'get': False,
     'mget': False,
     'put': True,
@@ -269,20 +268,20 @@ LOCAL_IS_SOURCE: Final[Mapping[Text, bool]] = MappingProxyType({
 # through and writes outside the target. Reproduced against the real
 # `_copy` with only the remote side faked: mode 0644, outside the
 # directory the caller named.
-DOWNLOADING_MODES: Final[frozenset[Text]] = frozenset({'get', 'mget'})
+DOWNLOADING_MODES: Final[frozenset[str]] = frozenset({'get', 'mget'})
 
 # The three `protocol_info` keys that each name a host-key policy. They
 # are alternatives, not layers: naming two of them is a caller asking for
 # two different policies at once, and there is no reading of that pair
 # which is not a guess.
-HOST_KEY_POLICY_KEYS: tuple[Text, ...] = (
+HOST_KEY_POLICY_KEYS: tuple[str, ...] = (
     'host_key',
     'insecure_skip_host_key_check',
     'known_hosts',
 )
 
 
-def file_stats_for(attrs: asyncssh.SFTPAttrs) -> Dict[Text, Any]:
+def file_stats_for(attrs: asyncssh.SFTPAttrs) -> Dict[str, Any]:
     """Return the metadata an envelope reports for one remote path.
 
     Read off the typed fields of the object ``sftp.lstat`` answered with.
@@ -300,7 +299,7 @@ def file_stats_for(attrs: asyncssh.SFTPAttrs) -> Dict[Text, Any]:
         the server did not send is None, which is distinguishable from
         one it sent as zero.
     """
-    stats: Dict[Text, Any] = {
+    stats: Dict[str, Any] = {
         'type': FILE_TYPE_NAMES.get(attrs.type, UNKNOWN_FILE_TYPE),
     }
     for name in FILE_STAT_FIELDS:
@@ -311,7 +310,7 @@ def file_stats_for(attrs: asyncssh.SFTPAttrs) -> Dict[Text, Any]:
 def transport_error_for(
     err: BaseException,
     *,
-    redact_params: Collection[Text] = (),
+    redact_params: Collection[str] = (),
 ) -> AsyncGatewayError:
     """Return the typed error for ``err``, or propagate a library bug.
 
@@ -382,24 +381,24 @@ class SFTPRequest(BaseRequestClass):
         super(SFTPRequest, self).__init__(*args, **kwargs)
 
         self.port: int = self.info.get('port', 22)
-        self.user: Text = self.auth.login
-        self.password: Text = self.auth.password
+        self.user: str = self.auth.login
+        self.password: str = self.auth.password
         # Optional, and genuinely so: `protocol_info` is optional for this
         # protocol (R11-AC3), so an `SFTPRequest` stays constructible with
         # no `mode` in it -- which is exactly why `_validate_mode` runs at
         # the top of `handle_request` and not in `__init__`. Annotating
-        # these `Text` asserted a non-None the constructor never
+        # these `str` asserted a non-None the constructor never
         # established, and contradicted the validator that exists because
         # it cannot.
-        self.mode_: Optional[Text] = self.info.get('mode')
-        self.remote_path: Optional[Text] = self.info.get('remote_path')
-        self.local_path: Optional[Text] = self.info.get('local_path')
+        self.mode_: Optional[str] = self.info.get('mode')
+        self.remote_path: Optional[str] = self.info.get('remote_path')
+        self.local_path: Optional[str] = self.info.get('local_path')
         # R22-AC3: refuse to overwrite by default, opt in by name.
         self.overwrite: bool = self.info.get('overwrite') is True
         # Read, never written: `recurse` is added to a copy at the one
         # place it is needed, because this is the caller's own dict and
         # writing into it is M28.
-        self.additional_arguments: Dict[Text, Any] = self.info.get(
+        self.additional_arguments: Dict[str, Any] = self.info.get(
             'additional_arguments', {})
 
         # `Any` on all three deliberately: what asyncssh accepts for
@@ -416,7 +415,7 @@ class SFTPRequest(BaseRequestClass):
         self.insecure_skip_host_key_check: bool = (
             self.info.get('insecure_skip_host_key_check') is True)
 
-        self.connect_options: Dict[Text, Any] = self._connect_options()
+        self.connect_options: Dict[str, Any] = self._connect_options()
 
     def _validate_mode(self) -> None:
         """Check that the caller named an operation to run.
@@ -445,7 +444,7 @@ class SFTPRequest(BaseRequestClass):
                 f'the SFTP operation to run, got {self.mode_!r}')
         # The same check, on the same shape, for the path every mode
         # acts on. Surfaced by removing `mypy`'s `ignore_errors`: with
-        # `remote_path` annotated honestly as `Optional[Text]`, the
+        # `remote_path` annotated honestly as `Optional[str]`, the
         # checker showed it reaching `sftp.lstat(...)`, whose signature
         # is `bytes | str | PurePath`. Absent, it arrived there as
         # `None` and raised `TypeError: expected str, bytes or
@@ -460,7 +459,7 @@ class SFTPRequest(BaseRequestClass):
                 "protocol_info['remote_path'] must be a non-empty string "
                 f'naming the path on the server, got {self.remote_path!r}')
 
-    def _connect_options(self) -> Dict[Text, Any]:
+    def _connect_options(self) -> Dict[str, Any]:
         """Return the keyword arguments ``asyncssh.connect`` is called with.
 
         Built once, at construction, so the caller-configuration errors it
@@ -508,7 +507,7 @@ class SFTPRequest(BaseRequestClass):
                 f'{list(HOST_KEY_POLICY_KEYS)}, or none of them to take '
                 f'the asyncssh default known_hosts resolution')
 
-        options: Dict[Text, Any] = {
+        options: Dict[str, Any] = {
             'host': self.url,
             'username': self.user,
             'password': self.password,
@@ -683,7 +682,7 @@ class SFTPRequest(BaseRequestClass):
 
     async def _run_session(
         self,
-    ) -> Tuple[asyncssh.SFTPAttrs, Optional[Sequence[Text]]]:
+    ) -> Tuple[asyncssh.SFTPAttrs, Optional[Sequence[str]]]:
         """Open one SSH session and run the caller's operation on it.
 
         Returns:
@@ -756,7 +755,7 @@ class SFTPRequest(BaseRequestClass):
         # own `additional_arguments`, which arrives here by reference
         # through three layers, so one directory transfer left it set for
         # every later call sharing that `protocol_info` (M28).
-        options: Dict[Text, Any] = dict(self.additional_arguments)
+        options: Dict[str, Any] = dict(self.additional_arguments)
         # `resolve_verb` above returns only for a name it matched in the
         # allowlist, so `mode_` is a non-empty str by the time this line
         # runs. mypy cannot see that across the call, and `str()` re-narrows
@@ -796,8 +795,8 @@ class SFTPRequest(BaseRequestClass):
 
     def _operands(
         self,
-        mode: Text,
-    ) -> Tuple[Optional[Text], Optional[Text]]:
+        mode: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Return ``(source, destination)`` in this mode's own direction.
 
         AGW-33. See :data:`LOCAL_IS_SOURCE` for why a per-mode table

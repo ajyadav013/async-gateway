@@ -25,7 +25,7 @@ envelope through a JSON encoder.
 | anything else / absent, any other payload          | JSON      |
 """
 
-from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Text
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
 from async_gateway.helpers.internal.filters_helper import (
     application_json_filters,
@@ -36,7 +36,7 @@ from async_gateway.helpers.internal.filters_helper import (
 #: A request filter: the payload and the verb in, transport keyword
 #: arguments out. Every filter in the table above satisfies it, which is
 #: what lets the dispatch treat them interchangeably.
-RequestFilter = Callable[..., Awaitable[Dict[Text, Any]]]
+RequestFilter = Callable[..., Awaitable[Dict[str, Any]]]
 
 #: Matched case-insensitively as a *key*, because a caller's header dict is
 #: an ordinary dict: ``{'content-type': '...'}`` is the same header as
@@ -57,7 +57,7 @@ RAW_BODY_MEDIA_TYPES = frozenset({
 })
 
 
-def normalise_media_type(value: Optional[Text]) -> Text:
+def normalise_media_type(value: Optional[str]) -> str:
     """Reduce a ``Content-Type`` value to its bare media type.
 
     Parameters are stripped and case is folded, because
@@ -76,7 +76,7 @@ def normalise_media_type(value: Optional[Text]) -> Text:
     return value.split(';', 1)[0].strip().lower()
 
 
-def media_type_of(headers: Optional[Mapping[Text, Text]]) -> Text:
+def media_type_of(headers: Optional[Mapping[str, str]]) -> str:
     """Return the media type ``headers`` announces, normalised.
 
     Args:
@@ -97,7 +97,7 @@ def media_type_of(headers: Optional[Mapping[Text, Text]]) -> Text:
     return ''
 
 
-def is_json_media_type(media_type: Text) -> bool:
+def is_json_media_type(media_type: str) -> bool:
     """Report whether ``media_type`` names a JSON body.
 
     ``application/problem+json`` and its relatives are JSON by RFC 6839's
@@ -118,7 +118,7 @@ def is_json_media_type(media_type: Text) -> bool:
     )
 
 
-def filter_for_media_type(media_type: Text, payload: Any) -> RequestFilter:
+def filter_for_media_type(media_type: str, payload: Any) -> RequestFilter:
     """Choose the request filter for a media type and payload.
 
     The table in this module's docstring, as code. It returns a filter for

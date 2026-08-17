@@ -34,7 +34,7 @@ import socket
 import ssl
 from collections.abc import Collection, Mapping
 from types import MappingProxyType
-from typing import Any, Final, Optional, Sequence, Text, Tuple, Union
+from typing import Any, Final, Optional, Sequence, Tuple, Union
 
 import aioftp
 
@@ -79,7 +79,7 @@ FTP_SUCCESS_STATUS: Final[int] = 200
 # them is reachable through the `getattr` lookup in `_run_command`, so a
 # list naming only the first closes M3 under one name and leaves it live
 # under the other two.
-REMOVING_COMMANDS: Final[frozenset[Text]] = frozenset(
+REMOVING_COMMANDS: Final[frozenset[str]] = frozenset(
     {'remove', 'remove_file', 'remove_directory'})
 
 # The FTP operations this library will dispatch, and the whole of what
@@ -97,7 +97,7 @@ REMOVING_COMMANDS: Final[frozenset[Text]] = frozenset(
 # reports `stat` in the `protocol_details` of every successful
 # non-removing command, so admitting either as a command in its own right
 # would be a second way to ask for what the envelope already carries.
-FTP_COMMANDS: Final[frozenset[Text]] = (
+FTP_COMMANDS: Final[frozenset[str]] = (
     frozenset({'download', 'upload'}) | REMOVING_COMMANDS)
 
 # The transfer commands, and which way round their two operands go
@@ -121,7 +121,7 @@ FTP_COMMANDS: Final[frozenset[Text]] = (
 # survived is that one positional order was applied to every verb, and
 # the most likely future mistake is "simplifying" this back into one.
 # True means the caller's LOCAL path is the source.
-LOCAL_IS_SOURCE: Final[Mapping[Text, bool]] = MappingProxyType({
+LOCAL_IS_SOURCE: Final[Mapping[str, bool]] = MappingProxyType({
     'download': False,
     'upload': True,
 })
@@ -129,7 +129,7 @@ LOCAL_IS_SOURCE: Final[Mapping[Text, bool]] = MappingProxyType({
 # The keys `get_ssl_config` may answer with. Both are read because the
 # helper's shape is owned by another requirement (R23) and is changing;
 # reading only one of them is precisely the defect this replaces.
-TLS_CONFIG_KEYS: Final[Tuple[Text, ...]] = ('ssl_context', 'ssl')
+TLS_CONFIG_KEYS: Final[Tuple[str, ...]] = ('ssl_context', 'ssl')
 
 # Ordered, because the families overlap: `TimeoutError` is an `OSError`
 # from Python 3.11, and `ssl.SSLError` and `socket.gaierror` are both
@@ -144,7 +144,7 @@ TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
 )
 
 
-def tls_context_for(ssl_config: Mapping[Text, Any]) -> ssl.SSLContext:
+def tls_context_for(ssl_config: Mapping[str, Any]) -> ssl.SSLContext:
     """Return the verifying TLS context an FTPS session connects with.
 
     Fail closed on two axes, because M2 has two halves and this seam has
@@ -218,7 +218,7 @@ def reply_status(error: aioftp.StatusCodeError) -> Optional[int]:
 def transport_error_for(
     err: BaseException,
     *,
-    redact_params: Collection[Text] = (),
+    redact_params: Collection[str] = (),
 ) -> AsyncGatewayError:
     """Return the typed error for ``err``, or propagate a library bug.
 
@@ -284,18 +284,18 @@ class FTPRequest(BaseRequestClass):
         super(FTPRequest, self).__init__(*args, **kwargs)
 
         self.port: int = self.info.get('port', DEFAULT_FTP_PORT)
-        self.user: Text = self.auth.login
-        self.password: Text = self.auth.password
+        self.user: str = self.auth.login
+        self.password: str = self.auth.password
         # Optional, and genuinely so: `protocol_info` is optional for this
         # protocol (R11-AC3), so an `FTPRequest` stays constructible with
         # none of these present. `resolve_verb` is what refuses a missing
         # or non-string `command`, by name and against the allowlist, and
         # `_run_command` reads `client_path` for None to decide whether a
-        # local path is involved at all. Annotating them `Text` asserted a
+        # local path is involved at all. Annotating them `str` asserted a
         # non-None the constructor never established.
-        self.command_: Optional[Text] = self.info.get('command')
-        self.server_path: Optional[Text] = self.info.get('server_path')
-        self.client_path: Optional[Text] = self.info.get('client_path')
+        self.command_: Optional[str] = self.info.get('command')
+        self.server_path: Optional[str] = self.info.get('server_path')
+        self.client_path: Optional[str] = self.info.get('client_path')
         # R22-AC3: refuse to overwrite by default, opt in by name. The
         # local side of a download is a caller-supplied path, so the
         # same decision that governs an HTTP download governs this one.
@@ -526,7 +526,7 @@ class FTPRequest(BaseRequestClass):
         all the same, so nothing is opened for a call that cannot run.
 
         Surfaced by removing mypy's ``ignore_errors``: with
-        ``server_path`` annotated honestly as ``Optional[Text]``, the
+        ``server_path`` annotated honestly as ``Optional[str]``, the
         checker showed it reaching ``aioftp.Client.stat``, whose
         signature is ``str | PurePosixPath``. Absent, it arrived there as
         ``None`` and raised ``TypeError: argument should be a str or an
@@ -552,7 +552,7 @@ class FTPRequest(BaseRequestClass):
     async def _run_command(
         self,
         client: aioftp.Client,
-    ) -> Optional[Mapping[Text, Any]]:
+    ) -> Optional[Mapping[str, Any]]:
         """Run the caller's command and read back what it left behind.
 
         Args:
@@ -564,7 +564,7 @@ class FTPRequest(BaseRequestClass):
             so a completed deletion ended in a ``stat`` on a path that no
             longer existed and was reported as a failure (M3).
 
-            ``Mapping[Text, Any]``, not ``dict[Text, Text]``, on both
+            ``Mapping[str, Any]``, not ``dict[str, str]``, on both
             halves. ``aioftp.Client.stat`` answers with a
             ``BasicListInfo`` or a ``UnixListInfo``, which are
             ``TypedDict``s: not assignable to a ``dict`` even where the
@@ -624,8 +624,8 @@ class FTPRequest(BaseRequestClass):
 
     def _operands(
         self,
-        command: Text,
-    ) -> Tuple[Optional[Text], Optional[Text]]:
+        command: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Return ``(source, destination)`` in this verb's own direction.
 
         AGW-33. See :data:`LOCAL_IS_SOURCE` for why a table decides this

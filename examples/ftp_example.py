@@ -13,9 +13,8 @@ local file**: pass ``overwrite=True`` to opt in.
 
 import asyncio
 import sys
+from types import SimpleNamespace
 from typing import Any, Dict
-
-import aiohttp
 
 from async_gateway.async_gateway import request
 
@@ -35,7 +34,7 @@ async def download(host: str = DEFAULT_HOST) -> Dict[str, Any]:
     result = await request(
         url=host,
         protocol='FTP',
-        auth=aiohttp.BasicAuth('user', 'password'),
+        auth=SimpleNamespace(login='user', password='password'),
         protocol_info={
             'port': 21,
             'command': 'download',

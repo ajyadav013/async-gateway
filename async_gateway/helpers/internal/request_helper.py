@@ -42,7 +42,6 @@ from typing import (
     Dict,
     List,
     Optional,
-    Text,
     Tuple,
     TypedDict,
 )
@@ -121,7 +120,7 @@ REQUEST_START_KEY = 'on_request_start'
 #: 200: a truncated upload reported as a success (H9, AGW-38). Every
 #: producer of a body in this module is therefore a coroutine function
 #: called once per attempt *and* once per hop.
-BodyFactory = Callable[[], Awaitable[Dict[Text, Any]]]
+BodyFactory = Callable[[], Awaitable[Dict[str, Any]]]
 
 #: One followed redirect hop, measured but not yet written: each attached
 #: tracer's ``results_collector`` paired with the seconds from *that
@@ -132,7 +131,7 @@ BodyFactory = Callable[[], Awaitable[Dict[Text, Any]]]
 #: per tracer and two tracers may legitimately disagree about it -- one
 #: attached to a caller's long-lived session, one to this call. Collapsing
 #: them to one number would silently pick a winner.
-RedirectEvent = List[Tuple[Dict[Text, Any], Optional[float]]]
+RedirectEvent = List[Tuple[Dict[str, Any], Optional[float]]]
 
 # Populate the mimetypes tables here, at import, rather than letting the
 # first `guess_type` call do it. `guess_type` initialises lazily, and that
@@ -163,7 +162,7 @@ class _HttpResultOptional(TypedDict, total=False):
             signal and there is no None to confuse with "no error".
     """
 
-    decode_error: Text
+    decode_error: str
 
 
 class HttpResult(_HttpResultOptional):
@@ -182,9 +181,9 @@ class HttpResult(_HttpResultOptional):
     """
 
     status_code: int
-    headers: Dict[Text, Text]
-    cookies: Dict[Text, Text]
-    text: Text
+    headers: Dict[str, str]
+    cookies: Dict[str, str]
+    text: str
 
 
 async def file_upload(
@@ -225,10 +224,10 @@ async def file_upload(
 
 async def handle_multipart_response(
     resp: aiohttp.ClientResponse,
-    http_file_download_config: Optional[Dict[Text, Any]],
+    http_file_download_config: Optional[Dict[str, Any]],
     *,
     max_response_bytes: int = MAX_RESPONSE_BYTES,
-) -> Text:
+) -> str:
     r"""Write a multipart response to disk and return what was written.
 
     Three things this does that its predecessor did not (M7). It writes the
@@ -320,13 +319,13 @@ async def handle_multipart_response(
 
 
 def redirect_target(
-    current_url: Text,
-    location: Text,
+    current_url: str,
+    location: str,
     *,
-    allowed_schemes: Collection[Text],
+    allowed_schemes: Collection[str],
     hop: int,
-    redact_params: Collection[Text],
-) -> Text:
+    redact_params: Collection[str],
+) -> str:
     """Resolve one ``Location`` and prove its scheme is allowed.
 
     Resolved against the URL that produced it, so a relative ``Location``
@@ -384,7 +383,7 @@ def redirect_target(
     return target
 
 
-def same_origin(left: Text, right: Text) -> bool:
+def same_origin(left: str, right: str) -> bool:
     """Report whether two URLs share a scheme, host and port.
 
     Args:
@@ -403,8 +402,8 @@ def same_origin(left: Text, right: Text) -> bool:
 
 
 def without_credentials(
-    headers: Optional[Dict[Text, Text]],
-) -> Optional[Dict[Text, Text]]:
+    headers: Optional[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
     """Return ``headers`` with every credential-bearing entry removed.
 
     Applied to a hop that crosses an origin boundary, which is what
@@ -430,7 +429,7 @@ def without_credentials(
 
 
 def measure_redirect(
-    trace_collectors: Collection[Dict[Text, Any]],
+    trace_collectors: Collection[Dict[str, Any]],
 ) -> RedirectEvent:
     """Measure a followed hop against each tracer's own view of its start.
 
@@ -533,8 +532,8 @@ def hop_deadline(
     timeout: aiohttp.ClientTimeout,
     deadline: Optional[float],
     *,
-    url: Text,
-    redact_params: Collection[Text],
+    url: str,
+    redact_params: Collection[str],
     hop: int,
 ) -> aiohttp.ClientTimeout:
     """Return the deadline for the next hop out of what the chain has left.
@@ -585,9 +584,9 @@ def hop_deadline(
 
 def after_redirect(
     status: int,
-    request_type: Text,
+    request_type: str,
     body_filters: Dict,
-) -> Tuple[Text, Dict]:
+) -> Tuple[str, Dict]:
     """Return the verb and body the next hop is issued with.
 
     Reproduces ``aiohttp``'s own rule rather than inventing one: a 301 or
@@ -624,10 +623,10 @@ def after_redirect(
 async def read_response(
     resp: aiohttp.ClientResponse,
     *,
-    url: Text,
-    redact_params: Collection[Text],
+    url: str,
+    redact_params: Collection[str],
     max_response_bytes: int,
-    http_file_download_config: Optional[Dict[Text, Any]],
+    http_file_download_config: Optional[Dict[str, Any]],
     refuse_multipart: bool = False,
 ) -> HttpResult:
     """Read one final (non-redirect) response into an :class:`HttpResult`.
@@ -752,17 +751,17 @@ async def read_response(
 
 async def make_http_request(
         session: aiohttp.ClientSession,
-        url: Text,
+        url: str,
         build_body: BodyFactory,
-        request_type: Text,
+        request_type: str,
         *,
-        redact_params: Collection[Text],
+        redact_params: Collection[str],
         timeout: aiohttp.ClientTimeout,
         max_response_bytes: int,
-        allowed_schemes: Collection[Text],
+        allowed_schemes: Collection[str],
         allow_redirects: bool,
         max_redirects: int,
-        trace_collectors: Collection[Dict[Text, Any]] = (),
+        trace_collectors: Collection[Dict[str, Any]] = (),
         **kwargs: Any) -> HttpResult:
     """Make the API call, follow its redirects, and return what came back.
 
@@ -863,7 +862,7 @@ async def make_http_request(
         None if timeout.total is None else time.monotonic() + timeout.total)
 
     body_filters: Dict = await build_body()
-    hop_headers: Optional[Dict[Text, Text]] = kwargs.get('headers')
+    hop_headers: Optional[Dict[str, str]] = kwargs.get('headers')
     hop_cookies = kwargs.get('cookies')
     hop_auth = kwargs.get('auth')
     verb = request_type
@@ -959,8 +958,8 @@ async def make_http_request(
 
 async def make_http_filters_with_stream_file_upload(
     session: aiohttp.ClientSession,
-    url: Text,
-    request_type: Text,
+    url: str,
+    request_type: str,
     circuit_breaker: CircuitBreakerHelper,
     **kwargs: Any,
 ) -> HttpResult:
@@ -1005,7 +1004,7 @@ async def make_http_filters_with_stream_file_upload(
     async with aiofiles.open(local_filepath, 'rb'):
         pass
 
-    async def build_body() -> Dict[Text, Any]:
+    async def build_body() -> Dict[str, Any]:
         """Open a fresh stream over the file for one send.
 
         Returns:
@@ -1025,8 +1024,8 @@ async def make_http_filters_with_stream_file_upload(
 
 
 def build_upload_form(
-    local_filepath: Text,
-    file_key: Text,
+    local_filepath: str,
+    file_key: str,
 ) -> aiohttp.FormData:
     """Build a multipart form that streams ``local_filepath`` as it sends.
 
@@ -1083,8 +1082,8 @@ def build_upload_form(
 
 async def make_http_filters_without_stream_uploads(
     session: aiohttp.ClientSession,
-    url: Text,
-    request_type: Text,
+    url: str,
+    request_type: str,
     circuit_breaker: CircuitBreakerHelper,
     **kwargs: Any,
 ) -> HttpResult:
@@ -1143,7 +1142,7 @@ async def make_http_filters_without_stream_uploads(
     async with aiofiles.open(local_filepath, 'rb'):
         pass
 
-    async def build_body() -> Dict[Text, Any]:
+    async def build_body() -> Dict[str, Any]:
         """Build a fresh multipart form for one send.
 
         Returns:
@@ -1162,8 +1161,8 @@ async def make_http_filters_without_stream_uploads(
 
 async def make_http_filters_without_file(
     session: aiohttp.ClientSession,
-    url: Text,
-    request_type: Text,
+    url: str,
+    request_type: str,
     circuit_breaker: CircuitBreakerHelper,
     **kwargs: Any,
 ) -> HttpResult:
@@ -1193,7 +1192,7 @@ async def make_http_filters_without_file(
     # carried a `charset` parameter (H14).
     request_filter = filter_for_media_type(media_type_of(headers), payload)
 
-    async def build_body() -> Dict[Text, Any]:
+    async def build_body() -> Dict[str, Any]:
         """Encode the caller's payload afresh for one send.
 
         Returns:
@@ -1216,7 +1215,7 @@ async def make_http_filters_without_file(
 #: how `"None" not callable` sat in this module behind `ignore_errors`.
 HttpFilterMethod = Callable[..., Awaitable[HttpResult]]
 
-filter_methods: Dict[Text, HttpFilterMethod] = {
+filter_methods: Dict[str, HttpFilterMethod] = {
     'http_with_stream_file_upload': make_http_filters_with_stream_file_upload,
     'http_without_stream_uploads': make_http_filters_without_stream_uploads,
     'http_filters_without_file': make_http_filters_without_file
@@ -1225,8 +1224,8 @@ filter_methods: Dict[Text, HttpFilterMethod] = {
 
 async def handle_http_request(
     session: aiohttp.ClientSession,
-    url: Text,
-    request_type: Text,
+    url: str,
+    request_type: str,
     circuit_breaker: CircuitBreakerHelper,
     **kwargs: Any,
 ) -> HttpResult:

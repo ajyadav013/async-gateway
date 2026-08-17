@@ -54,7 +54,7 @@ import errno
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
-from typing import AsyncIterator, Callable, Final, Optional, Text, Union
+from typing import AsyncIterator, Callable, Final, Optional, Union
 
 import aiofiles
 import aiofiles.os
@@ -69,13 +69,13 @@ from async_gateway.utils.exceptions import (
 #: Anything path-like this module accepts from a caller or from a remote
 #: listing. ``PurePath`` rather than ``Path`` because a name that came
 #: off the wire is a string to be judged, not a location to be touched.
-PathLike = Union[Text, PurePath]
+PathLike = Union[str, PurePath]
 
 #: The same, plus ``bytes``. ``asyncssh``'s filesystem protocol speaks
 #: bytes throughout -- ``scandir`` yields byte filenames and ``_copy``
 #: joins them with ``posixpath.join`` -- so the containment seam facing
 #: it has to accept them.
-BytesOrPathLike = Union[bytes, Text, PurePath]
+BytesOrPathLike = Union[bytes, str, PurePath]
 
 #: The mode every file this library creates is opened with: readable and
 #: writable by its owner and by nobody else. M18's "no mode restriction"
@@ -357,7 +357,7 @@ async def resolve_caller_path(path: PathLike) -> Path:
     return await asyncio.to_thread(caller_path, path)
 
 
-def refuse_symlink(path: Text) -> None:
+def refuse_symlink(path: str) -> None:
     """Refuse a path that is a symbolic link, by checking before opening.
 
     The degraded form of ``O_NOFOLLOW``, for a platform that does not
@@ -385,7 +385,7 @@ def guarded_opener(
     *,
     overwrite: bool,
     nofollow: int = O_NOFOLLOW,
-) -> Callable[[Text, int], int]:
+) -> Callable[[str, int], int]:
     """Build the ``opener`` a guarded write passes to ``open``.
 
     Returned rather than applied, because ``open`` (and therefore
@@ -412,7 +412,7 @@ def guarded_opener(
         A callable of ``(path, flags)`` returning an open file
         descriptor, suitable as ``open(..., opener=)``.
     """
-    def opener(path: Text, flags: int) -> int:
+    def opener(path: str, flags: int) -> int:
         """Open ``path`` with the containment flags added.
 
         Args:
@@ -440,7 +440,7 @@ def guarded_opener(
     return opener
 
 
-def _what_is_there(path: Text) -> Text:
+def _what_is_there(path: str) -> str:
     """Return what kind of thing already occupies ``path``.
 
     Blocking; called through a thread. Classification only, and only

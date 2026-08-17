@@ -56,7 +56,6 @@ from typing import (
     List,
     MutableMapping,
     Optional,
-    Text,
     Tuple,
     TypedDict,
     Union,
@@ -118,14 +117,14 @@ SOAP_12 = '1.2'
 #: recognises an inbound envelope's version from the document itself,
 #: which is what lets a non-conformant server be reported rather than
 #: mis-parsed.
-ENVELOPE_NAMESPACE: Dict[Text, Text] = {
+ENVELOPE_NAMESPACE: Dict[str, str] = {
     SOAP_11: 'http://schemas.xmlsoap.org/soap/envelope/',
     SOAP_12: 'http://www.w3.org/2003/05/soap-envelope',
 }
 
 #: The reverse of :data:`ENVELOPE_NAMESPACE`: which version a document's
 #: root namespace says it is.
-VERSION_BY_NAMESPACE: Dict[Text, Text] = {
+VERSION_BY_NAMESPACE: Dict[str, str] = {
     namespace: version
     for version, namespace in ENVELOPE_NAMESPACE.items()
 }
@@ -133,7 +132,7 @@ VERSION_BY_NAMESPACE: Dict[Text, Text] = {
 #: The media type each version's request -- and a conformant server's
 #: response -- is carried as. 1.1 predates the SOAP media type and uses
 #: the generic XML one.
-REQUEST_MEDIA_TYPE: Dict[Text, Text] = {
+REQUEST_MEDIA_TYPE: Dict[str, str] = {
     SOAP_11: 'text/xml',
     SOAP_12: 'application/soap+xml',
 }
@@ -186,14 +185,14 @@ class SoapFault(TypedDict):
             and a string preserves it exactly without pretending to.
     """
 
-    code: Text
-    subcodes: List[Text]
-    reason: Text
-    actor: Optional[Text]
-    detail: Optional[Text]
+    code: str
+    subcodes: List[str]
+    reason: str
+    actor: Optional[str]
+    detail: Optional[str]
 
 
-def validated_soap_version(soap_version: object) -> Text:
+def validated_soap_version(soap_version: object) -> str:
     """Return the SOAP version once proven one this library speaks.
 
     Rejected rather than defaulted, because the two versions differ on the
@@ -228,7 +227,7 @@ def validated_soap_version(soap_version: object) -> Text:
     return soap_version
 
 
-def validated_soap_action(soap_action: object) -> Optional[Text]:
+def validated_soap_action(soap_action: object) -> Optional[str]:
     """Return the SOAP action once proven safe to put in a header.
 
     The value reaches the wire inside a quoted string -- a ``SOAPAction``
@@ -299,7 +298,7 @@ def validated_soap_headers(soap_headers: object) -> Optional[Element]:
     return soap_headers
 
 
-def validated_soap_body(payload: Any) -> Text:
+def validated_soap_body(payload: Any) -> str:
     """Return the caller's request body as the XML text to be wrapped.
 
     Args:
@@ -336,7 +335,7 @@ def validated_soap_body(payload: Any) -> Text:
         f'does not read WSDL')
 
 
-def root_element_name(xml_text: Text) -> Text:
+def root_element_name(xml_text: str) -> str:
     """Return the local name of ``xml_text``'s root element, or ``''``.
 
     A deliberately small scan rather than a parse: this is asked of the
@@ -364,11 +363,11 @@ def root_element_name(xml_text: Text) -> Text:
 
 
 def build_envelope(
-    body: Union[Text, Element],
+    body: Union[str, Element],
     *,
-    version: Text,
+    version: str,
     headers: Optional[Element] = None,
-) -> Text:
+) -> str:
     """Wrap ``body`` in a SOAP envelope of ``version``, or pass it through.
 
     The string this returns is what reaches the wire, byte for byte once
@@ -417,9 +416,9 @@ def build_envelope(
 
 def soap_transport_headers(
     *,
-    version: Text,
-    action: Optional[Text] = None,
-) -> Dict[Text, Text]:
+    version: str,
+    action: Optional[str] = None,
+) -> Dict[str, str]:
     """Return the transport headers ``version`` requires for a request.
 
     The one place the two versions differ on the wire in a way a caller
@@ -452,7 +451,7 @@ def soap_transport_headers(
     return {'Content-Type': f'{media_type}; charset=utf-8{parameter}'}
 
 
-def scan_prolog(xml_text: Text) -> int:
+def scan_prolog(xml_text: str) -> int:
     """Return the offset of the root element's ``<``, refusing a DOCTYPE.
 
     The security core of this module, and the reason no XML dependency was
@@ -526,7 +525,7 @@ def scan_prolog(xml_text: Text) -> int:
     return -1
 
 
-def parse_document(xml_text: Text) -> Optional[Element]:
+def parse_document(xml_text: str) -> Optional[Element]:
     """Parse ``xml_text`` into a tree, after the prolog has been cleared.
 
     A plain ``def`` and the only blocking work in this module: parsing a
@@ -609,7 +608,7 @@ def fault_from_11(fault: Element) -> SoapFault:
     )
 
 
-def fault_from_12(fault: Element, namespace: Text) -> SoapFault:
+def fault_from_12(fault: Element, namespace: str) -> SoapFault:
     """Read a SOAP 1.2 ``<Fault>`` into the shared fault shape.
 
     The ``Subcode`` chain is walked to its end rather than read one level
@@ -627,7 +626,7 @@ def fault_from_12(fault: Element, namespace: Text) -> SoapFault:
     """
     qualified = f'{{{namespace}}}'
     code = fault.find(f'{qualified}Code')
-    subcodes: List[Text] = []
+    subcodes: List[str] = []
     value = ''
     if code is not None:
         value = (code.findtext(f'{qualified}Value') or '').strip()
@@ -655,9 +654,9 @@ def fault_from_12(fault: Element, namespace: Text) -> SoapFault:
 
 
 def parse_soap_response(
-    raw: Text,
+    raw: str,
     *,
-    version: Text,
+    version: str,
 ) -> Tuple[Optional[Element], Optional[SoapFault]]:
     """Parse one SOAP response into its body element and its Fault.
 
@@ -751,10 +750,10 @@ class SoapRequest(BaseRequestClass):
     #: Nothing. A SOAP call needs no configuration at all: the version
     #: defaults, the action is optional, and the verb is not the caller's
     #: to choose.
-    REQUIRED_INFO_KEYS: ClassVar[frozenset[Text]] = frozenset()
+    REQUIRED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset()
 
     #: The verb every SOAP binding uses.
-    REQUEST_TYPE: ClassVar[Text] = 'POST'
+    REQUEST_TYPE: ClassVar[str] = 'POST'
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Build a SOAP request and its envelope from ``protocol_info``.
@@ -790,16 +789,16 @@ class SoapRequest(BaseRequestClass):
         """
         super().__init__(*args, **kwargs)
 
-        self.soap_version: Text = validated_soap_version(
+        self.soap_version: str = validated_soap_version(
             self.info.get('soap_version', SOAP_11))
-        self.soap_action: Optional[Text] = validated_soap_action(
+        self.soap_action: Optional[str] = validated_soap_action(
             self.info.get('soap_action'))
         self.soap_headers: Optional[Element] = validated_soap_headers(
             self.info.get('soap_headers'))
         #: The exact text that reaches the wire, UTF-8 encoded. Held on
         #: the object so a test -- and a caller debugging a rejected
         #: request -- can compare it against what the server received.
-        self.envelope: Text = build_envelope(
+        self.envelope: str = build_envelope(
             validated_soap_body(self.response['payload']),
             version=self.soap_version,
             headers=self.soap_headers,
@@ -810,7 +809,7 @@ class SoapRequest(BaseRequestClass):
         # contradict -- and a contradicted Content-Type would also route
         # the envelope away from the raw-body filter and into the JSON
         # encoder, which is the routing hole this class exists inside.
-        self.headers: Dict[Text, Text] = {
+        self.headers: Dict[str, str] = {
             **self.info.get('headers', {}),
             **soap_transport_headers(
                 version=self.soap_version, action=self.soap_action),
@@ -823,7 +822,7 @@ class SoapRequest(BaseRequestClass):
             self.info.get('session'))
         self.trace_config: List[aiohttp.TraceConfig] = validated_trace_config(
             self.info, self.session)
-        self.trace_collectors: List[MutableMapping[Text, Any]] = (
+        self.trace_collectors: List[MutableMapping[str, Any]] = (
             trace_collectors_for(self.session, self.trace_config))
         # Derived from the bind above, exactly as `logic/http_client.py`
         # derives its own, rather than re-read off the tracers. Two
@@ -838,7 +837,7 @@ class SoapRequest(BaseRequestClass):
         # documented key means. A caller-supplied session leaves
         # `trace_config` empty either way, so `[]` is still what such a
         # call reports.
-        self.reported_collectors: List[MutableMapping[Text, Any]] = (
+        self.reported_collectors: List[MutableMapping[str, Any]] = (
             [] if self.session is not None else list(self.trace_collectors))
         self.max_response_bytes: int = validated_max_response_bytes(
             self.info.get('max_response_bytes', MAX_RESPONSE_BYTES))
@@ -846,7 +845,7 @@ class SoapRequest(BaseRequestClass):
             self.info.get('allow_redirects', True))
         self.max_redirects: int = validated_max_redirects(
             self.info.get('max_redirects', MAX_REDIRECTS))
-        self.allowed_schemes: frozenset[Text] = validated_allowed_schemes(
+        self.allowed_schemes: frozenset[str] = validated_allowed_schemes(
             self.info.get('allowed_schemes', ALLOWED_SCHEMES))
 
     async def handle_request(self) -> GatewayResponse:
@@ -993,7 +992,7 @@ class SoapRequest(BaseRequestClass):
             'soap_fault': None,
         }
 
-        decode_error: Optional[Text] = result.get('decode_error')
+        decode_error: Optional[str] = result.get('decode_error')
         if decode_error is not None:
             raise SerializationError(decode_error)
 
@@ -1027,7 +1026,7 @@ class SoapRequest(BaseRequestClass):
 
     def _warn_on_response_media_type(
         self,
-        headers: Dict[Text, Text],
+        headers: Dict[str, str],
     ) -> None:
         """Log a warning when the response media type is not the expected.
 

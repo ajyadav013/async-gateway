@@ -14,7 +14,7 @@ this class acts on configuration that has already been validated.
 
 import abc
 from collections.abc import Collection, Mapping
-from typing import Any, ClassVar, Optional, Text, Tuple
+from typing import Any, ClassVar, Optional, Tuple
 from urllib.parse import urlsplit
 
 from async_gateway.helpers.common.date_helper import monotonic_now
@@ -30,10 +30,10 @@ from async_gateway.utils.http_file_config import resolve_verb
 
 
 def validated_protocol_info(
-    info: Optional[Mapping[Text, Any]],
+    info: Optional[Mapping[str, Any]],
     *,
-    required: Collection[Text] = (),
-) -> dict[Text, Any]:
+    required: Collection[str] = (),
+) -> dict[str, Any]:
     """Return ``protocol_info`` as a dict once its shape is known good.
 
     The one implementation of "is this ``protocol_info`` usable", called
@@ -81,10 +81,10 @@ def validated_protocol_info(
 
 
 def destination_of(
-    protocol: Text,
-    url: Text,
+    protocol: str,
+    url: str,
     port: Optional[int] = None,
-) -> Tuple[Text, Text, int]:
+) -> Tuple[str, str, int]:
     """Return the ``(family, host, port)`` this call is dispatched to.
 
     The breaker registry's key, and the whole of what "per destination"
@@ -128,7 +128,7 @@ def destination_of(
     return family, host, port
 
 
-def _has_numeric_port(netloc: Text) -> bool:
+def _has_numeric_port(netloc: str) -> bool:
     """Report whether ``netloc`` ends in a port this library can read.
 
     Args:
@@ -148,15 +148,15 @@ class BaseRequestClass(abc.ABC):
 
     #: Keys this protocol cannot run without. The default requires nothing,
     #: so a protocol whose every key has a default inherits it untouched.
-    REQUIRED_INFO_KEYS: ClassVar[frozenset[Text]] = frozenset()
+    REQUIRED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(
-        self, url: Text,
+        self, url: str,
         auth: Any,
         response: GatewayResponse,
-        info: Optional[Mapping[Text, Any]],
+        info: Optional[Mapping[str, Any]],
         *,
-        redact_params: Collection[Text]
+        redact_params: Collection[str]
     ) -> None:
         """Initialize the request as per the config.
 
@@ -193,8 +193,8 @@ class BaseRequestClass(abc.ABC):
         self.url = url
         self.auth = auth
         self.response = response
-        self.info: dict[Text, Any] = {} if info is None else dict(info)
-        self.redact_params: frozenset[Text] = frozenset(redact_params)
+        self.info: dict[str, Any] = {} if info is None else dict(info)
+        self.redact_params: frozenset[str] = frozenset(redact_params)
         # Monotonic, so a wall-clock step cannot make `latency` negative,
         # and float, because that is what a clock reading is (L4).
         self.start_time: float = monotonic_now()
@@ -211,7 +211,7 @@ class BaseRequestClass(abc.ABC):
         #   `validated_timeout` exists precisely because it is not.
         # * `certificate` is `None` far more often than it is a pair, and
         #   its shape is checked by `get_ssl_config`, which takes `Any`
-        #   for the same reason. `Tuple[Text]` was wrong three ways: the
+        #   for the same reason. `Tuple[str]` was wrong three ways: the
         #   absent case, the arity (it is a *pair*), and the validation
         #   this class does not perform.
         self.timeout: Any = self.info.get('timeout', HTTP_TIMEOUT)
@@ -221,7 +221,7 @@ class BaseRequestClass(abc.ABC):
         # into this very dict, so a `protocol_info` reused across two
         # calls came back to its owner carrying a resilience object they
         # never put there (M12).
-        self.circuit_breaker_config: dict[Text, Any] = self.info.get(
+        self.circuit_breaker_config: dict[str, Any] = self.info.get(
             'circuit_breaker_config', {})
         # Looked up, not constructed. A breaker built here is a breaker
         # with a zeroed failure count on every request, which is why the
@@ -242,8 +242,8 @@ class BaseRequestClass(abc.ABC):
         client: Any,
         verb: Any,
         *,
-        allowed: Collection[Text],
-        setting: Text,
+        allowed: Collection[str],
+        setting: str,
     ) -> Any:
         """Return the operation ``verb`` names, once the allowlist admits it.
 
