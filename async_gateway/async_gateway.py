@@ -301,15 +301,40 @@ async def request(
         neither None nor a mapping, or that omits a key the chosen
         protocol requires, such as HTTP's "request_type"; a URL whose
         scheme the chosen protocol will not dispatch on, which for
-        ``protocol='HTTPS'`` includes a plain ``http://`` URL; and a
-        "serialization" value that is not callable or does not return str.
-        These are programming errors on the caller's side and are not
-        retryable, so they escape synchronously rather than becoming an
-        envelope a retry loop would re-attempt forever -- and, escaping,
-        they are reported to the caller exactly once and are not also
-        logged. Every one of them is raised before anything is dispatched.
-        Every *remote* or *transport* failure, by contrast, is reported as
-        an ``ok=False`` envelope.
+        ``protocol='HTTPS'`` includes a plain ``http://`` URL; a
+        "serialization" value that is not callable or does not return
+        str; and an HTTP "request_type" naming no verb in the R21
+        allowlist (``UnsupportedVerbError``, a subclass). These are
+        programming errors on the caller's side and are not retryable, so
+        they escape synchronously rather than becoming an envelope a
+        retry loop would re-attempt forever -- and, escaping, they are
+        reported to the caller exactly once and are not also logged.
+        Every one of them is raised before anything is dispatched. Every
+        *remote* or *transport* failure, by contrast, is reported as an
+        ``ok=False`` envelope.
+
+        **This is not every ``ConfigurationError`` the library can
+        produce, and what separates them is placement rather than kind**
+        (AGW-35). The rule is the ``try`` below, which is the one
+        conversion point: an ``AsyncGatewayError`` raised *before* it
+        escapes to the caller, and one raised *inside* it -- that is,
+        from within ``handle_request`` -- becomes an ``ok=False``
+        envelope carrying ``error['code'] == 'CONFIG'`` and status 400,
+        and is logged, because every envelope-producing failure is. The
+        list above is the escaping set, not the whole set.
+
+        The configuration errors that arrive the second way are the ones
+        a protocol defers by contract: FTP's ``command`` and SFTP's
+        ``mode`` -- absent, malformed, or outside the R21 allowlist --
+        which are checked once the protocol object is running, because
+        ``protocol_info`` is optional for those protocols at this
+        boundary and the object must stay constructible without one.
+
+        A caller who wants to handle both alike should catch
+        ``ConfigurationError`` *and* branch on
+        ``result['error']['code'] == 'CONFIG'``; a caller who only checks
+        ``result['ok']`` sees the envelope-borne ones and none of the
+        escaping ones.
     """
     # `protocol` and `protocol_info` -- including the keys the chosen
     # protocol requires -- are validated here, at the boundary, before an
