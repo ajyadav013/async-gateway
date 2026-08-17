@@ -115,6 +115,7 @@ from typing import (
 )
 
 from async_gateway.helpers.internal.base import BaseRequestClass
+from async_gateway.utils.contained_io import contained_download, local_base
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
@@ -210,6 +211,44 @@ TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
 RECURSING_MODES: Final[frozenset[Text]] = frozenset(
     {'copy', 'get', 'mcopy', 'mget', 'mput', 'put'})
 
+# Which way round each transfer mode's two operands go (AGW-33). The
+# real asyncssh signatures do **not** agree on one order:
+#
+#   get(remotepaths, localpath)    mget(remotepaths, localpath)
+#   put(localpaths,  remotepath)   mput(localpaths,  remotepath)
+#
+# `_run_operation` used to pass `(remote_path, local_path)` positionally
+# to every mode. That is correct for `get`/`mget` and **inverted** for
+# `put`/`mput`, which then glob the *remote* path on the local disk and
+# write to the *local* path on the server. Usually a clean failure; in a
+# mirrored-tree deployment a local file exists at the remote path and
+# the wrong file goes to the wrong destination with `ok=True`.
+#
+# A per-mode table beside `RECURSING_MODES`, not a conditional at the
+# call site, and this comment rather than none: one positional order
+# applied to every verb is exactly how the defect survived, and
+# "simplifying" the table back into one is the next reader's most likely
+# mistake. `copy`/`mcopy` are absent deliberately -- both operands are
+# remote, so neither is local and the question does not arise; whether
+# they are dispatchable at all is R21's allowlist, at S19.
+# True means the caller's LOCAL path is the source.
+LOCAL_IS_SOURCE: Final[Mapping[Text, bool]] = MappingProxyType({
+    'get': False,
+    'mget': False,
+    'put': True,
+    'mput': True,
+})
+
+# The modes that write to the **local** filesystem, and therefore need
+# the local destination contained (R22). `_copy` filters `scandir`
+# entry names that are `.` or `..` exactly and then `posixpath.join`s
+# them onto the destination, so a single server-supplied name that
+# *contains* a separator -- `../victimdir/OWNED` -- composes straight
+# through and writes outside the target. Reproduced against the real
+# `_copy` with only the remote side faked: mode 0644, outside the
+# directory the caller named.
+DOWNLOADING_MODES: Final[frozenset[Text]] = frozenset({'get', 'mget'})
+
 # The three `protocol_info` keys that each name a host-key policy. They
 # are alternatives, not layers: naming two of them is a caller asking for
 # two different policies at once, and there is no reading of that pair
@@ -303,6 +342,8 @@ class SFTPRequest(BaseRequestClass):
         self.mode_: Text = self.info.get('mode', None)
         self.remote_path: Text = self.info.get('remote_path', None)
         self.local_path: Text = self.info.get('local_path', None)
+        # R22-AC3: refuse to overwrite by default, opt in by name.
+        self.overwrite: bool = self.info.get('overwrite') is True
         # Read, never written: `recurse` is added to a copy at the one
         # place it is needed, because this is the caller's own dict and
         # writing into it is M28.
@@ -487,10 +528,19 @@ class SFTPRequest(BaseRequestClass):
             'port': 22, # optional, default is 22
             'mode': 'get', # required. The asyncssh SFTP operation to
                 # run: 'get', 'put' or 'remove'.
-            'remote_path': '', # path on the server to transfer or remove
+            'remote_path': '',
+                # path on the server: the SOURCE of a 'get' and the
+                # DESTINATION of a 'put'.
             'local_path': '',
-                # path the file is downloaded to or uploaded from.
-                # Omitted for an operation that names only a remote path.
+                # path on this machine: the DESTINATION of a 'get' and
+                # the SOURCE of a 'put'. The modes point in opposite
+                # directions and each is passed in its own -- see
+                # LOCAL_IS_SOURCE (AGW-33). Omitted for an operation
+                # that names only a remote path.
+            'overwrite': False, # optional, default False. A download
+                # refuses to replace an existing local file unless this
+                # is True; a symbolic link at the destination is
+                # refused either way.
             'additional_arguments': {}, # optional. Forwarded to the
                 # asyncssh operation. Never mutated: 'recurse' is added
                 # to a copy for a directory target.
@@ -522,6 +572,10 @@ class SFTPRequest(BaseRequestClass):
             DnsError: When the host name does not resolve.
             ConnectError: When the connection is refused or reset.
             TransportError: For any other transport or SSH failure.
+            PathContainmentError: When a path a download would write --
+                including one asyncssh composed out of the *server's*
+                own entry names -- resolves outside the directory
+                ``local_path`` names, or is a symbolic link (R22).
             ConfigurationError: When ``mode`` names no operation. Raised
                 before the connect, so nothing is opened for a call that
                 cannot run, and -- because it is raised here rather than
@@ -616,10 +670,54 @@ class SFTPRequest(BaseRequestClass):
         if is_directory and mode in RECURSING_MODES:
             options['recurse'] = True
 
-        operation = getattr(sftp, mode)
-        if self.local_path:
+        if not self.local_path:
             await self.circuit_breaker.run(
-                operation, self.remote_path, self.local_path, **options)
-        else:
+                getattr(sftp, mode), self.remote_path, **options)
+            return
+
+        if mode in DOWNLOADING_MODES:
+            # R22's actual threat model. `get` composes the server's
+            # own entry names onto the local destination inside
+            # `_copy`, so nothing this class does to `local_path`
+            # before the call reaches the paths that are written.
+            # `contained_download` runs the same transfer through a
+            # local filesystem view that refuses to leave the
+            # directory `local_path` names.
             await self.circuit_breaker.run(
-                operation, self.remote_path, **options)
+                contained_download,
+                sftp,
+                mode,
+                self.remote_path,
+                self.local_path,
+                base=local_base(self.local_path),
+                overwrite=self.overwrite,
+                **options)
+            return
+
+        source, destination = self._operands(mode)
+        await self.circuit_breaker.run(
+            getattr(sftp, mode), source, destination, **options)
+
+    def _operands(self, mode: Text) -> Tuple[Text, Text]:
+        """Return ``(source, destination)`` in this mode's own direction.
+
+        AGW-33. See :data:`LOCAL_IS_SOURCE` for why a per-mode table
+        decides this and one shared positional order cannot.
+
+        Args:
+            mode: The normalised mode name.
+
+        Returns:
+            The two operands, source first, in the order asyncssh
+            defines for *this* mode. A mode outside
+            :data:`LOCAL_IS_SOURCE` that nonetheless carries a
+            ``local_path`` keeps the historical
+            ``(remote_path, local_path)`` order -- ``copy``/``mcopy``
+            are the live case, and both their operands are remote, so
+            neither is the local one and there is no direction here to
+            establish. Whether they are dispatchable at all is R21's
+            allowlist, at S19.
+        """
+        if LOCAL_IS_SOURCE.get(mode, False):
+            return self.local_path, self.remote_path
+        return self.remote_path, self.local_path

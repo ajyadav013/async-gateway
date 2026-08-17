@@ -29,6 +29,7 @@ received invalidates every assertion built on it.
 
 import ast
 import asyncio
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
@@ -64,6 +65,7 @@ from async_gateway.utils.constants import (
 from async_gateway.utils.exceptions import (
     ConfigurationError,
     HttpStatusError,
+    PathContainmentError,
     ResponseTooLargeError,
 )
 from async_gateway.utils.http_file_config import (
@@ -110,6 +112,37 @@ async def _no_body() -> Dict[Text, Any]:
         An empty mapping of transport keyword arguments.
     """
     return {}
+
+
+def accepted_bytes(error: ResponseTooLargeError) -> int:
+    """Return how many bytes a mid-stream refusal says it had read.
+
+    The download cap used to be asserted by measuring the file on disk.
+    R22-AC5 removes a partial download, so there is no file left to
+    measure -- and the refusal's own count is the better witness anyway:
+    it reports what the *process* accepted, where a file size reports
+    only what reached disk. A read that buffered a whole body in memory
+    before writing a capped prefix of it would pass a size assertion and
+    fails this one.
+
+    Args:
+        error: The refusal ``response_too_large`` built. Its wording is
+            the one this parses, and the two are deliberately in the
+            same package: a change to the message that this cannot read
+            fails the tests rather than silently weakening them.
+
+    Returns:
+        The byte count named in the message.
+
+    Raises:
+        AssertionError: If the message carries no such count, which
+            would otherwise make every caller's comparison vacuous.
+    """
+    found = re.search(r'abandoned after (\d+) bytes', str(error))
+    assert found is not None, (
+        f'the refusal names no byte count, so nothing can be asserted '
+        f'about what was accepted: {error}')
+    return int(found.group(1))
 
 
 def _multipart_body(*parts: bytes) -> bytes:
@@ -1494,17 +1527,30 @@ async def test_a_chunked_download_never_writes_more_than_the_cap(
     http_server: RecordingHTTPServer,
     tmp_path: Path,
 ) -> None:
-    """The streamed-to-disk path is bounded too, and the file proves it.
+    """The streamed-to-disk path is bounded too, and it leaves nothing.
 
-    Two megabytes are offered against an eight-kilobyte cap. The bytes on
-    disk are what the process actually accepted, so a file no larger than
-    the cap is direct evidence that the full body was never taken -- an
-    assertion the raised error on its own cannot make.
+    Two megabytes are offered against an eight-kilobyte cap, and two
+    separate claims are made about the outcome.
+
+    The **cap held**: the refusal names how many bytes had been read
+    when it fired, and that is what the process actually accepted. The
+    count is read off the error rather than off the file's size because
+    R22-AC5 now *removes* the partial file, so the ``st_size`` this used
+    to assert on raises ``FileNotFoundError`` before it can be compared.
+    Taking it from the refusal is the stricter reading anyway: a file
+    size measures what reached *disk*, so a read that buffered the whole
+    body in memory and wrote eight kilobytes of it would have satisfied
+    the old assertion while accepting two megabytes. Verified by
+    mutation -- ``iter_capped`` rewritten to accumulate the whole body
+    and raise at the end fails this assertion and passes the old one.
+
+    And **nothing was orphaned**: the partial file a failed download
+    used to leave behind is gone (M19). Neither claim implies the other.
     """
     target = tmp_path / 'capped.bin'
     http_server.respond('/chunked', chunks=[b'y' * 4096] * 512)
 
-    with pytest.raises(ResponseTooLargeError):
+    with pytest.raises(ResponseTooLargeError) as caught:
         await _fetch(
             http_server.url_for('/chunked'),
             max_response_bytes=8192,
@@ -1514,7 +1560,8 @@ async def test_a_chunked_download_never_writes_more_than_the_cap(
             },
         )
 
-    assert target.stat().st_size <= 8192
+    assert accepted_bytes(caught.value) <= 8192 + 1024
+    assert not target.exists()
 
 
 async def test_a_multipart_body_over_the_cap_is_refused(
@@ -2200,11 +2247,19 @@ async def test_a_url_download_over_the_cap_is_refused(
     http_server: RecordingHTTPServer,
     tmp_path: Path,
 ) -> None:
-    """The same ceiling, reported the same way, on the second read path."""
+    """The same ceiling, reported the same way, on the second read path.
+
+    And the same two claims as its sibling above: the cap held, counted
+    off the refusal rather than off a file R22-AC5 no longer leaves
+    behind, and the partial download was removed. See
+    :func:`test_a_chunked_download_never_writes_more_than_the_cap` for
+    why the count is the stricter of the two available assertions and
+    for the mutation that proves it.
+    """
     target = tmp_path / 'downloaded.bin'
     http_server.respond('/file', chunks=[b'w' * 1024] * 64)
 
-    with pytest.raises(ResponseTooLargeError):
+    with pytest.raises(ResponseTooLargeError) as caught:
         await download_file_from_url(
             http_server.url_for('/file'),
             str(target),
@@ -2212,7 +2267,8 @@ async def test_a_url_download_over_the_cap_is_refused(
             chunk_size=1024,
         )
 
-    assert target.stat().st_size <= 2048
+    assert accepted_bytes(caught.value) <= 2048 + 1024
+    assert not target.exists()
 
 
 async def test_a_forbidden_url_download_raises_before_it_reads_a_byte(
@@ -2320,3 +2376,190 @@ async def test_a_url_download_sends_the_headers_and_deadline_it_was_given(
 
     assert target.read_bytes() == b'ok'
     assert http_server.requests[-1].headers['X-Trace'] == 'abc'
+
+
+# --- R22: the caller-supplied download path is guarded ---------------------
+
+
+async def test_r22_a_symlink_at_the_download_path_is_refused(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """M18's headline case: the README's own fixed ``/tmp`` example.
+
+    A hostile local process pre-creates a symlink at the predictable
+    path the documented example downloads to, and the download used to
+    follow it -- writing the endpoint's body through the link, into a
+    file the caller never named, at whatever ``umask`` allowed.
+
+    The assertion that matters is the second one: the victim file must
+    still not exist. Asserting only the refusal would be satisfied by an
+    implementation that wrote the bytes first and complained afterwards.
+    """
+    target = tmp_path / 'test.pdf'
+    victim = tmp_path / 'victim'
+    target.symlink_to(victim)
+    http_server.respond('/file', body=b'through the link')
+
+    with pytest.raises(PathContainmentError):
+        await _fetch(
+            http_server.url_for('/file'),
+            http_file_download_config={'download_filepath': str(target)},
+        )
+
+    assert not victim.exists()
+
+
+async def test_r22_a_download_refuses_to_overwrite_by_default(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """R22-AC3's chosen default, through the config a consumer writes.
+
+    The original bytes are asserted, not merely the exception: a
+    refusal that had already truncated the file would satisfy the first
+    assertion and lose the caller's data anyway.
+    """
+    target = tmp_path / 'out.bin'
+    target.write_bytes(b'the original')
+    http_server.respond('/file', body=b'the replacement')
+
+    with pytest.raises(ConfigurationError):
+        await _fetch(
+            http_server.url_for('/file'),
+            http_file_download_config={'download_filepath': str(target)},
+        )
+
+    assert target.read_bytes() == b'the original'
+
+
+async def test_r22_overwrite_true_is_plumbed_through_the_config(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """The opt-in exists, reaches the writer, and is asserted end to end.
+
+    Without this the shipped behaviour is "refuse, full stop" -- a hard
+    regression for any consumer re-downloading to a stable path, which
+    is exactly what the README's fixed ``/tmp/test.pdf`` example does on
+    its second run. Driven through ``http_file_download_config``,
+    because the criterion is about the surface a consumer configures and
+    a test of the internal writer would prove the plumbing untested.
+    """
+    target = tmp_path / 'out.bin'
+    target.write_bytes(b'the original')
+    http_server.respond('/file', body=b'the replacement')
+
+    await _fetch(
+        http_server.url_for('/file'),
+        http_file_download_config={
+            'download_filepath': str(target),
+            'overwrite': True,
+        },
+    )
+
+    assert target.read_bytes() == b'the replacement'
+
+
+async def test_r22_a_downloaded_file_is_not_world_readable(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """M18's mode half on the streamed path: 0600, whatever the umask.
+
+    The README's examples download to ``/tmp``, which on a shared host
+    is where a world-readable file is read by everyone on the box.
+    """
+    target = tmp_path / 'out.bin'
+    http_server.respond('/file', body=b'private bytes')
+
+    await _fetch(
+        http_server.url_for('/file'),
+        http_file_download_config={'download_filepath': str(target)},
+    )
+
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+async def test_r22_a_multipart_download_is_guarded_too(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """The third write path, which the first attempt at R22 left open.
+
+    ``handle_multipart_response`` writes to the same caller-supplied
+    ``download_filepath`` and had no containment at all -- so the
+    symlink attack the streamed path now refuses simply moved one
+    ``Content-Type`` across.
+    """
+    target = tmp_path / 'parts.bin'
+    victim = tmp_path / 'victim'
+    target.symlink_to(victim)
+    http_server.respond(
+        '/multipart',
+        body=_multipart_body(b'part one'),
+        headers=_multipart_headers(),
+    )
+
+    with pytest.raises(PathContainmentError):
+        await _fetch(
+            http_server.url_for('/multipart'),
+            http_file_download_config={'download_filepath': str(target)},
+        )
+
+    assert not victim.exists()
+
+
+async def test_r22_a_multipart_download_honours_overwrite(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """And the same opt-in reaches the multipart writer.
+
+    Guarding a path but leaving no way to re-download to it would break
+    the multipart case in exactly the way the streamed one is guarded
+    against breaking.
+    """
+    target = tmp_path / 'parts.bin'
+    target.write_bytes(b'the original')
+    http_server.respond(
+        '/multipart',
+        body=_multipart_body(b'part one'),
+        headers=_multipart_headers(),
+    )
+
+    await _fetch(
+        http_server.url_for('/multipart'),
+        http_file_download_config={
+            'download_filepath': str(target),
+            'overwrite': True,
+        },
+    )
+
+    assert target.read_bytes() == b'part one'
+
+
+async def test_r22_download_file_from_url_refuses_to_overwrite(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """The standalone helper takes the same default and the same opt-in.
+
+    It is a public coroutine with its own signature, so ``overwrite``
+    had to be plumbed there separately -- and a helper that swallowed it
+    in ``**kwargs`` would ship as refuse-only while looking configurable.
+    """
+    target = tmp_path / 'downloaded.bin'
+    target.write_bytes(b'the original')
+    http_server.respond('/file', body=b'the replacement')
+
+    with pytest.raises(ConfigurationError):
+        await download_file_from_url(
+            http_server.url_for('/file'), str(target))
+
+    assert target.read_bytes() == b'the original'
+
+    await download_file_from_url(
+        http_server.url_for('/file'), str(target), overwrite=True)
+
+    assert target.read_bytes() == b'the replacement'

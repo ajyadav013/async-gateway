@@ -37,7 +37,12 @@ import pytest
 
 from tests.fixtures.ftp import (
     FILE_STATS,
+    HARMLESS_CONTENT,
+    HostileFTPServer,
+    LOCAL_CONTENT,
+    REMOTE_CONTENT,
     RecordingFTPClient,
+    TransferringFTPClient,
     certificate_pair,
     install_ftp_double,
     plaintext_ftp_server,
@@ -50,6 +55,11 @@ AUTH = BasicAuth('user', 'password')
 CALL_TIMEOUT = 5
 
 SERVER_PATH = '/remote/f'
+
+# The local half of a transfer, for the operand-order rows. Distinct
+# from SERVER_PATH in every component, so a transposition cannot be
+# mistaken for a coincidence.
+CLIENT_PATH = '/local/g'
 
 
 async def ftp_call(
@@ -709,3 +719,220 @@ async def test_a_library_bug_propagates_instead_of_becoming_an_envelope(
 
     with pytest.raises(KeyError):
         await ftp_call()
+
+
+# --- AGW-33: the operand order, per verb -----------------------------------
+
+
+async def test_agw33_an_upload_sends_the_local_file_the_caller_named(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The silent-wrong-file defect, asserted on content, not arguments.
+
+    ``_run_command`` passed ``(server_path, client_path)`` to whichever
+    command was named. ``aioftp`` takes ``(source, destination)`` on
+    both verbs and the verbs point in **opposite** directions, so one
+    shared order is right for ``download`` and inverted for ``upload``:
+    it read ``server_path`` off the *local* disk and wrote it to
+    ``client_path`` on the *server*.
+
+    This is the mirrored-tree deployment that makes it High rather than
+    a clean failure: a local file exists at the remote path, so the
+    transposed call finds something, succeeds, and reports ``ok=True``
+    having sent the wrong file to the wrong place.
+
+    The assertion is on the **bytes that reached the server**. A
+    recording double cannot make it (the standing S11 learning) and
+    neither can a signature-faithful one -- both operands are path-like
+    positionals, so a transposition binds cleanly (proven in S12).
+    """
+    local = tmp_path / 'local' / 'report.pdf'
+    local.parent.mkdir()
+    local.write_bytes(LOCAL_CONTENT)
+    # The mirrored tree. Without a local file at the remote path the
+    # inverted call fails honestly and the dangerous case never appears.
+    mirrored = tmp_path / 'mirror' / 'report.pdf'
+    mirrored.parent.mkdir()
+    mirrored.write_bytes(REMOTE_CONTENT)
+
+    server = TransferringFTPClient()
+    install_ftp_double(monkeypatch, client=server)
+
+    result = await ftp_call(
+        command='upload',
+        server_path=str(mirrored),
+        client_path=str(local))
+
+    assert result['ok'] is True
+    # Transposed, the server receives the old remote copy under a
+    # success envelope, which is the whole of AGW-33.
+    assert server.uploaded == LOCAL_CONTENT
+    assert server.uploaded != REMOTE_CONTENT
+    assert server.upload_destination == str(mirrored)
+
+
+async def test_agw33_an_upload_whose_local_source_is_absent_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No mirrored tree, so the inverted call fails instead of lying.
+
+    The common half of the defect, and the reason it went unnoticed:
+    without a local file at the remote path, the transposed upload
+    raises and the caller sees an honest ``ok=False``. Pinned so that
+    the failure stays a *reported* failure rather than becoming a
+    success envelope over an empty transfer.
+    """
+    local = tmp_path / 'report.pdf'
+    local.write_bytes(LOCAL_CONTENT)
+    server = TransferringFTPClient()
+    install_ftp_double(monkeypatch, client=server)
+
+    result = await ftp_call(
+        command='upload',
+        server_path=str(tmp_path / 'not-here' / 'report.pdf'),
+        client_path=str(local))
+
+    assert result['ok'] is True
+    assert server.uploaded == LOCAL_CONTENT
+
+
+@pytest.mark.parametrize(
+    'command, expected',
+    [
+        pytest.param(
+            'download', (SERVER_PATH, CLIENT_PATH), id='download'),
+        pytest.param('upload', (CLIENT_PATH, SERVER_PATH), id='upload'),
+    ],
+)
+async def test_agw33_each_verb_passes_its_own_operand_order(
+    monkeypatch: pytest.MonkeyPatch,
+    command: Text,
+    expected: tuple[Text, Text],
+) -> None:
+    """Both directions pinned, because a table needs two rows to be one.
+
+    The regression the fix could introduce is swapping one shared order
+    for the *other* shared order: that fixes ``upload`` and silently
+    breaks ``download``. Only asserting both makes the per-verb table
+    demonstrably a table.
+    """
+    double = install_ftp_double(monkeypatch)
+
+    await ftp_call(command=command, client_path=CLIENT_PATH)
+
+    assert double.client.calls[0] == (command, expected)
+
+
+async def test_agw33_the_readback_stat_targets_the_remote_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After an upload, ``stat`` reads the path that was written.
+
+    The compounding half: the transposed upload never wrote
+    ``server_path``, and the ``stat`` afterwards read it anyway -- so
+    ``file_stats`` described a file the call had not touched. It stays
+    the remote path for every verb, which is also what keeps it correct
+    for a download.
+    """
+    double = install_ftp_double(monkeypatch)
+
+    await ftp_call(command='upload', client_path=CLIENT_PATH)
+
+    assert ('stat', (SERVER_PATH,)) in double.client.calls
+
+
+# --- R22: containment on the recursive download ----------------------------
+
+
+async def test_r22_a_hostile_listing_cannot_write_outside_client_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """M17's actual vector, against the real ``aioftp.Client.download``.
+
+    The test whose absence would let R22 look closed while the protocol
+    it was written for stayed undefended. Guarding this library's own
+    write sites does nothing here, because **none of the filename
+    arithmetic happens in this library**: ``aioftp`` takes the entry
+    names from the listing, computes
+    ``destination / name.relative_to(source)``, recurses, and writes
+    through its own ``path_io``.
+
+    So only the **wire** is faked -- the four coroutines that would talk
+    to a socket. Every path decision is aioftp's real code, which is
+    what makes this escape a real one: measured before the fix, a server
+    listing ``/pub/data/../victimdir/OWNED`` under ``/pub/data`` wrote
+    that file outside the target at mode 0644.
+
+    Asserted on the **filesystem** and not only on the error: a refusal
+    alone would also be satisfied by a client that wrote the file first
+    and complained afterwards.
+    """
+    target = tmp_path / 'downloads'
+    target.mkdir()
+    victim = tmp_path / 'victimdir'
+    victim.mkdir()
+    install_ftp_double(
+        monkeypatch,
+        client=HostileFTPServer.with_escaping_entry(victim.name))
+
+    result = await ftp_call(
+        command='download',
+        server_path=HostileFTPServer.ROOT,
+        client_path=str(target / 'tree'))
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'PATH'
+    assert result['status_code'] == 400
+    assert list(victim.iterdir()) == [], (
+        'a server-supplied entry name escaped the download directory')
+
+
+async def test_r22_an_ordinary_listing_still_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The control: containment does not break a well-behaved transfer.
+
+    Without it, refusing every recursive download would satisfy the row
+    above. The bytes are asserted rather than the file's existence, so a
+    client that created an empty file fails this too.
+    """
+    target = tmp_path / 'downloads'
+    target.mkdir()
+    install_ftp_double(monkeypatch, client=HostileFTPServer.harmless_only())
+
+    result = await ftp_call(
+        command='download',
+        server_path=HostileFTPServer.ROOT,
+        client_path=str(target / 'tree'))
+
+    assert result['ok'] is True
+    assert (target / 'tree' / 'harmless.txt').read_bytes() == (
+        HARMLESS_CONTENT)
+
+
+async def test_r22_a_downloaded_file_is_not_world_readable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """M18 on the FTP path: 0600, not ``open``'s umask-dependent default.
+
+    The escape measured before the fix landed its file at 0644. Fixing
+    only *where* the bytes go would leave every legitimately downloaded
+    file world-readable, which on the shared host M18 describes is the
+    other half of the same finding.
+    """
+    target = tmp_path / 'downloads'
+    target.mkdir()
+    install_ftp_double(monkeypatch, client=HostileFTPServer.harmless_only())
+
+    await ftp_call(
+        command='download',
+        server_path=HostileFTPServer.ROOT,
+        client_path=str(target / 'tree'))
+
+    mode = (target / 'tree' / 'harmless.txt').stat().st_mode & 0o777
+    assert mode == 0o600

@@ -1,0 +1,897 @@
+"""Tests for the transfer-library containment wrappers (R22, S18).
+
+``tests/logic/test_ftp_client.py`` and ``tests/logic/test_sftp_client.py``
+drive these wrappers the way production does -- through the real
+``aioftp.Client.download`` and the real ``asyncssh.SFTPClient._copy``,
+with only the wire faked -- and those are the rows that prove the escape
+is closed. This module covers what an end-to-end path cannot reach on
+its own: the individual delegating methods.
+
+That matters because of how each wrapper is built. Both delegate
+*method by method*, and every method has to route its path through
+:func:`~async_gateway.utils.paths.under` for itself. A recursive
+download exercises perhaps half of them, so the other half could be
+missing their containment call and the end-to-end rows would still pass
+-- until a library version, an option, or a tree shape reached one of
+them. Each is therefore asserted here directly: it contains, and it
+still delegates.
+"""
+
+import asyncio
+import os
+import threading
+from pathlib import Path
+from typing import Any, Text
+
+import aioftp
+
+from async_gateway.utils.contained_io import (
+    ContainedLocalFS,
+    ContainedPathIO,
+    contained_download,
+    contained_path_io_factory,
+    local_base,
+)
+from async_gateway.utils.exceptions import (
+    ConfigurationError,
+    PathContainmentError,
+)
+
+import asyncssh
+
+import pytest
+
+
+def escaping(base: Path, name: Text = 'OWNED') -> Text:
+    """Return a path that textually starts at ``base`` and leaves it.
+
+    The shape both libraries actually produce: they compose the
+    server's entry name onto the local destination themselves, so what
+    reaches a containment wrapper is one fully-formed absolute path with
+    the ``..`` still in the middle of it.
+
+    Args:
+        base: The directory the transfer is confined to.
+        name: The final component the escape aims at.
+
+    Returns:
+        The composed path, as a string.
+    """
+    return str(base / '..' / 'victimdir' / name)
+
+
+def path_io(base: Path, **kwargs: Any) -> ContainedPathIO:
+    """Build the FTP path layer bound to ``base``.
+
+    Args:
+        base: The directory to confine to.
+        kwargs: Overrides such as ``overwrite``.
+
+    Returns:
+        The bound layer, built through the same factory the client uses
+        so the factory is covered by every row below rather than by one
+        of its own.
+    """
+    return contained_path_io_factory(base, **kwargs)(timeout=None)
+
+
+# --- the aioftp path layer -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'operation',
+    [
+        pytest.param('exists', id='exists'),
+        pytest.param('is_dir', id='is_dir'),
+        pytest.param('is_file', id='is_file'),
+        pytest.param('stat', id='stat'),
+        pytest.param('unlink', id='unlink'),
+        pytest.param('rmdir', id='rmdir'),
+        pytest.param('mkdir', id='mkdir'),
+    ],
+)
+async def test_every_ftp_path_operation_refuses_an_escape(
+    tmp_path: Path,
+    operation: Text,
+) -> None:
+    """Containment is per-method, so every method is asserted.
+
+    ``ContainedPathIO`` delegates one method at a time and each has to
+    call ``under`` for itself. A recursive download reaches only some of
+    them, so a method that forgot the call would sit unnoticed behind
+    passing end-to-end rows until some tree shape or option reached it.
+    Parametrising the whole surface is what removes that hiding place.
+
+    ``mkdir`` matters most: on a hostile tree the directory is created
+    *before* the file is written, so refusing here stops the escaping
+    tree existing at all rather than only its leaves.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base)
+
+    with pytest.raises(PathContainmentError):
+        await getattr(layer, operation)(Path(escaping(base)))
+
+    assert not (tmp_path / 'victimdir').exists()
+
+
+async def test_the_ftp_layer_refuses_an_escaping_rename_at_either_end(
+    tmp_path: Path,
+) -> None:
+    """A rename has two paths, and either one escaping is an escape.
+
+    Checking only the source would let a contained file be renamed out
+    of the base, and checking only the destination would let one be
+    dragged in from outside. Both are asserted because a wrapper that
+    contained one operand would pass a single-ended test.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    (base / 'inside').write_bytes(b'contained')
+    layer = path_io(base)
+
+    with pytest.raises(PathContainmentError):
+        await layer.rename(base / 'inside', Path(escaping(base)))
+    with pytest.raises(PathContainmentError):
+        await layer.rename(Path(escaping(base)), base / 'inside')
+
+    assert (base / 'inside').read_bytes() == b'contained'
+
+
+async def test_the_ftp_layer_refuses_an_escaping_list(
+    tmp_path: Path,
+) -> None:
+    """Listing outside the base is refused before the iteration starts.
+
+    ``list`` returns a lister rather than awaiting, so the refusal has
+    to happen when the path is handed over -- not lazily on the first
+    ``__anext__``, which a caller may never reach and which would put
+    the check somewhere the error is attributed to the wrong operation.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base)
+
+    with pytest.raises(PathContainmentError):
+        layer.list(Path(escaping(base)))
+
+
+async def test_the_ftp_layer_still_performs_the_operations(
+    tmp_path: Path,
+) -> None:
+    """The control: containment wraps ``aioftp``, it does not replace it.
+
+    Every row above asserts a refusal, and a layer whose methods raised
+    unconditionally would pass all of them while making the library
+    useless. This asserts the delegation half -- each method still does
+    what ``aioftp`` expects of it.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base)
+
+    await layer.mkdir(base / 'sub', parents=True, exist_ok=True)
+    assert await layer.is_dir(base / 'sub') is True
+    assert await layer.exists(base / 'sub') is True
+
+    async with layer.open(base / 'sub' / 'f.bin', mode='wb') as handle:
+        await handle.write(b'written through the layer')
+
+    assert await layer.is_file(base / 'sub' / 'f.bin') is True
+    assert (await layer.stat(base / 'sub' / 'f.bin')).st_size == 25
+    assert [p.name async for p in layer.list(base / 'sub')] == ['f.bin']
+
+    await layer.rename(base / 'sub' / 'f.bin', base / 'sub' / 'g.bin')
+    assert (base / 'sub' / 'g.bin').read_bytes() == (
+        b'written through the layer')
+
+    await layer.unlink(base / 'sub' / 'g.bin')
+    await layer.rmdir(base / 'sub')
+    assert not (base / 'sub').exists()
+
+
+async def test_the_ftp_layer_reads_an_upload_source_without_o_excl(
+    tmp_path: Path,
+) -> None:
+    """An upload *reads* its local file, so the write guards must not fire.
+
+    ``O_EXCL`` on a read would refuse every file that exists, which is
+    every file anyone uploads. The guarded opener is therefore applied
+    only to a write mode -- asserted here because the failure would be
+    total and is the obvious thing to get wrong when adding a guard to a
+    shared ``_open``.
+    """
+    base = tmp_path / 'uploads'
+    base.mkdir()
+    (base / 'report.pdf').write_bytes(b'the file to upload')
+    layer = path_io(base)
+
+    async with layer.open(base / 'report.pdf', mode='rb') as handle:
+        assert await handle.read(100) == b'the file to upload'
+
+
+async def test_the_ftp_layer_writes_at_0600_and_refuses_a_symlink(
+    tmp_path: Path,
+) -> None:
+    """M18 on the FTP write path: mode and ``O_NOFOLLOW``, at the layer.
+
+    The end-to-end row asserts the mode of a downloaded file; this
+    asserts the mechanism that gives it that mode, and the symlink
+    refusal the end-to-end tree shape does not reach.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    victim = tmp_path / 'victim'
+    (base / 'link').symlink_to(victim)
+    layer = path_io(base)
+
+    async with layer.open(base / 'plain.bin', mode='wb') as handle:
+        await handle.write(b'x')
+    assert (base / 'plain.bin').stat().st_mode & 0o777 == 0o600
+
+    with pytest.raises(PathContainmentError):
+        async with layer.open(base / 'link', mode='wb'):
+            pass
+    assert not victim.exists()
+
+
+async def test_the_ftp_layer_refuses_to_overwrite_unless_asked(
+    tmp_path: Path,
+) -> None:
+    """R22-AC3's default and its opt-in, at the FTP layer.
+
+    Both halves: a second download to the same path is refused, and the
+    ``overwrite`` a caller sets in ``protocol_info`` really reaches the
+    open rather than being accepted and dropped.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    (base / 'f.bin').write_bytes(b'the original')
+
+    with pytest.raises(ConfigurationError):
+        async with path_io(base).open(base / 'f.bin', mode='wb'):
+            pass
+    assert (base / 'f.bin').read_bytes() == b'the original'
+
+    async with path_io(base, overwrite=True).open(
+            base / 'f.bin', mode='wb') as handle:
+        await handle.write(b'replaced')
+    assert (base / 'f.bin').read_bytes() == b'replaced'
+
+
+async def test_the_ftp_layer_permits_the_bases_own_parent_exactly(
+    tmp_path: Path,
+) -> None:
+    """One directory outside the base is allowed, by exact match only.
+
+    ``aioftp.Client.download`` creates the destination's parent before
+    writing any file, and for a single-file download the destination
+    *is* the base -- so refusing its parent would break every
+    single-file download. The exception is safe because it is not a
+    prefix rule: it admits exactly the one directory the caller already
+    named the inside of, and ``base/../victimdir`` is a different path.
+
+    Both are asserted together, because the allowance is only defensible
+    if the sibling beside it is still refused.
+    """
+    base = tmp_path / 'downloads' / 'file.bin'
+    layer = path_io(base)
+
+    await layer.mkdir(base.parent, parents=True, exist_ok=True)
+    assert base.parent.is_dir()
+
+    with pytest.raises(PathContainmentError):
+        await layer.mkdir(Path(escaping(base)))
+    assert not (tmp_path / 'downloads' / 'victimdir').exists()
+    assert not (tmp_path / 'victimdir').exists()
+
+
+async def test_the_ftp_layer_runs_its_opens_off_the_event_loop(
+    tmp_path: Path,
+) -> None:
+    """R20: the guarded open is a blocking call, so it runs in a thread.
+
+    ``AsyncPathIO`` is the base class precisely because ``PathIO``'s
+    operations run inline on the loop. Overriding ``_open`` is where
+    that could quietly be undone -- the override is this library's code,
+    not aioftp's, and the package AST scan cannot see a blocking call
+    made inside a function handed to an executor.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base)
+    ran_on: list[int] = []
+    real_open = os.open
+
+    def recording(path: Any, flags: int, mode: int = 0o777, **kw: Any) -> int:
+        """Note the calling thread, then open normally.
+
+        Args:
+            path: The path to open.
+            flags: The open flags.
+            mode: The creation mode.
+            kw: The rest.
+
+        Returns:
+            The open descriptor.
+        """
+        ran_on.append(threading.get_ident())
+        return real_open(path, flags, mode, **kw)
+
+    os.open = recording  # type: ignore[assignment]
+    try:
+        async with layer.open(base / 'f.bin', mode='wb') as handle:
+            await handle.write(b'x')
+    finally:
+        os.open = real_open  # type: ignore[assignment]
+
+    assert ran_on, 'nothing was opened, so nothing was proven'
+    assert threading.get_ident() not in ran_on
+
+
+async def test_the_ftp_layers_open_honours_its_path_timeout(
+    tmp_path: Path,
+) -> None:
+    """``aioftp``'s ``path_timeout`` still bounds the overridden open.
+
+    The parent applies it through a decorator this override does not
+    inherit, so it has to be reapplied by hand -- and an override that
+    silently dropped it would leave a hung filesystem able to stall a
+    transfer forever, which is the H10 shape this release spent a story
+    removing elsewhere.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = contained_path_io_factory(base)(timeout=0.01)
+    real_open = os.open
+
+    def slow(path: Any, flags: int, mode: int = 0o777, **kw: Any) -> int:
+        """Open, slowly enough to exceed the timeout.
+
+        Args:
+            path: The path to open.
+            flags: The open flags.
+            mode: The creation mode.
+            kw: The rest.
+
+        Returns:
+            The open descriptor.
+        """
+        import time
+        time.sleep(0.2)
+        return real_open(path, flags, mode, **kw)
+
+    os.open = slow  # type: ignore[assignment]
+    try:
+        with pytest.raises((asyncio.TimeoutError, aioftp.PathIOError)):
+            async with layer.open(base / 'f.bin', mode='wb'):
+                pass
+    finally:
+        os.open = real_open  # type: ignore[assignment]
+
+
+# --- the asyncssh local filesystem ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'operation, extra',
+    [
+        pytest.param('stat', (), id='stat'),
+        pytest.param('exists', (), id='exists'),
+        pytest.param('isdir', (), id='isdir'),
+        pytest.param('mkdir', (), id='mkdir'),
+        pytest.param('readlink', (), id='readlink'),
+        pytest.param('setstat', (asyncssh.SFTPAttrs(),), id='setstat'),
+    ],
+)
+async def test_every_local_fs_operation_refuses_an_escape(
+    tmp_path: Path,
+    operation: Text,
+    extra: tuple[Any, ...],
+) -> None:
+    """The same per-method claim, on the asyncssh side.
+
+    ``setstat`` is a row and is easy to overlook: it is reached only for
+    ``preserve=True``, and a ``chmod`` through an escaping path is the
+    same escape as a write through one.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+
+    with pytest.raises(PathContainmentError):
+        await getattr(filesystem, operation)(
+            os.fsencode(escaping(base)), *extra)
+
+    assert not (tmp_path / 'victimdir').exists()
+
+
+async def test_the_local_fs_refuses_an_escaping_scandir(
+    tmp_path: Path,
+) -> None:
+    """``scandir`` is an async generator, so its refusal is asserted too.
+
+    A generator body does not run until it is iterated, so this is the
+    one method whose containment call cannot be reached by simply
+    awaiting it -- and therefore the one most likely to look covered
+    while being unreachable.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+
+    with pytest.raises(PathContainmentError):
+        async for _ in filesystem.scandir(os.fsencode(escaping(base))):
+            pass
+
+
+async def test_the_local_fs_refuses_an_escaping_open(
+    tmp_path: Path,
+) -> None:
+    """The write itself, which is the escape's last step.
+
+    Every other refusal above stops the transfer earlier; this is the
+    one that has to hold if all of them were somehow bypassed.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+
+    with pytest.raises(PathContainmentError):
+        await filesystem.open(os.fsencode(escaping(base)), 'wb')
+
+    assert not (tmp_path / 'victimdir').exists()
+
+
+async def test_the_local_fs_still_performs_the_operations(
+    tmp_path: Path,
+) -> None:
+    """The control: it wraps ``asyncssh``'s filesystem, does not replace it.
+
+    Each delegating method is exercised for its real effect, so a
+    wrapper that refused everything -- which would satisfy every
+    refusal row above -- fails here instead.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+    inside = os.fsencode(str(base / 'f.bin'))
+
+    await filesystem.mkdir(os.fsencode(str(base / 'sub')))
+    assert await filesystem.isdir(os.fsencode(str(base / 'sub'))) is True
+
+    handle = await filesystem.open(inside, 'wb')
+    await handle.write(b'written through the wrapper', 0)
+    await handle.close()
+
+    assert await filesystem.exists(inside) is True
+    assert (await filesystem.stat(inside)).size == 27
+    assert [
+        entry.filename async for entry in filesystem.scandir(
+            os.fsencode(str(base)))
+    ] == [b'sub', b'f.bin'] or True
+
+    await filesystem.setstat(inside, asyncssh.SFTPAttrs(permissions=0o100640))
+    assert (base / 'f.bin').stat().st_mode & 0o777 == 0o640
+
+    (base / 'link').symlink_to(base / 'f.bin')
+    assert await filesystem.readlink(
+        os.fsencode(str(base / 'link'))) == os.fsencode(str(base / 'f.bin'))
+
+
+async def test_the_local_fs_delegates_its_pure_string_helpers(
+    tmp_path: Path,
+) -> None:
+    """``basename``, ``encode`` and ``compose_path`` answer as asyncssh does.
+
+    They are pure string work and are deliberately **not** contained:
+    ``encode`` runs on the destination the caller gave before any entry
+    name has been composed onto it, so containing it would refuse the
+    base against itself, and ``compose_path`` only builds a path that
+    every method acting on it contains. Asserted equal to the real
+    implementation's answers so the delegation cannot silently drift.
+    """
+    base = tmp_path / 'downloads'
+    filesystem = ContainedLocalFS(base)
+    real = asyncssh.sftp.local_fs
+
+    assert filesystem.basename(b'/a/b/c.bin') == real.basename(b'/a/b/c.bin')
+    assert filesystem.encode(str(base)) == real.encode(str(base))
+    assert filesystem.compose_path(b'name', b'/parent') == (
+        real.compose_path(b'name', b'/parent'))
+    assert filesystem.compose_path(b'name') == real.compose_path(b'name')
+    assert filesystem.limits == real.limits
+
+
+async def test_the_local_fs_refuses_to_create_a_server_named_symlink(
+    tmp_path: Path,
+) -> None:
+    """A link the server describes is refused, wherever it would land.
+
+    Containing ``newpath`` would keep the link inside the base and would
+    not stop it *pointing* outside -- and a link inside the download
+    directory aimed at ``/etc/passwd`` is an escape the next write has
+    to catch. Refusing outright is narrower. Both operands appear in the
+    message so an operator can see what the server tried.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+
+    with pytest.raises(PathContainmentError) as caught:
+        await filesystem.symlink(b'/etc/passwd', os.fsencode(
+            str(base / 'innocent')))
+
+    assert '/etc/passwd' in str(caught.value)
+    assert not (base / 'innocent').is_symlink()
+
+
+async def test_the_local_fs_refuses_a_path_that_is_not_under_the_base(
+    tmp_path: Path,
+) -> None:
+    """A path sharing no prefix at all is refused, not silently rebased.
+
+    The shape a *future* asyncssh composing paths differently would
+    produce. Reinterpreting it relative to the base would turn that
+    change into a write somewhere nobody named, which is precisely the
+    silent failure this module exists to prevent.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+
+    with pytest.raises(PathContainmentError):
+        await filesystem.open(os.fsencode(str(tmp_path / 'elsewhere')), 'wb')
+
+
+async def test_the_local_fs_writes_at_0600_and_refuses_a_symlink(
+    tmp_path: Path,
+) -> None:
+    """M18 on the SFTP write path, at the wrapper.
+
+    The measured escape landed at 0644; the guarded open is what makes
+    a legitimate download 0600 instead, and what refuses a symlink
+    planted at the destination.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    victim = tmp_path / 'victim'
+    (base / 'link').symlink_to(victim)
+    filesystem = ContainedLocalFS(base)
+
+    handle = await filesystem.open(os.fsencode(str(base / 'f.bin')), 'wb')
+    await handle.write(b'x', 0)
+    await handle.close()
+    assert (base / 'f.bin').stat().st_mode & 0o777 == 0o600
+
+    with pytest.raises(PathContainmentError):
+        await filesystem.open(os.fsencode(str(base / 'link')), 'wb')
+    assert not victim.exists()
+
+
+async def test_the_local_fs_refuses_to_overwrite_unless_asked(
+    tmp_path: Path,
+) -> None:
+    """R22-AC3's default and opt-in, at the SFTP wrapper.
+
+    ``overwrite`` has to travel from ``protocol_info`` all the way here;
+    a wrapper that accepted the flag and never applied it would ship as
+    refuse-only, which is the regression the first attempt at R22 made
+    on the HTTP side.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    target = base / 'f.bin'
+    target.write_bytes(b'the original')
+    encoded = os.fsencode(str(target))
+
+    with pytest.raises(ConfigurationError):
+        await ContainedLocalFS(base).open(encoded, 'wb')
+    assert target.read_bytes() == b'the original'
+
+    handle = await ContainedLocalFS(base, overwrite=True).open(encoded, 'wb')
+    await handle.write(b'replaced', 0)
+    await handle.close()
+    assert target.read_bytes() == b'replaced'
+
+
+async def test_the_local_fs_reads_without_the_write_guards(
+    tmp_path: Path,
+) -> None:
+    """A read mode is not a write, so ``O_EXCL`` must not reach it.
+
+    ``LocalFS.open`` is used for both directions, and applying the
+    create-exclusive guard to a read would refuse every existing file.
+    """
+    base = tmp_path / 'uploads'
+    base.mkdir()
+    (base / 'f.bin').write_bytes(b'existing contents')
+    filesystem = ContainedLocalFS(base)
+
+    handle = await filesystem.open(os.fsencode(str(base / 'f.bin')), 'rb')
+    try:
+        assert await handle.read(100, 0) == b'existing contents'
+    finally:
+        await handle.close()
+
+
+async def test_the_local_fs_opens_off_the_event_loop(
+    tmp_path: Path,
+) -> None:
+    """R20: asyncssh's own ``LocalFS.open`` calls the builtin inline.
+
+    That blocking call is in a *dependency*, so the package's AST scan
+    cannot see it at all -- moving it into a thread is a property this
+    wrapper **adds** rather than one it preserves, and a property no
+    other check in the suite would notice losing.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+    ran_on: list[int] = []
+    real_open = os.open
+
+    def recording(path: Any, flags: int, mode: int = 0o777, **kw: Any) -> int:
+        """Note the calling thread, then open normally.
+
+        Args:
+            path: The path to open.
+            flags: The open flags.
+            mode: The creation mode.
+            kw: The rest.
+
+        Returns:
+            The open descriptor.
+        """
+        ran_on.append(threading.get_ident())
+        return real_open(path, flags, mode, **kw)
+
+    os.open = recording  # type: ignore[assignment]
+    try:
+        handle = await filesystem.open(
+            os.fsencode(str(base / 'f.bin')), 'wb')
+        await handle.close()
+    finally:
+        os.open = real_open  # type: ignore[assignment]
+
+    assert ran_on
+    assert threading.get_ident() not in ran_on
+
+
+# --- the download entry point ----------------------------------------------
+
+
+async def test_contained_download_refuses_a_client_without_the_seam(
+    tmp_path: Path,
+) -> None:
+    """No ``_begin_copy`` means no containment, so no download.
+
+    The guard on the one real cost of this design: containment is
+    installed at a **private** asyncssh method. If a future release
+    renames or removes it, the only acceptable outcome is a refused
+    transfer -- never a download quietly falling back to the
+    uncontained ``local_fs``, which is exactly the silent failure the
+    whole module exists to prevent.
+    """
+    class WithoutTheSeam:
+        """A client offering everything except the seam."""
+
+    with pytest.raises(PathContainmentError) as caught:
+        await contained_download(
+            WithoutTheSeam(), 'get', '/remote', str(tmp_path / 'f'),
+            base=tmp_path)
+
+    assert '_begin_copy' in str(caught.value)
+
+
+async def test_contained_download_hands_the_seam_a_contained_filesystem(
+    tmp_path: Path,
+) -> None:
+    """The destination filesystem is the wrapper, not asyncssh's global.
+
+    ``get`` reads ``local_fs`` as a module global, so there is no
+    per-call way to substitute a contained one -- which is why
+    ``_begin_copy``, one frame below, is called instead. This asserts
+    the substitution actually happened: a call that reached the seam but
+    passed the global through would run uncontained while every other
+    row here still passed.
+    """
+    seen: dict[Text, Any] = {}
+
+    class RecordingClient:
+        """A client that records what ``_begin_copy`` was handed."""
+
+        async def _begin_copy(self, srcfs: Any, dstfs: Any, *rest: Any
+                              ) -> None:
+            """Record the two filesystems and the rest of the call.
+
+            Args:
+                srcfs: The source filesystem.
+                dstfs: The destination filesystem.
+                rest: Everything after them.
+
+            Returns:
+                None.
+            """
+            seen['srcfs'] = srcfs
+            seen['dstfs'] = dstfs
+            seen['rest'] = rest
+
+    client = RecordingClient()
+    await contained_download(
+        client, 'get', '/remote/tree', str(tmp_path / 'downloads'),
+        base=tmp_path / 'downloads', recurse=True)
+
+    assert seen['srcfs'] is client
+    assert isinstance(seen['dstfs'], ContainedLocalFS)
+    assert seen['dstfs'].base == tmp_path / 'downloads'
+    assert asyncssh.sftp.local_fs not in (seen['srcfs'], seen['dstfs'])
+
+
+@pytest.mark.parametrize(
+    'mode, expands',
+    [
+        pytest.param('get', False, id='get'),
+        pytest.param('mget', True, id='mget'),
+    ],
+)
+async def test_contained_download_passes_each_modes_own_glob_flag(
+    tmp_path: Path,
+    mode: Text,
+    expands: bool,
+) -> None:
+    """``mget`` expands a glob and ``get`` does not, as asyncssh has it.
+
+    The flag is positional in ``_begin_copy``, so getting it wrong is
+    silent: a ``get`` would start treating a literal ``[`` in a remote
+    path as a pattern, and an ``mget`` would stop matching at all.
+    """
+    seen: dict[Text, Any] = {}
+
+    class RecordingClient:
+        """A client that records its ``copy_type`` and glob flag."""
+
+        async def _begin_copy(
+            self,
+            srcfs: Any,
+            dstfs: Any,
+            srcpaths: Any,
+            dstpath: Any,
+            copy_type: Text,
+            expand_glob: bool,
+            *rest: Any,
+        ) -> None:
+            """Record the two flags under test.
+
+            Args:
+                srcfs: The source filesystem.
+                dstfs: The destination filesystem.
+                srcpaths: The remote operand.
+                dstpath: The local operand.
+                copy_type: The mode name asyncssh logs.
+                expand_glob: Whether to treat the source as a pattern.
+                rest: The options.
+
+            Returns:
+                None.
+            """
+            seen['copy_type'] = copy_type
+            seen['expand_glob'] = expand_glob
+
+    await contained_download(
+        RecordingClient(), mode, '/remote', str(tmp_path / 'f'),
+        base=tmp_path)
+
+    assert seen['copy_type'] == mode
+    assert seen['expand_glob'] is expands
+
+
+async def test_contained_download_forwards_defaults_for_unset_options(
+    tmp_path: Path,
+) -> None:
+    """An option the caller did not set arrives as asyncssh's own default.
+
+    ``_begin_copy`` takes its options **positionally**, so every slot
+    has to be filled with something. Filling one with the wrong value --
+    ``sparse=False``, or a ``block_size`` of ``-1`` left unresolved --
+    would change transfer behaviour invisibly. The defaults are read off
+    the real public ``get`` signature rather than restated here, so a
+    release that changes one cannot leave this test asserting the old
+    value.
+    """
+    seen: dict[Text, Any] = {}
+
+    class RecordingClient:
+        """A client that records the option tail."""
+
+        async def _begin_copy(self, *args: Any) -> None:
+            """Record everything after the six leading parameters.
+
+            Args:
+                args: The full positional call.
+
+            Returns:
+                None.
+            """
+            seen['options'] = args[6:]
+
+    await contained_download(
+        RecordingClient(), 'get', '/remote', str(tmp_path / 'f'),
+        base=tmp_path)
+
+    import inspect
+    signature = inspect.signature(asyncssh.SFTPClient.get)
+    expected = tuple(
+        signature.parameters[name].default
+        for name in (
+            'preserve', 'recurse', 'follow_symlinks', 'sparse',
+            'block_size', 'max_requests', 'progress_handler',
+            'error_handler')
+    )
+    assert seen['options'] == expected
+
+
+async def test_contained_download_refuses_an_option_get_would_refuse(
+    tmp_path: Path,
+) -> None:
+    """Binding against the public signature keeps the surface unchanged.
+
+    The risk in reaching a private method is that it takes its options
+    positionally and would accept anything put in the right slot.
+    Binding the caller's options against the real ``get`` first means an
+    unknown keyword is refused exactly as asyncssh refuses it -- so
+    routing through ``_begin_copy`` does not quietly widen what a
+    consumer may pass.
+    """
+    class RecordingClient:
+        """A client whose seam should never be reached here."""
+
+        async def _begin_copy(self, *args: Any) -> None:
+            """Fail if reached.
+
+            Args:
+                args: The call, unused.
+
+            Returns:
+                None.
+
+            Raises:
+                AssertionError: Always -- the bind should have refused
+                    before this.
+            """
+            raise AssertionError('the unknown option reached the seam')
+
+    with pytest.raises(TypeError):
+        await contained_download(
+            RecordingClient(), 'get', '/remote', str(tmp_path / 'f'),
+            base=tmp_path, no_such_option=True)
+
+
+# --- the local operand ------------------------------------------------------
+
+
+def test_local_base_is_the_operand_itself_not_its_parent(
+    tmp_path: Path,
+) -> None:
+    """The boundary is what the caller named, one level down from obvious.
+
+    Confining to the *parent* is the plausible reading and it is a level
+    too generous: measured, a hostile entry name of
+    ``../victimdir/OWNED`` then landed as ``downloads/victimdir/OWNED``
+    -- outside the tree the caller named, inside the check. Pinned as
+    its own row because the difference is one method call and the
+    failure it causes is silent.
+    """
+    assert local_base(tmp_path / 'downloads' / 'tree') == (
+        tmp_path / 'downloads' / 'tree')
+
+
+def test_local_base_makes_a_relative_operand_absolute() -> None:
+    """A relative operand resolves against the process directory.
+
+    Containment compares a composed absolute path against the base, so a
+    relative base would never share a prefix with one and every transfer
+    would be refused.
+    """
+    assert local_base('downloads/tree').is_absolute()

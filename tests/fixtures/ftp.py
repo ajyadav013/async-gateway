@@ -32,9 +32,9 @@ S9's file and its shape is shared with four other protocols.
 import asyncio
 import datetime
 import tempfile
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Text
 
 import aioftp
@@ -53,6 +53,15 @@ FTPCall = tuple[Text, tuple[Any, ...]]
 
 # What `aioftp.Client.stat` reports for a file that is still there.
 FILE_STATS: dict[Text, Text] = {'size': '12', 'type': 'file'}
+
+# Three payloads that are distinguishable on sight, because the defects
+# they witness are all "the right operation moved the wrong bytes".
+# AGW-33's killer assertion compares the first two, so they must never
+# be equal.
+LOCAL_CONTENT: bytes = b'the file the caller meant'
+REMOTE_CONTENT: bytes = b'the old remote copy'
+HARMLESS_CONTENT: bytes = b'an ordinary file from an ordinary server'
+ESCAPED_CONTENT: bytes = b'written outside the directory you named'
 
 
 class RecordingFTPClient:
@@ -84,6 +93,10 @@ class RecordingFTPClient:
         self.calls: list[FTPCall] = []
         self.stat_error = stat_error
         self.command_error = command_error
+        # The path layer `FTPContextDouble` builds from the factory the
+        # code under test passed. Only `HostileFTPServer`, which runs
+        # aioftp's real `download`, ever reads it.
+        self.path_io: Any = None
 
     async def _invoked(self, name: Text, args: tuple[Any, ...]) -> None:
         """Record one command invocation and fail if configured to.
@@ -184,6 +197,244 @@ class RecordingFTPClient:
         return dict(FILE_STATS)
 
 
+class TransferringFTPClient(RecordingFTPClient):
+    """A client that actually *moves bytes*, for the operand-order rows.
+
+    AGW-33 is a transposition of two path-like positionals, and neither
+    a recording double nor a signature-faithful one can see it: both
+    operands bind cleanly either way round (proven in S12). Only a test
+    that models a filesystem -- asserting which path was **read** and
+    which was **written** -- can catch it.
+
+    So ``upload`` here reads its source operand off the real disk, the
+    way ``aioftp.Client.upload`` does, and keeps what it read as
+    :attr:`uploaded`. A test then asserts on the *content* that reached
+    the remote side, which is the only assertion that distinguishes the
+    right file from a same-named wrong one.
+
+    Attributes:
+        uploaded: The bytes the server received, or None if no upload
+            reached it.
+        upload_destination: The remote path they were written to.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Build a transferring client double.
+
+        Args:
+            kwargs: Forwarded to :class:`RecordingFTPClient`.
+        """
+        super().__init__(**kwargs)
+        self.uploaded: Optional[bytes] = None
+        self.upload_destination: Optional[Text] = None
+
+    async def upload(self, *args: Any, **kwargs: Any) -> None:
+        """Read the source off disk and record what the server received.
+
+        Args:
+            args: ``(source, destination)`` in ``aioftp``'s order --
+                for an upload, source is **local**.
+            kwargs: Transfer options, unused.
+
+        Returns:
+            None, as ``aioftp`` does.
+
+        Raises:
+            FileNotFoundError: If the source operand names nothing on
+                the local disk -- which is what a real ``upload`` does,
+                and is the honest-failure half of AGW-33.
+        """
+        await self._invoked('upload', args)
+        source, destination = args[0], args[1]
+        self.uploaded = Path(source).read_bytes()
+        self.upload_destination = str(destination)
+
+
+class HostileFTPServer(RecordingFTPClient):
+    """A server whose directory listing carries an escaping entry name.
+
+    R22's Description says the remote server supplies the entry names on
+    a recursive download, so this supplies them -- including one
+    containing ``../``, which is exactly what it warns about.
+
+    Only the **wire** is faked. The four coroutines replaced here are
+    the ones that would talk to a socket; the recursion, the
+    ``name.relative_to(source)`` arithmetic and every write stay
+    ``aioftp.Client.download``'s own real code. That is what makes the
+    escape this drives a real escape rather than a modelled one:
+    measured against the unfixed library, the hostile entry landed
+    outside the target directory at mode 0644.
+
+    Attributes:
+        listing: What ``list`` reports for the root, as
+            ``(entry path, kind)`` pairs.
+        contents: The bytes each file path yields.
+    """
+
+    #: The remote directory a test asks to download.
+    ROOT: Text = '/pub/data'
+
+    def __init__(
+        self,
+        listing: Sequence[tuple[Text, Text]],
+        contents: Mapping[Text, bytes],
+    ) -> None:
+        """Build a server presenting one directory.
+
+        Args:
+            listing: The entries the server claims the root holds.
+            contents: The bytes behind each file path.
+        """
+        super().__init__()
+        self.listing = list(listing)
+        self.contents = dict(contents)
+
+    async def download(self, *args: Any, **kwargs: Any) -> None:
+        """Run ``aioftp``'s **real** recursive download over this listing.
+
+        The one method that must not be a recording stub. Everything
+        R22's threat model is about happens inside
+        ``aioftp.Client.download`` -- the recursion over the listing,
+        the ``name.relative_to(source)`` arithmetic, the ``path_io``
+        writes -- so a double that recorded the call and returned would
+        assert nothing about where a hostile entry name lands.
+
+        The real method is bound to *this* object, so its four wire
+        coroutines resolve to the fakes above and everything else is
+        aioftp's own code. :attr:`path_io` is whatever
+        :class:`FTPContextDouble` read off the client's own
+        ``path_io_factory`` keyword -- so if the code under test ever
+        stopped passing one, the containment would vanish here exactly
+        as it would in production.
+
+        Args:
+            args: ``(source, destination)`` -- remote first, for a
+                download.
+            kwargs: ``write_into`` and the block size.
+
+        Returns:
+            None, as ``aioftp`` does.
+        """
+        await self._invoked('download', args)
+        await aioftp.Client.download(self, *args, **kwargs)
+
+    @classmethod
+    def harmless_only(cls) -> 'HostileFTPServer':
+        """Return a server whose listing is entirely well-behaved.
+
+        Returns:
+            The control server, for asserting that containment does not
+            break an ordinary transfer.
+        """
+        return cls(
+            [(f'{cls.ROOT}/harmless.txt', 'file')],
+            {f'{cls.ROOT}/harmless.txt': HARMLESS_CONTENT},
+        )
+
+    @classmethod
+    def with_escaping_entry(cls, sibling: Text) -> 'HostileFTPServer':
+        """Return a server that also lists an entry name containing ``../``.
+
+        Args:
+            sibling: The name of the directory beside the download
+                target that the escape aims at.
+
+        Returns:
+            A server whose listing carries one harmless entry and one
+            that walks out of the destination.
+        """
+        escaping = f'{cls.ROOT}/../{sibling}/OWNED'
+        return cls(
+            [
+                (f'{cls.ROOT}/harmless.txt', 'file'),
+                (escaping, 'file'),
+            ],
+            {
+                f'{cls.ROOT}/harmless.txt': HARMLESS_CONTENT,
+                escaping: ESCAPED_CONTENT,
+            },
+        )
+
+    async def is_file(self, path: Any) -> bool:
+        """Report whether the server calls a remote path a file.
+
+        Args:
+            path: The remote path.
+
+        Returns:
+            True when the server has contents for it.
+        """
+        return str(PurePosixPath(path)) in self.contents
+
+    async def is_dir(self, path: Any) -> bool:
+        """Report whether the server calls a remote path a directory.
+
+        Args:
+            path: The remote path.
+
+        Returns:
+            True for the root, which is the only directory served.
+        """
+        return str(PurePosixPath(path)) == self.ROOT
+
+    async def list(self, path: Any, **kwargs: Any) -> list[Any]:
+        """Return the entries the server claims a directory holds.
+
+        Args:
+            path: The directory listed.
+            kwargs: ``aioftp``'s listing options, unused.
+
+        Returns:
+            ``(path, info)`` pairs in ``aioftp``'s own shape, entry
+            names verbatim -- a hostile one included.
+        """
+        return [
+            (PurePosixPath(name), {'type': kind})
+            for name, kind in self.listing
+        ]
+
+    def download_stream(self, path: Any, **kwargs: Any) -> Any:
+        """Open a byte stream over one remote file.
+
+        Args:
+            path: The remote file.
+            kwargs: ``aioftp``'s stream options, unused.
+
+        Returns:
+            An async context manager yielding a block iterator.
+        """
+        return _byte_stream(self.contents[str(PurePosixPath(path))])
+
+
+@asynccontextmanager
+async def _byte_stream(data: bytes) -> AsyncIterator[Any]:
+    """Yield ``data`` in the shape ``aioftp``'s download stream has.
+
+    Args:
+        data: The file's contents.
+
+    Yields:
+        An object with ``aioftp``'s ``iter_by_block``.
+    """
+    class Stream:
+        """One remote file's bytes, block by block."""
+
+        async def iter_by_block(self, size: int = 8192) -> AsyncIterator[
+                bytes]:
+            """Yield the file in blocks.
+
+            Args:
+                size: The block size, unused -- the payloads here are
+                    small enough to arrive in one.
+
+            Yields:
+                The file's bytes.
+            """
+            yield data
+
+    yield Stream()
+
+
 class RefusingContext:
     """An async context manager whose entry raises a given error.
 
@@ -264,6 +515,17 @@ class FTPContextDouble:
         self.calls.append((args, dict(kwargs)))
         if self.connect_error is not None:
             return RefusingContext(self.connect_error)
+        # Build the client's path layer out of the factory the code
+        # under test actually passed, and give it to the double. A
+        # server that runs aioftp's real `download` needs a real
+        # `path_io` to write through -- and taking it from the recorded
+        # keyword rather than constructing one here is what makes the
+        # containment claim a claim about the *library's* configuration:
+        # if `ftp_client` stopped passing a factory, the fallback below
+        # is aioftp's own uncontained default and the escape rows go
+        # red, exactly as they would in production.
+        factory = kwargs.get('path_io_factory', aioftp.pathio.PathIO)
+        self.client.path_io = factory(timeout=kwargs.get('path_timeout'))
         return _entered(self.client)
 
     @property

@@ -70,6 +70,9 @@ rather than a mapping shaped like what the client hoped to find.
 """
 
 import inspect
+import logging
+import os
+import posixpath
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,6 +122,321 @@ SYMLINK_ATTRS = asyncssh.SFTPAttrs(
 # all, since ``SFTPAttrs.__str__`` omits an unknown file type.
 UNPARSEABLE_ATTRS = asyncssh.SFTPAttrs()
 TYPELESS_ATTRS = asyncssh.SFTPAttrs(size=12, permissions=0o100644)
+
+# `_begin_copy`'s positional options after `copy_type`/`expand_glob`,
+# in its own order, and what each is when the caller named nothing.
+# Read off the real `get` signature rather than restated, so a release
+# that reorders or renames one is a loud failure here rather than a
+# silent misattribution in a recorded call.
+COPY_OPTION_NAMES: tuple[str, ...] = (
+    'preserve',
+    'recurse',
+    'follow_symlinks',
+    'sparse',
+    'block_size',
+    'max_requests',
+    'progress_handler',
+    'error_handler',
+)
+COPY_OPTION_DEFAULTS: Mapping[str, Any] = {
+    name: inspect.signature(
+        asyncssh.SFTPClient.get).parameters[name].default
+    for name in COPY_OPTION_NAMES
+}
+
+# One remote tree a hostile server can present, keyed by byte path:
+# `{path: (attrs, [(entry name, attrs), ...], contents)}`. Entry names
+# are what `scandir` yields, and nothing constrains them -- which is
+# the whole point: a name containing `../` is exactly what R22's
+# Description says a server may emit.
+RemoteTree = Mapping[bytes, tuple[asyncssh.SFTPAttrs,
+                                  Sequence[tuple[bytes, asyncssh.SFTPAttrs]],
+                                  bytes]]
+
+
+def _normalised(options: Sequence[Any]) -> list[Any]:
+    """Resolve the ``<= 0`` sentinels the real ``_begin_copy`` resolves.
+
+    ``block_size`` and ``max_requests`` default to ``-1``, meaning "pick
+    one from the transports' limits", and it is the real
+    ``_begin_copy`` -- not ``_copy`` -- that does the picking. This
+    double replaces ``_begin_copy``, so it inherits that job: passing
+    ``-1`` straight through makes the copier ask for a zero-length
+    range and write an **empty file**, which would quietly turn every
+    download assertion into a vacuous one.
+
+    Args:
+        options: ``_begin_copy``'s positional options, in its own order.
+
+    Returns:
+        The same options with the two sentinels resolved.
+    """
+    resolved = list(options)
+    block = COPY_OPTION_NAMES.index('block_size')
+    requests = COPY_OPTION_NAMES.index('max_requests')
+    if resolved[block] <= 0:
+        resolved[block] = asyncssh.sftp.MAX_SFTP_READ_LEN
+    if resolved[requests] <= 0:
+        resolved[requests] = 16
+    return resolved
+
+
+def remote_file(contents: bytes) -> asyncssh.SFTPAttrs:
+    """Return the attributes a server reports for a file of some size.
+
+    Args:
+        contents: The bytes the file holds.
+
+    Returns:
+        Real ``SFTPAttrs``, so ``_copy`` branches on the same typed
+        field it branches on in production.
+    """
+    return asyncssh.SFTPAttrs(
+        type=asyncssh.FILEXFER_TYPE_REGULAR,
+        size=len(contents),
+        permissions=0o100644)
+
+
+#: The remote directory the tree below is rooted at.
+REMOTE_TREE_ROOT: str = '/pub/data'
+
+#: Payloads distinguishable on sight, because every defect these
+#: witness is "the right operation moved the wrong bytes". AGW-33's
+#: killer assertion compares the first two, so they must never be equal.
+LOCAL_CONTENT: bytes = b'the file the caller meant'
+REMOTE_CONTENT: bytes = b'the old remote copy'
+HARMLESS_CONTENT: bytes = b'an ordinary file from an ordinary server'
+ESCAPED_CONTENT: bytes = b'written outside the directory you named'
+
+
+def hostile_tree(
+    *,
+    escape: Optional[str] = None,
+    symlink: Optional[str] = None,
+) -> RemoteTree:
+    """Build the tree a server presents to a recursive download.
+
+    Always carries one harmless file, so a test can tell "the transfer
+    ran and the escape was refused" from "nothing happened at all".
+
+    Args:
+        escape: An entry name to add verbatim, typically containing
+            ``../``. asyncssh's ``_copy`` filters a name that is ``.``
+            or ``..`` *exactly* and then ``posixpath.join``s it, so a
+            name that merely **contains** a separator composes straight
+            through -- which is the defect. None omits the row.
+        symlink: A link target the server claims for an entry named
+            ``link``, or None for no link at all.
+
+    Returns:
+        The tree, keyed by byte path.
+    """
+    root = os.fsencode(REMOTE_TREE_ROOT)
+    harmless = posixpath.join(root, b'harmless.txt')
+    entries: list[tuple[bytes, asyncssh.SFTPAttrs]] = [
+        (b'harmless.txt', remote_file(HARMLESS_CONTENT)),
+    ]
+    tree: dict[bytes, Any] = {
+        root: (DIRECTORY_ATTRS, entries, b''),
+        harmless: (remote_file(HARMLESS_CONTENT), [], HARMLESS_CONTENT),
+    }
+    if escape is not None:
+        name = os.fsencode(escape)
+        entries.append((name, remote_file(ESCAPED_CONTENT)))
+        tree[posixpath.join(root, name)] = (
+            remote_file(ESCAPED_CONTENT), [], ESCAPED_CONTENT)
+    if symlink is not None:
+        entries.append((b'link', SYMLINK_ATTRS))
+        tree[posixpath.join(root, b'link')] = (
+            SYMLINK_ATTRS, [], os.fsencode(symlink))
+    return tree
+
+
+class RemoteTreeFS:
+    """The remote half of a transfer: whatever a server chooses to say.
+
+    Implements the small structural filesystem protocol asyncssh's
+    ``_copy`` calls on its *source*, backed by a dict instead of a
+    socket. Only the wire is faked -- every decision about what the
+    entry names mean, and where they compose to, stays asyncssh's.
+
+    Attributes:
+        tree: The directory structure this server presents.
+    """
+
+    limits = asyncssh.sftp.SFTPLimits(0, 32768, 32768, 0)
+
+    def __init__(self, tree: RemoteTree) -> None:
+        """Hold the tree this server answers from.
+
+        Args:
+            tree: The structure to present.
+        """
+        self.tree = tree
+
+    def encode(self, path: Any) -> bytes:
+        """Encode a path the way asyncssh's remote side encodes one.
+
+        Args:
+            path: The path to encode.
+
+        Returns:
+            The encoded path.
+        """
+        return path if isinstance(path, bytes) else os.fsencode(str(path))
+
+    @staticmethod
+    def basename(path: bytes) -> bytes:
+        """Return the final component of a remote path.
+
+        Args:
+            path: The path to take the basename of.
+
+        Returns:
+            Its final component.
+        """
+        return posixpath.basename(path)
+
+    def compose_path(
+        self,
+        path: bytes,
+        parent: Optional[bytes] = None,
+    ) -> bytes:
+        """Join a name onto a remote parent directory.
+
+        Args:
+            path: The name to join.
+            parent: The directory to join it onto, or None.
+
+        Returns:
+            The composed path.
+        """
+        path = self.encode(path)
+        return posixpath.join(parent, path) if parent else path
+
+    async def stat(
+        self,
+        path: bytes,
+        *,
+        follow_symlinks: bool = True,
+    ) -> asyncssh.SFTPAttrs:
+        """Return what this server says about a path.
+
+        Args:
+            path: The path to describe.
+            follow_symlinks: Unused; this server presents no links.
+
+        Returns:
+            The configured attributes.
+        """
+        return self.tree[path][0]
+
+    async def isdir(self, path: bytes) -> bool:
+        """Report whether this server calls a path a directory.
+
+        Args:
+            path: The path to test.
+
+        Returns:
+            True when it is a directory.
+        """
+        return (self.tree[path][0].type
+                == asyncssh.FILEXFER_TYPE_DIRECTORY)
+
+    async def scandir(self, path: bytes) -> Any:
+        """Yield the entries this server claims a directory holds.
+
+        Args:
+            path: The directory to scan.
+
+        Yields:
+            One ``SFTPName`` per configured entry, name verbatim --
+            including one containing ``../``, which is what a hostile
+            server sends and what ``_copy`` must not compose through.
+        """
+        for name, attrs in self.tree[path][1]:
+            yield asyncssh.sftp.SFTPName(name, attrs=attrs)
+
+    async def readlink(self, path: bytes) -> bytes:
+        """Return the link target this server claims for a path.
+
+        Args:
+            path: The remote link.
+
+        Returns:
+            The target string, verbatim -- the server chooses it, and
+            nothing constrains where it points.
+        """
+        return self.tree[path][2]
+
+    async def open(
+        self,
+        path: bytes,
+        mode: str,
+        block_size: int = -1,
+    ) -> Any:
+        """Open a remote file for reading.
+
+        Args:
+            path: The remote path.
+            mode: The mode asyncssh asked for, unused.
+            block_size: Unused.
+
+        Returns:
+            A reader over the configured contents.
+        """
+        return _RemoteFile(self.tree[path][2])
+
+
+class _RemoteFile:
+    """One remote file being read, as asyncssh's copier expects it."""
+
+    def __init__(self, data: bytes) -> None:
+        """Hold the bytes this file yields.
+
+        Args:
+            data: The file's contents.
+        """
+        self.data = data
+
+    def request_ranges(self, offset: int, length: int) -> Any:
+        """Return the ranges holding data, as one whole range.
+
+        Args:
+            offset: Where to start.
+            length: How much to cover.
+
+        Returns:
+            An async iterator over the single range.
+        """
+        async def ranges() -> Any:
+            """Yield the one range this file has.
+
+            Yields:
+                The ``(offset, length)`` pair.
+            """
+            yield offset, length
+
+        return ranges()
+
+    async def read(self, size: int, offset: int) -> Optional[bytes]:
+        """Read from the file.
+
+        Args:
+            size: How many bytes to read.
+            offset: Where to read from.
+
+        Returns:
+            The bytes, or None at end of file.
+        """
+        return self.data[offset:offset + size] or None
+
+    async def close(self) -> None:
+        """Close the file.
+
+        Returns:
+            None.
+        """
 
 
 @dataclass(frozen=True)
@@ -283,7 +601,25 @@ class StubSFTPClient:
     that no option leaked into it from an earlier call. Every operation is
     bound against the real method's signature first, so an argument the
     library would refuse is refused here too.
+
+    Attributes:
+        version: The SFTP protocol version ``_copy`` reads off its
+            client to choose an error class.
+        supports_remote_copy: Read by ``_copy`` on the remote-to-remote
+            path, which no download takes.
+        logger: Where ``_copy`` writes its progress lines.
     """
+
+    version = 3
+    supports_remote_copy = False
+    logger = logging.getLogger('tests.fixtures.sftp')
+
+    #: asyncssh's own recursion, bound to this double. ``_copy`` calls
+    #: ``self._copy`` for each subdirectory, so it has to be reachable
+    #: as an attribute here and not merely invoked once from outside --
+    #: otherwise only the top level of a tree is ever real, which is the
+    #: one level a traversal test does not care about.
+    _copy = asyncssh.SFTPClient._copy
 
     def __init__(
         self,
@@ -292,6 +628,7 @@ class StubSFTPClient:
         entries: Sequence[str] = ('f',),
         lstat_error: Optional[BaseException] = None,
         operation_error: Optional[BaseException] = None,
+        remote_tree: Optional[RemoteTree] = None,
     ) -> None:
         """Build an SFTP client double.
 
@@ -310,12 +647,20 @@ class StubSFTPClient:
             operation_error: Raised by whichever operation is invoked, so
                 a test can drive a failure during the transfer or the
                 mutation itself.
+            remote_tree: What a server presents to a *recursive
+                download*. When given, :meth:`_begin_copy` runs
+                asyncssh's real ``_copy`` over it instead of only
+                recording the call, so bytes actually land on disk and a
+                containment claim can be asserted against where they
+                landed. None -- the default -- keeps every existing row
+                recording-only.
         """
         self.calls: list[SFTPCall] = []
         self.attrs = attrs
         self.entries = entries
         self.lstat_error = lstat_error
         self.operation_error = operation_error
+        self.remote_tree = remote_tree
 
     def names(self) -> list[str]:
         """Return the operations invoked, in order.
@@ -404,6 +749,69 @@ class StubSFTPClient:
         """
         await self._invoked('get', args, kwargs)
 
+    async def _begin_copy(
+        self,
+        srcfs: Any,
+        dstfs: Any,
+        srcpaths: Any,
+        dstpath: Any,
+        copy_type: str,
+        expand_glob: bool,
+        *options: Any,
+    ) -> None:
+        """Record a download and run its real local-side effects.
+
+        The private seam local-download containment is installed at
+        (R22/AGW-18). It is doubled rather than the public ``get``
+        because the client now reaches this method for a download -- but
+        *recording* alone would prove nothing about containment, which
+        is a claim about where bytes land, not about which arguments
+        were passed.
+
+        So when the test supplies a :attr:`remote_tree`, this delegates
+        to **asyncssh's own** ``_copy`` with the ``dstfs`` the client
+        chose. That is the real recursion, the real ``posixpath.join``
+        filename arithmetic, and the real filter that drops only an
+        exactly-``.``/``..`` entry name -- so a server-supplied name
+        that *contains* a separator composes through exactly as it does
+        in production, and whether it escapes is decided by the object
+        under test rather than by this double.
+
+        Args:
+            srcfs: The source filesystem; the client passes itself.
+            dstfs: The destination filesystem -- the object whose
+                containment is under test.
+            srcpaths: The remote source operand.
+            dstpath: The local destination operand.
+            copy_type: ``'get'`` or ``'mget'``.
+            expand_glob: Whether the source is a glob pattern.
+            options: ``_begin_copy``'s remaining positional options, in
+                its own order.
+
+        Returns:
+            None.
+
+        Raises:
+            BaseException: ``operation_error``, when one was configured.
+        """
+        await self._invoked(copy_type, (srcpaths, dstpath), {
+            name: value
+            for name, value in zip(COPY_OPTION_NAMES, options)
+            if value != COPY_OPTION_DEFAULTS[name]
+        })
+        if self.remote_tree is None:
+            return
+        source = os.fsencode(srcpaths)
+        await self._copy(
+            RemoteTreeFS(self.remote_tree),
+            dstfs,
+            source,
+            os.fsencode(dstpath),
+            self.remote_tree[source][0],
+            *_normalised(options),
+            False,
+        )
+
     async def put(self, *args: Any, **kwargs: Any) -> None:
         """Accept an upload and report success by not raising.
 
@@ -415,6 +823,24 @@ class StubSFTPClient:
             None, as ``asyncssh`` does.
         """
         await self._invoked('put', args, kwargs)
+
+    async def mput(self, *args: Any, **kwargs: Any) -> None:
+        """Accept a glob upload and report success by not raising.
+
+        Present because AGW-33's operand-order table has to cover the
+        mode R21's allowlist (S19) is about to admit, not only the two
+        dispatched today: ``mput`` carries the identical transposition,
+        and a table proven over ``put`` alone would leave it live on the
+        day it becomes reachable.
+
+        Args:
+            args: The local and remote paths.
+            kwargs: Transfer options such as ``recurse``.
+
+        Returns:
+            None, as ``asyncssh`` does.
+        """
+        await self._invoked('mput', args, kwargs)
 
     async def remove(self, *args: Any, **kwargs: Any) -> None:
         """Delete a remote file, or refuse a directory the way a server does.
@@ -441,6 +867,54 @@ class StubSFTPClient:
         if self.attrs.type == asyncssh.FILEXFER_TYPE_DIRECTORY:
             raise asyncssh.SFTPFailure(
                 'the remove target is a directory, not a file')
+
+
+class TransferringSFTPClient(StubSFTPClient):
+    """A client that actually *moves bytes*, for the operand-order rows.
+
+    AGW-33 transposes two path-like positionals, and neither this
+    module's signature-faithful binding nor a recording double can see
+    that: both operands bind cleanly either way round. Only a test with
+    a modelled filesystem can, by asserting which path was **read** and
+    which was **written**.
+
+    So ``put`` here reads its source operand off the real disk, the way
+    ``asyncssh.SFTPClient.put`` does, and keeps what it read.
+
+    Attributes:
+        uploaded: The bytes the server received, or None.
+        upload_destination: The remote path they were written to.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Build a transferring client double.
+
+        Args:
+            kwargs: Forwarded to :class:`StubSFTPClient`.
+        """
+        super().__init__(**kwargs)
+        self.uploaded: Optional[bytes] = None
+        self.upload_destination: Optional[str] = None
+
+    async def put(self, *args: Any, **kwargs: Any) -> None:
+        """Read the local source and record what reached the server.
+
+        Args:
+            args: ``(localpaths, remotepath)`` in asyncssh's order for
+                this verb -- source is **local**.
+            kwargs: Transfer options.
+
+        Returns:
+            None, as ``asyncssh`` does.
+
+        Raises:
+            FileNotFoundError: If the source operand names nothing
+                locally, which is what a real ``put`` does and is the
+                honest-failure half of AGW-33.
+        """
+        await self._invoked('put', args, kwargs)
+        self.uploaded = Path(args[0]).read_bytes()
+        self.upload_destination = str(args[1])
 
 
 class StubSSHConnection:

@@ -74,6 +74,7 @@ from async_gateway.utils.http_file_config import (
     iter_capped,
     response_too_large,
 )
+from async_gateway.utils.paths import resolve_caller_path, safe_writer
 from async_gateway.utils.redaction import redact_url
 
 #: Where a download lands when the caller names no path. The README
@@ -180,9 +181,22 @@ async def fetch_file(file_config: Dict):
     """Download file from s3 or from given link or.
 
     just read from the local pod file path.
+
+    The HTTP branch writes through
+    :func:`~async_gateway.utils.paths.safe_writer` (R22): the path is
+    canonicalised before the open, ``O_NOFOLLOW`` refuses a symlink at
+    it, the mode is 0600, an existing file is refused unless
+    ``overwrite`` is True, and a failure part-way leaves no partial
+    file. The S3 branch writes inside ``aioboto3`` and is not reachable
+    from here.
+
     :param file_config: Dict contains s3 config,
     download link, local filepath etc.
     file_config[local_filepath] is mandatory
+    :param file_config['overwrite']: optional, default False.
+    :raises PathContainmentError: if ``local_filepath`` is a symbolic
+    link, or names a directory rather than a file.
+    :raises ConfigurationError: if it exists and ``overwrite`` is False.
     """
     if file_config.get('s3_config'):
         await download_file_from_s3(
@@ -192,6 +206,7 @@ async def fetch_file(file_config: Dict):
     elif file_config.get('file_download_path'):
         # Add separate aio params when required
         request_type = file_config.get('request_type', 'get')
+        target = await resolve_caller_path(file_config['local_filepath'])
         async with aiohttp.ClientSession(
                 headers=file_config.get('headers'),
                 timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as session:
@@ -199,8 +214,10 @@ async def fetch_file(file_config: Dict):
             session_obj = request_obj(file_config['file_download_path'])
             async with session_obj as response:
                 contents = await response.content.read()
-                async with aiofiles.open(
-                        file_config['local_filepath'], 'wb') as file_obj:
+                async with safe_writer(
+                    target,
+                    overwrite=file_config.get('overwrite') is True,
+                ) as file_obj:
                     await file_obj.write(contents)
 
 
@@ -239,6 +256,16 @@ async def handle_multipart_response(
     while other requests are in flight suspends this coroutine rather than
     the whole event loop (R20).
 
+    It is opened through
+    :func:`~async_gateway.utils.paths.safe_writer` (R22). This is a
+    caller-supplied path reached from a *response*, and the caller does
+    not choose when a multipart body arrives -- so the same guarantees
+    the streamed download gets apply here: the path is canonicalised
+    before it is opened, ``O_NOFOLLOW`` refuses a symlink planted at it,
+    the mode is 0600, an existing file is refused unless
+    ``download_filepath``'s config carries ``overwrite: True``, and a
+    part that fails mid-read leaves no partial file behind.
+
     The running total is bounded by ``max_response_bytes`` for the same
     reason the other two read paths are (R14): the accumulator below is an
     in-memory list of every part, so an endpoint choosing the body size
@@ -260,14 +287,21 @@ async def handle_multipart_response(
     Raises:
         ResponseTooLargeError: Once the parts read exceed
             ``max_response_bytes``. The remainder of the body is not read.
+        PathContainmentError: If ``download_filepath`` is a symbolic
+            link, or names a directory rather than a file.
+        ConfigurationError: If it exists and the config does not carry
+            ``overwrite: True``.
     """
     config = http_file_download_config or {}
     response_file_name = (
         config.get('download_filepath') or DEFAULT_DOWNLOAD_FILEPATH)
+    target = await resolve_caller_path(response_file_name)
     reader = aiohttp.MultipartReader.from_response(resp)
     parts: List[bytes] = []
     total = 0
-    async with aiofiles.open(response_file_name, 'wb') as response_file:
+    async with safe_writer(
+            target, overwrite=config.get('overwrite') is True
+    ) as response_file:
         while not reader.at_eof():
             part = await reader.next()
             if part is None:
@@ -653,7 +687,18 @@ async def read_response(
         # blocked the event loop once for every chunk of the download, so
         # one large transfer stalled every other request the consuming
         # process had in flight (R20).
-        async with aiofiles.open(filepath, 'wb') as read_file:
+        #
+        # Through `safe_writer` rather than `aiofiles.open` directly
+        # (R22): canonicalised before the open, `O_NOFOLLOW` and mode
+        # 0600 on it, refusing an existing file unless the config asked
+        # to overwrite, and removing what it wrote if the read fails
+        # part-way -- which the cap below makes an ordinary outcome, not
+        # an exotic one.
+        target = await resolve_caller_path(filepath)
+        async with safe_writer(
+            target,
+            overwrite=http_file_download_config.get('overwrite') is True,
+        ) as read_file:
             async for chunk in iter_capped(
                 resp.content,
                 chunk_size=chunk_size,

@@ -44,6 +44,35 @@ as parallel lanes in W22.)*
 
 _None recorded yet._
 
+## Inbound obligations from other stories
+
+### From S18 / AGW-18 (R22, path containment) — landed
+
+S18 did not edit `README.md`: this story owns that file. R22-AC3 and R22-AC6 both require a
+statement **in the README**, so S18 discharges the code half and hands the prose half here. Four
+facts, all of them now true of the shipped code:
+
+- **Downloads refuse to overwrite by default.** `O_EXCL` is the default on every local write; an
+  existing destination raises `ConfigurationError`. Callers re-downloading to a stable path pass
+  `overwrite=True` — available on `download_file_from_url(...)`, in `http_file_download_config`,
+  and in the FTP/SFTP `protocol_info`. **The README's own examples use fixed `/tmp/test.pdf` and
+  `/tmp/temp.png`, which now fail on their second run unless the flag is passed** — so whatever
+  those examples become, they must not silently teach the broken shape.
+- **Downloaded files are created mode 0600**, not at whatever `umask` allows (M18).
+- **A symbolic link at the destination is refused, never followed** — including with
+  `overwrite=True`, which opts into replacing a file and not into following a link.
+- **Platform degradation (R22-AC6).** Where `O_NOFOLLOW` is unavailable the write degrades to an
+  explicit pre-write `lstat` check, which carries a TOCTOU window the flag does not. The criterion
+  says this difference is documented; that sentence belongs in this README.
+
+Two further consumer-visible facts worth a line, both from R22's Edge Cases: a relative
+`local_filepath` resolves against the **process CWD**, and a destination that is itself a directory
+is reported as a directory rather than advising `overwrite=True` (the flag cannot help there).
+
+**Breaking change** (for the CHANGELOG, AGW-31/S31 — also recorded in AGW-18's work log): a second
+download to an existing path previously succeeded and now raises `ConfigurationError` unless
+`overwrite=True`.
+
 ## Work Log
 
 _Empty — opened at stage 1g, before implementation._
