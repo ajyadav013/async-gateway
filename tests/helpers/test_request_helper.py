@@ -63,6 +63,7 @@ from async_gateway.helpers.internal.request_helper import (
 from async_gateway.utils.constants import (
     ALLOWED_SCHEMES,
     CHUNK_SIZE_CONSTANT,
+    CREDENTIAL_HEADERS,
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
 )
@@ -77,6 +78,7 @@ from async_gateway.utils.http_file_config import (
     guard_declared_length,
     iter_capped,
 )
+from async_gateway.utils.redaction import SENSITIVE_HEADERS
 
 from tests.fixtures.http_server import RecordingHTTPServer, ResponseSpec
 
@@ -1869,6 +1871,51 @@ def test_a_cross_origin_hop_drops_every_credential_header() -> None:
 def test_credential_stripping_is_case_insensitive() -> None:
     """Header names are case-insensitive, and a leak must not hinge on it."""
     assert without_credentials({'AUTHORIZATION': 'Bearer secret'}) == {}
+
+
+def test_anything_the_envelope_redacts_a_cross_origin_hop_strips() -> None:
+    """The invariant, not the header names -- the drift *was* the leak.
+
+    Two lists answered the same question for two surfaces:
+    ``SENSITIVE_HEADERS`` decided what the envelope masks,
+    ``CREDENTIAL_HEADERS`` decided what a cross-origin hop strips. Kept
+    as independent literals they diverged, and the divergence was H1 --
+    ``x-api-key`` had been in the redaction set all along, so the library
+    returned ``X-Api-Key: ***redacted***`` to the caller while forwarding
+    ``APIKEYSECRET`` to whatever host a hostile ``Location`` named.
+    Redacting a value asserts it is secret; forwarding it denies that.
+
+    This asserts the *relation* rather than today's membership, so a
+    header added to either set tomorrow is covered without anyone
+    remembering this test exists. A test naming the five headers would
+    have passed throughout the window in which H1 was exploitable.
+    """
+    sent = {name: f'{name}-secret' for name in SENSITIVE_HEADERS}
+
+    assert without_credentials(sent) == {}
+    assert SENSITIVE_HEADERS <= CREDENTIAL_HEADERS
+
+
+def test_a_cross_origin_hop_strips_the_common_bearer_token_headers(
+) -> None:
+    """The headers H1 measured leaking, named so the fix cannot regress.
+
+    The invariant above cannot cover these on its own: ``api-key``,
+    ``x-auth-token``, ``x-amz-security-token`` and ``x-csrf-token`` are
+    not in the redaction set, so only naming them proves they are
+    stripped. Each is a bearer token in the plain sense -- holding it is
+    enough to act as the caller.
+    """
+    sent = {
+        'X-Api-Key': 'APIKEYSECRET',
+        'X-Amz-Security-Token': 'AWSSECRET',
+        'X-Auth-Token': 'AUTHTOKSECRET',
+        'Api-Key': 'APIKEY2SECRET',
+        'X-Csrf-Token': 'CSRFSECRET',
+        'Accept': 'application/json',
+    }
+
+    assert without_credentials(sent) == {'Accept': 'application/json'}
 
 
 #: A body that survives being sent twice, and two that do not. ``b'x'``

@@ -1023,10 +1023,134 @@ def test_normalise_param_names_fails_safe_on_every_shape(
 
 
 def test_redact_url_returns_a_url_it_cannot_parse_unchanged() -> None:
-    """Diagnostic data is kept: the URL is not a security boundary."""
+    """Diagnostic data is kept: the URL is not a security boundary.
+
+    Kept, now, is not the same as echoed -- an unparseable URL carrying a
+    credential is masked by the test below. This one holds the other half
+    of that bargain: one carrying *no* credential still comes back whole,
+    so the fallback did not turn a diagnostic into a row of asterisks.
+    """
     unparseable = 'http://[oops'
 
     assert redact_url(unparseable) == unparseable
+
+
+def test_redact_url_masks_userinfo_in_a_url_it_cannot_parse() -> None:
+    """The unparseable URL is the *most* exposed one, not an obscure one.
+
+    ``redact_url`` echoed its input on a parse failure, and M1/AGW-34
+    accepted that only on the condition that no caller-visible surface
+    reached it uncomposed. The condition was false: ``validated_url``
+    builds its "url is not parseable" message with this function, so the
+    single input that reaches this branch is by definition the one the
+    caller is about to be shown. The unclosed IPv6 bracket is what
+    defeats ``urlsplit``; the fallback is regex and does not care.
+    """
+    unparseable = 'http://user:SUPERSECRET123@[::1/p'
+
+    masked = redact_url(unparseable)
+
+    assert 'SUPERSECRET123' not in masked
+    assert masked == f'http://user:{REDACTED}@[::1/p'
+
+
+def test_redact_url_masks_a_sensitive_pair_in_a_url_it_cannot_parse(
+) -> None:
+    """The fallback carries the query rule into the failure path too.
+
+    Not only userinfo: a URL that fails to parse can carry its secret in
+    a query parameter just as readily, and the branch that gave up on
+    one gave up on both.
+    """
+    unparseable = 'http://[::1/p?api_key=QUERYSECRET'
+
+    masked = redact_url(unparseable)
+
+    assert 'QUERYSECRET' not in masked
+    assert masked == f'http://[::1/p?api_key={REDACTED}'
+
+
+@pytest.mark.parametrize(
+    'text, expected',
+    [
+        pytest.param(
+            'https://user:PASS@host/p',
+            'https://host/p',
+            id='parseable-url-loses-userinfo-to-the-third-pass'),
+        pytest.param(
+            'RetriesExhausted: http://u:PASS@h/p failed, retrying',
+            'RetriesExhausted: http://h/p failed, retrying',
+            id='inside-prose'),
+        pytest.param(
+            "see http://user:PA'SS@host/p here",
+            'see http://host/p here',
+            id='password-holding-a-quote'),
+        pytest.param(
+            'see http://user:PA"SS@host/p here',
+            'see http://host/p here',
+            id='password-holding-a-double-quote'),
+        pytest.param(
+            'error: http://user:UNPARSESECRET@[::1/p failed',
+            f'error: http://user:{REDACTED}@[::1/p failed',
+            id='unparseable-url-keeps-the-shape-and-masks'),
+        pytest.param(
+            'error: http://BARETOKEN@[::1/p failed',
+            f'error: http://{REDACTED}@[::1/p failed',
+            id='bare-userinfo-is-masked-whole'),
+        pytest.param(
+            'no scheme here user:PASS@host',
+            'no scheme here user:PASS@host',
+            id='an-email-shaped-string-is-not-userinfo'),
+    ],
+)
+def test_redact_text_masks_url_userinfo(text: str, expected: str) -> None:
+    """Userinfo is invisible to a query-pair rule, so it needs its own.
+
+    It carries no ``?`` and no ``=``, and ``redact_text`` is the masker
+    the three surfaces that get no second pass rely on:
+    ``error['message']``, ``error['cause']`` and the logged traceback.
+
+    The embedded-URL pass already covered the *plain* case, and the
+    first two rows are it working -- it drops userinfo outright, which
+    is stronger than masking. The two rows that earn this pass are the
+    ones that pass cannot reach. ``_EMBEDDED_URL`` stops at a quote and
+    a backtick, so a password containing one truncates the match before
+    the ``@`` and the tail is left in the clear; ``urlsplit`` gives up
+    on the unclosed bracket entirely. Both were measured leaking with
+    this pass disabled.
+
+    The last row is the bound: a rule that fired without a scheme would
+    mask every ``user@host`` in prose, so the scheme is required.
+    """
+    assert redact_text(text) == expected
+
+
+def test_redact_text_masks_a_pair_after_a_legacy_semicolon_separator(
+) -> None:
+    """``;`` separates query parameters too, and servers still read it.
+
+    Once recommended by HTML 4.01 and still parsed by PHP and servlet
+    containers, so ``?a=1;api_key=S`` is two parameters to the server
+    that receives it and the second is secret. The pair rule split on
+    ``?`` and ``&`` alone, so the secret stayed in the clear in
+    ``error['message']`` and the logged traceback (L1).
+    """
+    text = 'GET failed for host/p?a=1;api_key=LEGACYSECRET now'
+
+    masked = redact_text(text)
+
+    assert 'LEGACYSECRET' not in masked
+    assert masked == f'GET failed for host/p?a=1;api_key={REDACTED} now'
+
+
+def test_redact_text_keeps_the_semicolon_it_masks_after() -> None:
+    """Masking reports what was sent; it does not rewrite it to ``&``.
+
+    A caller reading the redacted string is reading a record of their own
+    request, so normalising the separator would misreport it.
+    """
+    assert redact_text('?token=A;api_key=B') == (
+        f'?token={REDACTED};api_key={REDACTED}')
 
 
 def test_redact_url_leaves_a_url_with_nothing_to_mask_alone() -> None:
