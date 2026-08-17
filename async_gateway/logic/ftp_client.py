@@ -258,8 +258,28 @@ def transport_error_for(
 class FTPRequest(BaseRequestClass):
     """Implements Aioftp to make ftp calls."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        """Initialize the ftp request class."""
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Build an FTP request from a validated ``protocol_info``.
+
+        Reads the FTP-specific keys off ``self.info`` once, here, so the
+        transfer methods below read attributes rather than re-reading the
+        caller's mapping and disagreeing about its defaults.
+
+        Args:
+            *args: Forwarded verbatim to :class:`BaseRequestClass` --
+                ``url``, ``auth``, ``response`` and ``info``, in that
+                order.
+            **kwargs: Forwarded verbatim to the base, which requires
+                ``redact_params`` keyword-only.
+
+        Raises:
+            ConfigurationError: From the base, if ``info`` is neither
+                None nor a mapping, or omits a key this protocol
+                requires. FTP's own ``command`` is deliberately *not*
+                checked here: it is validated once the request runs,
+                because ``protocol_info`` is optional for this protocol
+                and the object must stay constructible without one.
+        """
         super(FTPRequest, self).__init__(*args, **kwargs)
 
         self.port: int = self.info.get('port', DEFAULT_FTP_PORT)

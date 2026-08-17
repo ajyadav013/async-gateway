@@ -726,8 +726,21 @@ class HttpRequest(BaseRequestClass):
     REQUIRED_INFO_KEYS: ClassVar[frozenset[Text]] = frozenset(
         {'request_type'})
 
-    def __init__(self, *args, **kwargs) -> None:
-        """Initializing the http request class.
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Build an HTTP request from a validated ``protocol_info``.
+
+        Every caller-supplied value this protocol accepts is validated
+        here, at construction, rather than at dispatch: a configuration
+        error raised before the request goes out escapes to the caller as
+        an exception, where one raised during it would become an
+        ``ok=False`` envelope a retry loop would re-attempt.
+
+        Args:
+            *args: Forwarded verbatim to :class:`BaseRequestClass` --
+                ``url``, ``auth``, ``response`` and ``info``, in that
+                order.
+            **kwargs: Forwarded verbatim to the base, which requires
+                ``redact_params`` keyword-only.
 
         Raises:
             ConfigurationError: If ``protocol_info`` cannot form a valid

@@ -331,11 +331,11 @@ async def download_file_from_url(
         file_download_path: Text,
         local_filepath: Text,
         request_type: Text = 'get',
-        headers=None,
+        headers: Optional[Mapping[Text, Text]] = None,
         timeout: Optional[float] = None,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
         chunk_size: int = CHUNK_SIZE_CONSTANT,
-        overwrite: bool = False, **kwargs):
+        overwrite: bool = False, **kwargs: Any) -> None:
     """Download File from url.
 
     The session carries an explicit ``timeout``: without one ``aiohttp``
@@ -435,7 +435,8 @@ async def download_file_from_url(
                     await file_obj.write(chunk)
 
 
-async def delete_local_file_path(local_filepath: Text, **kwargs) -> None:
+async def delete_local_file_path(
+        local_filepath: Text, **kwargs: Any) -> None:
     """Delete a downloaded file, succeeding when it is already gone.
 
     The unlink goes through ``aiofiles.os`` rather than ``os.remove``:

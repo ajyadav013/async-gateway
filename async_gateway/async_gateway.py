@@ -213,10 +213,10 @@ async def request(
         data: Optional[Union[Dict, Text]] = None,
         auth: object = None,
         protocol: Text = '',
-        protocol_info: Dict = None,
-        pre_processor_config: Dict = None,
-        post_processor_config: Dict = None,
-        **kwargs
+        protocol_info: Optional[Dict[Text, Any]] = None,
+        pre_processor_config: Optional[Dict[Text, Any]] = None,
+        post_processor_config: Optional[Dict[Text, Any]] = None,
+        **kwargs: Any,
 ) -> GatewayResponse:
     """Multiple protocols.
 
@@ -292,6 +292,10 @@ async def request(
     } Optional
     :param post_processor_config: Expects Dict
     {"function": function_address, "params": {"param1": value1}} Optional
+    :param kwargs: Accepted and ignored. Present so a caller passing a
+        keyword this version does not read gets the call it asked for
+        rather than a ``TypeError``; every option this library acts on is
+        named above or lives inside ``protocol_info``.
     :returns GatewayResponse: the same key set for every protocol, on both
         the success and the failure path. Check ``result['ok']`` -- it is
         the only success predicate, and it is False for every failure.
