@@ -27,6 +27,25 @@ the one the caller is about to be told about by name, so the failure path
 is the *most* exposed surface rather than an obscure one. It now falls
 back to the regex passes, which need no parse to succeed.
 
+The userinfo rule has the same history for the same reason, and its
+fourth round is what settled it. Each round, a hand-rolled recogniser
+here decided where an authority begins and a URL parser decided
+differently -- ``%2F``, then a tab, then a backslash, then whitespace --
+and each fix taught the recogniser the reported spelling while leaving the
+disagreement itself in place, so the next spelling was always available.
+Two independent readings of one string will always have a fifth. So they
+are no longer independent: ``_parser_view`` deletes exactly what
+``urllib.parse`` deletes, from ``urllib.parse``'s own constant, before
+the scan runs. The offsets scanned are the offsets the parser will walk,
+and the two cannot disagree by construction rather than by having
+remembered enough examples.
+
+Where the *parsers themselves* disagree -- ``aiohttp`` finds an authority
+in ``http: //u:PW@h/p`` where ``urlsplit`` finds a path -- no
+normalisation can reconcile them, so the separator run accepts every
+spelling and masks on any reading. That is the fail-closed direction this
+module errs in throughout.
+
 That query-pair rule asks nothing about the string around it, and the
 asking is what it replaces. A predicate classifying "is this a URL?"
 failed open three times on one leak: it first demanded a scheme *and* a
@@ -42,9 +61,10 @@ errs in too.
 """
 
 import re
+import urllib.parse as _parse
 from bisect import bisect_left
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from typing import Any, Final
+from typing import Any, Final, Optional
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from aiohttp import BasicAuth
@@ -140,29 +160,75 @@ _QUERY_PAIR: Final[re.Pattern[str]] = re.compile(
 # no `:`. 32 characters is far longer than any registered scheme.
 #
 # `//` is the separator RFC 3986 gives; every other spelling is what
-# group 2 exists to consume -- `/\/`, `\\`, `///`, or nothing at all. A
-# browser and `urlsplit` disagree about which of those introduce an
-# authority, and that disagreement is precisely the defect, so this
-# takes no side and accepts them all. The percent-encoded forms are
-# there because a *round trip* reintroduces them: `aiohttp` normalises
-# the backslash in `http:/\/user:PW@host/p` to `%5C`, and it is that
-# spelling -- `http:///%5C/user:PW@host/p` -- which reaches
-# `error['message']`, `error['cause']` and the logged traceback. Masking
-# one spelling and not the other would mask the URL the caller wrote and
-# publish the one the library reports.
+# group 2 exists to consume -- `/\/`, `\\`, `///`, ` //`, or nothing at
+# all. A browser, `yarl` and `urlsplit` disagree about which of those
+# introduce an authority, and that disagreement is precisely the defect,
+# so this takes no side and accepts them all.
+#
+# Whitespace is in the set because the two readings genuinely differ on
+# it and one of them leaks: `urlsplit` reads the space in
+# `http: //user:PW@host/p` as the start of a *path* and reports no
+# password, while `aiohttp` round-trips the same string to
+# `http:///%20//user:PW@host/p` and puts the password in the envelope
+# `url`, `extra['url']` and the logged traceback (NEW-M1c).
+_AUTHORITY_SEPARATORS: Final[str] = '/\\ \t\n\r\v\f'
+
+# Each separator in *both* spellings it can reach this module in: the
+# character, and its percent-encoded form, which is what a round trip
+# through `aiohttp` produces -- the backslash in `http:/\/user:PW@host/p`
+# arrives back as `http:///%5C/user:PW@host/p`, and the space as `%20`.
+# Masking one spelling and not the other masks the URL the caller wrote
+# and publishes the one the library reports.
+#
+# Generated from the set rather than written out, and that is the whole
+# point of the line. The hand-written alternation it replaces listed
+# `%2F` and `%5C` and not `%20`, so adding the space to the character
+# class above fixed `http: //` and left `http:///%20//` -- the same
+# spelling, after one round trip, still leaking. Deriving both forms from
+# one list makes that class of miss unrepresentable: a separator cannot
+# be half-added.
+#
+# ``(?i:...)`` scopes the case-insensitivity to the escapes alone, so
+# ``%5c`` and ``%5C`` both match while nothing else in the pattern --
+# the scheme run, the character class -- changes meaning.
+_SEPARATOR_RUN: Final[str] = '(?:[{}]|(?i:{}))*'.format(
+    re.escape(_AUTHORITY_SEPARATORS),
+    '|'.join(
+        f'%{ord(char):02x}' for char in sorted(_AUTHORITY_SEPARATORS)),
+)
+
+# What this does **not** do is try to enumerate the characters `urlsplit`
+# *ignores*. That job belongs to `_parser_view` below, which deletes them
+# the way CPython does before this pattern ever runs -- because guessing
+# at them by character class is the mistake that produced four rounds of
+# findings.
 #
 # The run is a group of this pattern rather than a second pattern
 # matched at an offset, because `Pattern.match` returns `Optional` and a
 # run of `*` never fails -- so the None arm would be unreachable code
 # guarded by an untestable branch. A group cannot be absent.
 _SCHEME_PREFIX: Final[re.Pattern[str]] = re.compile(
-    r'([A-Za-z][A-Za-z0-9+.\-]{0,31}:)((?:[/\\]|%2[Ff]|%5[Cc])*)')
+    r'([A-Za-z][A-Za-z0-9+.\-]{0,31}:)(' + _SEPARATOR_RUN + ')')
 
 # The three characters that end an authority in RFC 3986 -- the start of
 # the path, the query, or the fragment. Userinfo cannot reach past one.
 _AUTHORITY_END: Final[frozenset[str]] = frozenset('/?#')
 
 _AT_SIGN: Final[frozenset[str]] = frozenset('@')
+
+# The characters CPython deletes from a URL before parsing it, taken from
+# `urllib.parse` itself rather than restated. They are tab, newline and
+# carriage return -- WHATWG's rule -- and importing the constant is the
+# point of this line: a hand-written copy is a fifth spelling waiting to
+# diverge, which is the entire history of this module.
+#
+# A private name, so it is read defensively: on an interpreter that has
+# renamed or dropped it, the fallback is the same three characters the
+# WHATWG URL standard fixes, and the standard is what CPython is
+# tracking. A test asserts the two agree on this interpreter, so the
+# fallback cannot quietly become the operative value.
+_URL_IGNORED: Final[frozenset[str]] = frozenset(
+    getattr(_parse, '_UNSAFE_URL_BYTES_TO_REMOVE', ('\t', '\n', '\r')))
 
 
 def _offsets_of(text: str, characters: frozenset[str]) -> list[int]:
@@ -183,6 +249,58 @@ def _offsets_of(text: str, characters: frozenset[str]) -> list[int]:
         The offsets, ascending.
     """
     return [offset for offset, char in enumerate(text) if char in characters]
+
+
+def _parser_view(text: str) -> tuple[str, Optional[list[int]]]:
+    """Return ``text`` as ``urlsplit`` sees it, plus the map back to it.
+
+    **This is the fix for the class of defect, not for one more input
+    shape.** Four rounds of findings have now come from the same root
+    cause: a hand-rolled recogniser here deciding where an authority
+    begins, and ``urlsplit`` deciding differently. The scanner and the
+    parser being two independent readings of one string is what
+    guarantees a fifth spelling exists; the only durable answer is to
+    stop having two.
+
+    So the deletion ``urlsplit`` performs is performed here first, from
+    ``urllib.parse``'s own constant. ``http:<TAB>//user:PW@[::1/p``
+    reaches a server as ``http://user:PW@[::1/p`` -- the tab is simply
+    gone -- while the scanner read the ``//`` after it as the start of a
+    *path*, ended the authority before the ``@``, and masked nothing. It
+    now scans the same characters the parser will, so the two cannot
+    disagree about where the credential is (NEW-M1c).
+
+    Masking has to land on the caller's *original* string, though: the
+    returned diagnostic is a record of what they actually passed, and
+    silently deleting the tab from it would misreport that. Hence the
+    map -- offset in the parser's view to offset in the original -- so
+    the scan happens in one coordinate system and the slicing in the
+    other.
+
+    None rather than an identity list when nothing was deleted, which is
+    the overwhelmingly common case and the one whose cost is measured:
+    this runs inside ``log_failure`` on the event loop and a 200 KB
+    traceback would otherwise buy a 200,000-element list to say nothing.
+
+    Args:
+        text: The string about to be scanned for credentials.
+
+    Returns:
+        The text with every character :data:`_URL_IGNORED` deleted, and a
+        list whose *i*-th entry is where view offset *i* sits in the
+        original -- one entry longer than the view, so the end offset
+        maps too. The list is None when nothing was deleted and the two
+        coordinate systems are therefore the same.
+    """
+    if not _URL_IGNORED.intersection(text):
+        return text, None
+    origin = [
+        offset for offset, char in enumerate(text)
+        if char not in _URL_IGNORED
+    ]
+    view = ''.join(text[offset] for offset in origin)
+    origin.append(len(text))
+    return view, origin
 
 
 def _mask_userinfo(text: str) -> str:
@@ -211,15 +329,32 @@ def _mask_userinfo(text: str) -> str:
       rule nor the unparseable fallback ran and the password reached the
       envelope ``url`` and the log record's ``extra['url']`` in the clear
       (NEW-M1b).
+    * ``http:<TAB>//user:SECRETPW@[::1/p`` -- the separator run accepted
+      ``/``, ``\\``, ``%2F`` and ``%5C`` but not whitespace, while
+      ``urlsplit`` *deletes* tab, newline and carriage return before it
+      parses. The scanner therefore read the ``//`` as the start of a
+      path where the parser read an authority, ended before the ``@``,
+      and masked nothing (NEW-M1c).
 
     So this stops asking what a userinfo *looks like*. It takes the two
     facts RFC 3986 fixes -- an authority follows a scheme, and it ends at
     the first ``/``, ``?`` or ``#`` -- and masks up to the **last** ``@``
-    before that end, whatever lies between. Three of the four bypasses
+    before that end, whatever lies between. Three of the five bypasses
     above are characters some class excluded, and there is no class here
     to exclude them from: tab, newline, space, backslash, percent escape
-    and non-ASCII are all simply *inside* the credential. The fourth is
-    answered by accepting any separator run rather than ``//`` alone.
+    and non-ASCII are all simply *inside* the credential.
+
+    The remaining two are the same defect twice: this scanner and
+    ``urlsplit`` reading one string differently, which is guaranteed to
+    keep producing spellings for as long as they are two independent
+    readings. So they are no longer independent. The scan runs over
+    :func:`_parser_view` -- the string with exactly the characters
+    CPython deletes deleted, from ``urllib.parse``'s own constant -- so
+    the offsets this walks are the offsets the parser will walk. That is
+    the structural half; accepting any separator run rather than ``//``
+    alone is the other, and covers the readings that differ without any
+    character being deleted (``aiohttp`` sees an authority in
+    ``http: //u:PW@h/p`` where ``urlsplit`` sees a path).
 
     That is the fail-closed direction, and it is the point: over-masking
     a string that merely looks like an authority costs a diagnostic,
@@ -245,25 +380,30 @@ def _mask_userinfo(text: str) -> str:
 
     Returns:
         ``text`` with every such credential replaced by :data:`REDACTED`,
-        or ``text`` itself when it holds no ``@`` to mask before.
+        or ``text`` itself when it holds no ``@`` to mask before. What
+        comes back is built from the caller's *original* string, deleted
+        characters and all: the parser view exists to decide where the
+        credential is, never to rewrite the diagnostic the caller reads.
     """
     if '@' not in text:
         return text
 
-    ats = _offsets_of(text, _AT_SIGN)
-    ends = _offsets_of(text, _AUTHORITY_END)
+    view, origin = _parser_view(text)
+    ats = _offsets_of(view, _AT_SIGN)
+    ends = _offsets_of(view, _AUTHORITY_END)
     masked: list[str] = []
     read = 0
-    for scheme in _SCHEME_PREFIX.finditer(text):
+    for scheme in _SCHEME_PREFIX.finditer(view):
         # A `scheme:` found *inside* a credential already masked is not a
-        # second authority; `read` is where the last mask ended.
+        # second authority; `read` is where the last mask ended, in view
+        # coordinates like everything else in this loop.
         if scheme.start() < read:
             continue
         start = scheme.end()
         separators = scheme.group(2)
 
         after = bisect_left(ends, start)
-        stop = ends[after] if after < len(ends) else len(text)
+        stop = ends[after] if after < len(ends) else len(view)
         # The last `@` before the authority ends: RFC 3986's rule, and
         # `urlsplit`'s. `bisect_left(ats, stop) - 1` is the last one at
         # or before `stop`; it belongs to *this* authority only if it is
@@ -273,19 +413,33 @@ def _mask_userinfo(text: str) -> str:
             continue
         credential = ats[last]
 
-        userinfo = text[start:credential]
+        userinfo = view[start:credential]
         colon = userinfo.find(':')
-        if colon < 0:
-            if not separators:
-                continue
-            masked.append(text[read:start])
-        else:
-            masked.append(text[read:start + colon + 1])
+        keep_to = start if colon < 0 else start + colon + 1
+        if colon < 0 and not separators:
+            continue
+        # Offsets decided in the view, sliced from the original: the
+        # caller reads back the string they passed, minus the secret.
+        masked.append(text[_at(origin, read):_at(origin, keep_to)])
         masked.append(REDACTED)
         read = credential
 
-    masked.append(text[read:])
+    masked.append(text[_at(origin, read):])
     return ''.join(masked)
+
+
+def _at(origin: Optional[list[int]], offset: int) -> int:
+    """Translate a parser-view offset into an offset in the original.
+
+    Args:
+        origin: The map :func:`_parser_view` returned, or None when it
+            deleted nothing and the two coordinate systems coincide.
+        offset: The offset in the view.
+
+    Returns:
+        The corresponding offset in the original string.
+    """
+    return offset if origin is None else origin[offset]
 
 
 def _mask_in_string(text: str, sensitive: frozenset[str]) -> str:

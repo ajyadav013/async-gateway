@@ -12,19 +12,24 @@ acceptance criterion it proves.
 """
 
 import asyncio
+import itertools
 import json
 import logging
 import re
 import socket
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlsplit
 
 from aiohttp import BasicAuth
 
 from failsafe import RetriesExhausted
 
 import pytest
+
+import yarl
 
 from async_gateway import async_gateway as entrypoint
 from async_gateway.async_gateway import request
@@ -35,6 +40,7 @@ from async_gateway.helpers.common.date_helper import (
     utc_now_iso,
 )
 from async_gateway.logic.http_client import HttpRequest, transport_error_for
+from async_gateway.utils import redaction
 from async_gateway.utils.envelope import (
     GatewayResponse,
     finalise_error,
@@ -1413,6 +1419,290 @@ def test_redact_text_stays_linear_on_a_hostile_string(text: str) -> None:
     started = monotonic_now()
 
     redact_text(text)
+
+    assert elapsed_since(started) < 2.0
+
+
+# --- NEW-M1c: the scanner and the parsers, held to one another -------------
+
+#: The password every generated spelling carries, and the only string
+#: these rows assert the absence of. A userinfo *name* is kept by design
+#: -- a name is diagnostic, a value is not -- so a distinct sentinel for
+#: it is what stops that designed behaviour reading as a leak.
+FUZZ_SECRET = 'FUZZSECRETPW'
+
+#: The pieces every URL spelling is assembled from. Each list is a place
+#: a previous round of findings went wrong, kept as an axis rather than
+#: as one example: schemes carrying a deleted character, separator runs
+#: in raw *and* percent-encoded form, userinfo with an embedded ``@`` or
+#: no username, hosts that make ``urlsplit`` raise, and the three
+#: characters that end an authority.
+FUZZ_SCHEMES = [
+    'http', 'HTTPS', 'a', 'ht\ttp', 'x+y-z.1',
+    # A deleted character at the *end* of the scheme, which is a
+    # different case from one in the middle: `urlsplit` deletes it
+    # and reads a perfectly ordinary `a://user:PW@h/p`, while a
+    # scanner reading the raw string finds no `:` adjacent to the
+    # scheme run at all and masks nothing. It is the one shape that
+    # `_parser_view` alone catches -- the widened separator run does
+    # not reach it -- so without this row that half of the fix has no
+    # failing test behind it.
+    'a\t', 'https\n', 'x\r',
+]
+FUZZ_SEPARATORS = [
+    '', '/', '//', '///', '/\\', '\\\\', '%2F%2F', '%5C%5C',
+    '\t//', ' //', '\n//', '/\t/', '\r\n//', '%2F\t/',
+    '%20//', '%09//', '%0A//', '%0d%0a//', '/%20/', '\x0b//', '\f//',
+    '%2f%5c', ' \t //', '%20%20//',
+]
+FUZZ_USERINFO = [
+    f'user:{FUZZ_SECRET}',
+    f'u:PART@SS{FUZZ_SECRET}',
+    f':{FUZZ_SECRET}',
+    f'us\ter:{FUZZ_SECRET}',
+]
+FUZZ_HOSTS = ['127.0.0.1', '[::1', '[::1]', 'host:1', 'ho\tst']
+FUZZ_TAILS = ['/p', '?a=1', '#f', '']
+
+
+def fuzz_spellings() -> set[str]:
+    """Generate every URL spelling the differential check reads.
+
+    Each assembled spelling is yielded twice: as written, and as
+    ``yarl`` renders it after a round trip. The second is not decoration
+    -- it is the string that actually reaches ``error['message']`` and
+    the logged traceback, and it is a *different* string: ``aiohttp``
+    turns ``http: //u:PW@h/p`` into ``http:///%20//u:PW@h/p``. A fuzz
+    that read only what the caller typed declared the space fixed while
+    the percent-encoded form still leaked, which is exactly what
+    happened while this fix was being written.
+
+    Returns:
+        The distinct spellings to check, de-duplicated.
+    """
+    spellings: set[str] = set()
+    for parts in itertools.product(
+            FUZZ_SCHEMES, FUZZ_SEPARATORS, FUZZ_USERINFO,
+            FUZZ_HOSTS, FUZZ_TAILS):
+        scheme, separators, userinfo, host, tail = parts
+        url = f'{scheme}:{separators}{userinfo}@{host}{tail}'
+        spellings.add(url)
+        try:
+            spellings.add(str(yarl.URL(url)))
+        except (ValueError, UnicodeError):
+            # A spelling neither reader accepts carries no live password
+            # by either reading, so it has nothing to disagree about.
+            continue
+    return spellings
+
+
+def a_reader_sees_the_password(url: str) -> bool:
+    """Report whether either URL reader finds a live password here.
+
+    Two oracles, because two readers decide what a *server* acts on and
+    either can be the one that matters. ``urlsplit`` is what this package
+    parses with; ``yarl`` is what ``aiohttp`` dispatches with, and the
+    two genuinely disagree -- ``yarl`` finds a password in
+    ``http:<TAB>//u:PW@h/p`` where ``urlsplit`` sees a path. Asking only
+    one would license publishing the credential the other reads.
+
+    Args:
+        url: The spelling to read.
+
+    Returns:
+        True when either reader reports a password containing
+        :data:`FUZZ_SECRET`.
+    """
+    for read in (urlsplit, yarl.URL):
+        try:
+            password = read(url).password
+        except (ValueError, UnicodeError):
+            continue
+        if password is not None and FUZZ_SECRET in password:
+            return True
+    return False
+
+
+def test_no_url_spelling_leaks_a_password_a_reader_can_see() -> None:
+    r"""The fourth bypass, and the check that a fifth cannot ship.
+
+    Four rounds of findings against this module were one root cause: a
+    hand-rolled recogniser deciding where an authority begins, and a URL
+    parser deciding differently. Every round fixed the shape that had
+    been reported and left the disagreement in place, so the next
+    spelling was always available -- ``%2F``, then a tab, then ``/\\``,
+    then whitespace.
+
+    This is the property those four rows were each an instance of, and
+    it is stated as a *differential*: for every spelling generated, if
+    either real reader reports a live password, then no published
+    surface may still carry it. It is deliberately not a list of
+    remembered inputs. A list grows by one after each incident; this
+    fails on a shape nobody has thought of yet, which is the only kind
+    that has ever gone wrong here.
+
+    All four published surfaces are checked. The envelope's ``url``
+    (``redact_url``), the log record's ``extra['url']``
+    (``redact_value``), and the two prose surfaces -- ``error['message']``
+    and ``extra['traceback']`` -- through ``redact_text``, one of them
+    wrapped in a real ``ConfigurationError`` sentence because that is
+    how the string actually arrives: ``validated_url``'s own "url is not
+    parseable" message is the exact path that published a password in
+    the clear (M1/AGW-34).
+
+    Measured before the fix: 1280 of these spellings had a live password
+    on at least one published surface. The assertion is zero, not
+    fewer.
+    """
+    leaks: list[tuple[str, list[str]]] = []
+    checked = 0
+    for url in sorted(fuzz_spellings()):
+        if not a_reader_sees_the_password(url):
+            continue
+        checked += 1
+        surfaces = {
+            'envelope url (redact_url)': redact_url(url),
+            "extra['url'] (redact_value)": redact_value(url),
+            'message (redact_text)': redact_text(url),
+            "extra['traceback'] (redact_text)": redact_text(
+                f'ConfigurationError: url is not parseable: {url}'),
+        }
+        published = sorted(
+            name for name, text in surfaces.items()
+            if FUZZ_SECRET in text)
+        if published:
+            leaks.append((url, published))
+
+    assert checked > 1000, (
+        f'only {checked} spellings carried a password either reader '
+        f'could see, so this row is close to vacuous -- the generators '
+        f'above have stopped producing authorities')
+    assert leaks == [], (
+        f'{len(leaks)} spellings publish a password a URL reader can '
+        f'see; first five: {leaks[:5]}')
+
+
+def test_the_deleted_character_set_is_taken_from_the_parser() -> None:
+    """The agreement is by construction, and this is what proves it.
+
+    :func:`_parser_view` reads ``urllib.parse``'s own
+    ``_UNSAFE_URL_BYTES_TO_REMOVE`` -- a private name -- with a literal
+    fallback for an interpreter that has renamed it. That fallback is
+    the failure mode worth guarding: if the attribute disappears, the
+    module silently reverts to a *hand-written* list, which is precisely
+    the arrangement that produced four bypasses, and nothing would say
+    so.
+
+    So this asserts the two agree on the interpreter under test. It
+    fails on the interpreter where the constant moves, which is the
+    moment to look rather than a moment to discover from a leak.
+    """
+    assert redaction._URL_IGNORED == frozenset(
+        urllib.parse._UNSAFE_URL_BYTES_TO_REMOVE)
+    assert redaction._URL_IGNORED == frozenset({'\t', '\n', '\r'})
+
+
+def test_masking_reports_the_string_the_caller_actually_passed() -> None:
+    """Scanning the parser's view must not rewrite the diagnostic.
+
+    The scan runs over a copy with tab, newline and carriage return
+    deleted, because that is what ``urlsplit`` reads. What comes back
+    must still be the caller's own string: the redacted URL is a record
+    of what they passed, and quietly deleting characters from it
+    misreports the call -- the same reason a masked query pair keeps its
+    caller's ``;`` rather than being normalised to ``&``.
+
+    So the tab survives here and the password does not. A fix that
+    masked correctly by scanning *and returning* the view would pass
+    every row above and fail this one.
+    """
+    masked = redact_text('http:\t//user:VIEWPW@host/p')
+
+    assert 'VIEWPW' not in masked
+    assert masked == f'http:\t//user:{REDACTED}@host/p'
+
+
+@pytest.mark.parametrize(
+    'url, secret',
+    [
+        pytest.param(
+            'http: //user:SPACEPW@127.0.0.1:1/p', 'SPACEPW',
+            id='a-space-before-the-slashes'),
+        pytest.param(
+            'http:///%20//user:ROUNDTRIPPW@127.0.0.1:1/p', 'ROUNDTRIPPW',
+            id='the-same-url-after-an-aiohttp-round-trip'),
+        pytest.param(
+            'http:\x0b//u:VTABPW@h/p', 'VTABPW',
+            id='a-vertical-tab'),
+        pytest.param(
+            'http:\f//u:FORMFEEDPW@h/p', 'FORMFEEDPW',
+            id='a-form-feed'),
+        pytest.param(
+            'http:%09//u:PCTTABPW@h/p', 'PCTTABPW',
+            id='a-percent-encoded-tab'),
+        pytest.param(
+            'http:%0A//u:PCTLFPW@h/p', 'PCTLFPW',
+            id='a-percent-encoded-newline'),
+    ],
+)
+def test_whitespace_in_the_separator_run_is_masked(
+    url: str,
+    secret: str,
+) -> None:
+    """The half of NEW-M1c the differential fuzz structurally cannot see.
+
+    The fuzz above asks "does a URL reader report a live password?" and
+    masks wherever one does. These rows are the shapes where **neither**
+    reader reports one and the credential is published anyway --
+    ``urlsplit`` and ``yarl`` both read ``http: //user:PW@h/p`` as a
+    path, so the fuzz's oracle says there is nothing to hide, while the
+    reviewer's finding is that the password appears in the envelope
+    ``url``, ``extra['url']`` and ``extra['traceback']`` in the clear.
+
+    A published credential is a leak whether or not a parser agrees it
+    is one: whatever the *remote server* does with the string, a caller
+    reading their own logs must not find the password in them. So this
+    is the fail-closed direction the module errs in everywhere else --
+    mask what looks like an authority, and pay a diagnostic rather than
+    a secret.
+
+    Both spellings of each character, raw and percent-encoded, because
+    the round trip through ``aiohttp`` rewrites the first into the
+    second: ``http: //`` is reported back as ``http:///%20//``. Adding
+    whitespace to the raw class and not to the escapes fixed the URL the
+    caller wrote and left the one the library prints -- which is exactly
+    what happened once while this fix was being written, and is why the
+    two lists are now generated from one set rather than typed out.
+    """
+    assert secret not in redact_text(url)
+    assert secret not in redact_value(url)
+    assert secret not in redact_url(url)
+    assert secret not in redact_text(
+        f'ConfigurationError: url is not parseable: {url}')
+
+
+def test_redact_text_masking_stays_linear_on_a_hostile_separator_run(
+) -> None:
+    """The widened separator run must not buy back the 35s pattern.
+
+    The run this fix grew now accepts whitespace and eight
+    percent-escapes as well as slashes, and it is still a ``*``
+    quantifier over an alternation -- the shape that backtracks
+    catastrophically when it is allowed to. It does not here, because
+    every branch consumes at least one character and no two branches
+    match the same one, so a run is capped by its own length.
+
+    That argument is worth an assertion rather than a comment: this
+    masker runs inside ``log_failure`` on the event loop, and the
+    pattern it replaced took 35s on 200KB. The rows are the shapes that
+    stress the new alternation specifically -- a 200KB run of escapes,
+    and a 200KB mix of raw separators -- both of which the previous
+    hostile-string row did not contain.
+    """
+    started = monotonic_now()
+
+    redact_text('http:' + '%20' * 66000 + 'u:p@h')
+    redact_text('http:' + '/\\ \t' * 50000 + 'u:p@h')
 
     assert elapsed_since(started) < 2.0
 
