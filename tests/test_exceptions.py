@@ -16,6 +16,12 @@ import pickle
 from aiohttp import ClientConnectorError
 from aiohttp.client_reqrep import ConnectionKey
 
+from failsafe import RetriesExhausted
+
+import orjson
+
+import pytest
+
 from async_gateway.async_gateway import request
 from async_gateway.utils import exceptions
 from async_gateway.utils.exceptions import (
@@ -47,12 +53,6 @@ from async_gateway.utils.status_map import (
     WARNING_CODES,
     status_for,
 )
-
-from failsafe import RetriesExhausted
-
-import orjson
-
-import pytest
 
 # (class, its parent, its wire-stable code, its default status) -- Part B's
 # hierarchy diagram and status table, asserted rather than described.

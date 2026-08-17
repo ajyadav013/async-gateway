@@ -25,13 +25,13 @@ from typing import Any
 
 import aiohttp
 
+import pytest
+
 from async_gateway.async_gateway import request
 from async_gateway.utils.constants import HTTP_TIMEOUT
 from async_gateway.utils.envelope import GatewayResponse
 from async_gateway.utils.exceptions import ConfigurationError
 from async_gateway.utils.request_tracer import request_tracer
-
-import pytest
 
 from tests.fixtures.http_server import RecordingHTTPServer
 

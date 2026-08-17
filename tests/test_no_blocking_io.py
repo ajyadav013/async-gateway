@@ -115,10 +115,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
 
+import pytest
+
 from async_gateway.helpers.internal import request_helper
 from async_gateway.utils.http_file_config import delete_local_file_path
-
-import pytest
 
 #: Builtins that open a file synchronously when called bare.
 BANNED_BUILTINS = frozenset({'open'})

@@ -22,6 +22,7 @@ from collections.abc import AsyncIterator, Collection, Mapping
 from typing import Any, Final, Optional, Text
 
 import aioboto3
+
 import aiohttp
 
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError

@@ -55,6 +55,9 @@ from typing import (
 
 import aioftp
 
+import asyncssh
+from asyncssh.sftp import LocalFile, local_fs
+
 from async_gateway.utils.exceptions import PathContainmentError
 from async_gateway.utils.paths import (
     BytesOrPathLike,
@@ -63,9 +66,6 @@ from async_gateway.utils.paths import (
     guarded_opener,
     under,
 )
-
-import asyncssh
-from asyncssh.sftp import LocalFile, local_fs
 
 #: The modes that create or truncate a file, as opposed to reading one.
 #: Only these get the guarded opener: an ``upload`` reads its local
@@ -129,6 +129,13 @@ def _open_guarded(path: Path, mode: Text, overwrite: bool) -> io.BytesIO:
         OSError: For every other reason the open failed -- a missing
             parent, a permission failure -- reported as itself.
     """
+    # type: ignore[return-value] -- the declared return is `io.BytesIO`
+    # because that is what `aioftp.pathio.AbstractPathIO._open` declares
+    # and this value is handed straight back to it; the builtin actually
+    # answers a `BufferedReader`/`BufferedWriter`. Annotating the true
+    # type here would make the override incompatible with the base class,
+    # so the mismatch is aioftp's and is pinned at the two sites that
+    # cross it rather than papered over with `Any`.
     if not _writes(mode):
         return open(path, mode)  # type: ignore[return-value]
     try:
@@ -338,6 +345,12 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
         return await super().rename(
             self.contained(source), self.contained(destination))
 
+    # type: ignore[override] -- aioftp's own `AsyncPathIO._open` carries
+    # the identical ignore against its `AbstractPathIO._open(self, path,
+    # mode)` base: the concrete signature widens `path` to `Path` and adds
+    # `**kwargs`. This override matches the class it actually extends, so
+    # the incompatibility is inherited from the dependency's own hierarchy
+    # and cannot be annotated away from here.
     async def _open(  # type: ignore[override]
         self,
         path: Path,

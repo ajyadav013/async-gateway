@@ -38,6 +38,10 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from multidict import CIMultiDict
+
+import pytest
+
 from async_gateway.async_gateway import request
 from async_gateway.helpers.internal.request_helper import (
     DEFAULT_DOWNLOAD_FILEPATH,
@@ -73,10 +77,6 @@ from async_gateway.utils.http_file_config import (
     guard_declared_length,
     iter_capped,
 )
-
-from multidict import CIMultiDict
-
-import pytest
 
 from tests.fixtures.http_server import RecordingHTTPServer, ResponseSpec
 

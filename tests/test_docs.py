@@ -146,6 +146,8 @@ from typing import (  # noqa: F401 -- re-exported into example namespaces
     Union,
 )
 
+import pytest
+
 from async_gateway.async_gateway import request
 from async_gateway.helpers.internal.circuit_breaker_helper import (
     BREAKER_CONFIG_KEYS,
@@ -162,8 +164,6 @@ from async_gateway.utils.http_file_config import (
 )
 from async_gateway.utils.redaction import PAYLOAD_REDACTION_DEPTH
 from async_gateway.utils.status_map import STATUS_BY_CODE
-
-import pytest
 
 from tests.fixtures.ftp import (
     TransferringFTPClient,

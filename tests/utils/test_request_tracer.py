@@ -32,6 +32,8 @@ from typing import Any
 
 import aiohttp
 
+import pytest
+
 from async_gateway.async_gateway import request
 from async_gateway.utils.envelope import GatewayResponse
 from async_gateway.utils.request_tracer import (
@@ -40,8 +42,6 @@ from async_gateway.utils.request_tracer import (
     begin_trace_scope,
     request_tracer,
 )
-
-import pytest
 
 from tests.fixtures.http_server import RecordingHTTPServer
 

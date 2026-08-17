@@ -26,6 +26,10 @@ import asyncio
 import time
 from typing import Any, Optional
 
+from failsafe import CircuitOpen, RetriesExhausted
+
+import pytest
+
 from async_gateway.helpers.internal.base import destination_of
 from async_gateway.helpers.internal.breaker_registry import (
     get_breaker, registry_size, reset)
@@ -40,10 +44,6 @@ from async_gateway.utils.constants import (BREAKER_REGISTRY_MAX,
                                            UNKNOWN_PORT)
 from async_gateway.utils.exceptions import (ConfigurationError,
                                             ResponseTooLargeError)
-
-from failsafe import CircuitOpen, RetriesExhausted
-
-import pytest
 
 from tests.fixtures.clock import FakeClock, RecordingSleep
 
@@ -135,6 +135,11 @@ def counting(error: BaseException, succeed_after: int) -> Any:
             BaseException: ``error``, until ``succeed_after`` calls have
                 been made.
         """
+        # type: ignore[attr-defined] -- the call counter is kept as an
+        # attribute on the function object so the closure has no mutable
+        # cell to reset between retries; a function is not typed as
+        # carrying arbitrary attributes, and the alternative (a class, or
+        # a `nonlocal` counter) is more machinery than the fixture needs.
         call.calls += 1  # type: ignore[attr-defined]
         if call.calls <= succeed_after:  # type: ignore[attr-defined]
             raise error

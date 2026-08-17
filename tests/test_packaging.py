@@ -36,9 +36,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Iterator, List, Tuple
 
-import async_gateway
-
 import pytest
+
+import async_gateway
 
 from tests.fixtures.http_server import RecordingHTTPServer
 

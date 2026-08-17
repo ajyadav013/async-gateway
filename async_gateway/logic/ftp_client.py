@@ -38,6 +38,8 @@ from typing import Any, Final, Optional, Sequence, Text, Tuple, Union
 
 import aioftp
 
+from failsafe import CircuitOpen, FailsafeError
+
 from async_gateway.helpers.internal.base import BaseRequestClass
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.contained_io import (
@@ -57,8 +59,6 @@ from async_gateway.utils.exceptions import (
     unwrap_cause,
 )
 from async_gateway.utils.redaction import redact_url, redact_value
-
-from failsafe import CircuitOpen, FailsafeError
 
 logger = logging.getLogger(__name__)
 

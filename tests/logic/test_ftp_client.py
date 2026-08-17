@@ -26,14 +26,14 @@ import aioftp
 
 from aiohttp import BasicAuth
 
+import pytest
+
 from async_gateway.async_gateway import request
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.logic import ftp_client
 from async_gateway.logic.ftp_client import FTPRequest, tls_context_for
 from async_gateway.utils.envelope import GatewayResponse, new_envelope
 from async_gateway.utils.exceptions import TlsError
-
-import pytest
 
 from tests.fixtures.ftp import (
     FILE_STATS,

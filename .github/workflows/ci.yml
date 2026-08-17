@@ -20,10 +20,11 @@
 #
 # No step carries `continue-on-error`: every one of them is a required check.
 #
-# Known-red until later stories land (this is correct, not a misconfiguration):
-# `build-and-install` fails today because `async_gateway` imports `ujson`,
-# which is not declared (finding C1) -- R3/Step 4 closes it. `flake8 .`
-# reports the pre-existing violation baseline that R27/Step 24 drives to zero.
+# `flake8 .` is green as of R27/Step 24 (story AGW-25): the violation
+# baseline is gone, there is no baseline-suppression file, and the two
+# settings that made the command mean something -- a legal
+# `application_import_names` and the `.claude` exclusion -- are documented
+# in `.flake8`.
 
 name: CI
 
@@ -75,6 +76,32 @@ jobs:
 
       - name: flake8
         run: flake8 .
+
+      - name: no unjustified suppression (R27-AC7)
+        # A lint or type suppression is allowed; an *unaccountable* one is
+        # not. Every `# noqa` must name the code it silences, and every
+        # `# type: ignore` must name the error category -- so a suppression
+        # added for one reason cannot silently start hiding a second,
+        # unrelated finding. `.claude` is not scanned for the same reason
+        # flake8 excludes it: it is vendored agent tooling, not this
+        # library.
+        #
+        # The `--` justification is enforced too, but on the *contiguous
+        # comment block above the line* rather than on the line itself:
+        # at 79 columns a real explanation does not fit beside the code,
+        # and a trailing-comment-only rule buys a one-word alibi instead
+        # of a reason.
+        run: python .github/scripts/check_suppressions.py
+
+      - name: format check (R27-AC8)
+        # This project configures no autoformatter -- deliberately, and
+        # `CLAUDE.md` says so. `flake8` is the formatting judge instead,
+        # and this step is its check-mode run narrowed to the codes that
+        # *are* formatting: layout (E1/E2/E3/W2/W3), line length (E501,
+        # W505), and the committed quote style (Q). Separated from the
+        # `flake8` step above so a formatting regression is named as one
+        # in the job list rather than buried in a general lint failure.
+        run: flake8 --select=E1,E2,E3,E501,W2,W3,W505,Q .
 
       - name: mypy
         # `ignore_errors = true` is still set in pyproject.toml; R27/Step 24

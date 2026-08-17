@@ -47,14 +47,14 @@ from typing import Any, Iterator, Optional, Text
 
 from aiohttp import BasicAuth
 
+import asyncssh
+
+import pytest
+
 from async_gateway.async_gateway import request
 from async_gateway.logic.sftp_client import SFTPRequest
 from async_gateway.utils.envelope import GatewayResponse, new_envelope
 from async_gateway.utils.exceptions import ConfigurationError
-
-import asyncssh
-
-import pytest
 
 from tests.fixtures.sftp import (
     ACCEPTED_KEY_ALGORITHMS,

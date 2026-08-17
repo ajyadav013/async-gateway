@@ -11,9 +11,9 @@ empty object.
 
 from typing import Any, Optional, Text, Union
 
-from async_gateway.utils.exceptions import SerializationError
-
 import orjson
+
+from async_gateway.utils.exceptions import SerializationError
 
 #: Everything a valid JSON document can decode to. Deliberately *not*
 #: ``utils.envelope.JsonBody``, which names only the object and array

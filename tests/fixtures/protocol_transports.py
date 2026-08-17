@@ -40,12 +40,12 @@ import aioftp
 import aiohttp
 from aiohttp import BasicAuth
 
-from async_gateway.helpers.internal.request_helper import HttpResult
-from async_gateway.logic import http_client, soap_client
-
 import asyncssh
 
 import pytest
+
+from async_gateway.helpers.internal.request_helper import HttpResult
+from async_gateway.logic import http_client, soap_client
 
 # What a doubled transport says when it refuses. One string, so a test that
 # needs to recognise the double's own failure has something to match on.

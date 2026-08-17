@@ -114,6 +114,10 @@ from typing import (
     Tuple,
 )
 
+import asyncssh
+
+from failsafe import CircuitOpen, FailsafeError
+
 from async_gateway.helpers.internal.base import BaseRequestClass
 from async_gateway.utils.contained_io import contained_download, local_base
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
@@ -130,10 +134,6 @@ from async_gateway.utils.exceptions import (
     unwrap_cause,
 )
 from async_gateway.utils.redaction import redact_url, redact_value
-
-import asyncssh
-
-from failsafe import CircuitOpen, FailsafeError
 
 logger = logging.getLogger(__name__)
 

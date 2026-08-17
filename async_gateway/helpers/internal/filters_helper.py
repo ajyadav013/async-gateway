@@ -50,9 +50,9 @@ from typing import Any, Dict, List, Optional, Text, Tuple, Union
 
 import aiohttp
 
-from async_gateway.utils.exceptions import ConfigurationError
-
 import orjson
+
+from async_gateway.utils.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 

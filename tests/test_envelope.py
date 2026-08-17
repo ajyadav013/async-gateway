@@ -22,6 +22,10 @@ from typing import Any, Iterator
 
 from aiohttp import BasicAuth
 
+from failsafe import RetriesExhausted
+
+import pytest
+
 from async_gateway import async_gateway as entrypoint
 from async_gateway.async_gateway import request
 from async_gateway.helpers.common import date_helper
@@ -56,10 +60,6 @@ from async_gateway.utils.redaction import (
     redact_url,
     redact_value,
 )
-
-from failsafe import RetriesExhausted
-
-import pytest
 
 from tests.fixtures.http_server import RecordingHTTPServer
 from tests.fixtures.protocol_transports import (

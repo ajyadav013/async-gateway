@@ -25,6 +25,10 @@ from typing import Any, Text
 
 import aioftp
 
+import asyncssh
+
+import pytest
+
 from async_gateway.utils.contained_io import (
     ContainedLocalFS,
     ContainedPathIO,
@@ -36,10 +40,6 @@ from async_gateway.utils.exceptions import (
     ConfigurationError,
     PathContainmentError,
 )
-
-import asyncssh
-
-import pytest
 
 
 def escaping(base: Path, name: Text = 'OWNED') -> Text:
@@ -319,6 +319,11 @@ async def test_the_ftp_layer_runs_its_opens_off_the_event_loop(
         ran_on.append(threading.get_ident())
         return real_open(path, flags, mode, **kw)
 
+    # type: ignore[assignment] -- `os.open` is replaced for the
+    # duration of this test to observe which thread the real open runs
+    # on. mypy rightly refuses an assignment to a stdlib function; the
+    # substitution is the experiment, and it is undone in the `finally`
+    # below.
     os.open = recording  # type: ignore[assignment]
     try:
         async with layer.open(base / 'f.bin', mode='wb') as handle:
@@ -362,6 +367,11 @@ async def test_the_ftp_layers_open_honours_its_path_timeout(
         time.sleep(0.2)
         return real_open(path, flags, mode, **kw)
 
+    # type: ignore[assignment] -- `os.open` is replaced for the
+    # duration of this test to observe which thread the real open runs
+    # on. mypy rightly refuses an assignment to a stdlib function; the
+    # substitution is the experiment, and it is undone in the `finally`
+    # below.
     os.open = slow  # type: ignore[assignment]
     try:
         with pytest.raises((asyncio.TimeoutError, aioftp.PathIOError)):
@@ -647,6 +657,11 @@ async def test_the_local_fs_opens_off_the_event_loop(
         ran_on.append(threading.get_ident())
         return real_open(path, flags, mode, **kw)
 
+    # type: ignore[assignment] -- `os.open` is replaced for the
+    # duration of this test to observe which thread the real open runs
+    # on. mypy rightly refuses an assignment to a stdlib function; the
+    # substitution is the experiment, and it is undone in the `finally`
+    # below.
     os.open = recording  # type: ignore[assignment]
     try:
         handle = await filesystem.open(

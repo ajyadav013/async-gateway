@@ -18,9 +18,9 @@ into every other coroutine on the loop.
 
 from collections.abc import Iterator
 
-from async_gateway.helpers.internal.breaker_registry import reset
-
 import pytest
+
+from async_gateway.helpers.internal.breaker_registry import reset
 
 
 class FakeClock:

@@ -71,6 +71,18 @@ runtime.
   suite so they cannot rot. They ship in neither the wheel nor the sdist.
 - **This changelog**, plus a CI step that fails a pull request touching
   `async_gateway/` without touching `CHANGELOG.md`.
+- **A lint gate that is on and at zero.** `flake8 .` exits 0 with no output
+  from a fresh `pip install -e '.[dev]'`. Two configuration defects were
+  what previously made the command meaningless rather than merely noisy:
+  `application_import_names` named `async-gateway`, which is not a legal
+  module name, so every first-party import was classified third-party and
+  import-order checking had been checking a fiction; and a bare `.` walked
+  into the checked-in agent tooling under `.claude/`, which is not this
+  library. Both are fixed and documented in `.flake8`. Two new CI steps
+  hold the line: one fails any `# noqa` or `# type: ignore` that does not
+  name the code it silences *and* carry a `-- why`, and one runs `flake8`
+  in check mode over the formatting codes alone, since this project
+  configures no autoformatter and `flake8` is the formatting judge.
 
 ### Changed — BREAKING
 

@@ -64,6 +64,8 @@ from xml.etree.ElementTree import Element, ParseError, fromstring, tostring
 
 import aiohttp
 
+from failsafe import CircuitOpen, RetriesExhausted
+
 from async_gateway.helpers.internal import media_type_of
 from async_gateway.helpers.internal.base import BaseRequestClass
 from async_gateway.helpers.internal.request_helper import (
@@ -101,8 +103,6 @@ from async_gateway.utils.redaction import (
     redact_headers,
     redact_url,
 )
-
-from failsafe import CircuitOpen, RetriesExhausted
 
 logger = logging.getLogger(__name__)
 

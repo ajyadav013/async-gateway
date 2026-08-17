@@ -40,6 +40,8 @@ import logging
 from typing import Any, Final
 from xml.etree.ElementTree import Element, fromstring, tostring
 
+import pytest
+
 from async_gateway.async_gateway import request
 from async_gateway.logic import soap_client
 from async_gateway.logic.soap_client import (
@@ -53,8 +55,6 @@ from async_gateway.logic.soap_client import (
 from async_gateway.utils.envelope import GatewayResponse
 from async_gateway.utils.exceptions import ConfigurationError
 from async_gateway.utils.request_tracer import request_tracer
-
-import pytest
 
 from tests.fixtures.http_server import RecordingHTTPServer
 

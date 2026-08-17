@@ -31,6 +31,8 @@ from typing import Any, Callable, Final
 
 from aiohttp import BasicAuth
 
+import pytest
+
 from async_gateway.async_gateway import (
     dispatch_url_for,
     request,
@@ -48,8 +50,6 @@ from async_gateway.logic.soap_client import SoapRequest
 from async_gateway.utils.constants import HTTP_TIMEOUT
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import ConfigurationError
-
-import pytest
 
 AUTH: Final[BasicAuth] = BasicAuth('user', 'password')
 

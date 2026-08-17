@@ -37,6 +37,10 @@ import importlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError
+
+import pytest
+
 from async_gateway.utils.exceptions import (
     ConfigurationError,
     HttpStatusError,
@@ -45,10 +49,6 @@ from async_gateway.utils.http_file_config import (
     download_file_from_s3,
     download_file_from_url,
 )
-
-from botocore.exceptions import NoCredentialsError, PartialCredentialsError
-
-import pytest
 
 from tests.fixtures.http_server import RecordingHTTPServer
 
@@ -401,7 +401,11 @@ def test_the_s3_download_refuses_positional_arguments() -> None:
     the mistake is a ``TypeError`` at the call site.
     """
     with pytest.raises(TypeError):
-        download_file_from_s3('my-bucket', 'key', '/tmp/f')  # type: ignore
+        # type: ignore[misc] -- the positional call is the thing under
+        # test, so mypy's (correct) refusal of it has to be silenced for
+        # the runtime TypeError to be reachable.
+        download_file_from_s3(  # type: ignore[misc]
+            'my-bucket', 'key', '/tmp/f')
 
 
 async def test_the_s3_download_still_accepts_every_argument_by_keyword(

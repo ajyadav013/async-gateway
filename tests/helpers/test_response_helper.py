@@ -25,14 +25,14 @@ applies only to a body that really said ``{}``.
 
 from typing import Text, Union
 
+import orjson
+
+import pytest
+
 from async_gateway.helpers.internal.response_helper import (
     application_json_response,
 )
 from async_gateway.utils.exceptions import SerializationError
-
-import orjson
-
-import pytest
 
 
 async def test_a_text_body_decodes() -> None:

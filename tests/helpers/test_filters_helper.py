@@ -48,6 +48,10 @@ from urllib.parse import parse_qs
 
 import aiohttp
 
+import orjson
+
+import pytest
+
 from async_gateway import async_gateway as entrypoint
 from async_gateway.helpers.internal import (
     RequestFilter,
@@ -72,10 +76,6 @@ from async_gateway.logic.http_client import (
     default_json_serialize,
 )
 from async_gateway.utils.exceptions import ConfigurationError
-
-import orjson
-
-import pytest
 
 from tests.fixtures.http_server import RecordingHTTPServer
 from tests.fixtures.tls import (

@@ -18,9 +18,12 @@ from typing import Any, ClassVar, Optional, Text, Tuple
 from urllib.parse import urlsplit
 
 import aiohttp
+
 from async_gateway.helpers.common.date_helper import monotonic_now
 from async_gateway.helpers.internal.breaker_registry import get_breaker
-from async_gateway.helpers.internal.circuit_breaker_helper import CircuitBreakerHelper
+from async_gateway.helpers.internal.circuit_breaker_helper import (
+    CircuitBreakerHelper,
+)
 from async_gateway.utils.constants import (DEFAULT_PORTS, HTTP_TIMEOUT,
                                            UNKNOWN_PORT)
 from async_gateway.utils.envelope import GatewayResponse
@@ -157,7 +160,7 @@ class BaseRequestClass(abc.ABC):
         *,
         redact_params: Collection[Text]
     ) -> None:
-        """Initializing the request as per the config.
+        """Initialize the request as per the config.
 
         :param url: url to make http/ftp/sftp call.
         :param auth: auth object for ex aiohttp.BasicAuth(username, password)

@@ -24,6 +24,11 @@ from typing import (
 )
 
 import aiohttp
+
+from failsafe import CircuitOpen, FailsafeError, RetriesExhausted
+
+import orjson
+
 from async_gateway.helpers.internal import is_json_media_type, media_type_of
 from async_gateway.helpers.internal.base import BaseRequestClass
 from async_gateway.helpers.internal.filters_helper import is_get
@@ -63,8 +68,6 @@ from async_gateway.utils.request_tracer import (
     begin_trace_scope,
     request_tracer,
 )
-from failsafe import CircuitOpen, FailsafeError, RetriesExhausted
-import orjson
 
 JsonSerializer = Callable[[Any], Text]
 
