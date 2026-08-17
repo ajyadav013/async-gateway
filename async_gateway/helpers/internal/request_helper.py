@@ -930,7 +930,7 @@ async def make_http_filters_with_stream_file_upload(
             file_name=local_filepath,
             file_upload_chunk_size=chunk_size)}
 
-    return await circuit_breaker.failsafe.run(
+    return await circuit_breaker.run(
         make_http_request,
         session,
         url,
@@ -1059,7 +1059,7 @@ async def make_http_filters_without_stream_uploads(
         """
         return {'data': build_upload_form(local_filepath, file_key)}
 
-    return await circuit_breaker.failsafe.run(
+    return await circuit_breaker.run(
         make_http_request,
         session,
         url,
@@ -1106,7 +1106,7 @@ async def make_http_filters_without_file(
         """
         return await request_filter(payload, request_type=request_type)
 
-    return await circuit_breaker.failsafe.run(
+    return await circuit_breaker.run(
         make_http_request,
         session,
         url,

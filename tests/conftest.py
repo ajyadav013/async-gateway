@@ -6,6 +6,13 @@ module owned by exactly one story, so stories adding a double never contend
 for this file.
 """
 
+from tests.fixtures.clock import (clean_breaker_registry, fake_clock,
+                                  recording_sleep)
 from tests.fixtures.http_server import http_server
 
-__all__ = ['http_server']
+__all__ = [
+    'clean_breaker_registry',
+    'fake_clock',
+    'http_server',
+    'recording_sleep',
+]

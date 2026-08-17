@@ -15,11 +15,14 @@ this class acts on configuration that has already been validated.
 import abc
 from collections.abc import Collection, Mapping
 from typing import Any, ClassVar, Optional, Text, Tuple
+from urllib.parse import urlsplit
 
 import aiohttp
 from async_gateway.helpers.common.date_helper import monotonic_now
+from async_gateway.helpers.internal.breaker_registry import get_breaker
 from async_gateway.helpers.internal.circuit_breaker_helper import CircuitBreakerHelper
-from async_gateway.utils.constants import HTTP_TIMEOUT
+from async_gateway.utils.constants import (DEFAULT_PORTS, HTTP_TIMEOUT,
+                                           UNKNOWN_PORT)
 from async_gateway.utils.envelope import GatewayResponse
 from async_gateway.utils.exceptions import ConfigurationError
 
@@ -75,6 +78,69 @@ def validated_protocol_info(
     return dict(info)
 
 
+def destination_of(
+    protocol: Text,
+    url: Text,
+    port: Optional[int] = None,
+) -> Tuple[Text, Text, int]:
+    """Return the ``(family, host, port)`` this call is dispatched to.
+
+    The breaker registry's key, and the whole of what "per destination"
+    means (M16). Two calls share a breaker exactly when all three parts
+    match, so ``https://a`` and ``https://b`` never do, and one host on
+    two ports does not either.
+
+    The HTTP family carries its host and port inside the URL; FTP and
+    SFTP take a bare host name and their port from ``protocol_info``,
+    which is why ``port`` is a parameter rather than something parsed
+    here.
+
+    Args:
+        protocol: The normalised protocol name -- ``'HTTP'``, ``'HTTPS'``,
+            ``'FTP'``, ``'SFTP'``.
+        url: The URL or bare host this call is dispatched to.
+        port: The port the protocol resolved, for protocols that carry it
+            outside the URL. None means "take it from the URL, or from
+            the family's default".
+
+    Returns:
+        The family lower-cased, the host lower-cased, and the port. A
+        scheme with no known default and no port in the URL reports
+        :data:`~async_gateway.utils.constants.UNKNOWN_PORT`, which is
+        ``-1`` and deliberately not ``0``: ``0`` is a legal port number,
+        so using it as "unknown" would collapse every unknown-scheme
+        destination onto a single key and re-create M16 for exactly the
+        callers whose scheme this library did not anticipate.
+    """
+    parsed = urlsplit(url if '://' in url else f'//{url}')
+    family = (parsed.scheme or protocol).lower()
+    host = (parsed.hostname or '').lower()
+
+    if port is None:
+        # `parsed.port` raises on a port that is not a number, which is a
+        # malformed URL the dispatch guard has already rejected for the
+        # HTTP family; `netloc` is what remains for everything else.
+        port = parsed.port if _has_numeric_port(parsed.netloc) else None
+    if port is None:
+        port = DEFAULT_PORTS.get(family, UNKNOWN_PORT)
+    return family, host, port
+
+
+def _has_numeric_port(netloc: Text) -> bool:
+    """Report whether ``netloc`` ends in a port this library can read.
+
+    Args:
+        netloc: The network-location part of a split URL.
+
+    Returns:
+        True when a numeric port follows the last colon outside any
+        IPv6 bracket, so reading ``parsed.port`` cannot raise.
+    """
+    tail = netloc.rpartition(']')[2]
+    _, colon, candidate = tail.rpartition(':')
+    return bool(colon) and candidate.isdigit()
+
+
 class BaseRequestClass(abc.ABC):
     """Base class for handling json requests."""
 
@@ -125,17 +191,25 @@ class BaseRequestClass(abc.ABC):
         self.timeout: int = self.info.get('timeout', HTTP_TIMEOUT)
         self.certificate: Tuple[Text] = self.info.get('certificate')
 
-        self.circuit_breaker_config: dict = self._get_circuit_breaker_config(
-            self.info.get('circuit_breaker_config', {}))
-        self.circuit_breaker = CircuitBreakerHelper(**self.circuit_breaker_config)
-
-    def _get_circuit_breaker_config(self, circuit_breaker_config: dict) -> dict:
-        """return retry policy for circuit breaker config."""
-        if circuit_breaker_config.get('retry_config'):
-            retry_policy_dict: dict = circuit_breaker_config['retry_config']
-            retry_policy = CircuitBreakerHelper.get_retry_policy(**retry_policy_dict)
-            circuit_breaker_config['retry_policy'] = retry_policy
-        return circuit_breaker_config
+        # Read, never written to. The old code wrote a live `RetryPolicy`
+        # into this very dict, so a `protocol_info` reused across two
+        # calls came back to its owner carrying a resilience object they
+        # never put there (M12).
+        self.circuit_breaker_config: dict[Text, Any] = self.info.get(
+            'circuit_breaker_config', {})
+        # Looked up, not constructed. A breaker built here is a breaker
+        # with a zeroed failure count on every request, which is why the
+        # advertised circuit could never open (H8); the registry keys one
+        # per destination so accumulating that count does not make one
+        # flaky host everyone's outage (M16).
+        self.circuit_breaker: CircuitBreakerHelper = get_breaker(
+            *destination_of(
+                self.response.get('protocol', ''),
+                url,
+                self.info.get('port'),
+            ),
+            self.circuit_breaker_config,
+        )
 
     @abc.abstractmethod
     async def handle_request(self) -> GatewayResponse:

@@ -618,8 +618,8 @@ class SFTPRequest(BaseRequestClass):
 
         operation = getattr(sftp, mode)
         if self.local_path:
-            await self.circuit_breaker.failsafe.run(
+            await self.circuit_breaker.run(
                 operation, self.remote_path, self.local_path, **options)
         else:
-            await self.circuit_breaker.failsafe.run(
+            await self.circuit_breaker.run(
                 operation, self.remote_path, **options)
