@@ -32,8 +32,11 @@ document whose *prolog* declares one therefore closes the whole relevant
 class at zero dependency cost, and R14's byte cap -- which every read
 below goes through -- bounds what remains: unbounded tree size and
 decompression bombs, which the prolog guard does not address.
-``defusedxml`` was rejected as itself dormant since 2021, and promoting
-``lxml`` to runtime as a binary wheel in a pure-Python client library.
+``defusedxml`` was rejected as itself dormant since 2021, and the
+libxml2-backed alternative as a binary wheel in an otherwise pure-Python
+client library. (That package is named in the spec and in this module's
+tests, not here: R19-AC7 greps this package for its name and requires
+zero matches, so the runtime decision is checkable rather than asserted.)
 
 **The guard is prolog-scoped, and that is load-bearing.** It rejects a
 ``<!`` declaration appearing *before the root element's start tag* only.
