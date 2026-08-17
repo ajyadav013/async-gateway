@@ -40,6 +40,7 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    FrozenSet,
     List,
     Optional,
     Tuple,
@@ -62,7 +63,7 @@ from async_gateway.helpers.internal.circuit_breaker_helper import (
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.constants import (
     CHUNK_SIZE_CONSTANT,
-    CREDENTIAL_HEADERS,
+    CROSS_ORIGIN_SAFE_HEADERS,
     MAX_RESPONSE_BYTES,
     POST_TO_GET_REDIRECTS,
     REDIRECT_STATUSES,
@@ -401,30 +402,49 @@ def same_origin(left: str, right: str) -> bool:
         second.scheme, second.hostname, second.port)
 
 
-def without_credentials(
+def cross_origin_headers(
     headers: Optional[Dict[str, str]],
+    *,
+    also_forward: FrozenSet[str] = frozenset(),
 ) -> Optional[Dict[str, str]]:
-    """Return ``headers`` with every credential-bearing entry removed.
+    """Return only the headers that are safe to hand a different origin.
 
+    An **allowlist**: a header survives by being in
+    :data:`~async_gateway.utils.constants.CROSS_ORIGIN_SAFE_HEADERS` or
+    in the caller's ``also_forward``, and everything else is dropped.
     Applied to a hop that crosses an origin boundary, which is what
-    ``aiohttp`` did for itself while it owned the redirect loop. Owning the
-    loop without reproducing it would forward the caller's
-    ``Authorization`` header to whatever host a hostile endpoint named --
-    a credential leak introduced *by* the fix for one.
+    ``aiohttp`` did for itself while it owned the redirect loop.
+
+    This was a denylist twice and leaked twice. Naming the secrets to
+    strip requires having thought of every one of them, and the header
+    that leaks is by definition the one nobody thought of: the first
+    list forwarded ``X-Api-Key`` (H1), and the second -- built from the
+    union of every credential set in the codebase -- still forwarded
+    ``X-Vault-Token``, ``Private-Token``, ``X-Goog-Api-Key`` and seven
+    more to a live hostile server (NEW-H1b). Inverting the question
+    makes the unrecognised header the *safe* case, because it does not
+    cross, so the guard no longer has to keep pace with every vendor
+    that invents an auth header.
 
     Args:
         headers: The headers sent on the previous hop, or None.
+        also_forward: Extra lower-cased header names the caller declared
+            safe to forward, from
+            ``protocol_info['cross_origin_headers']``. Validated at the
+            boundary to exclude anything in
+            :data:`~async_gateway.utils.constants.CREDENTIAL_HEADERS`.
 
     Returns:
-        A new mapping without the credential headers, or None when there
-        were no headers at all.
+        A new mapping holding only the allowed headers, or None when
+        there were no headers at all.
     """
     if not headers:
         return headers
+    allowed = CROSS_ORIGIN_SAFE_HEADERS | also_forward
     return {
         name: value
         for name, value in headers.items()
-        if name.lower() not in CREDENTIAL_HEADERS
+        if name.lower() in allowed
     }
 
 
@@ -761,6 +781,7 @@ async def make_http_request(
         allowed_schemes: Collection[str],
         allow_redirects: bool,
         max_redirects: int,
+        cross_origin_forward: FrozenSet[str] = frozenset(),
         trace_collectors: Collection[Dict[str, Any]] = (),
         **kwargs: Any) -> HttpResult:
     """Make the API call, follow its redirects, and return what came back.
@@ -769,11 +790,15 @@ async def make_http_request(
     with ``allow_redirects=False`` and each ``Location`` is resolved and
     scheme-checked by :func:`redirect_target` before the next one is
     issued, because a guardrail that only sees the caller's own URL guards
-    nothing an attacker chose (FI-16). Crossing an origin also strips the
-    credential headers and the caller's ``auth``, which is what
-    ``aiohttp`` did for itself. The credential headers it can strip are
-    the *per-request* ones, which is why a caller-supplied session
-    carrying any of them is refused at the boundary by
+    nothing an attacker chose (FI-16). Crossing an origin also drops the
+    caller's ``cookies`` and ``auth`` outright and reduces the headers to
+    :func:`cross_origin_headers`' **allowlist**, which is stricter than
+    what ``aiohttp`` did for itself: it forwards only the handful of
+    headers that describe the request rather than the caller's
+    relationship with the origin, so a header this library has never
+    heard of does not cross. The headers it can filter are the
+    *per-request* ones, which is why a caller-supplied session carrying
+    anything outside the allowlist is refused at the boundary by
     ``logic.http_client.validated_session`` rather than here: a session
     default is merged in by ``aiohttp`` itself and no hop can withhold it.
 
@@ -826,6 +851,11 @@ async def make_http_request(
     :param allow_redirects - whether to follow at all. False returns the
     redirect response itself, exactly as the transport would.
     :param max_redirects - how many hops to follow before giving up.
+    :param cross_origin_forward - extra lower-cased header names the
+    caller has declared safe to carry across an origin boundary, widening
+    :func:`cross_origin_headers`' allowlist. Empty by default, which is
+    the fail-closed position; validated at the boundary so it can never
+    re-admit a known credential header.
     :param trace_collectors - the ``results_collector`` mapping of each
     tracer attached to the session, so a followed hop can be recorded the
     way ``aiohttp``'s own ``on_request_redirect`` recorded it. Defaults to
@@ -948,7 +978,8 @@ async def make_http_request(
                 verb, body_filters = after_redirect(
                     resp.status, verb, await build_body())
                 if not same_origin(target, following):
-                    hop_headers = without_credentials(hop_headers)
+                    hop_headers = cross_origin_headers(
+                        hop_headers, also_forward=cross_origin_forward)
                     hop_cookies = None
                     hop_auth = None
                 target = following

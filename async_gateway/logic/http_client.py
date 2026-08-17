@@ -38,6 +38,7 @@ from async_gateway.helpers.internal.response_helper import \
 from async_gateway.utils.constants import (
     ALLOWED_SCHEMES,
     CREDENTIAL_HEADERS,
+    CROSS_ORIGIN_SAFE_HEADERS,
     HTTP_ERROR_STATUS,
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
@@ -226,7 +227,88 @@ def validated_upload_config(
     return http_file_upload_config
 
 
-def validated_session(session: object) -> Optional[aiohttp.ClientSession]:
+def validated_cross_origin_headers(
+    cross_origin_headers: object,
+) -> frozenset[str]:
+    """Return the caller's extra cross-origin header names, lower-cased.
+
+    The **escape hatch** on the cross-origin allowlist, and the reason
+    the allowlist can afford to be short. Inverting to an allowlist
+    (:data:`~async_gateway.utils.constants.CROSS_ORIGIN_SAFE_HEADERS`)
+    means the library now decides, on the caller's behalf, that a header
+    it has not heard of is not worth the risk of forwarding. That is the
+    right default and the wrong absolute: a caller propagating
+    ``X-Request-Id`` across a CDN redirect for tracing has a real need,
+    knows their own header is not a secret, and would otherwise have to
+    give up redirect-following entirely to keep it.
+
+    So the hatch exists, and its shape is what makes it safe to offer:
+
+    * **Opt-in and per call.** Empty by default, so the fail-closed
+      position is what a caller gets without asking. Naming a header is
+      an explicit, reviewable statement about that one header.
+    * **It widens into the unknown region only.** A name in
+      :data:`~async_gateway.utils.constants.CREDENTIAL_HEADERS` is
+      refused outright rather than honoured. The hatch lets a caller say
+      "this header of mine is not a secret"; it does not let them
+      say ``Authorization`` is not a secret, because that is not a
+      trade-off this library offers at any level of insistence -- and a
+      hatch that could re-admit ``Authorization`` would simply be the
+      leak again, spelled as a config key.
+
+    A bare ``str`` is rejected first, for the reason
+    :func:`validated_allowed_schemes` rejects one: ``frozenset('x-id')``
+    is a set of five characters, an "allowlist" that would forward
+    nothing the caller meant and would do it silently.
+
+    Args:
+        cross_origin_headers: ``protocol_info['cross_origin_headers']``,
+            of whatever type the caller passed, or absent.
+
+    Returns:
+        The header names, lower-cased. Empty when the caller named none.
+
+    Raises:
+        ConfigurationError: If the value is a bare ``str``, is not a
+            collection, names anything that is not a ``str``, or names a
+            known credential header.
+    """
+    if cross_origin_headers is None:
+        return frozenset()
+    if isinstance(cross_origin_headers, str):
+        raise ConfigurationError(
+            f'protocol_info["cross_origin_headers"] must be a collection '
+            f'of header names, not the single string '
+            f'{cross_origin_headers!r}: a str iterates as its characters, '
+            f'so this would forward '
+            f'{sorted(frozenset(cross_origin_headers))} and no real header')
+    if not isinstance(cross_origin_headers, Collection):
+        raise ConfigurationError(
+            f'protocol_info["cross_origin_headers"] must be a collection '
+            f'of header names, got {type(cross_origin_headers).__name__}')
+    names: List[str] = []
+    for name in cross_origin_headers:
+        if not isinstance(name, str):
+            raise ConfigurationError(
+                f'protocol_info["cross_origin_headers"] must name headers '
+                f'as str, got {type(name).__name__} {name!r}')
+        names.append(name.lower())
+    refused = sorted(frozenset(names) & CREDENTIAL_HEADERS)
+    if refused:
+        raise ConfigurationError(
+            f'protocol_info["cross_origin_headers"] names the credential '
+            f'header(s) {refused}, which are never forwarded across an '
+            f'origin boundary. The key widens the cross-origin allowlist '
+            f'to headers this library does not recognise; it cannot '
+            f're-admit one it recognises as a credential, because a '
+            f'hostile Location would receive it')
+    return frozenset(names)
+
+
+def validated_session(
+    session: object,
+    cross_origin_forward: frozenset[str] = frozenset(),
+) -> Optional[aiohttp.ClientSession]:
     """Return the caller's session once proven usable, or None.
 
     A session the caller supplies is *theirs*: it is used and never closed,
@@ -237,30 +319,43 @@ def validated_session(session: object) -> Optional[aiohttp.ClientSession]:
     ``RuntimeError: Session is closed`` from inside the transport, which
     reads as a network failure and is retried like one.
 
-    A session carrying a **credential** is refused for a different and
-    sharper reason. ``aiohttp`` merges a session's default headers and
-    ``auth`` into every request it issues, underneath the ones this call
-    passes, and the redirect loop can only withhold what it passes. A
+    A session carrying **anything the cross-origin allowlist would drop**
+    is refused for a different and sharper reason. ``aiohttp`` merges a
+    session's default headers and ``auth`` into every request it issues,
+    underneath the ones this call passes, and the redirect loop can only
+    withhold what it passes. A
     ``ClientSession(headers={'Authorization': ...})`` would therefore send
     that token to whatever host a hostile ``Location`` named -- a leak
     ``aiohttp``'s own loop did not have, introduced by taking the loop
-    over. Refusing the combination keeps the documented promise on
-    :func:`~async_gateway.helpers.internal.request_helper.make_http_request`
-    true rather than true-except-on-this-path; the same credentials
-    supplied per call, which is the route the message names, are stripped
-    on a cross-origin hop exactly as before.
+    over.
+
+    This refuses on the **allowlist**, not on the credential list, and
+    the difference is the whole point of NEW-H1b. Checking session
+    defaults against a list of known credentials left the same hole on
+    this path that the hop had: a session carrying ``X-Vault-Token`` --
+    or any header no list names -- passed validation and then leaked,
+    because no hop can withhold a session default. Refusing whatever the
+    hop itself would drop keeps the two surfaces answering one question,
+    so a header added to the allowlist is admitted here automatically and
+    one that is not is refused here for the same reason it does not
+    cross.
 
     Args:
         session: ``protocol_info['session']``, of whatever type the caller
             actually passed, or None when they passed nothing.
+        cross_origin_forward: The names
+            ``protocol_info['cross_origin_headers']`` declared safe to
+            cross, already validated. A session default may carry one of
+            these, because the caller has said so about that header.
 
     Returns:
         The same session, or None when the library is to create its own.
 
     Raises:
         ConfigurationError: If the value is neither None nor a live
-            ``aiohttp.ClientSession``, or if it carries a credential
-            header or a session-level ``auth``.
+            ``aiohttp.ClientSession``, or if it carries a header the
+            cross-origin allowlist would drop, or a session-level
+            ``auth``.
     """
     if session is None:
         return None
@@ -273,19 +368,27 @@ def validated_session(session: object) -> Optional[aiohttp.ClientSession]:
             'protocol_info["session"] is already closed; a closed session '
             'cannot carry a request, and this library never reopens one '
             'it does not own')
+    allowed = CROSS_ORIGIN_SAFE_HEADERS | cross_origin_forward
     carried = sorted({
         name.lower()
         for name in session.headers
-        if name.lower() in CREDENTIAL_HEADERS
+        if name.lower() not in allowed
     })
     if carried:
+        credentials = sorted(frozenset(carried) & CREDENTIAL_HEADERS)
+        detail = (
+            f'credential header(s) {credentials}' if credentials
+            else f'header(s) {carried}, which are not on the cross-origin '
+                 f'allowlist')
         raise ConfigurationError(
-            f'protocol_info["session"] carries the credential header(s) '
-            f'{carried} as session defaults, which aiohttp merges into '
-            f'every request and no redirect hop can withhold; a hostile '
-            f'Location would receive them. Pass them in '
-            f'protocol_info["headers"] instead, which this library strips '
-            f'when a hop crosses an origin')
+            f'protocol_info["session"] carries the {detail} as session '
+            f'defaults, which aiohttp merges into every request and no '
+            f'redirect hop can withhold; a hostile Location would receive '
+            f'them. Pass them in protocol_info["headers"] instead, which '
+            f'this library drops when a hop crosses an origin -- or, for a '
+            f'header of yours that is not a secret, name it in '
+            f'protocol_info["cross_origin_headers"] to forward it '
+            f'deliberately')
     if session.auth is not None:
         raise ConfigurationError(
             'protocol_info["session"] carries a session-level auth, which '
@@ -753,13 +856,16 @@ class HttpRequest(BaseRequestClass):
                 ``results_collector``; an
                 ``http_file_upload_config`` combined with a GET; a
                 "session" that is not a live ``aiohttp.ClientSession`` or
-                that carries a credential header or a session-level
+                that carries a header the cross-origin allowlist would
+                drop or a session-level
                 ``auth``; a "max_response_bytes" that is not a positive
                 int; an "allow_redirects" that is not a bool; a
                 "max_redirects" that is not a non-negative int; a
-                "timeout" that is not a positive number of seconds; or an
+                "timeout" that is not a positive number of seconds; an
                 "allowed_schemes" that is not a non-empty collection of
-                scheme names. ``UnsupportedVerbError`` -- a
+                scheme names; or a "cross_origin_headers" that is not a
+                collection of header names, or that names a known
+                credential header. ``UnsupportedVerbError`` -- a
                 ``ConfigurationError`` -- for a "request_type" naming no
                 verb in the R21 allowlist. All are raised here, in the
                 constructor, because
@@ -785,12 +891,18 @@ class HttpRequest(BaseRequestClass):
             'http_file_download_config')
         self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(
             total=validated_timeout(self.timeout))
+        # Read before the session, which is validated *against* it: a
+        # session default naming one of these is admissible precisely
+        # because the caller has declared that header safe to forward.
+        self.cross_origin_forward: frozenset[str] = (
+            validated_cross_origin_headers(
+                self.info.get('cross_origin_headers')))
         # None means "build one and close it"; anything else is the
         # caller's and is never closed here. Read before the serialiser,
         # which cannot be honoured on a session this library did not
         # create and is refused with one.
         self.session: Optional[aiohttp.ClientSession] = validated_session(
-            self.info.get('session'))
+            self.info.get('session'), self.cross_origin_forward)
         self.serialization: JsonSerializer = validated_serialization(
             self.info, self.session)
         self.trace_config: List[aiohttp.TraceConfig] = validated_trace_config(
@@ -947,6 +1059,7 @@ class HttpRequest(BaseRequestClass):
                 allowed_schemes=self.allowed_schemes,
                 allow_redirects=self.allow_redirects,
                 max_redirects=self.max_redirects,
+                cross_origin_forward=self.cross_origin_forward,
                 trace_collectors=self.trace_collectors,
             )
         except CircuitOpen as err:

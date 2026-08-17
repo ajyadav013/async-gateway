@@ -1328,7 +1328,7 @@ async def test_a_session_carrying_its_own_auth_is_refused(
     assert http_server.requests == []
 
 
-async def test_a_credential_free_session_still_strips_on_a_cross_origin_hop(
+async def test_an_allowlisted_session_still_strips_on_a_cross_origin_hop(
     http_server: RecordingHTTPServer,
 ) -> None:
     """The route the refusal names, driven end to end through ``session=``.
@@ -1339,6 +1339,13 @@ async def test_a_credential_free_session_still_strips_on_a_cross_origin_hop(
     connection pooling and the stripping. No redirect test went through
     ``session=`` before, which is why the leak on that path was invisible
     to a suite that covered the same hop without one.
+
+    ``X-Trace`` rides on the *session*, so it reaches the second origin
+    whatever the hop decides -- ``aiohttp`` merges session defaults and
+    no hop can withhold them. That is exactly why it must now be
+    declared in ``cross_origin_headers``: the declaration is the caller
+    stating the header is not a secret, which is the only basis on which
+    this library lets one cross.
     """
     elsewhere = RecordingHTTPServer()
     session = aiohttp.ClientSession(
@@ -1356,6 +1363,7 @@ async def test_a_credential_free_session_still_strips_on_a_cross_origin_hop(
             http_server,
             '/start',
             session=session,
+            cross_origin_headers=['X-Trace'],
             headers={'Authorization': 'Bearer supersecret'},
         )
 
@@ -1364,11 +1372,64 @@ async def test_a_credential_free_session_still_strips_on_a_cross_origin_hop(
         assert http_server.requests[-1].headers.get(
             'Authorization') == 'Bearer supersecret'
         assert 'Authorization' not in elsewhere.requests[-1].headers
-        # A non-credential session default is untouched by any of this.
+        # The declared session default is untouched by any of this.
         assert elsewhere.requests[-1].headers.get('X-Trace') == 'kept'
     finally:
         await elsewhere.close()
         await session.close()
+
+
+async def test_a_session_default_off_the_allowlist_is_refused(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """The NEW-H1b hole on the ``session=`` path, closed by the inversion.
+
+    This refusal used to fire only on a *named* credential, which left
+    the same gap here that the hop had: a session carrying
+    ``X-Vault-Token`` -- a header no list named -- passed validation and
+    then leaked on every cross-origin hop, because no hop can withhold a
+    session default. Refusing whatever the hop itself would drop makes
+    the two surfaces answer one question, and the message names the way
+    through for a header that genuinely is not a secret.
+    """
+    session = aiohttp.ClientSession(
+        headers={'X-Vault-Token': 'VAULT-SECRET'},
+        timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT))
+    try:
+        with pytest.raises(ConfigurationError) as caught:
+            await _get_with(http_server, session=session)
+    finally:
+        await session.close()
+
+    assert 'x-vault-token' in str(caught.value)
+    assert 'cross_origin_headers' in str(caught.value)
+    assert http_server.requests == []
+
+
+async def test_a_harmless_session_default_off_the_allowlist_is_refused(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """Fail-closed applies to the session too, credential or not.
+
+    ``X-Trace`` is nobody's secret and is still refused unless declared,
+    because "is this header a secret?" is precisely the question the
+    inversion exists to stop this library guessing at. The diagnostic
+    still distinguishes the two cases, so a caller can tell an oversight
+    from a real credential -- but the classification reports the
+    refusal, it does not decide it.
+    """
+    session = aiohttp.ClientSession(
+        headers={'X-Trace': 'harmless'},
+        timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT))
+    try:
+        with pytest.raises(ConfigurationError) as caught:
+            await _get_with(http_server, session=session)
+    finally:
+        await session.close()
+
+    assert 'not on the cross-origin allowlist' in str(caught.value)
+    assert 'x-trace' in str(caught.value)
+    assert http_server.requests == []
 
 
 async def test_a_serializer_cannot_be_combined_with_a_supplied_session(
@@ -1527,6 +1588,19 @@ async def test_a_foreign_tracer_on_a_supplied_session_is_skipped_not_fatal(
         pytest.param({'timeout': None}, id='timeout-none'),
         pytest.param({'timeout': 0}, id='timeout-zero'),
         pytest.param({'timeout': -5}, id='timeout-negative'),
+        pytest.param(
+            {'cross_origin_headers': 'x-request-id'},
+            id='cross-origin-bare-str'),
+        pytest.param(
+            {'cross_origin_headers': 7}, id='cross-origin-not-collection'),
+        pytest.param(
+            {'cross_origin_headers': [7]}, id='cross-origin-name-not-str'),
+        pytest.param(
+            {'cross_origin_headers': ['Authorization']},
+            id='cross-origin-names-a-credential'),
+        pytest.param(
+            {'cross_origin_headers': ['X-Vault-Token']},
+            id='cross-origin-names-a-measured-leak'),
     ],
 )
 async def test_a_redirect_key_that_cannot_form_a_call_is_refused(
@@ -1550,6 +1624,14 @@ async def test_a_redirect_key_that_cannot_form_a_call_is_refused(
     ``TypeError: unsupported operand type(s) for +: 'float' and 'str'``
     un-enveloped, and ``timeout=True`` was silently taken as a
     one-second deadline and answered ``ok=True``.
+
+    ``cross_origin_headers`` joins them because it widens a security
+    guard, which makes its failure modes the expensive kind. A bare
+    string is the same character-set trap ``allowed_schemes`` has, and
+    the last two rows are the load-bearing ones: the key may widen the
+    allowlist into headers this library has no opinion about, never back
+    into one it recognises as a credential. A hatch that could re-admit
+    ``Authorization`` would be NEW-H1b again, spelled as a config key.
 
     The refusal is at construction, so nothing is dispatched: the
     recorded request count is the assertion that the rejection is early
