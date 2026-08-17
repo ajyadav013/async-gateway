@@ -33,7 +33,7 @@ import asyncio
 import datetime
 import tempfile
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Text
 
@@ -630,6 +630,18 @@ async def plaintext_ftp_server() -> AsyncIterator[int]:
     implemented: a client that gets past the handshake has already failed
     the assertion this server exists for.
 
+    **The handler must close its own writer, and that is not tidiness.**
+    On CPython 3.12 ``Server.wait_closed()`` waits for every *handler
+    task and transport* the server ever accepted, so a handler that
+    returns while its transport is still open makes the ``finally``
+    below block forever -- the whole suite hangs on this one test, with
+    an idle event loop and no traceback pointing anywhere near here.
+    CPython 3.13 changed that (gh-104344) and macOS runs 3.14, which is
+    why this was invisible on the development machine and reproduces
+    100% of the time in a 3.12 container. 3.12 is in this project's
+    committed CI matrix, so the fixture is simply wrong, not merely
+    unlucky.
+
     Yields:
         The port the listener is bound to on 127.0.0.1.
     """
@@ -637,7 +649,7 @@ async def plaintext_ftp_server() -> AsyncIterator[int]:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Answer one connection with a plaintext FTP banner.
+        """Answer one connection with a plaintext FTP banner, then hang up.
 
         Args:
             reader: The connection's reader, unused.
@@ -648,6 +660,13 @@ async def plaintext_ftp_server() -> AsyncIterator[int]:
         """
         writer.write(b'220 plaintext ftp service ready\r\n')
         await writer.drain()
+        writer.close()
+        # The peer is a TLS client that has already given up on a
+        # plaintext banner, so it may have reset the connection before
+        # this runs. That is the expected path here, not an error worth
+        # propagating out of a fixture whose job is finished.
+        with suppress(ConnectionError, OSError):
+            await writer.wait_closed()
 
     server = await asyncio.start_server(greet, '127.0.0.1', 0)
     try:
