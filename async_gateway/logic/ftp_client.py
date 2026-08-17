@@ -76,6 +76,24 @@ FTP_SUCCESS_STATUS: Final[int] = 200
 REMOVING_COMMANDS: Final[frozenset[Text]] = frozenset(
     {'remove', 'remove_file', 'remove_directory'})
 
+# The FTP operations this library will dispatch, and the whole of what
+# `command` may name (R21-AC1, R15-AC8). Every one is a coroutine method
+# of `aioftp.Client`: the transfer pair takes two paths, the three
+# removals take one, and that split is what `_run_command` reads
+# `client_path` to decide.
+#
+# What the set *excludes* is the point. An unbounded `getattr` on a
+# connected `aioftp.Client` reached `close`, `quit`, `command` and every
+# other attribute of a live session, so a mistyped command did not fail:
+# it ran whatever else that name meant, or raised a `TypeError` the
+# envelope reported as a fabricated status (M25). `list` and `stat` are
+# absent deliberately rather than by oversight -- this protocol already
+# reports `stat` in the `protocol_details` of every successful
+# non-removing command, so admitting either as a command in its own right
+# would be a second way to ask for what the envelope already carries.
+FTP_COMMANDS: Final[frozenset[Text]] = (
+    frozenset({'download', 'upload'}) | REMOVING_COMMANDS)
+
 # The keys `get_ssl_config` may answer with. Both are read because the
 # helper's shape is owned by another requirement (R23) and is changing;
 # reading only one of them is precisely the defect this replaces.
@@ -390,9 +408,26 @@ class FTPRequest(BaseRequestClass):
             command that removed it. The read used to be unconditional,
             so a completed deletion ended in a ``stat`` on a path that no
             longer existed and was reported as a failure (M3).
+
+        Raises:
+            UnsupportedVerbError: If ``command`` names nothing in
+                :data:`FTP_COMMANDS` (R15-AC8). Raised here, inside
+                ``handle_request``'s ``try``, so it reaches the caller as
+                a ``CONFIG`` envelope rather than escaping -- and raised
+                *before* the operation is looked up, so an unknown name
+                never resolves to an attribute of the connected session.
+                It replaces the ``TypeError`` such a name used to produce
+                from inside the transport, which belonged to no family
+                and was reported as a fabricated status.
         """
-        command = self.command_.lower()
-        operation = getattr(client, command)
+        # Resolved before the name is normalised for the `REMOVING_COMMANDS`
+        # test below, not after: `command` absent is `None`, and
+        # `None.strip()` is the `AttributeError` this criterion exists to
+        # replace. Only a name the allowlist admitted is normalised here,
+        # so the read cannot raise.
+        operation = self.resolve_verb(
+            client, self.command_, allowed=FTP_COMMANDS, setting='command')
+        command = self.command_.strip().lower()
         if self.client_path:
             await self.circuit_breaker.run(
                 operation,
