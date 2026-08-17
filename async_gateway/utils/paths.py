@@ -308,10 +308,16 @@ def caller_path(path: PathLike) -> Path:
             and R22's "a caller-supplied path that is itself a
             directory" edge case.
     """
-    absolute = Path(path).absolute()
-    if _names_a_directory(PurePath(absolute.name)):
+    # Read off the *string*, before `Path` sees it: `pathlib` strips a
+    # trailing separator while parsing, so `Path('/tmp/x/').name` is
+    # `'x'` and a check made after construction cannot tell `/tmp/x/`
+    # -- which names a directory -- from `/tmp/x`, which names a file.
+    spelled = os.fspath(path)
+    if not spelled or spelled.endswith(os.sep) or _names_a_directory(
+            PurePath(Path(spelled).name)):
         raise PathContainmentError(
             f'{str(path)!r} names a directory, not a file to write to')
+    absolute = Path(spelled).absolute()
     return resolve_within(absolute.parent, absolute.name)
 
 
@@ -434,6 +440,28 @@ def guarded_opener(
     return opener
 
 
+def _what_is_there(path: Text) -> Text:
+    """Return what kind of thing already occupies ``path``.
+
+    Blocking; called through a thread. Classification only, and only
+    *after* an open has already been refused -- so unlike a pre-write
+    check, nothing here can be raced into permitting a write.
+
+    Args:
+        path: The path the open refused.
+
+    Returns:
+        ``'symlink'``, ``'directory'``, or ``'file'`` for anything else
+        -- including a path that has since vanished, which is the
+        ordinary-file message and not worth a third case.
+    """
+    if os.path.islink(path):
+        return 'symlink'
+    if os.path.isdir(path):
+        return 'directory'
+    return 'file'
+
+
 async def _refusal(path: PathLike, err: OSError) -> Optional[
         AsyncGatewayError]:
     """Return the typed error a refused guarded open should raise.
@@ -460,10 +488,20 @@ async def _refusal(path: PathLike, err: OSError) -> Optional[
             f'{str(path)!r}')
     if err.errno != errno.EEXIST:
         return None
-    if await asyncio.to_thread(os.path.islink, os.fspath(path)):
+    kind = await asyncio.to_thread(_what_is_there, os.fspath(path))
+    if kind == 'symlink':
         return PathContainmentError(
             f'refusing to write through the symbolic link at '
             f'{str(path)!r}')
+    if kind == 'directory':
+        # Reported as itself rather than as "exists, pass overwrite":
+        # `overwrite=True` would not help, it would reach the open
+        # again and earn `IsADirectoryError`. Telling a caller to
+        # retry with a flag that cannot work is worse than saying
+        # nothing. R22's "a caller-supplied path that is itself a
+        # directory" edge case.
+        return ConfigurationError(
+            f'{str(path)!r} is a directory, not a file to write to')
     return ConfigurationError(
         f'{str(path)!r} already exists and overwrite is False; pass '
         f'overwrite=True to replace it')
