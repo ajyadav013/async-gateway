@@ -33,12 +33,17 @@ import logging
 import socket
 import ssl
 from collections.abc import Collection, Mapping
+from types import MappingProxyType
 from typing import Any, Final, Optional, Sequence, Text, Tuple, Union
 
 import aioftp
 
 from async_gateway.helpers.internal.base import BaseRequestClass
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
+from async_gateway.utils.contained_io import (
+    contained_path_io_factory,
+    local_root,
+)
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
@@ -76,6 +81,32 @@ FTP_SUCCESS_STATUS: Final[int] = 200
 # under the other two.
 REMOVING_COMMANDS: Final[frozenset[Text]] = frozenset(
     {'remove', 'remove_file', 'remove_directory'})
+
+# The transfer commands, and which way round their two operands go
+# (AGW-33). `aioftp.Client` takes `(source, destination)` on both verbs
+# and the two verbs point in **opposite directions**, so one shared
+# positional order is correct for exactly one of them:
+#
+#   download(source=remote, destination=local)
+#   upload(source=local,    destination=remote)
+#
+# `_run_command` used to pass `(server_path, client_path)` to whichever
+# command the caller named. For `download` that is right. For `upload`
+# it reads `server_path` off the **local** filesystem and writes it to
+# `client_path` on the **server**: usually a clean failure, but in a
+# mirrored-tree deployment a local file exists at the remote path and
+# the wrong file is transferred to the wrong place while the envelope
+# reports `ok=True` (AGW-33, High).
+#
+# A table beside the command set rather than a conditional at the call
+# site, and this comment rather than none: the reason the defect
+# survived is that one positional order was applied to every verb, and
+# the most likely future mistake is "simplifying" this back into one.
+# True means the caller's LOCAL path is the source.
+LOCAL_IS_SOURCE: Final[Mapping[Text, bool]] = MappingProxyType({
+    'download': False,
+    'upload': True,
+})
 
 # The keys `get_ssl_config` may answer with. Both are read because the
 # helper's shape is owned by another requirement (R23) and is changing;
@@ -220,6 +251,10 @@ class FTPRequest(BaseRequestClass):
         self.command_: Text = self.info.get('command', None)
         self.server_path: Text = self.info.get('server_path', None)
         self.client_path: Text = self.info.get('client_path', None)
+        # R22-AC3: refuse to overwrite by default, opt in by name. The
+        # local side of a download is a caller-supplied path, so the
+        # same decision that governs an HTTP download governs this one.
+        self.overwrite: bool = self.info.get('overwrite') is True
         # `True`, matching the HTTP client. A default that puts the
         # caller's password on the wire is not a default anyone asked
         # for by name (H1).
@@ -236,9 +271,17 @@ class FTPRequest(BaseRequestClass):
             'port': 21, # optional, default is 21
             'command': 'download', # download, upload, remove
             'server_path': '',
-                # path from where to get/delete or upload file on server.
+                # path on the server: the SOURCE of a download and the
+                # DESTINATION of an upload.
             'client_path': '',
-                # path where file is downloaded/uploaded to.
+                # path on this machine: the DESTINATION of a download
+                # and the SOURCE of an upload. The two verbs point in
+                # opposite directions and each is passed in its own --
+                # see LOCAL_IS_SOURCE (AGW-33).
+            'overwrite': False, # optional, default False. A download
+                # refuses to replace an existing local file unless this
+                # is True; a symbolic link at the destination is
+                # refused either way.
             'verify_ssl': True, # optional, default is True. False opens
                 # the session in plaintext and logs a warning.
             'certificate': ('cert path', 'key path'), # optional
@@ -278,8 +321,14 @@ class FTPRequest(BaseRequestClass):
                 open.
             GatewayTimeoutError: When the connect, or any one socket
                 operation of the transfer, exceeds ``timeout``.
+            PathContainmentError: When a path a download would write --
+                including one the *server* composed out of its own
+                entry names -- resolves outside the directory
+                ``client_path`` names, or is a symbolic link (R22).
             ConfigurationError: When ``certificate`` is not a
-                ``(certificate path, key path)`` pair.
+                ``(certificate path, key path)`` pair, or when a
+                download's local destination already exists and
+                ``overwrite`` is not True.
             DnsError: When the host name does not resolve.
             ConnectError: When the connection is refused or reset.
             TransportError: For any other transport failure.
@@ -294,6 +343,7 @@ class FTPRequest(BaseRequestClass):
                 ssl=tls,
                 connection_timeout=self.timeout,
                 socket_timeout=self.timeout,
+                path_io_factory=self._path_io_factory(),
             ) as client:
                 file_stats = await self._run_command(client)
         except CircuitOpen as err:
@@ -316,6 +366,37 @@ class FTPRequest(BaseRequestClass):
             self.response,
             status_code=FTP_SUCCESS_STATUS,
             started=self.start_time)
+
+    def _path_io_factory(self) -> Any:
+        """Return the local-filesystem layer this session is confined to.
+
+        R22's actual threat model, and the half that is not visible
+        anywhere in this module: ``aioftp.Client.download`` takes the
+        entry names a server sent, composes them onto the local
+        destination itself, recurses, and writes through its own
+        ``path_io``. Nothing this class can do to ``client_path`` before
+        the call reaches those composed paths -- a server listing
+        ``/pub/data/../victimdir/OWNED`` under ``/pub/data`` produced
+        ``downloads/../victimdir/OWNED`` and wrote it, at mode 0644,
+        outside the directory the caller named (reproduced against the
+        real client with only the wire faked).
+
+        The ``path_io_factory`` is the one seam ``aioftp`` offers
+        between its recursion and the disk, so containment is installed
+        there. Every path the client composes is checked against the
+        directory the caller's ``client_path`` names, and every write
+        goes out with ``O_NOFOLLOW`` and mode 0600.
+
+        Returns:
+            The bound path-IO factory when the call names a local path,
+            or ``aioftp``'s own default when it does not -- a command
+            with no ``client_path`` touches no local file, so there is
+            nothing to confine and no directory to confine it to.
+        """
+        if not self.client_path:
+            return aioftp.pathio.PathIO
+        base, _ = local_root(self.client_path)
+        return contained_path_io_factory(base, overwrite=self.overwrite)
 
     async def _tls_value(self) -> Union[ssl.SSLContext, bool]:
         """Return what this session hands ``aioftp`` as its ``ssl``.
@@ -388,10 +469,11 @@ class FTPRequest(BaseRequestClass):
         command = self.command_.lower()
         operation = getattr(client, command)
         if self.client_path:
+            source, destination = self._operands(command)
             await self.circuit_breaker.failsafe.run(
                 operation,
-                self.server_path,
-                self.client_path,
+                source,
+                destination,
                 write_into=True)
         else:
             await self.circuit_breaker.failsafe.run(
@@ -400,4 +482,31 @@ class FTPRequest(BaseRequestClass):
 
         if command in REMOVING_COMMANDS:
             return None
+        # The remote path, for every verb. An upload's `client_path` is
+        # local and stat-ing it would report the file that was read
+        # rather than the one that was written.
         return await client.stat(self.server_path)
+
+    def _operands(self, command: Text) -> Tuple[Text, Text]:
+        """Return ``(source, destination)`` in this verb's own direction.
+
+        AGW-33. See :data:`LOCAL_IS_SOURCE` for why a table decides this
+        and a single shared positional order cannot.
+
+        Args:
+            command: The normalised command name.
+
+        Returns:
+            The two operands, source first, in the order ``aioftp``
+            defines for *this* verb. A command outside
+            :data:`LOCAL_IS_SOURCE` that nonetheless carries a
+            ``client_path`` keeps the historical
+            ``(server_path, client_path)`` order: this method's job is
+            the operand direction of the two transfer verbs, and
+            inventing a direction for a verb nobody has established one
+            for would be a guess. Which commands are dispatchable at all
+            is R21's allowlist, at S19.
+        """
+        if LOCAL_IS_SOURCE.get(command, False):
+            return self.client_path, self.server_path
+        return self.server_path, self.client_path

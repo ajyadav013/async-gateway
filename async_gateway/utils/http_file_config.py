@@ -13,7 +13,6 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Optional, Text
 
 import aioboto3
-import aiofiles.os
 import aiohttp
 
 from .constants import (
@@ -23,6 +22,7 @@ from .constants import (
     STATUS_CODE_403,
 )
 from .exceptions import HttpStatusError, ResponseTooLargeError
+from .paths import resolve_caller_path, safe_unlink, safe_writer
 
 #: The response header that declares a body's length before it is read.
 #: Matched case-insensitively, because a plain ``dict`` of headers does not
@@ -176,7 +176,8 @@ async def download_file_from_url(
         headers=None,
         timeout: Optional[float] = None,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
-        chunk_size: int = CHUNK_SIZE_CONSTANT, **kwargs):
+        chunk_size: int = CHUNK_SIZE_CONSTANT,
+        overwrite: bool = False, **kwargs):
     """Download File from url.
 
     The session carries an explicit ``timeout``: without one ``aiohttp``
@@ -193,6 +194,16 @@ async def download_file_from_url(
     The status is judged *before* the body is touched. It was judged after,
     which meant the whole body of a 403 was read and then discarded.
 
+    The write goes through :func:`~async_gateway.utils.paths.safe_writer`
+    (R22). Three things change. The path is canonicalised before it is
+    opened, so ``..`` and a symlinked intermediate component resolve to
+    where they actually point (M17). The open carries ``O_NOFOLLOW`` and
+    mode 0600, so the symlink a hostile local process pre-created at the
+    README's fixed ``/tmp/test.pdf`` is refused rather than written
+    through, and the result is not world-readable (M18). And a failure
+    part-way through the body removes what was written instead of
+    orphaning it (M19).
+
     :param file_download_path: complete url from where to download
     :param local_filepath: machine file path to download and store it
     :param request_type: HTTP method
@@ -201,13 +212,23 @@ async def download_file_from_url(
         defaulting to ``HTTP_TIMEOUT``
     :param max_response_bytes: ceiling on the bytes read from the response
     :param chunk_size: bytes requested per read
+    :param overwrite: whether an existing ``local_filepath`` may be
+        replaced. **False by default** (R22-AC3): a download that
+        silently replaces a file is how a caller loses one, and a
+        symlink planted at the destination is how someone else's file
+        gets written. Pass True to re-download to a stable path.
     :param kwargs
     :raises HttpStatusError: if the endpoint answers 403.
     :raises ResponseTooLargeError: if the response declares, or streams,
         more than ``max_response_bytes``.
+    :raises PathContainmentError: if ``local_filepath`` is a symbolic
+        link, or names a directory rather than a file.
+    :raises ConfigurationError: if ``local_filepath`` already exists and
+        ``overwrite`` is False.
     """
     if headers is None:
         headers = {}
+    target = await resolve_caller_path(local_filepath)
     client_timeout = aiohttp.ClientTimeout(
         total=HTTP_TIMEOUT if timeout is None else timeout)
     async with aiohttp.ClientSession(
@@ -220,7 +241,8 @@ async def download_file_from_url(
                     'Access to the requested file is forbidden.',
                     STATUS_CODE_403)
             guard_declared_length(response.headers, max_response_bytes)
-            async with aiofiles.open(local_filepath, 'wb') as file_obj:
+            async with safe_writer(
+                    target, overwrite=overwrite) as file_obj:
                 async for chunk in iter_capped(
                     response.content,
                     chunk_size=chunk_size,
@@ -230,7 +252,7 @@ async def download_file_from_url(
 
 
 async def delete_local_file_path(local_filepath: Text, **kwargs) -> None:
-    """Deletes downloaded file.
+    """Delete a downloaded file, succeeding when it is already gone.
 
     The unlink goes through ``aiofiles.os`` rather than ``os.remove``:
     a synchronous unlink is a blocking filesystem call, and on an async
@@ -238,12 +260,15 @@ async def delete_local_file_path(local_filepath: Text, **kwargs) -> None:
     (R20/C3). ``aiofiles.os.remove`` runs it in a thread, so the loop
     stays free while the directory entry is removed.
 
-    Note the import is ``import aiofiles.os``: importing ``aiofiles``
-    alone does not bind the ``os`` submodule.
+    **Idempotent** (M19/R22-AC4). This is documented as the
+    post-processor *cleanup* step, and a cleanup that raises on the
+    second call is one no caller can run from a ``finally``: the
+    download path's own ``try/finally`` removes a partial file, so a
+    caller's cleanup routinely arrives at a path something has already
+    removed. Absence is the outcome asked for, however it was reached.
+    It used to raise ``FileNotFoundError``.
 
     :param local_filepath: file to be deleted
     :param kwargs
-    :raises FileNotFoundError: if the file is already gone. Making the
-        delete idempotent is R22's change, not this one.
     """
-    await aiofiles.os.remove(local_filepath)
+    await safe_unlink(local_filepath)
