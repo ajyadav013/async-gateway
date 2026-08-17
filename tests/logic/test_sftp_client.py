@@ -1232,7 +1232,7 @@ async def test_agw33_an_upload_mode_passes_local_first(
     mode: Text,
     expected: tuple[Text, Text],
 ) -> None:
-    """asyncssh's signatures disagree on order, so one order cannot serve.
+    """The asyncssh signatures disagree on order, so one cannot serve.
 
     ``get(remotepaths, localpath)`` against
     ``put(localpaths, remotepath)``. The client passed

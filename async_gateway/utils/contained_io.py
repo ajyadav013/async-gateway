@@ -41,7 +41,7 @@ import asyncio
 import inspect
 import io
 import os
-from pathlib import Path, PurePath
+from pathlib import Path
 from types import MappingProxyType
 from typing import (
     Any,
@@ -53,15 +53,16 @@ from typing import (
     Tuple,
 )
 
+import aioftp
+
 from async_gateway.utils.exceptions import PathContainmentError
 from async_gateway.utils.paths import (
     BytesOrPathLike,
     PathLike,
+    classify_refusal,
     guarded_opener,
     under,
 )
-
-import aioftp
 
 import asyncssh
 from asyncssh.sftp import LocalFile, local_fs
@@ -122,13 +123,28 @@ def _open_guarded(path: Path, mode: Text, overwrite: bool) -> io.BytesIO:
         The open file object.
 
     Raises:
-        OSError: As ``open`` does. ``EEXIST`` for a target already
-            there, ``ELOOP``/``EMLINK`` for a symbolic link.
+        PathContainmentError: If the target is a symbolic link.
+        ConfigurationError: If the target exists and ``overwrite`` is
+            False.
+        OSError: For every other reason the open failed -- a missing
+            parent, a permission failure -- reported as itself.
     """
     if not _writes(mode):
         return open(path, mode)  # type: ignore[return-value]
-    return open(  # type: ignore[return-value]
-        path, mode, opener=guarded_opener(overwrite=overwrite))
+    try:
+        return open(  # type: ignore[return-value]
+            path, mode, opener=guarded_opener(overwrite=overwrite))
+    except OSError as err:
+        # The same classification :func:`safe_writer` gives the HTTP
+        # path. Without it a refused overwrite reached an FTP or SFTP
+        # caller as a raw ``FileExistsError`` and a refused symlink as
+        # ``OSError``, so R22-AC3's typed contract held on one protocol
+        # and not the other two. Already in a thread, so the classifier's
+        # stat is off the loop.
+        refusal = classify_refusal(path, err)
+        if refusal is None:
+            raise
+        raise refusal from err
 
 
 class ContainedPathIO(aioftp.pathio.AsyncPathIO):

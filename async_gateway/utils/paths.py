@@ -462,7 +462,7 @@ def _what_is_there(path: Text) -> Text:
     return 'file'
 
 
-async def _refusal(path: PathLike, err: OSError) -> Optional[
+def classify_refusal(path: PathLike, err: OSError) -> Optional[
         AsyncGatewayError]:
     """Return the typed error a refused guarded open should raise.
 
@@ -470,6 +470,16 @@ async def _refusal(path: PathLike, err: OSError) -> Optional[
     been written, so reading the filesystem here cannot be raced into
     permitting anything -- which is what makes an ``islink`` legitimate
     *after* the refusal when it would be a vulnerability before it.
+
+    Blocking, and deliberately so: the two write seams that need it are
+    already inside a thread when the refusal arrives -- the protocol
+    wrappers' opens run in an executor -- and only the async
+    :func:`safe_writer` has to hand it to one. A single classifier is
+    the point. When the FTP and SFTP wrappers each let the raw
+    ``OSError`` escape instead, the same refused overwrite surfaced as
+    ``FileExistsError`` on the protocol paths and as ``ConfigurationError``
+    on the HTTP one, so R22-AC3's default was untypeable by a caller
+    that used both.
 
     Args:
         path: The path the open refused.
@@ -488,7 +498,7 @@ async def _refusal(path: PathLike, err: OSError) -> Optional[
             f'{str(path)!r}')
     if err.errno != errno.EEXIST:
         return None
-    kind = await asyncio.to_thread(_what_is_there, os.fspath(path))
+    kind = _what_is_there(os.fspath(path))
     if kind == 'symlink':
         return PathContainmentError(
             f'refusing to write through the symbolic link at '
@@ -549,7 +559,9 @@ async def safe_writer(
         handle: AsyncBufferedIOBase = await aiofiles.open(
             path, 'wb', opener=guarded_opener(overwrite=overwrite))
     except OSError as err:
-        refusal = await _refusal(path, err)
+        # In a thread: the classifier stats the path, and R20 bans that
+        # on the loop. The protocol wrappers are already in one.
+        refusal = await asyncio.to_thread(classify_refusal, path, err)
         if refusal is None:
             raise
         raise refusal from err

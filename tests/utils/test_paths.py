@@ -757,6 +757,53 @@ async def test_the_caller_path_canonicalisation_is_off_the_loop_too(
     assert threading.get_ident() not in ran_on
 
 
+async def test_the_refusal_classifier_does_not_run_on_the_event_loop(
+    tmp_path: Path,
+) -> None:
+    """The third blocking site R20 covers: classifying a refused open.
+
+    :func:`classify_refusal` stats the path to tell a symlink from an
+    ordinary file from a directory, and it is reached on *every* refused
+    write -- the ``EEXIST`` a default-refusing download earns is the
+    ordinary case, not the rare one. The AST scan cannot see it for the
+    same reason it cannot see ``.resolve()``: the ``os.path`` calls are
+    inside a helper, one call away from the async function.
+
+    The classifier is deliberately a plain ``def`` so the two protocol
+    wrappers -- already inside an executor when their open fails -- can
+    call it directly. That makes it :func:`safe_writer`'s job to hop,
+    and this asserts the hop rather than trusting it.
+    """
+    target = tmp_path / 'occupied.bin'
+    target.write_bytes(b'already here')
+    ran_on: list[int] = []
+    real_islink = os.path.islink
+
+    def recording(path: Any) -> bool:
+        """Note the calling thread, then answer normally.
+
+        Args:
+            path: The path being tested.
+
+        Returns:
+            Whether it is a symbolic link.
+        """
+        ran_on.append(threading.get_ident())
+        return real_islink(path)
+
+    os.path.islink = recording  # type: ignore[assignment]
+    try:
+        with pytest.raises(ConfigurationError):
+            async with safe_writer(target):
+                pass
+    finally:
+        os.path.islink = real_islink  # type: ignore[assignment]
+
+    assert ran_on, 'nothing was classified, so nothing was proven'
+    assert threading.get_ident() not in ran_on, (
+        'the refusal classifier stat ran on the event loop thread (R20)')
+
+
 # --- the caller-supplied path -----------------------------------------------
 
 
@@ -874,7 +921,7 @@ def test_under_splits_a_composed_path_and_refuses_the_escape(
 
 
 def test_under_accepts_the_bytes_asyncssh_speaks(tmp_path: Path) -> None:
-    """asyncssh's filesystem protocol is bytes end to end.
+    """The asyncssh filesystem protocol is bytes end to end.
 
     ``scandir`` yields byte filenames and ``_copy`` joins them with
     ``posixpath.join``, so a seam that took only ``str`` would fail on

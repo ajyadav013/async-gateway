@@ -1,6 +1,6 @@
 # AGW-33: transfer verbs pass the remote path as the LOCAL source (FTP `upload`, SFTP `put`/`mput`)
 
-- **Status:** OPEN
+- **Status:** DONE — fixed in S18 (`lane/s18`), pending the main session's merge
 - **Severity: High.** Not Critical — it needs a misconfiguration-shaped precondition — but see
   *The silent-wrong-file case* below: in a mirrored-tree deployment both clients transfer the wrong
   file to the wrong destination and report `ok=True`.
@@ -152,4 +152,37 @@ which are genuinely ambiguous. Then:
 
 ## Work Log
 
-_Empty — opened when the defect was routed, before S18 is dispatched._
+Fixed inside S18 (`lane/s18`), as Ruling R routed it. Against the Definition of Done, item by item:
+
+- **A requirement was written first.** R22 now carries a normative operand-order paragraph
+  (*Revision 5, AGW-33*): for an **upload** the operands are **LOCAL SOURCE → REMOTE DESTINATION**;
+  the download-direction verbs stay remote-first. `copy`/`mcopy` are ruled **out of reach** — both
+  operands are remote, so neither is local and the question does not arise; whether they are
+  dispatchable at all stays R21's allowlist decision at S19.
+- **FTP.** `download` and `upload` no longer share one order. `LOCAL_IS_SOURCE` in
+  `logic/ftp_client.py` decides per verb; `_operands` reads it.
+- **SFTP.** The same table in `logic/sftp_client.py`: `get`/`mget` keep `(remote, local)`,
+  `put`/`mput` become `(local, remote)`.
+- **A table beside the command set, not a conditional at the call site**, with a comment naming
+  *why* the verbs differ — the stated most-likely future mistake is "simplifying" it back into one
+  shared order, and both tables say so.
+- **Tests model a filesystem and assert content.** `test_agw33_an_upload_sends_the_local_file_the_caller_named`
+  (FTP) and `test_agw33_a_put_sends_the_local_file_the_caller_named` (SFTP) build the **mirrored
+  tree** — a local file present at the remote path — and assert the bytes that reached the server
+  are the local file's, not the mirrored one's. Transposed, the wrong file arrives under `ok=True`,
+  which is the defect. Argument-order rows exist too, but as a supplement: as this ticket predicted,
+  neither a signature-faithful double (S12) nor a recording one (S11) can see two path-like
+  positionals swap.
+- **An upload whose local source is absent fails with `ok=False`** and never reaches `finalise_ok`
+  — `test_agw33_an_upload_whose_local_source_is_absent_fails`.
+- **The post-command readback stats the remote path** for every verb —
+  `test_agw33_the_readback_stat_targets_the_remote_path` (`ftp_client.py:498`,
+  `sftp_client.py:633`).
+- **The S12 docstring note** pointing at this ticket is gone; the `put` rows now genuinely certify
+  the verb.
+
+**Mutation proof.** Setting both tables back to one shared order (`'upload': False`,
+`'put'/'mput': False`) turns **6 rows red** across the two clients, including all three
+content-asserting ones; restored, green.
+
+Verification for the whole lane is in AGW-18's work log.
