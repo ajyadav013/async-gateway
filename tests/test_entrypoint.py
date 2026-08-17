@@ -44,6 +44,7 @@ from async_gateway.logic import protocol_mapping
 from async_gateway.logic.ftp_client import FTPRequest
 from async_gateway.logic.http_client import HttpRequest
 from async_gateway.logic.sftp_client import SFTPRequest
+from async_gateway.logic.soap_client import SoapRequest
 from async_gateway.utils.constants import HTTP_TIMEOUT
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import ConfigurationError
@@ -181,12 +182,28 @@ async def test_r11_ac2_unusable_protocol_raises_configuration_error(
         assert supported in message
 
 
-async def test_h3_soap_is_an_unknown_protocol_until_its_class_exists() -> None:
-    """``'SOAP'`` is absent from the registry, not mapped to ``None``."""
-    assert 'SOAP' not in protocol_mapping
+def test_h3_soap_maps_to_a_real_class_and_never_to_none() -> None:
+    """``'SOAP'`` dispatches to a real strategy class (H3, R11-AC5).
 
-    with pytest.raises(ConfigurationError):
-        await request('http://host/p', protocol='SOAP')
+    The closing half of H3, and the reason this assertion is written as a
+    *type* check rather than as ``'SOAP' in protocol_mapping``. The defect
+    was never the key's absence: the key was present and mapped to
+    ``None``, so ``request(protocol='SOAP')`` reached
+    ``protocol_class(...)`` and died with ``TypeError: 'NoneType' object
+    is not callable`` -- a crash out of a function whose contract is to
+    return an envelope. A membership test passes on that exact defect.
+
+    Between the two, the key was deliberately *absent* rather than mapped
+    to a placeholder, so a SOAP call was rejected as an unknown protocol
+    with a message naming what the library did support. S22 wrote
+    ``logic/soap_client.py``, so the entry that was once a landmine is
+    now a class, and every entry in the registry is one.
+    """
+    assert protocol_mapping['SOAP'] is SoapRequest
+    assert all(
+        isinstance(strategy, type)
+        and issubclass(strategy, BaseRequestClass)
+        for strategy in protocol_mapping.values())
 
 
 async def test_r11_ac2_a_rejected_protocol_is_reported_once_and_not_logged(
