@@ -50,6 +50,7 @@ from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
     CircuitOpenError,
+    ConfigurationError,
     ConnectError,
     DnsError,
     FtpStatusError,
@@ -285,9 +286,16 @@ class FTPRequest(BaseRequestClass):
         self.port: int = self.info.get('port', DEFAULT_FTP_PORT)
         self.user: Text = self.auth.login
         self.password: Text = self.auth.password
-        self.command_: Text = self.info.get('command', None)
-        self.server_path: Text = self.info.get('server_path', None)
-        self.client_path: Text = self.info.get('client_path', None)
+        # Optional, and genuinely so: `protocol_info` is optional for this
+        # protocol (R11-AC3), so an `FTPRequest` stays constructible with
+        # none of these present. `resolve_verb` is what refuses a missing
+        # or non-string `command`, by name and against the allowlist, and
+        # `_run_command` reads `client_path` for None to decide whether a
+        # local path is involved at all. Annotating them `Text` asserted a
+        # non-None the constructor never established.
+        self.command_: Optional[Text] = self.info.get('command')
+        self.server_path: Optional[Text] = self.info.get('server_path')
+        self.client_path: Optional[Text] = self.info.get('client_path')
         # R22-AC3: refuse to overwrite by default, opt in by name. The
         # local side of a download is a caller-supplied path, so the
         # same decision that governs an HTTP download governs this one.
@@ -367,11 +375,13 @@ class FTPRequest(BaseRequestClass):
                 that will not load -- raised by ``get_ssl_config`` and
                 deliberately not caught here, see :meth:`_tls_value` --
                 or when a download's local destination already exists
-                and ``overwrite`` is not True.
+                and ``overwrite`` is not True, or when ``server_path``
+                is absent or is not a non-empty string.
             DnsError: When the host name does not resolve.
             ConnectError: When the connection is refused or reset.
             TransportError: For any other transport failure.
         """
+        self._validate_server_path()
         try:
             # Inside the `try`, so a certificate that will not load is
             # reported through the same contract as everything else
@@ -505,10 +515,44 @@ class FTPRequest(BaseRequestClass):
             ) from err
         return tls_context_for(ssl_config)
 
+    def _validate_server_path(self) -> None:
+        """Check that the caller named the path on the server.
+
+        Called at the top of :meth:`handle_request` rather than from the
+        constructor, and for the same reason ``SFTPRequest`` validates
+        its ``mode`` there: ``protocol_info`` is optional for this
+        protocol at the entry point (R11-AC3), so an ``FTPRequest`` has
+        to remain constructible without one. Called before the connect
+        all the same, so nothing is opened for a call that cannot run.
+
+        Surfaced by removing mypy's ``ignore_errors``: with
+        ``server_path`` annotated honestly as ``Optional[Text]``, the
+        checker showed it reaching ``aioftp.Client.stat``, whose
+        signature is ``str | PurePosixPath``. Absent, it arrived there as
+        ``None`` and raised ``TypeError: argument should be a str or an
+        os.PathLike object`` from inside ``PurePosixPath`` -- and a
+        ``TypeError`` belongs to no transport family, so it escaped
+        ``request()`` un-enveloped as a library bug rather than being
+        reported as the caller's configuration error it is.
+
+        Returns:
+            None. Which *commands* are dispatchable is R21's allowlist,
+            checked separately in :meth:`_run_command`; what is checked
+            here is only that there is a remote path to act on.
+
+        Raises:
+            ConfigurationError: If ``server_path`` is absent or is not a
+                non-empty string.
+        """
+        if not isinstance(self.server_path, str) or not self.server_path:
+            raise ConfigurationError(
+                "protocol_info['server_path'] must be a non-empty string "
+                f'naming the path on the server, got {self.server_path!r}')
+
     async def _run_command(
         self,
         client: aioftp.Client,
-    ) -> Optional[dict[Text, Text]]:
+    ) -> Optional[Mapping[Text, Any]]:
         """Run the caller's command and read back what it left behind.
 
         Args:
@@ -519,6 +563,15 @@ class FTPRequest(BaseRequestClass):
             command that removed it. The read used to be unconditional,
             so a completed deletion ended in a ``stat`` on a path that no
             longer existed and was reported as a failure (M3).
+
+            ``Mapping[Text, Any]``, not ``dict[Text, Text]``, on both
+            halves. ``aioftp.Client.stat`` answers with a
+            ``BasicListInfo`` or a ``UnixListInfo``, which are
+            ``TypedDict``s: not assignable to a ``dict`` even where the
+            fields match, and ``UnixListInfo['unix.mode']`` is an ``int``,
+            so the value type was wrong too. The value is forwarded into
+            ``protocol_details`` and never mutated, so the read-only type
+            is both accurate and sufficient.
 
         Raises:
             UnsupportedVerbError: If ``command`` names nothing in
@@ -538,7 +591,13 @@ class FTPRequest(BaseRequestClass):
         # so the read cannot raise.
         operation = self.resolve_verb(
             client, self.command_, allowed=FTP_COMMANDS, setting='command')
-        command = self.command_.strip().lower()
+        # `resolve_verb` returns only for a name it matched in the
+        # allowlist, so `command_` is a non-empty str by the time this
+        # line runs. mypy cannot see that across the call, and `str()` is
+        # how the local re-narrows it without asserting anything the line
+        # above has not already enforced -- a no-op for the str this
+        # always is, and unreachable for the None it never is here.
+        command = str(self.command_).strip().lower()
         if self.client_path:
             source, destination = self._operands(command)
             await self.circuit_breaker.run(
@@ -556,9 +615,17 @@ class FTPRequest(BaseRequestClass):
         # The remote path, for every verb. An upload's `client_path` is
         # local and stat-ing it would report the file that was read
         # rather than the one that was written.
-        return await client.stat(self.server_path)
+        #
+        # `str()` re-narrows what `_validate_server_path` established at
+        # the top of `handle_request`; mypy cannot see that across the
+        # call, and the local asserts nothing the validator has not
+        # already enforced.
+        return await client.stat(str(self.server_path))
 
-    def _operands(self, command: Text) -> Tuple[Text, Text]:
+    def _operands(
+        self,
+        command: Text,
+    ) -> Tuple[Optional[Text], Optional[Text]]:
         """Return ``(source, destination)`` in this verb's own direction.
 
         AGW-33. See :data:`LOCAL_IS_SOURCE` for why a table decides this
@@ -577,6 +644,13 @@ class FTPRequest(BaseRequestClass):
             inventing a direction for a verb nobody has established one
             for would be a guess. Which commands are dispatchable at all
             is R21's allowlist, at S19.
+
+            Either operand may be None: ``protocol_info`` is optional for
+            this protocol, so neither path is guaranteed present. The
+            caller reaches this method only inside ``if self.client_path``,
+            which establishes one of the two; ``aioftp`` refuses the other
+            on its own terms if it is missing, and that refusal is a
+            transport failure this class already classifies.
         """
         if LOCAL_IS_SOURCE.get(command, False):
             return self.client_path, self.server_path

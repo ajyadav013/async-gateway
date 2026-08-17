@@ -129,7 +129,7 @@ def _open_guarded(path: Path, mode: Text, overwrite: bool) -> io.BytesIO:
         OSError: For every other reason the open failed -- a missing
             parent, a permission failure -- reported as itself.
     """
-    # type: ignore[return-value] -- the declared return is `io.BytesIO`
+    # `type: ignore[return-value]` -- the declared return is `io.BytesIO`
     # because that is what `aioftp.pathio.AbstractPathIO._open` declares
     # and this value is handed straight back to it; the builtin actually
     # answers a `BufferedReader`/`BufferedWriter`. Annotating the true
@@ -345,7 +345,7 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
         return await super().rename(
             self.contained(source), self.contained(destination))
 
-    # type: ignore[override] -- aioftp's own `AsyncPathIO._open` carries
+    # `type: ignore[override]` -- aioftp's own `AsyncPathIO._open` carries
     # the identical ignore against its `AbstractPathIO._open(self, path,
     # mode)` base: the concrete signature widens `path` to `Path` and adds
     # `**kwargs`. This override matches the class it actually extends, so
@@ -388,7 +388,17 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
             # The parent's, decorators and all: an upload's read is
             # ordinary ``aioftp`` behaviour and its failures should
             # arrive as ``aioftp`` failures.
-            return await super()._open(target, mode, **kwargs)
+            #
+            # `type: ignore[arg-type]` -- aioftp types the base `_open`'s
+            # `mode` as a union of ~40 string *Literals*, but the value
+            # arriving here is whatever `aioftp.Client` passed down, typed
+            # `str` at this override's own signature (which is aioftp's
+            # own shape -- see the `[override]` ignore on the def). mypy
+            # cannot narrow a `str` to a Literal union, and enumerating
+            # the union here would restate a dependency's private detail
+            # that goes stale on its next release.
+            return await super()._open(
+                target, mode, **kwargs)  # type: ignore[arg-type]
         opened = asyncio.get_running_loop().run_in_executor(
             self.executor, _open_guarded, target, mode, self.overwrite)
         if self.timeout is None:

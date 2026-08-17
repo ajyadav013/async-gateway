@@ -135,7 +135,7 @@ def counting(error: BaseException, succeed_after: int) -> Any:
             BaseException: ``error``, until ``succeed_after`` calls have
                 been made.
         """
-        # type: ignore[attr-defined] -- the call counter is kept as an
+        # `type: ignore[attr-defined]` -- the call counter is kept as an
         # attribute on the function object so the closure has no mutable
         # cell to reset between retries; a function is not typed as
         # carrying arbitrary attributes, and the alternative (a class, or

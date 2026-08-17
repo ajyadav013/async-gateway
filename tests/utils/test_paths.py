@@ -491,7 +491,7 @@ def _flags_from(opener: Any, tmp_path: Path) -> int:
         captured.append(flags)
         return real_open(os.devnull, os.O_WRONLY)
 
-    # type: ignore[assignment] -- `os.open` is replaced for the
+    # `type: ignore[assignment]` -- `os.open` is replaced for the
     # duration of this test to observe which thread the real open runs
     # on. mypy rightly refuses an assignment to a stdlib function; the
     # substitution is the experiment, and it is undone in the `finally`
@@ -532,7 +532,7 @@ def test_r22_ac3_the_mode_reaches_the_kernel(tmp_path: Path) -> None:
         captured.append(mode)
         return real_open(path, flags, mode, **kwargs)
 
-    # type: ignore[assignment] -- `os.open` is replaced for the
+    # `type: ignore[assignment]` -- `os.open` is replaced for the
     # duration of this test to observe which thread the real open runs
     # on. mypy rightly refuses an assignment to a stdlib function; the
     # substitution is the experiment, and it is undone in the `finally`
@@ -717,7 +717,7 @@ async def test_canonicalisation_does_not_run_on_the_event_loop(
         ran_on.append(threading.get_ident())
         return real_resolve(self, strict=strict)
 
-    # type: ignore[method-assign] -- `Path.resolve` is replaced for the
+    # `type: ignore[method-assign]` -- `Path.resolve` is replaced for the
     # duration of this test to observe which thread the real call runs
     # on. mypy rightly refuses a method assignment on a stdlib class;
     # the substitution is the experiment, and it is undone in the
@@ -762,7 +762,7 @@ async def test_the_caller_path_canonicalisation_is_off_the_loop_too(
         ran_on.append(threading.get_ident())
         return real_resolve(self, strict=strict)
 
-    # type: ignore[method-assign] -- `Path.resolve` is replaced for the
+    # `type: ignore[method-assign]` -- `Path.resolve` is replaced for the
     # duration of this test to observe which thread the real call runs
     # on. mypy rightly refuses a method assignment on a stdlib class;
     # the substitution is the experiment, and it is undone in the
@@ -811,7 +811,7 @@ async def test_the_refusal_classifier_does_not_run_on_the_event_loop(
         ran_on.append(threading.get_ident())
         return real_islink(path)
 
-    # type: ignore[assignment] -- `os.path.islink` is replaced for the
+    # `type: ignore[assignment]` -- `os.path.islink` is replaced for the
     # duration of this test to observe which thread the real call runs
     # on. mypy rightly refuses an assignment to a stdlib function; the
     # substitution is the experiment, and it is undone in the `finally`

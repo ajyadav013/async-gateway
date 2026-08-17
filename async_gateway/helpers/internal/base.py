@@ -17,8 +17,6 @@ from collections.abc import Collection, Mapping
 from typing import Any, ClassVar, Optional, Text, Tuple
 from urllib.parse import urlsplit
 
-import aiohttp
-
 from async_gateway.helpers.common.date_helper import monotonic_now
 from async_gateway.helpers.internal.breaker_registry import get_breaker
 from async_gateway.helpers.internal.circuit_breaker_helper import (
@@ -154,7 +152,7 @@ class BaseRequestClass(abc.ABC):
 
     def __init__(
         self, url: Text,
-        auth: aiohttp.BasicAuth,
+        auth: Any,
         response: GatewayResponse,
         info: Optional[Mapping[Text, Any]],
         *,
@@ -163,7 +161,15 @@ class BaseRequestClass(abc.ABC):
         """Initialize the request as per the config.
 
         :param url: url to make http/ftp/sftp call.
-        :param auth: auth object for ex aiohttp.BasicAuth(username, password)
+        :param auth: whatever auth object the caller passed, e.g.
+        ``aiohttp.BasicAuth(username, password)``. ``Any``, matching
+        ``request()``'s own ``auth: object = None`` and the README --
+        this library forwards it to the HTTP transport untouched and
+        reads ``.login``/``.password`` off it on FTP and SFTP, so it
+        accepts anything aiohttp does and, at this layer, ``None``. The
+        previous ``aiohttp.BasicAuth`` annotation named neither the
+        default nor the alternatives, and made the entry point's own
+        documented signature a type error.
         :param response: the ``GatewayResponse`` skeleton created by the
         entry point. The subclass fills it and returns it; it never
         replaces it with a dict of its own.
@@ -192,8 +198,24 @@ class BaseRequestClass(abc.ABC):
         # Monotonic, so a wall-clock step cannot make `latency` negative,
         # and float, because that is what a clock reading is (L4).
         self.start_time: float = monotonic_now()
-        self.timeout: int = self.info.get('timeout', HTTP_TIMEOUT)
-        self.certificate: Tuple[Text] = self.info.get('certificate')
+        # `Any`, and deliberately, on both of these. Each is a raw
+        # caller-supplied value that has *not yet been validated*, and the
+        # annotation has to say so or it is a claim this line does not
+        # establish:
+        #
+        # * `timeout` is whatever the caller wrote -- the HTTP and SOAP
+        #   subclasses replace it with an `aiohttp.ClientTimeout` built
+        #   through `validated_timeout`, FTP and SFTP pass it to their
+        #   transports as seconds. Annotating `int` here contradicted both
+        #   subclasses and described a `'ten'` as impossible when
+        #   `validated_timeout` exists precisely because it is not.
+        # * `certificate` is `None` far more often than it is a pair, and
+        #   its shape is checked by `get_ssl_config`, which takes `Any`
+        #   for the same reason. `Tuple[Text]` was wrong three ways: the
+        #   absent case, the arity (it is a *pair*), and the validation
+        #   this class does not perform.
+        self.timeout: Any = self.info.get('timeout', HTTP_TIMEOUT)
+        self.certificate: Any = self.info.get('certificate')
 
         # Read, never written to. The old code wrote a live `RetryPolicy`
         # into this very dict, so a `protocol_info` reused across two

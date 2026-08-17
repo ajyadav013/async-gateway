@@ -81,14 +81,14 @@ properties cannot be delegated:
   floor in :func:`test_every_module_docstring_says_what_and_why` is the
   part no linter supplies.
 * ``mypy``'s ``disallow_untyped_defs`` is configured in ``pyproject.toml``
-  -- and is **inert there today**, because ``ignore_errors = true`` in the
-  same section suppresses it along with everything else. That was measured
-  rather than assumed: with both settings on, ``mypy async_gateway``
-  reports ``Success: no issues found`` while seven functions are missing
-  annotations. Story S25 removes ``ignore_errors``; until it does, the
-  strictness flag is a promise with nothing behind it, and
-  :func:`test_every_signature_is_fully_annotated` is what actually holds
-  the line. It keeps holding it afterwards, which is the point: a gate
+  -- and was **inert there** for most of this release, because
+  ``ignore_errors = true`` in the same section suppressed it along with
+  everything else. That was measured rather than assumed: with both
+  settings on, ``mypy async_gateway`` reported ``Success: no issues
+  found`` while seven functions were missing annotations. Story AGW-26
+  removed ``ignore_errors``, so the flag now has something behind it.
+  :func:`test_every_signature_is_fully_annotated` held the line while it
+  did not, and keeps holding it now, which is the point: a gate
   that can be switched off by an unrelated setting in the same file is a
   gate that will be.
 
@@ -1519,9 +1519,11 @@ def test_every_signature_is_fully_annotated(path: Path) -> None:
 
     This is the standing enforcement of ``disallow_untyped_defs``, and
     it is not redundant with the mypy setting: ``ignore_errors = true``
-    in the same ``pyproject.toml`` section suppresses that flag entirely
-    today, so the configured strictness currently checks nothing. See
-    this module's docstring.
+    in the same ``pyproject.toml`` section suppressed that flag entirely
+    until AGW-26 removed it, so the configured strictness checked
+    nothing while this test was the only thing holding the property. It
+    stays for the same reason it was written. See this module's
+    docstring.
 
     Private helpers are **not** exempt. The docstring rule excuses them
     from prose; nothing excuses a function in a typed package from

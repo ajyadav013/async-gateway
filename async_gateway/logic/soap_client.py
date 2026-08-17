@@ -54,6 +54,7 @@ from typing import (
     ClassVar,
     Dict,
     List,
+    MutableMapping,
     Optional,
     Text,
     Tuple,
@@ -822,11 +823,23 @@ class SoapRequest(BaseRequestClass):
             self.info.get('session'))
         self.trace_config: List[aiohttp.TraceConfig] = validated_trace_config(
             self.info, self.session)
-        self.trace_collectors: List[Dict[Text, Any]] = trace_collectors_for(
-            self.session, self.trace_config)
-        self.reported_collectors: List[Dict[Text, Any]] = [
-            tracer.results_collector for tracer in self.trace_config
-        ]
+        self.trace_collectors: List[MutableMapping[Text, Any]] = (
+            trace_collectors_for(self.session, self.trace_config))
+        # Derived from the bind above, exactly as `logic/http_client.py`
+        # derives its own, rather than re-read off the tracers. Two
+        # reasons, and the first is why this is a type fix and not a
+        # rewrite: reading `tracer.results_collector` reached an
+        # attribute `aiohttp.TraceConfig` does not declare -- this
+        # library attaches it in `request_tracer()` -- so the only other
+        # way to type the line was a `type: ignore` for a lookup the
+        # module next door already avoids. The second is that the two
+        # HTTP-family protocols now put the same kind of object into the
+        # same envelope key, which is what `request_tracer` being one
+        # documented key means. A caller-supplied session leaves
+        # `trace_config` empty either way, so `[]` is still what such a
+        # call reports.
+        self.reported_collectors: List[MutableMapping[Text, Any]] = (
+            [] if self.session is not None else list(self.trace_collectors))
         self.max_response_bytes: int = validated_max_response_bytes(
             self.info.get('max_response_bytes', MAX_RESPONSE_BYTES))
         self.allow_redirects: bool = validated_allow_redirects(

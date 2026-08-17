@@ -298,7 +298,17 @@ async def handle_multipart_response(
             if part is None:
                 break
             while True:
-                chunk = await part.read_chunk()
+                # `type: ignore[union-attr]` -- `MultipartReader.next()`
+                # is typed `MultipartReader | BodyPartReader | None`,
+                # and only the `BodyPartReader` arm has `read_chunk`.
+                # The other arm is a *nested* `multipart/...` part, which
+                # this library does not descend into: today it would
+                # reach here and raise `AttributeError`. Making it
+                # descend, or refusing it with a typed error, is a
+                # behaviour change and is outside AGW-26's
+                # type-conformance-only boundary -- reported as a defect
+                # against the owning story rather than smuggled in here.
+                chunk = await part.read_chunk()  # type: ignore[union-attr]
                 if not chunk:
                     break
                 total += len(chunk)
@@ -984,7 +994,11 @@ async def make_http_filters_with_stream_file_upload(
     :returns HttpResult: what the final hop answered, as
     :func:`make_http_request` assembled it.
     """
-    http_file_upload_config = kwargs.get('http_file_upload_config')
+    # Subscripted, not `.get()`. `handle_http_request` routes here only
+    # when the config is present *and* carries a chunk size, so a `.get()`
+    # would be describing a None this path cannot receive -- and the two
+    # reads on the next lines would then be indexing it.
+    http_file_upload_config = kwargs['http_file_upload_config']
     local_filepath = http_file_upload_config['local_filepath']
     chunk_size = http_file_upload_config[
         'file_upload_chunk_size']
@@ -1112,7 +1126,11 @@ async def make_http_filters_without_stream_uploads(
     :returns HttpResult: what the final hop answered, as
     :func:`make_http_request` assembled it.
     """
-    http_file_upload_config = kwargs.get('http_file_upload_config')
+    # Subscripted, not `.get()`, for the reason given on the sibling
+    # method: `handle_http_request` routes here only when the config is
+    # present, so a None this path cannot receive was being indexed on
+    # the next two lines.
+    http_file_upload_config = kwargs['http_file_upload_config']
     local_filepath = http_file_upload_config['local_filepath']
     file_key = http_file_upload_config['file_key']
     # Opened and closed, rather than `stat`ed: the contract above is that
@@ -1192,7 +1210,13 @@ async def make_http_filters_without_file(
         **kwargs)
 
 
-filter_methods = {
+#: One filter method's signature. Naming it is what makes the table below
+#: typed, and a typed table is what makes `filter_method(...)` a call mypy
+#: can check. Untyped, a `.get()` off it answers `Any | None` -- which is
+#: how `"None" not callable` sat in this module behind `ignore_errors`.
+HttpFilterMethod = Callable[..., Awaitable[HttpResult]]
+
+filter_methods: Dict[Text, HttpFilterMethod] = {
     'http_with_stream_file_upload': make_http_filters_with_stream_file_upload,
     'http_without_stream_uploads': make_http_filters_without_stream_uploads,
     'http_filters_without_file': make_http_filters_without_file
@@ -1230,13 +1254,18 @@ async def handle_http_request(
     assembled it.
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
+    # Subscripted, not `.get()`. All three keys are literals defined in
+    # `filter_methods` a few lines above, so a `.get()` here could only
+    # ever answer None by way of a typo in this very function -- and it
+    # would answer it *silently*, into a call. Subscripting makes that
+    # typo a `KeyError` at the one line responsible for it.
     if http_file_upload_config:
         if http_file_upload_config.get('file_upload_chunk_size'):
-            filter_method = filter_methods.get('http_with_stream_file_upload')
+            filter_method = filter_methods['http_with_stream_file_upload']
         else:
-            filter_method = filter_methods.get('http_without_stream_uploads')
+            filter_method = filter_methods['http_without_stream_uploads']
     else:
-        filter_method = filter_methods.get('http_filters_without_file')
+        filter_method = filter_methods['http_filters_without_file']
 
     return await filter_method(
         session,

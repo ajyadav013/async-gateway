@@ -764,3 +764,67 @@ def test_examples_ship_in_neither_artifact(tmp_path: Path) -> None:
 
     assert not in_wheel, f'examples leaked into the wheel: {in_wheel}'
     assert not in_sdist, f'examples leaked into the sdist: {in_sdist}'
+
+
+def test_py_typed_ships_in_both_artifacts(tmp_path: Path) -> None:
+    """R4-AC5: the PEP 561 marker reaches the consumer.
+
+    ``py.typed`` is not a ``.py`` file, so setuptools does not carry it
+    with the package on its own -- it ships only because
+    ``[tool.setuptools.package-data]`` names it. Delete that one line and
+    the wheel still installs, still imports and still runs; the *only*
+    symptom is that every downstream type checker treats
+    ``async_gateway`` as untyped and silently ignores the annotations
+    this release exists to add. A failure with no runtime signal is
+    exactly the kind that needs a test rather than a review.
+
+    Asserted on the **built artifacts**, not on the source tree: the file
+    existing in ``async_gateway/`` is what a ``git status`` shows, and it
+    is not the property that matters. Both artifacts are checked because
+    they are packed by different machinery -- ``package-data`` for the
+    wheel, ``MANIFEST.in`` plus setuptools' defaults for the sdist -- and
+    a change can drop it from one while leaving the other intact.
+
+    ``build`` is not in the dev extra, so this skips where it is absent,
+    for the same reason and with the same CI backstop as the sibling test
+    above.
+
+    Args:
+        tmp_path: pytest's per-test directory. Built into, never into the
+            repository's own ``dist/``, which the CI build job requires
+            to be absent from a clean checkout.
+
+    Returns:
+        None.
+    """
+    build = subprocess.run(  # nosec B603 - fixed argv, this project's build
+        [sys.executable, '-m', 'build', '--outdir', str(tmp_path)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if build.returncode != 0:
+        pytest.skip(f'`python -m build` unavailable: {build.stderr[-200:]}')
+
+    wheels = sorted(tmp_path.glob('*.whl'))
+    sdists = sorted(tmp_path.glob('*.tar.gz'))
+    assert wheels and sdists, 'the build produced no artifacts to inspect'
+
+    with zipfile.ZipFile(wheels[-1]) as wheel:
+        in_wheel = [n for n in wheel.namelist() if n.endswith('py.typed')]
+    with tarfile.open(sdists[-1]) as sdist:  # nosec B202 - names only
+        in_sdist = [n for n in sdist.getnames() if n.endswith('py.typed')]
+
+    # The sdist prefixes every member with `<name>-<version>/`, so the
+    # expected path is derived from the declared version rather than
+    # written out -- a literal here would fail the next release for the
+    # wrong reason and teach whoever fixes it to loosen the assertion.
+    sdist_root = f'async_gateway-{_read_declared_version()}'
+
+    assert in_wheel == ['async_gateway/py.typed'], (
+        f'py.typed is missing from the wheel (found {in_wheel!r}); '
+        f'downstream type checkers will ignore this package entirely')
+    assert in_sdist == [f'{sdist_root}/async_gateway/py.typed'], (
+        f'py.typed is missing from the sdist (found {in_sdist!r}); '
+        f'an install from source would ship untyped')

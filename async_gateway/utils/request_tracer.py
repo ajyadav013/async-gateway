@@ -260,8 +260,24 @@ def request_tracer(
         context.results = collector.current()
         return context
 
-    trace_config = aiohttp.TraceConfig(trace_config_ctx_factory=trace_context)
-    trace_config.results_collector = collector
+    # `type: ignore[arg-type]` -- aiohttp types
+    # `trace_config_ctx_factory` as `type[SimpleNamespace]`, the class
+    # itself, but it *calls* the value
+    # (`self._trace_config_ctx_factory(trace_request_ctx=...)`), so any
+    # callable returning a `SimpleNamespace` satisfies the code and a
+    # factory function is the documented way to seed the context.
+    # Passing the bare class would drop the per-request `results`
+    # binding, which is the whole point of this module (H17).
+    trace_config = aiohttp.TraceConfig(
+        trace_config_ctx_factory=trace_context)  # type: ignore[arg-type]
+    # `type: ignore[attr-defined]` -- `results_collector` is this
+    # library's own attribute, attached here and read by
+    # `logic/http_client.py` and `helpers/internal/request_helper.py`.
+    # `aiohttp.TraceConfig` naturally does not declare it, and a
+    # subclass that did would change the type callers pass to
+    # `trace_configs`, breaking the caller-supplied-tracer path this
+    # module documents.
+    trace_config.results_collector = collector  # type: ignore[attr-defined]
 
     def elapsed(context: SimpleNamespace) -> float:
         """Return seconds from this request's start to now.

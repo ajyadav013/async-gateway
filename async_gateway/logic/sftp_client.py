@@ -384,9 +384,16 @@ class SFTPRequest(BaseRequestClass):
         self.port: int = self.info.get('port', 22)
         self.user: Text = self.auth.login
         self.password: Text = self.auth.password
-        self.mode_: Text = self.info.get('mode', None)
-        self.remote_path: Text = self.info.get('remote_path', None)
-        self.local_path: Text = self.info.get('local_path', None)
+        # Optional, and genuinely so: `protocol_info` is optional for this
+        # protocol (R11-AC3), so an `SFTPRequest` stays constructible with
+        # no `mode` in it -- which is exactly why `_validate_mode` runs at
+        # the top of `handle_request` and not in `__init__`. Annotating
+        # these `Text` asserted a non-None the constructor never
+        # established, and contradicted the validator that exists because
+        # it cannot.
+        self.mode_: Optional[Text] = self.info.get('mode')
+        self.remote_path: Optional[Text] = self.info.get('remote_path')
+        self.local_path: Optional[Text] = self.info.get('local_path')
         # R22-AC3: refuse to overwrite by default, opt in by name.
         self.overwrite: bool = self.info.get('overwrite') is True
         # Read, never written: `recurse` is added to a copy at the one
@@ -436,6 +443,22 @@ class SFTPRequest(BaseRequestClass):
             raise ConfigurationError(
                 "protocol_info['mode'] must be a non-empty string naming "
                 f'the SFTP operation to run, got {self.mode_!r}')
+        # The same check, on the same shape, for the path every mode
+        # acts on. Surfaced by removing `mypy`'s `ignore_errors`: with
+        # `remote_path` annotated honestly as `Optional[Text]`, the
+        # checker showed it reaching `sftp.lstat(...)`, whose signature
+        # is `bytes | str | PurePath`. Absent, it arrived there as
+        # `None` and raised `TypeError: expected str, bytes or
+        # os.PathLike object` from inside asyncssh -- which belongs to
+        # no transport family, so it escaped `request()` un-enveloped
+        # as a library bug rather than being reported as the caller's
+        # configuration error it is. Checked here beside `mode` and
+        # before the connect, so nothing is opened for a call that
+        # cannot run.
+        if not isinstance(self.remote_path, str) or not self.remote_path:
+            raise ConfigurationError(
+                "protocol_info['remote_path'] must be a non-empty string "
+                f'naming the path on the server, got {self.remote_path!r}')
 
     def _connect_options(self) -> Dict[Text, Any]:
         """Return the keyword arguments ``asyncssh.connect`` is called with.
@@ -673,13 +696,19 @@ class SFTPRequest(BaseRequestClass):
             branch did is precisely H2, and returning them makes that
             shape unavailable rather than merely unused.
         """
+        # `_validate_mode` has already refused an absent or non-string
+        # `remote_path`, and `handle_request` runs it before reaching
+        # here. mypy cannot see that across the call, so the local
+        # re-narrows what the validator established rather than
+        # re-asserting it.
+        remote_path = str(self.remote_path)
         async with asyncssh.connect(**self.connect_options) as conn:
             async with conn.start_sftp_client() as sftp:
-                attrs = await sftp.lstat(self.remote_path)
+                attrs = await sftp.lstat(remote_path)
                 is_directory = (
                     attrs.type == asyncssh.FILEXFER_TYPE_DIRECTORY)
                 remote_files = (
-                    await sftp.listdir(self.remote_path)
+                    await sftp.listdir(remote_path)
                     if is_directory else None)
                 await self._run_operation(sftp, is_directory=is_directory)
                 return attrs, remote_files
@@ -728,7 +757,12 @@ class SFTPRequest(BaseRequestClass):
         # through three layers, so one directory transfer left it set for
         # every later call sharing that `protocol_info` (M28).
         options: Dict[Text, Any] = dict(self.additional_arguments)
-        mode = self.mode_.strip().lower()
+        # `resolve_verb` above returns only for a name it matched in the
+        # allowlist, so `mode_` is a non-empty str by the time this line
+        # runs. mypy cannot see that across the call, and `str()` re-narrows
+        # the local without asserting anything the resolution has not
+        # already enforced.
+        mode = str(self.mode_).strip().lower()
         if is_directory and mode in RECURSING_MODES:
             options['recurse'] = True
 
@@ -760,7 +794,10 @@ class SFTPRequest(BaseRequestClass):
         await self.circuit_breaker.run(
             operation, source, destination, **options)
 
-    def _operands(self, mode: Text) -> Tuple[Text, Text]:
+    def _operands(
+        self,
+        mode: Text,
+    ) -> Tuple[Optional[Text], Optional[Text]]:
         """Return ``(source, destination)`` in this mode's own direction.
 
         AGW-33. See :data:`LOCAL_IS_SOURCE` for why a per-mode table
@@ -779,6 +816,13 @@ class SFTPRequest(BaseRequestClass):
             neither is the local one and there is no direction here to
             establish. Whether they are dispatchable at all is R21's
             allowlist, at S19.
+
+            Either operand may be None: ``protocol_info`` is optional for
+            this protocol, so neither path is guaranteed present. The
+            caller reaches this method only inside ``if self.local_path``,
+            which establishes one of the two; asyncssh refuses the other
+            on its own terms if it is missing, and that refusal is a
+            transport failure this class already classifies.
         """
         if LOCAL_IS_SOURCE.get(mode, False):
             return self.local_path, self.remote_path

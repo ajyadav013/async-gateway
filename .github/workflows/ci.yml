@@ -104,9 +104,33 @@ jobs:
         run: flake8 --select=E1,E2,E3,E501,W2,W3,W505,Q .
 
       - name: mypy
-        # `ignore_errors = true` is still set in pyproject.toml; R27/Step 24
-        # removes it and drives the ~44 hidden errors to zero.
+        # Green with no `ignore_errors` anywhere as of R27/Step 24 (story
+        # AGW-26), and `ignore_missing_imports` only per-module, each
+        # override naming the package that ships no stubs.
         run: mypy async_gateway
+
+      - name: no global type suppression (R27-AC5)
+        # The gate this pair of settings is *for* is the one they can
+        # silently switch off: `ignore_errors` turns the whole check into
+        # "Success: no issues found", and a global
+        # `ignore_missing_imports` silences the next untyped dependency
+        # as well as the four known ones. Both are cheap to reintroduce
+        # under deadline and invisible in a green run -- the spec's own
+        # premortem names "`ignore_errors = True` restored within a week"
+        # as the likely failure -- so the config is asserted here rather
+        # than trusted.
+        run: |
+          if grep -qE '^\s*ignore_errors' pyproject.toml; then
+            echo '::error::ignore_errors is back in pyproject.toml' >&2
+            exit 1
+          fi
+          if awk '/^\[tool\.mypy\]/{f=1;next} /^\[/{f=0} f' pyproject.toml \
+             | grep -qE '^\s*ignore_missing_imports'; then
+            echo '::error::ignore_missing_imports is set globally in' \
+                 '[tool.mypy]; it belongs in a per-module override that' \
+                 'names the package' >&2
+            exit 1
+          fi
 
       - name: pytest
         run: pytest

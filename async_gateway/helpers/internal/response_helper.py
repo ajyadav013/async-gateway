@@ -9,25 +9,26 @@ a truncated or HTML response as though the server had answered with an
 empty object.
 """
 
-from typing import Any, Optional, Text, Union
+from typing import Text, Union
 
 import orjson
 
+from async_gateway.utils.envelope import JsonBody
 from async_gateway.utils.exceptions import SerializationError
 
-#: Everything a valid JSON document can decode to. Deliberately *not*
-#: ``utils.envelope.JsonBody``, which names only the object and array
-#: forms: ``b'42'``, ``b'"hello"'`` and ``b'true'`` are all valid JSON
-#: bodies and decode to scalars, so annotating this function with
-#: ``JsonBody`` would have claimed a narrowness it does not have. ``None``
-#: covers both the absent body and the literal ``null``.
+#: Everything a valid JSON document can decode to -- and now literally
+#: ``utils.envelope.JsonBody``, because that is the same set.
 #:
-#: ``JsonBody`` itself is the narrow one and wants widening to match --
-#: these values do reach ``GatewayResponse['json']``. That type belongs to
-#: another story and is recorded as a defect against it rather than
-#: changed from here.
-DecodedJsonBody = Optional[
-    dict[Text, Any] | list[Any] | Text | int | float | bool]
+#: It was a separate local alias for one release: ``JsonBody`` named only
+#: the object and array forms, which understated what this function
+#: returns (``b'42'``, ``b'"hello"'`` and ``b'true'`` are all valid JSON
+#: bodies), so annotating with it would have claimed a narrowness this
+#: function does not have. Widening ``JsonBody`` was recorded as a defect
+#: against whichever story owned ``utils/envelope.py`` and is discharged
+#: at AGW-26; with the two sets equal, keeping two names for one type is
+#: how they come to disagree again. The alias survives only as the local
+#: spelling, so this module's signatures read unchanged.
+DecodedJsonBody = JsonBody
 
 
 async def application_json_response(

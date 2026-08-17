@@ -112,6 +112,21 @@ Homepage = "https://github.com/ajyadav013/async-gateway"
 include = ["async_gateway*"]
 namespaces = false
 
+[tool.setuptools.package-data]
+# PEP 561. `py.typed` is not a `.py` file, so setuptools does not carry it
+# with the package on its own: a wheel built without this line ships the
+# annotations while telling every downstream type checker to ignore them.
+# `tests/test_packaging.py` asserts it is in both artifacts, because the
+# failure is silent by construction -- the wheel installs, imports and
+# runs perfectly, and the only symptom is a consumer's mypy reporting
+# `async_gateway` as untyped.
+#
+# Added at AGW-26 and deliberately not earlier (FI-13): the marker is a
+# promise that this package's own types check, so publishing it while
+# `ignore_errors = true` was still hiding two dozen real errors would
+# have exported them into every consumer's build.
+"async_gateway" = ["py.typed"]
+
 # --- Tool configuration migrated out of the deleted setup.cfg ---------------
 
 [tool.bandit]
@@ -121,9 +136,6 @@ namespaces = false
 exclude_dirs = ["./env"]
 
 [tool.mypy]
-ignore_missing_imports = true
-# Removing this is R27's job (Step 24); it currently hides ~44 errors.
-ignore_errors = true
 
 # R30's annotation criterion. Every function in `async_gateway` carries a
 # full signature as of story S24, and these two keep it that way:
@@ -131,18 +143,51 @@ ignore_errors = true
 # `disallow_incomplete_defs` refuses the more common regression -- a def
 # that annotates some of its parameters and forgets one.
 #
-# Both are INERT until `ignore_errors` above is removed, and that was
-# measured rather than assumed: with both settings present,
-# `mypy async_gateway` reports "Success: no issues found in 27 source
-# files" while seven functions are missing annotations. `ignore_errors`
-# suppresses the whole check, these two included. They are declared here
-# anyway so that removing `ignore_errors` in S25 turns the criterion on
-# without also having to remember to add them -- and `tests/test_docs.py`
-# enforces the same property independently, by AST, in the meantime. A
-# gate that an unrelated setting in the same file can switch off is not
-# by itself a gate.
+# Both were INERT until AGW-26 removed `ignore_errors` from this section,
+# and that was measured rather than assumed: with both settings present,
+# `mypy async_gateway` reported "Success: no issues found in 27 source
+# files" while seven functions were missing annotations -- `ignore_errors`
+# suppressed the whole check, these two included. They were declared ahead
+# of time so that removing it turned the criterion on without anyone also
+# having to remember to add them, and `tests/test_docs.py` enforces the
+# same property independently, by AST. A gate that an unrelated setting in
+# the same file can switch off is not by itself a gate.
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
+
+# Per-module, never global (R27-AC5). A blanket
+# `ignore_missing_imports = true` -- which is what this section carried
+# until AGW-26 -- silences the *next* untyped dependency too, including
+# one added by accident, so the setting that was meant to acknowledge
+# four known gaps quietly became a policy of not noticing any.
+#
+# Each entry below names a package that genuinely ships neither inline
+# annotations nor a stub distribution, verified against the installed
+# version rather than assumed. Adding a fifth is a deliberate act with a
+# comment attached, which is the whole point of listing them.
+
+[[tool.mypy.overrides]]
+# `pyfailsafe` 0.6.0: no `py.typed`, no `types-pyfailsafe` on PyPI. The
+# project is dormant, and ADR 0001 records the keep/replace/vendor
+# decision -- a replacement would take this entry with it.
+module = ["failsafe.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# `aioboto3` and its transitive `botocore`: neither ships `py.typed`.
+# Stubs exist for boto3 (`boto3-stubs`) but not for the async fork, and
+# `botocore.exceptions` is imported directly for two exception classes.
+module = ["aioboto3.*", "botocore.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# `aiofiles`: no inline annotations. `types-aiofiles` exists on PyPI and
+# would remove this entry, but adding a dev dependency is a change this
+# story's boundary does not cover -- recorded so the upgrade path is
+# named rather than forgotten.
+# shortcut: per-module ignore -- add `types-aiofiles` to the dev set.
+module = ["aiofiles.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

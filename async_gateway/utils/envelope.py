@@ -17,7 +17,7 @@ envelope carries no credential value (invariant E9), which is what the
 caller logs and stores.
 """
 
-from collections.abc import Collection
+from collections.abc import Collection, MutableMapping
 from typing import Any, Optional, TypedDict
 
 from async_gateway.helpers.common.date_helper import (
@@ -27,9 +27,19 @@ from async_gateway.helpers.common.date_helper import (
 from async_gateway.utils.exceptions import AsyncGatewayError, unwrap_cause
 from async_gateway.utils.redaction import redact_payload, redact_url
 
-# A parsed JSON body is an object, an array, or absent. An empty body and a
-# body that was literally `{}` stay distinguishable.
-JsonBody = Optional[dict[str, Any] | list[Any]]
+# Everything a valid JSON document can decode to. An empty body and a body
+# that was literally `{}` stay distinguishable, and so do the scalars:
+# `b'42'`, `b'"hello"'` and `b'true'` are all valid JSON bodies, they all
+# reach this key through `application_json_response`, and the narrower
+# `Optional[dict | list]` this used to be understated what the envelope
+# actually carries (AGW-13's recorded defect 3, deferred to whichever story
+# owns this module and discharged here at AGW-26 -- the ticket says "before
+# or with R27 rather than discovered by it", and removing `ignore_errors`
+# is what would otherwise have discovered it).
+#
+# `None` covers the absent body and the literal `null` alike; a parse
+# *failure* does not reach here at all, it raises `SerializationError`.
+JsonBody = Optional[dict[str, Any] | list[Any] | str | int | float | bool]
 
 # No status yet. Every finalised envelope replaces it, so it is visible only
 # on an envelope still being filled -- never on one that was returned.
@@ -93,7 +103,15 @@ class GatewayResponse(TypedDict):
     cookies: dict[str, str]
     error: Optional[GatewayError]
     protocol_details: dict[str, Any]
-    request_tracer: list[dict[str, Any]]
+    # `MutableMapping`, not `dict`, and the difference is load-bearing.
+    # These are the *live* mappings the tracer callbacks write into, put
+    # on the envelope before dispatch so a failed call still carries the
+    # events it recorded -- and for a tracer this library built, the
+    # object is a `ResultsCollector`, which is a `MutableMapping` and is
+    # deliberately not a dict (H17: a dict here is shared by every
+    # request the tracer serves). `dict` described a copy this key has
+    # never held.
+    request_tracer: list[MutableMapping[str, Any]]
     pre_processor_response: Any
     post_processor_response: Any
 

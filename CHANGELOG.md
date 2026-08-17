@@ -83,6 +83,24 @@ runtime.
   name the code it silences *and* carry a `-- why`, and one runs `flake8`
   in check mode over the formatting codes alone, since this project
   configures no autoformatter and `flake8` is the formatting judge.
+- **A type gate that reports.** `ignore_errors = true` is gone from
+  `pyproject.toml` and `mypy async_gateway` exits 0 on the 24 real errors it
+  had been turning into `Success: no issues found` — including a `"None" not
+  callable` on the HTTP filter-method dispatch, four `Optional` attributes
+  annotated as though they could not be None, and an envelope `json` type too
+  narrow for the scalar bodies that reach it. Two latent defects surfaced with
+  them and are fixed: a missing `remote_path` (SFTP) or `server_path` (FTP)
+  reached the transport as an un-enveloped `TypeError` rather than the caller's
+  `ConfigurationError` it is. `ignore_missing_imports` is now per-module, one
+  override per package that genuinely ships no stubs, so the *next* untyped
+  dependency is noticed rather than pre-silenced; a CI step fails either
+  setting coming back.
+- **`py.typed`** (PEP 561), so downstream type checkers see the annotations
+  instead of ignoring the package. Added last, deliberately: the marker is a
+  promise that this package's own types check, and publishing it earlier would
+  have exported the errors above into every consumer's build. A packaging test
+  asserts it ships in both the wheel and the sdist, because the failure has no
+  runtime symptom at all.
 
 ### Changed — BREAKING
 

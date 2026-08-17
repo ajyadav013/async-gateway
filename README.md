@@ -588,7 +588,7 @@ from async_gateway.utils.envelope import GatewayError, GatewayResponse
 | `cookies` | `dict[str, str]` | Response cookies, **every** value redacted; `{}` for protocols that have none. |
 | `error` | `GatewayError` or `None` | The failure. None **exactly when** `ok` is True. |
 | `protocol_details` | `dict[str, Any]` | Per-protocol extras, so the top-level key set stays invariant. |
-| `request_tracer` | `list[dict[str, Any]]` | Per-request trace results; `[]` when tracing is off. |
+| `request_tracer` | `list[MutableMapping[str, Any]]` | Per-request trace results; `[]` when tracing is off. Mapping-like, and read as one — for a tracer built by `request_tracer()` the entry is a live `ResultsCollector` view rather than a plain `dict`, so that concurrent calls sharing a tracer do not share results. |
 | `pre_processor_response` | `Any` | What your pre-processor returned. |
 | `post_processor_response` | `Any` | What your post-processor returned. |
 

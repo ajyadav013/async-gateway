@@ -401,7 +401,7 @@ def test_the_s3_download_refuses_positional_arguments() -> None:
     the mistake is a ``TypeError`` at the call site.
     """
     with pytest.raises(TypeError):
-        # type: ignore[misc] -- the positional call is the thing under
+        # `type: ignore[misc]` -- the positional call is the thing under
         # test, so mypy's (correct) refusal of it has to be silenced for
         # the runtime TypeError to be reachable.
         download_file_from_s3(  # type: ignore[misc]
