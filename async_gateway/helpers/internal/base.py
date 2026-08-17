@@ -80,6 +80,54 @@ def validated_protocol_info(
     return dict(info)
 
 
+def credentials_of(auth: Any, *, protocol: Text) -> Tuple[Text, Text]:
+    """Return the ``(user, password)`` a credentialled protocol will use.
+
+    FTP and SFTP have no anonymous mode in this library: both interpolate
+    a user name and a password into their connect call, so a call without
+    credentials cannot be formed at all. ``request()`` nonetheless
+    defaults ``auth`` to None and documents it as optional, which made
+    the *documented default* call for those two protocols an
+    ``AttributeError`` on ``None.login`` raised from the constructor
+    (H5). That escaped the envelope, and it contradicted this library's
+    own contract that a non-``AsyncGatewayError`` reaching the caller
+    means a bug in here -- a missing credential is the caller's
+    configuration, not a library bug.
+
+    Read once, here, rather than as two attribute reads per protocol, so
+    both protocols reject the same shapes with the same message and
+    neither can drift into accepting what the other refuses.
+
+    Args:
+        auth: The caller's ``auth`` argument, of whatever type they
+            actually passed. None is what arrives on the documented
+            default call; an object carrying no ``login``/``password``
+            is what arrives from a caller who passed some other kind of
+            auth object.
+        protocol: The protocol name to name in the message, so the
+            caller is told which of their calls needs credentials.
+
+    Returns:
+        The login and the password to connect with.
+
+    Raises:
+        ConfigurationError: If ``auth`` is None, or carries no string
+            ``login`` and ``password``. Raised from the protocol
+            constructor, which the entry point runs *outside* its one
+            conversion ``try``, so it escapes to the caller
+            synchronously and unlogged -- the same contract every other
+            pre-dispatch configuration rejection follows.
+    """
+    login = getattr(auth, 'login', None)
+    password = getattr(auth, 'password', None)
+    if not isinstance(login, str) or not isinstance(password, str):
+        raise ConfigurationError(
+            f'{protocol} requires credentials: auth must carry a string '
+            f'"login" and "password", as aiohttp.BasicAuth(user, '
+            f'password) does, got {type(auth).__name__}')
+    return login, password
+
+
 def destination_of(
     protocol: Text,
     url: Text,

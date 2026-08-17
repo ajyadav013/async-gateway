@@ -80,16 +80,25 @@ Three rules replace them:
   with a keyword its caller never wrote (M28).
 
 **Caller-configuration errors leave this class two ways, and the line
-between them is dispatch, not method.** The host-key policy checks in
-:meth:`SFTPRequest._connect_options` run in ``__init__``, before
-``request()`` has dispatched anything, so their ``ConfigurationError``
-escapes the call **synchronously** the way every other pre-dispatch
-rejection does; :meth:`SFTPRequest._validate_mode` runs at the top of
-:meth:`SFTPRequest.handle_request`, after dispatch, so its
-``ConfigurationError`` is converted at the entry point's one conversion
-point and arrives as a ``CONFIG`` **envelope**. The split is inherited:
-``protocol_info`` is optional for this protocol (R11-AC3), so an
-``SFTPRequest`` has to stay constructible with no ``mode`` in it.
+between them is the entry point's one conversion ``try`` -- which is to
+say, constructor versus method** (AGW-35). The credentials read and the
+host-key policy checks in :meth:`SFTPRequest._connect_options` run in
+``__init__``, which ``request()`` calls *outside* that ``try``, so their
+``ConfigurationError`` escapes **synchronously** and unlogged the way
+every other constructor rejection does;
+:meth:`SFTPRequest._validate_mode` runs at the top of
+:meth:`SFTPRequest.handle_request`, which is *inside* it, so its
+``ConfigurationError`` is converted at the one conversion point and
+arrives as a logged ``CONFIG``/400 **envelope**.
+
+An earlier reading named *dispatch* as the line. It does not survive
+measurement: ``_validate_mode`` is the first statement of
+``handle_request`` and returns before any connect is opened, so nothing
+has been dispatched when it raises -- and it envelopes anyway, because
+what decides is the ``try`` it sits in. The split is otherwise
+inherited: ``protocol_info`` is optional for this protocol (R11-AC3),
+so an ``SFTPRequest`` has to stay constructible with no ``mode`` in it,
+and ``mode`` therefore cannot be checked in ``__init__``.
 
 Failures are classified rather than swallowed: an ``SFTPError`` carries
 the server's own ``SSH_FX_*`` code to the status table, and everything
@@ -118,7 +127,10 @@ import asyncssh
 
 from failsafe import CircuitOpen, FailsafeError
 
-from async_gateway.helpers.internal.base import BaseRequestClass
+from async_gateway.helpers.internal.base import (
+    BaseRequestClass,
+    credentials_of,
+)
 from async_gateway.utils.contained_io import contained_download, local_base
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
@@ -133,6 +145,7 @@ from async_gateway.utils.exceptions import (
     TransportError,
     unwrap_cause,
 )
+from async_gateway.utils.http_file_config import validated_verb
 from async_gateway.utils.redaction import redact_url, redact_value
 
 logger = logging.getLogger(__name__)
@@ -372,8 +385,13 @@ class SFTPRequest(BaseRequestClass):
         Raises:
             ConfigurationError: From the base, if ``info`` is neither
                 None nor a mapping, or omits a key this protocol
-                requires; and from :meth:`_connect_options` if the
-                host-key configuration is self-contradictory. SFTP's own
+                requires; from
+                :func:`~async_gateway.helpers.internal.base.credentials_of`
+                if ``auth`` carries no credentials, which SFTP cannot
+                connect without; and from :meth:`_connect_options` if the
+                host-key configuration is self-contradictory. All escape
+                synchronously, because the entry point constructs this
+                object outside its one conversion ``try``. SFTP's own
                 ``mode`` is deliberately *not* checked here: it is
                 validated once the request runs, because
                 ``protocol_info`` is optional for this protocol and the
@@ -382,8 +400,14 @@ class SFTPRequest(BaseRequestClass):
         super(SFTPRequest, self).__init__(*args, **kwargs)
 
         self.port: int = self.info.get('port', 22)
-        self.user: Text = self.auth.login
-        self.password: Text = self.auth.password
+        # Not `self.auth.login`: `auth` defaults to None at the entry
+        # point and is documented optional, so the read that looks
+        # unconditional here is the documented default call crashing with
+        # an `AttributeError` that escapes the envelope entirely (H5).
+        self.user: Text
+        self.password: Text
+        self.user, self.password = credentials_of(
+            self.auth, protocol='SFTP')
         # Optional, and genuinely so: `protocol_info` is optional for this
         # protocol (R11-AC3), so an `SFTPRequest` stays constructible with
         # no `mode` in it -- which is exactly why `_validate_mode` runs at
@@ -428,9 +452,7 @@ class SFTPRequest(BaseRequestClass):
         same, so nothing is opened for a call that cannot run.
 
         Returns:
-            None. Whether ``mode`` names an operation this library will
-            dispatch is R21's allowlist to decide, not this method's;
-            what is checked here is only that there is a name to look up.
+            None.
 
         Raises:
             ConfigurationError: If ``mode`` is absent or is not a
@@ -438,11 +460,28 @@ class SFTPRequest(BaseRequestClass):
                 ``self.mode_.lower()`` inside the session, after
                 ``lstat`` had already run against the server, and
                 surface as an ``AttributeError`` on ``None``.
+            UnsupportedVerbError: If ``mode`` names nothing in
+                :data:`SFTP_MODES` (R17-AC7). A ``ConfigurationError``,
+                so it reaches the caller as ``CONFIG``/400 like the
+                rejections beside it. Checked here as well as at the
+                ``getattr`` in :meth:`_run_session`, and the redundancy
+                is the point: the allowlist reading is one function
+                (:func:`~async_gateway.utils.http_file_config.validated_verb`,
+                which ``resolve_verb`` also calls), but deferring the
+                *only* check to the attribute lookup meant the connect
+                reported the caller's typo first -- a server whose host
+                key did not verify turned an unknown ``mode`` into
+                ``HOST_KEY``/495, a transport verdict on a call that
+                could never have run. Checked before the connect, the
+                caller's own error is what they are told about; the
+                lookup keeps its own check so no ordering resolves an
+                unadmitted name against a live client.
         """
         if not isinstance(self.mode_, str) or not self.mode_:
             raise ConfigurationError(
                 "protocol_info['mode'] must be a non-empty string naming "
                 f'the SFTP operation to run, got {self.mode_!r}')
+        validated_verb(self.mode_, allowed=SFTP_MODES, setting='mode')
         # The same check, on the same shape, for the path every mode
         # acts on. Surfaced by removing `mypy`'s `ignore_errors`: with
         # `remote_path` annotated honestly as `Optional[Text]`, the
