@@ -227,7 +227,7 @@ def test_the_declared_version_is_the_one_that_gets_installed() -> None:
 
 
 def test_the_version_is_the_one_zero_zero_reset() -> None:
-    """The version is ``1.0.0``, down from the fork-inherited ``2.7.3``.
+    """The version is ``1.0.0``, down from the fork-inherited 2.x version.
 
     The decrease is only sound because nothing was ever published under this
     name (OQ4, re-verified 404 on 2026-08-17). Pinning the exact string here
