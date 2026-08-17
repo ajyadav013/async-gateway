@@ -236,6 +236,32 @@ def documented_code_spans() -> set[str]:
     return {span.strip() for span in _INLINE_CODE.findall(README_TEXT)}
 
 
+def prose_after(anchor: str) -> str:
+    """Return the README text after ``anchor``, whitespace-collapsed.
+
+    Collapsed because this document is hard-wrapped at 79 columns, so a claim
+    these tests look for -- "process working directory", "redirect chain
+    included" -- routinely has a newline in the middle of it. Matching the raw
+    text makes a pure reflow fail, which is a false positive, and a false
+    positive on a documentation test teaches the next person to weaken the
+    assertion rather than to keep the claim.
+
+    Args:
+        anchor: The heading or phrase the section starts at.
+
+    Returns:
+        Everything after ``anchor`` with every run of whitespace reduced to one
+        space.
+
+    Raises:
+        AssertionError: If the anchor is absent, which means the section was
+            renamed and this test has stopped checking it.
+    """
+    section = README_TEXT.partition(anchor)[2]
+    assert section, f'the README has no section at {anchor!r}'
+    return ' '.join(section.split())
+
+
 def source_protocol_info_keys() -> set[str]:
     """Return the ``protocol_info`` keys the package actually reads.
 
@@ -831,8 +857,7 @@ def test_payload_echo_disclosure_is_present_and_correct() -> None:
     so a change to ``PAYLOAD_REDACTION_DEPTH`` that the README does not follow
     fails here.
     """
-    section = README_TEXT.partition('## Redaction and the payload echo')[2]
-    assert section, 'the README has no redaction section'
+    section = prose_after('## Redaction and the payload echo')
     assert f'depth of {PAYLOAD_REDACTION_DEPTH}' in section, (
         f'the README does not state the masking depth as '
         f'{PAYLOAD_REDACTION_DEPTH}')
@@ -852,8 +877,8 @@ def test_soap_section_carries_the_three_consumer_facts() -> None:
     where that documentation lives, so the claim is tested rather than merely
     made.
     """
-    section = README_TEXT.partition('### SOAP')[2].partition('\n## ')[0]
-    assert section, 'the README has no SOAP section'
+    section = prose_after('### SOAP').partition(' ## Public API')[0]
+    assert section, 'the SOAP section is empty'
 
     # 1. Hand-built XML only -- no dict-to-XML mapping.
     assert 'no dict-to-XML mapping' in section
@@ -893,8 +918,7 @@ def test_sftp_transport_security_is_documented() -> None:
 
 def test_url_trust_contract_is_stated() -> None:
     """Check the README says plainly that the caller owns URL validation."""
-    section = README_TEXT.partition('## You own URL validation')[2]
-    assert section, 'the README has no URL-trust section'
+    section = prose_after('## You own URL validation')
     assert 'SSRF' in section
     assert 'validate' in section
     assert 'untrusted' in section
@@ -919,8 +943,7 @@ def test_the_fabricated_status_is_gone() -> None:
 
 def test_the_release_section_names_one_file_to_bump() -> None:
     """Check the release procedure names exactly one file to edit."""
-    section = README_TEXT.partition('### Cutting a release')[2]
-    assert section, 'the README has no release section'
+    section = prose_after('### Cutting a release')
     assert 'exactly one file' in section
     assert 'pyproject.toml' in section
     assert 'setup.py' not in section
@@ -929,8 +952,7 @@ def test_the_release_section_names_one_file_to_bump() -> None:
 
 def test_the_licence_and_attribution_are_stated() -> None:
     """Check the README states the licence and the copyright attribution."""
-    section = README_TEXT.partition('## Licence and attribution')[2]
-    assert section, 'the README has no licence section'
+    section = prose_after('## Licence and attribution')
     assert 'MIT' in section
     licence_line = next(
         line for line in (REPO_ROOT / 'LICENSE').read_text(
@@ -945,8 +967,7 @@ def test_the_supported_python_versions_track_the_floor() -> None:
     pyproject = (REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8')
     floor = re.search(r'requires-python\s*=\s*[\'"]>=\s*(\d+\.\d+)',
                       pyproject).group(1)
-    section = README_TEXT.partition('## Supported Python versions')[2]
-    assert section, 'the README has no supported-versions section'
+    section = prose_after('## Supported Python versions')
     assert f'Python {floor} and newer' in section, (
         f'the README does not state the {floor} floor pyproject declares')
 
@@ -980,16 +1001,14 @@ def test_the_timeout_contract_states_the_whole_chain() -> None:
     ``max_redirects=10`` chain run for eleven times the stated timeout, and a
     reader budgeting on the wrong one has no way to discover it.
     """
-    section = README_TEXT.partition('### Timeouts')[2]
-    assert section, 'the README has no timeout section'
+    section = prose_after('### Timeouts')
     assert 'whole exchange' in section
     assert 'redirect chain included' in section
 
 
 def test_the_local_write_contract_is_documented() -> None:
     """Check the download overwrite, mode and symlink rules are all stated."""
-    section = README_TEXT.partition('## Local files')[2]
-    assert section, 'the README has no local-files section'
+    flat = prose_after('## Local files')
     for claim in (
         'refuse to overwrite by default',
         'overwrite=True',
@@ -999,7 +1018,7 @@ def test_the_local_write_contract_is_documented() -> None:
         'symbolic link',
         'process working directory',
     ):
-        assert claim in section, (
+        assert claim in flat, (
             f'the local-write contract does not state {claim!r}')
 
 
@@ -1011,8 +1030,7 @@ def test_the_traceback_logging_tradeoff_is_documented() -> None:
     consumer-visible cost, so it is documented as a choice with a stated
     revert rather than left to be discovered in production.
     """
-    section = README_TEXT.partition('## Logging')[2]
-    assert section, 'the README has no logging section'
+    section = prose_after('## Logging')
     assert "extra['traceback']" in section
     assert 'exc_info' in section
     assert 'group' in section, (

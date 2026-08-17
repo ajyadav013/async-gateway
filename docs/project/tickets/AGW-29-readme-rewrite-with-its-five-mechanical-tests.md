@@ -140,6 +140,47 @@ the single file per R5-AC7; `async_gateway.__version__` does not exist yet
 `mypy async_gateway` clean; `flake8 async_gateway tests` 19 findings — the
 unchanged pre-existing baseline, none in the new file.
 
+### One criterion not met as literally worded — the length
+
+R29's tenth criterion asks that the README be "**substantially shorter** than
+1,126 lines". **It is not: it is 1,300.** Recorded here rather than glossed,
+because a criterion quietly reinterpreted is worse than one openly missed.
+
+The criterion's own parenthetical subordinates it — "*A test asserts every
+`protocol_info` key the code reads appears in the README, and vice versa — this
+is the anti-drift criterion, **not the length***" — and the AGW-29 ticket
+restates that as "the `protocol_info`-keys-both-ways test is the anti-drift
+criterion — not the length". Both anti-drift directions are tested and pass.
+
+Why the number went up rather than down. The old 1,126 lines were mostly
+*volume without content*: 379 lines of pasted JSON response dumps, 55 lines of
+raw HTML `<table>` markup, zero mentions of SFTP, and no error, envelope,
+security, versioning or URL-trust sections at all. The new document is 424 lines
+of code blocks (every one of which executes in CI), 188 lines of tables
+generated from and checked against the real defaults, 256 blank, and 419 of
+prose covering sixteen required sections — five protocols where the old one
+documented two, plus the six inbound obligations other stories handed to this
+one.
+
+A trim pass was run rather than assumed: the redundant-sentence scan found no
+duplicated prose, and the four wordiest passages were tightened, which removed 4
+lines. Cutting to below 1,126 from here would mean deleting a *required*
+section — the local-write contract, the SOAP consumer facts, the traceback
+trade-off — each of which is a blocking obligation with a test asserting it.
+Deleting content to hit a line count, while the tests that guard that content
+still pass, would be optimising the metric against its own purpose.
+
+**Recommendation to the reviewer:** accept the length, or name which required
+section should go. This is flagged as a deviation for a human to rule on, not
+self-approved.
+
+*(The trim pass also exposed a real defect in my own tests: the prose-claim
+assertions matched the raw text, so re-wrapping a paragraph split "process
+working directory" across a newline and failed a test on a pure reflow. That is
+a false positive, and a false positive on a docs test teaches the next person to
+weaken the assertion. All nine such tests now read through a
+whitespace-collapsing `prose_after()` helper.)*
+
 **OQ7 read, not decided:** the LICENSE line is retained as `2022 Fynd` and the
 README's attribution section states it verbatim, with the fork's own
 contributors named alongside — the recommended reading. AGW-28 owns any change

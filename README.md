@@ -1056,8 +1056,7 @@ admits no real scheme at all.
 
 ## Local files: downloads, uploads and overwrite
 
-Every local file this library writes goes through one guarded path, and its
-rules are consumer-visible.
+Every local file this library writes goes through one guarded path.
 
 **Downloads refuse to overwrite by default.** An existing destination raises
 `ConfigurationError`. Opt in by name with `overwrite=True` — available on
@@ -1074,11 +1073,9 @@ await download_file_from_url(
 )
 ```
 
-This is a **breaking change** from earlier versions, and it is why the examples
-in this README take their paths from a variable rather than writing to a fixed
-`/tmp/test.pdf`: a second run of an example that hardcodes a path now fails by
-design, which is exactly the point. Pass `overwrite=True` when you re-download
-to a stable path.
+This is a **breaking change**, and it is why the examples here take their paths
+from a variable rather than a fixed `/tmp/test.pdf`: a second run of an example
+that hardcodes a path now fails by design.
 
 **Files are created mode `0600`** — readable and writable by their owner and
 nobody else, rather than at whatever `umask` allows.
@@ -1090,9 +1087,9 @@ check before them: a pre-write `lstat` that likes what it sees and then opens
 has a window between the two syscalls, and that window is the attack.
 
 **Platform note.** `O_NOFOLLOW` is POSIX and absent on some platforms. Where it
-is unavailable the write degrades to an explicit pre-write `lstat` symlink
-check, which **carries the time-of-check/time-of-use window the flag does not**.
-This is an explicit, documented weakening rather than a silent one.
+is unavailable the write degrades to a pre-write `lstat` symlink check, which
+**carries the time-of-check/time-of-use window the flag does not** — an
+explicit, documented weakening rather than a silent one.
 
 **Paths are canonicalised before they are opened**, so `..` and a symlinked
 intermediate component resolve to where they actually point. On a recursive FTP
@@ -1100,14 +1097,13 @@ or SFTP directory download the **remote server** supplies the entry names, and
 each composed path is checked against the directory your `client_path` /
 `local_path` names — a hostile listing cannot write outside it.
 
-Two further behaviours worth knowing: a **relative** `local_filepath` resolves
-against the **process working directory**, and a destination that is itself a
-**directory** is reported as a directory rather than advising `overwrite=True`,
-because the flag cannot help there.
+Two more: a **relative** `local_filepath` resolves against the **process working
+directory**, and a destination that is itself a **directory** is reported as a
+directory rather than advising `overwrite=True`, which cannot help there.
 
 **A failure part-way through a download removes what it wrote** rather than
-orphaning a partial file — and `delete_local_file_path` is idempotent precisely
-so your own cleanup can run after it.
+orphaning a partial file — and `delete_local_file_path` is idempotent so your
+own cleanup can still run after it.
 
 `http_file_download_config` keys: `download_filepath` (default
 `'response.txt'`), `file_download_chunk_size` (default 65536), `overwrite`
@@ -1184,20 +1180,20 @@ A configuration error that *escapes* to you is never logged, because you are
 already being told about it.
 
 **The traceback is carried as a redacted string in `extra['traceback']`, not via
-`exc_info=True`.** That is a deliberate trade with a real cost, and it is yours
-to weigh. A live `exc_info` is formatted by whichever handler *your* application
-installed, from the exception objects themselves — and the chained `aiohttp`
-exception at the bottom of a transport failure stringifies to the **unredacted
-URL**, query string and all. There is no way to mask that after the fact, so the
-traceback is rendered and redacted before the record leaves the library.
+`exc_info=True`** — a deliberate trade, and yours to weigh. A live `exc_info` is
+formatted by whichever handler *your* application installed, from the exception
+objects themselves, and the chained `aiohttp` exception at the bottom of a
+transport failure stringifies to the **unredacted URL**, query string and all.
+That cannot be masked after the fact, so the traceback is rendered and redacted
+before the record leaves the library.
 
 The cost: a handler reading `record.exc_info` finds nothing, so **APM tools that
 group exceptions natively — Sentry, Datadog and the like — will not group these
 failures**. If your deployment sends no credentials in URLs and you would rather
 have native grouping, the revert is one line in
 `async_gateway/async_gateway.py`'s `log_failure`: replace the `'traceback'`
-entry in `extra` with `exc_info=exc` on the `logger.log` call. Make that choice
-knowingly — it re-opens the leak the current form closes.
+entry in `extra` with `exc_info=exc` on the `logger.log` call. Choose knowingly
+— it re-opens the leak the current form closes.
 
 ---
 
