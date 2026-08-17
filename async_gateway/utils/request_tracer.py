@@ -39,7 +39,7 @@ live exception object: an ``aiohttp.ClientResponseError`` carries
 """
 
 import asyncio
-from collections.abc import Iterator, MutableMapping, Sequence
+from collections.abc import Collection, Iterator, MutableMapping, Sequence
 from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -214,8 +214,20 @@ def begin_trace_scope(
     return scopes
 
 
-def request_tracer() -> aiohttp.TraceConfig:
+def request_tracer(
+    *,
+    redact_params: Collection[str] = (),
+) -> aiohttp.TraceConfig:
     """Build a tracer whose results belong to one request.
+
+    Args:
+        redact_params: The caller's additional sensitive query-parameter
+            names, as normalised by ``request()``. They widen what the
+            exception report masks beyond the built-in names, which apply
+            regardless. Omitting them costs the caller's *extension*
+            names only -- which is why a tracer the caller builds
+            themselves still redacts, just not their custom parameters,
+            since this library cannot know them.
 
     Returns:
         An ``aiohttp.TraceConfig`` with all fifteen callbacks registered
@@ -491,13 +503,23 @@ def request_tracer() -> aiohttp.TraceConfig:
         chain rather than trusting a wrapper whose own ``str()`` is
         blank -- and there is no unredacted way out of it.
 
+        The caller's ``redact_query_params`` are passed through, because
+        the exception this reports is ``aiohttp``'s and its text is the
+        URL that failed: an ``InvalidUrlClientError`` stringifies to the
+        whole URL, query string included. Redacting with the built-in
+        names alone would mask ``api_key`` and leave a caller's own
+        ``session_id`` in the clear on the envelope -- which is invariant
+        E9's promise about *all four* credential surfaces, not most of
+        them.
+
         Args:
             session: The session issuing the request.
             context: The per-request trace context.
             params: The method, URL, headers and exception raised.
         """
         context.results['on_request_exception'] = elapsed(context)
-        message, _ = unwrap_cause(params.exception)
+        message, _ = unwrap_cause(
+            params.exception, redact_params=redact_params)
         context.results['on_request_exception_message'] = message
 
     async def on_request_end(

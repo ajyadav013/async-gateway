@@ -477,6 +477,8 @@ def validated_serialization(
 def validated_trace_config(
     protocol_info: Dict,
     session: Optional[aiohttp.ClientSession],
+    *,
+    redact_params: Collection[Text] = (),
 ) -> List[aiohttp.TraceConfig]:
     """Return the tracers to attach, once proven attachable and usable.
 
@@ -507,6 +509,11 @@ def validated_trace_config(
             a conflict.
         session: The already-validated caller session, or None when the
             library will build its own.
+        redact_params: The caller's additional sensitive query-parameter
+            names, handed to the tracer this library builds so its
+            exception report masks them. A tracer the *caller* built
+            cannot be given them -- it already exists -- which is the
+            documented cost of supplying one.
 
     Returns:
         The tracers to attach to the session this library creates, or an
@@ -529,7 +536,7 @@ def validated_trace_config(
                 'session and let this library build one')
         return []
     if 'trace_config' not in protocol_info:
-        return [request_tracer()]
+        return [request_tracer(redact_params=redact_params)]
     trace_config = protocol_info['trace_config']
     if isinstance(trace_config, str):
         raise ConfigurationError(
@@ -720,7 +727,7 @@ class HttpRequest(BaseRequestClass):
         self.serialization: JsonSerializer = validated_serialization(
             self.info, self.session)
         self.trace_config: List[aiohttp.TraceConfig] = validated_trace_config(
-            self.info, self.session)
+            self.info, self.session, redact_params=self.redact_params)
         # Both collector lists are *bound per call*, in `_exchange`, not
         # here. A tracer is a session-level object a caller may reuse
         # across concurrent calls, so the mapping this call's results go
@@ -816,6 +823,15 @@ class HttpRequest(BaseRequestClass):
         # call filled.
         self.reported_collectors = (
             [] if self.session is not None else list(self.trace_collectors))
+        # Put them on the envelope *now*, not after a successful read.
+        # These are the live mappings the callbacks write into, so the
+        # envelope tracks them in place -- which is the only way a
+        # *failed* call carries a trace at all. Assigning in
+        # `_copy_into_envelope` meant every failure reported `[]`,
+        # including the connection error whose `on_request_exception` is
+        # the one event M20 is about: the tracer recorded it faithfully
+        # and the envelope threw it away.
+        self.response['request_tracer'] = self.reported_collectors
         if self.session is not None:
             return await self._exchange(self.session)
         async with aiohttp.ClientSession(
@@ -917,17 +933,14 @@ class HttpRequest(BaseRequestClass):
         announce as JSON is left in ``text`` alone; ``json`` stays None,
         which is not an error.
 
-        ``request_tracer`` is filled from ``reported_collectors``, not
-        from the wider ``trace_collectors`` the redirect loop writes
-        into. The two differ on exactly one path: a caller-supplied
-        session, whose own tracers this library now writes to but does
-        not put on the envelope. Those collectors belong to an object
-        that outlives this call -- a session reused across several calls
-        would have every envelope aliasing one mutating dict, so the
-        first call's envelope would silently report the fifth call's
-        timings. Reporting ``[]`` there keeps the documented contract
-        ("tracing this library owns is off") and leaves the caller
-        reading their own tracer, which is the object they already hold.
+        ``request_tracer`` is **not** written here. It is assigned in
+        :meth:`handle_request`, at the moment the trace scope is bound,
+        because the mappings are live: the callbacks keep writing into
+        them and the envelope tracks them in place. Assigning here
+        instead made the key reachable only on the path that got a
+        response back, so every failed call reported ``[]`` -- including
+        the connection error whose ``on_request_exception`` the tracer
+        had recorded correctly and the envelope then discarded.
 
         Args:
             result: What the transport boundary returned.
@@ -940,7 +953,6 @@ class HttpRequest(BaseRequestClass):
         self.response['headers'] = redact_headers(result['headers'])
         self.response['cookies'] = redact_cookies(result['cookies'])
         self.response['text'] = result['text']
-        self.response['request_tracer'] = self.reported_collectors
 
         decode_error: Optional[Text] = result.get('decode_error')
         if decode_error is not None:
