@@ -1,4 +1,15 @@
-"""Constants."""
+"""The library's tunable defaults, in one place with their reasoning.
+
+Every default a caller may override without writing code lives here rather
+than as a literal at its use site, so changing one is a reviewable edit to
+a named constant instead of a hunt through four protocol modules.
+
+Several of these values were themselves findings: the transfer chunk was
+64 times smaller than conventional, the retry base and its ceiling were
+both zero (which is not backoff), and the breaker registry was unbounded.
+Each therefore carries the comment explaining why the number is what it
+is, because a bare number invites the next reader to change it back.
+"""
 
 from collections.abc import Mapping
 from types import MappingProxyType

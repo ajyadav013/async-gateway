@@ -354,8 +354,31 @@ def transport_error_for(
 class SFTPRequest(BaseRequestClass):
     """Implements asyncssh to make sftp calls."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        """Initialise the SFTP request class."""
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Build an SFTP request from a validated ``protocol_info``.
+
+        Reads the SFTP-specific keys off ``self.info`` once, here, and
+        resolves the connect options -- including the host-key policy --
+        so the transfer methods below read attributes rather than
+        re-deriving them per operation.
+
+        Args:
+            *args: Forwarded verbatim to :class:`BaseRequestClass` --
+                ``url``, ``auth``, ``response`` and ``info``, in that
+                order.
+            **kwargs: Forwarded verbatim to the base, which requires
+                ``redact_params`` keyword-only.
+
+        Raises:
+            ConfigurationError: From the base, if ``info`` is neither
+                None nor a mapping, or omits a key this protocol
+                requires; and from :meth:`_connect_options` if the
+                host-key configuration is self-contradictory. SFTP's own
+                ``mode`` is deliberately *not* checked here: it is
+                validated once the request runs, because
+                ``protocol_info`` is optional for this protocol and the
+                object must stay constructible without one.
+        """
         super(SFTPRequest, self).__init__(*args, **kwargs)
 
         self.port: int = self.info.get('port', 22)

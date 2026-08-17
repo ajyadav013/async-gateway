@@ -36,6 +36,7 @@ from collections.abc import Collection
 from pathlib import PurePath
 from typing import (
     Any,
+    AsyncIterator,
     Awaitable,
     Callable,
     Dict,
@@ -53,6 +54,9 @@ from async_gateway.helpers.internal import (
     MULTIPART_MEDIA_PREFIX,
     filter_for_media_type,
     media_type_of,
+)
+from async_gateway.helpers.internal.circuit_breaker_helper import (
+    CircuitBreakerHelper,
 )
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.constants import (
@@ -74,7 +78,11 @@ from async_gateway.utils.http_file_config import (
     resolve_verb,
     response_too_large,
 )
-from async_gateway.utils.paths import resolve_caller_path, safe_writer
+from async_gateway.utils.paths import (
+    PathLike,
+    resolve_caller_path,
+    safe_writer,
+)
 from async_gateway.utils.redaction import redact_url
 
 #: Where a download lands when the caller names no path. The README
@@ -178,9 +186,34 @@ class HttpResult(_HttpResultOptional):
 
 
 async def file_upload(
-        file_name=None,
-        file_upload_chunk_size=CHUNK_SIZE_CONSTANT):
-    """Generates the chunk of file in a file stream."""
+        file_name: Optional[PathLike] = None,
+        file_upload_chunk_size: int = CHUNK_SIZE_CONSTANT,
+) -> AsyncIterator[bytes]:
+    """Yield a local file's bytes one chunk at a time.
+
+    The streaming upload body. Read with ``aiofiles`` so the read does not
+    block the event loop, and yielded rather than returned so a large file
+    never has to be resident in memory at once.
+
+    One-shot, like every async generator: the first consumer exhausts it.
+    That is why callers build one per attempt and per redirect hop through
+    a :data:`BodyFactory` rather than sharing one (H9, AGW-38).
+
+    Args:
+        file_name: Path to the local file to stream. Passed straight to
+            ``aiofiles.open``; ``None`` is accepted by the signature but
+            reaches ``open`` and raises, so callers pass a real path.
+        file_upload_chunk_size: Bytes per read, defaulting to
+            :data:`~async_gateway.utils.constants.CHUNK_SIZE_CONSTANT`.
+
+    Yields:
+        Successive chunks of the file's bytes, ending when the file is
+        exhausted. A zero-length file yields nothing.
+
+    Raises:
+        FileNotFoundError: If ``file_name`` names no existing file.
+        OSError: For any other reason the file cannot be opened or read.
+    """
     async with aiofiles.open(file_name, 'rb') as f:
         chunk = await f.read(file_upload_chunk_size)
         while chunk:
@@ -706,7 +739,7 @@ async def read_response(
 
 
 async def make_http_request(
-        session,
+        session: aiohttp.ClientSession,
         url: Text,
         build_body: BodyFactory,
         request_type: Text,
@@ -718,7 +751,7 @@ async def make_http_request(
         allow_redirects: bool,
         max_redirects: int,
         trace_collectors: Collection[Dict[Text, Any]] = (),
-        **kwargs) -> HttpResult:
+        **kwargs: Any) -> HttpResult:
     """Make the API call, follow its redirects, and return what came back.
 
     The loop is this library's, not ``aiohttp``'s. Each request goes out
@@ -913,11 +946,11 @@ async def make_http_request(
 
 
 async def make_http_filters_with_stream_file_upload(
-    session,
+    session: aiohttp.ClientSession,
     url: Text,
     request_type: Text,
-    circuit_breaker,
-    **kwargs
+    circuit_breaker: CircuitBreakerHelper,
+    **kwargs: Any,
 ) -> HttpResult:
     """Make filters for http call involving file upload in chunks.
 
@@ -946,6 +979,8 @@ async def make_http_filters_with_stream_file_upload(
     ``RetriesExhausted``, classified as a ``ConnectError``, and reported
     as a 502 from an endpoint that was never dialled -- with the caller's
     absolute local path in the message.
+    :returns HttpResult: what the final hop answered, as
+    :func:`make_http_request` assembled it.
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
     local_filepath = http_file_upload_config['local_filepath']
@@ -1031,11 +1066,11 @@ def build_upload_form(
 
 
 async def make_http_filters_without_stream_uploads(
-    session,
+    session: aiohttp.ClientSession,
     url: Text,
     request_type: Text,
-    circuit_breaker,
-    **kwargs
+    circuit_breaker: CircuitBreakerHelper,
+    **kwargs: Any,
 ) -> HttpResult:
     """Make filters for file upload over http.
 
@@ -1071,6 +1106,9 @@ async def make_http_filters_without_stream_uploads(
     mid-flight deletion could not reach the upload. It is the accepted
     cost of building the body once per attempt, which is what makes a
     retry send the file rather than zero bytes.
+
+    :returns HttpResult: what the final hop answered, as
+    :func:`make_http_request` assembled it.
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
     local_filepath = http_file_upload_config['local_filepath']
@@ -1103,11 +1141,11 @@ async def make_http_filters_without_stream_uploads(
 
 
 async def make_http_filters_without_file(
-    session,
+    session: aiohttp.ClientSession,
     url: Text,
     request_type: Text,
-    circuit_breaker,
-    **kwargs
+    circuit_breaker: CircuitBreakerHelper,
+    **kwargs: Any,
 ) -> HttpResult:
     """Make filters to make http call.
 
@@ -1123,6 +1161,9 @@ async def make_http_filters_without_file(
     consumed. Re-running the filter is cheap and takes this path out of
     that class of defect entirely rather than leaving it depending on
     which body shape the caller's ``Content-Type`` happened to select.
+
+    :returns HttpResult: what the final hop answered, as
+    :func:`make_http_request` assembled it.
     """
     headers = kwargs.get('headers')
     payload = kwargs.get('payload')
@@ -1157,11 +1198,11 @@ filter_methods = {
 
 
 async def handle_http_request(
-    session: object,
+    session: aiohttp.ClientSession,
     url: Text,
     request_type: Text,
-    circuit_breaker: object,
-    **kwargs
+    circuit_breaker: CircuitBreakerHelper,
+    **kwargs: Any,
 ) -> HttpResult:
     """Identify filter metods to be called before http request.
 
@@ -1181,6 +1222,10 @@ async def handle_http_request(
     entry point's ``AsyncGatewayError`` conversion. Raising it at this depth
     turned a configuration error into an ``ok=False`` envelope. This
     function acts on what it is handed and does not check it again (R11).
+
+    :returns HttpResult: whatever the selected filter method returned --
+    ultimately what the final hop answered, as :func:`make_http_request`
+    assembled it.
     """
     http_file_upload_config = kwargs.get('http_file_upload_config')
     if http_file_upload_config:
