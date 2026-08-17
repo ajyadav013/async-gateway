@@ -48,6 +48,7 @@ from async_gateway.helpers.internal.request_helper import (
     HttpResult,
     REQUEST_START_KEY,
     after_redirect,
+    cross_origin_headers,
     file_upload,
     handle_multipart_response,
     hop_deadline,
@@ -58,12 +59,12 @@ from async_gateway.helpers.internal.request_helper import (
     record_redirect,
     redirect_target,
     same_origin,
-    without_credentials,
 )
 from async_gateway.utils.constants import (
     ALLOWED_SCHEMES,
     CHUNK_SIZE_CONSTANT,
     CREDENTIAL_HEADERS,
+    CROSS_ORIGIN_SAFE_HEADERS,
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
 )
@@ -1858,7 +1859,7 @@ def test_a_cross_origin_hop_drops_every_credential_header() -> None:
     whatever host a hostile endpoint named -- a credential leak
     introduced by the fix for a different one.
     """
-    stripped = without_credentials({
+    stripped = cross_origin_headers({
         'Authorization': 'Bearer secret',
         'Cookie': 'session=secret',
         'Proxy-Authorization': 'Basic secret',
@@ -1868,43 +1869,75 @@ def test_a_cross_origin_hop_drops_every_credential_header() -> None:
     assert stripped == {'Accept': 'application/json'}
 
 
-def test_credential_stripping_is_case_insensitive() -> None:
-    """Header names are case-insensitive, and a leak must not hinge on it."""
-    assert without_credentials({'AUTHORIZATION': 'Bearer secret'}) == {}
+def test_the_cross_origin_allowlist_is_case_insensitive() -> None:
+    """Header names are case-insensitive, and a leak must not hinge on it.
+
+    Both directions, because an allowlist can now fail either way: a
+    dropped header whose case defeated the *deny* test was the old bug,
+    and a *kept* header whose case defeats the allow test would be a new
+    one -- ``ACCEPT`` silently vanishing on every cross-origin hop.
+    """
+    assert cross_origin_headers({'AUTHORIZATION': 'Bearer secret'}) == {}
+    assert cross_origin_headers({'ACCEPT': 'application/json'}) == {
+        'ACCEPT': 'application/json'}
 
 
-def test_anything_the_envelope_redacts_a_cross_origin_hop_strips() -> None:
+def test_a_header_on_no_list_anywhere_does_not_cross_an_origin() -> None:
+    """Fail-closed, which is the entire reason for the inversion.
+
+    ``x-totally-novel-secret`` appears in no set in this codebase --
+    not ``CREDENTIAL_HEADERS``, not ``SENSITIVE_HEADERS``, not
+    ``CROSS_ORIGIN_SAFE_HEADERS``. A denylist forwards it, and that is
+    not a hypothetical: NEW-H1b was ten real headers a denylist built
+    from the union of every credential set in this codebase still
+    forwarded to a hostile host, each with its exact secret. The next
+    such header has not been invented yet, and this asserts it will be
+    dropped anyway -- the one property naming headers can never give.
+    """
+    novel = 'X-Totally-Novel-Secret'
+
+    assert novel.lower() not in CREDENTIAL_HEADERS
+    assert novel.lower() not in SENSITIVE_HEADERS
+    assert novel.lower() not in CROSS_ORIGIN_SAFE_HEADERS
+    assert cross_origin_headers({novel: 'NOVEL-SECRET'}) == {}
+
+
+def test_no_credential_header_is_on_the_cross_origin_allowlist() -> None:
     """The invariant, not the header names -- the drift *was* the leak.
 
     Two lists answered the same question for two surfaces:
     ``SENSITIVE_HEADERS`` decided what the envelope masks,
-    ``CREDENTIAL_HEADERS`` decided what a cross-origin hop strips. Kept
-    as independent literals they diverged, and the divergence was H1 --
-    ``x-api-key`` had been in the redaction set all along, so the library
-    returned ``X-Api-Key: ***redacted***`` to the caller while forwarding
-    ``APIKEYSECRET`` to whatever host a hostile ``Location`` named.
-    Redacting a value asserts it is secret; forwarding it denies that.
+    ``CREDENTIAL_HEADERS`` decided what a cross-origin hop stripped.
+    Kept as independent literals they diverged, and the divergence was
+    H1 -- ``x-api-key`` had been in the redaction set all along, so the
+    library returned ``X-Api-Key: ***redacted***`` to the caller while
+    forwarding ``APIKEYSECRET`` to whatever host a hostile ``Location``
+    named. Redacting a value asserts it is secret; forwarding it denies
+    that.
 
-    This asserts the *relation* rather than today's membership, so a
-    header added to either set tomorrow is covered without anyone
-    remembering this test exists. A test naming the five headers would
-    have passed throughout the window in which H1 was exploitable.
+    Now that the hop filters on an allowlist the relation is the
+    complementary one -- *disjointness* -- and it is what stops someone
+    "fixing" a dropped header by adding a credential to the allowlist.
+    Asserted as a relation rather than as today's membership, so a header
+    added to either set tomorrow is covered without anyone remembering
+    this test exists.
     """
     sent = {name: f'{name}-secret' for name in SENSITIVE_HEADERS}
 
-    assert without_credentials(sent) == {}
+    assert cross_origin_headers(sent) == {}
     assert SENSITIVE_HEADERS <= CREDENTIAL_HEADERS
+    assert not (CREDENTIAL_HEADERS & CROSS_ORIGIN_SAFE_HEADERS)
 
 
-def test_a_cross_origin_hop_strips_the_common_bearer_token_headers(
+def test_a_cross_origin_hop_strips_the_measured_bearer_token_headers(
 ) -> None:
-    """The headers H1 measured leaking, named so the fix cannot regress.
+    """Every header H1 and NEW-H1b measured leaking, named as regressions.
 
-    The invariant above cannot cover these on its own: ``api-key``,
-    ``x-auth-token``, ``x-amz-security-token`` and ``x-csrf-token`` are
-    not in the redaction set, so only naming them proves they are
-    stripped. Each is a bearer token in the plain sense -- holding it is
-    enough to act as the caller.
+    The disjointness invariant above cannot reach these on its own: none
+    is in the redaction set, so only naming them proves they are
+    dropped. Each is a bearer token in the plain sense -- holding it is
+    enough to act as the caller -- and each was observed arriving at a
+    live hostile server with its exact secret before the allowlist.
     """
     sent = {
         'X-Api-Key': 'APIKEYSECRET',
@@ -1912,10 +1945,55 @@ def test_a_cross_origin_hop_strips_the_common_bearer_token_headers(
         'X-Auth-Token': 'AUTHTOKSECRET',
         'Api-Key': 'APIKEY2SECRET',
         'X-Csrf-Token': 'CSRFSECRET',
+        'X-Access-Token': 'ACCESSTOKEN-SECRET',
+        'X-Auth-Key': 'AUTHKEY-SECRET',
+        'X-Session-Token': 'SESSIONTOKEN-SECRET',
+        'X-Functions-Key': 'FUNCTIONSKEY-SECRET',
+        'Private-Token': 'PRIVATETOKEN-SECRET',
+        'X-Goog-Api-Key': 'GOOGAPIKEY-SECRET',
+        'Dd-Api-Key': 'DDAPIKEY-SECRET',
+        'X-Shopify-Access-Token': 'SHOPIFY-SECRET',
+        'X-Vault-Token': 'VAULT-SECRET',
+        'Authentication': 'AUTHENTICATION-SECRET',
         'Accept': 'application/json',
     }
 
-    assert without_credentials(sent) == {'Accept': 'application/json'}
+    assert cross_origin_headers(sent) == {'Accept': 'application/json'}
+
+
+def test_the_body_describing_headers_survive_a_cross_origin_hop() -> None:
+    """A 307 re-sends the body, so the headers describing it must follow.
+
+    An allowlist that dropped ``Content-Type`` would turn every
+    body-preserving cross-origin redirect into a request the peer cannot
+    parse -- trading a credential leak for a correctness bug. These are
+    the entries that earn their place by describing the *request*, not
+    the caller's relationship with the origin it was addressed to.
+    """
+    sent = {
+        'Accept': 'application/json',
+        'Accept-Encoding': 'gzip',
+        'Content-Type': 'application/json',
+        'Content-Length': '9',
+        'Range': 'bytes=0-99',
+        'User-Agent': 'probe/1.0',
+    }
+
+    assert cross_origin_headers(sent) == sent
+
+
+def test_the_caller_may_widen_the_allowlist_for_one_header() -> None:
+    """The escape hatch: opt-in, per call, and only into the unknown.
+
+    A caller propagating ``X-Request-Id`` across a CDN redirect knows
+    their own header is not a secret, and without this would have to
+    give up redirect-following to keep it.
+    """
+    sent = {'X-Request-Id': 'abc123', 'X-Vault-Token': 'VAULT-SECRET'}
+
+    assert cross_origin_headers(
+        sent, also_forward=frozenset({'x-request-id'})) == {
+            'X-Request-Id': 'abc123'}
 
 
 #: A body that survives being sent twice, and two that do not. ``b'x'``
@@ -2386,11 +2464,11 @@ def test_a_location_that_is_not_parseable_is_a_configuration_error(
         pytest.param({}, id='empty'),
     ],
 )
-def test_stripping_credentials_from_no_headers_is_not_an_error(
+def test_filtering_no_headers_at_all_is_not_an_error(
     headers: Any,
 ) -> None:
     """A call with no headers at all still crosses origins."""
-    assert without_credentials(headers) == headers
+    assert cross_origin_headers(headers) == headers
 
 
 async def test_a_url_download_streams_to_disk_within_the_cap(

@@ -120,46 +120,131 @@ REDIRECT_STATUSES: Final[FrozenSet[int]] = frozenset(
 POST_TO_GET_REDIRECTS: Final[FrozenSet[int]] = frozenset({301, 302})
 SEE_OTHER_STATUS: Final[int] = 303
 
+#: The request headers a hop that **crosses an origin** still carries.
+#: Everything not named here is dropped. Matched lower-cased.
+#:
+#: **This is an allowlist, and the inversion is the fix.** The library
+#: shipped a denylist twice and leaked twice. The first version named
+#: three headers and forwarded ``X-Api-Key`` (H1); the second took the
+#: union of every credential list in the codebase and still forwarded
+#: ``X-Vault-Token``, ``Private-Token``, ``X-Goog-Api-Key`` and seven
+#: more, each measured arriving at a hostile host with its exact secret
+#: (NEW-H1b). Both fixes were correct about the headers they named and
+#: wrong about the shape: a denylist answers "is this one of the secrets
+#: we thought of?", and the header that leaks is by definition the one
+#: nobody thought of. Every vendor that invents a new auth header --
+#: and they invent them continuously -- silently re-opens it.
+#:
+#: An allowlist asks the opposite question, "is this one of the few
+#: headers we know is safe to hand a stranger?", and answers *no* by
+#: default. That makes the unknown header the **safe** case rather than
+#: the exploitable one, so the set stops needing to keep up with every
+#: vendor on the internet. It fails closed: a header this library has
+#: never heard of does not cross an origin, and the cost of being wrong
+#: about an entry is one benign header the caller re-sends, not one
+#: credential the caller cannot un-send.
+#:
+#: What earns a place here is a header that (a) carries no secret in any
+#: deployment, and (b) describes the *request itself* rather than the
+#: caller's relationship with the origin it was addressed to:
+#:
+#: * content negotiation -- ``accept``, ``accept-charset``,
+#:   ``accept-encoding``, ``accept-language``. These describe what the
+#:   client can parse and are meaningless as a credential.
+#: * the body -- ``content-type``, ``content-length``,
+#:   ``content-encoding``, ``content-language``, ``content-disposition``.
+#:   A 307 or 308 re-sends the body verbatim, and a body whose type
+#:   did not survive with it arrives as something the peer cannot parse.
+#: * ``range``, which names bytes of the resource being fetched. The
+#:   download path exists to be redirected at a CDN and a dropped
+#:   ``Range`` silently turns a resumed download into a whole one.
+#: * ``cache-control`` and ``pragma`` -- freshness directives.
+#: * ``user-agent``, which identifies the client software. Dropping it
+#:   makes the second hop look like a different client to every server
+#:   that varies on it, and it has never been a secret.
+#:
+#: Three headers are pointedly **absent** despite looking benign, and
+#: each absence is a decision rather than an oversight. ``referer``
+#: carries the previous URL, and this library's own redaction machinery
+#: exists because callers put tokens in query strings -- forwarding it
+#: cross-origin would hand a stranger a URL the envelope redacts.
+#: ``host`` and ``origin`` name the origin that was just left, so
+#: forwarding either to a *different* origin is wrong on its face;
+#: ``aiohttp`` sets ``host`` per connection anyway. ``if-none-match``
+#: and ``if-modified-since`` carry validators minted by the previous
+#: origin, which mean nothing to the new one.
+CROSS_ORIGIN_SAFE_HEADERS: Final[FrozenSet[str]] = frozenset({
+    'accept',
+    'accept-charset',
+    'accept-encoding',
+    'accept-language',
+    'cache-control',
+    'content-disposition',
+    'content-encoding',
+    'content-language',
+    'content-length',
+    'content-type',
+    'pragma',
+    'range',
+    'user-agent',
+})
+
 #: Credential-bearing request headers this module names in its own right,
 #: beyond the ones :data:`~async_gateway.utils.redaction.SENSITIVE_HEADERS`
 #: already classifies. Every entry is a header whose value is a bearer
 #: token in the plain sense: possessing it is sufficient to act as the
 #: caller, so a hostile ``Location`` receiving one is a full credential
 #: leak and not merely an information disclosure. Matched lower-cased.
+#:
+#: The last ten are the ones NEW-H1b measured leaking. They are named
+#: here even though :data:`CROSS_ORIGIN_SAFE_HEADERS` already drops them
+#: for not being on it, because this set now has a *second* job the
+#: allowlist cannot do -- see :data:`CREDENTIAL_HEADERS`.
 _EXTRA_CREDENTIAL_HEADERS: Final[FrozenSet[str]] = frozenset({
     'x-api-key',
     'x-auth-token',
     'x-amz-security-token',
     'api-key',
     'x-csrf-token',
+    'x-access-token',
+    'x-auth-key',
+    'x-session-token',
+    'x-functions-key',
+    'private-token',
+    'x-goog-api-key',
+    'dd-api-key',
+    'x-shopify-access-token',
+    'x-vault-token',
+    'authentication',
 })
 
-#: Request headers that carry a credential and must not cross an origin
-#: boundary on a redirect. Matched lower-cased.
+#: Request headers known to carry a credential. Matched lower-cased.
 #:
-#: **Derived from the redaction set, not maintained beside it.** These two
-#: lists answer the same question -- "is this header a credential?" -- for
-#: two different surfaces: one decides what the envelope *masks*, this one
-#: decides what a cross-origin hop *strips*. Kept as independent literals
-#: they drifted, and the drift was the leak (H1): ``SENSITIVE_HEADERS``
-#: had classified ``x-api-key`` as a credential for as long as it existed,
-#: so the library redacted ``X-Api-Key`` in the envelope it returned while
-#: forwarding that same header verbatim to whatever host a hostile
-#: ``Location`` named. The envelope showed ``***redacted***``; the evil
-#: host got ``APIKEYSECRET``. Redacting a value is a *statement* that it is
-#: secret, and forwarding it across an origin contradicts that statement.
+#: **This is no longer what decides a cross-origin hop** --
+#: :data:`CROSS_ORIGIN_SAFE_HEADERS` is, and it drops everything absent
+#: from it, so a credential header is dropped for the same reason any
+#: unknown header is. What this set decides now is the two questions an
+#: allowlist genuinely cannot answer:
 #:
-#: Taking the union makes the contradiction unrepresentable rather than
-#: merely fixed: anything added to either set is stripped from the next
-#: cross-origin hop automatically, so the invariant "anything we redact,
-#: we also strip" holds by construction instead of by two reviewers
-#: remembering the other list exists. The union is the safe direction
-#: because over-stripping costs a caller one re-sent header on a
-#: cross-origin redirect, while under-stripping costs them the credential.
-#: ``set-cookie`` rides along from the redaction set: it is a response
-#: header and so is not normally present on a request at all, but a caller
-#: who does set one has it stripped, which is the same fail-closed
-#: direction as everything else here.
+#: 1. **What a caller may not opt back in.** The per-call escape hatch
+#:    ``protocol_info['cross_origin_headers']`` widens the allowlist into
+#:    the *unknown* region, never into this one. A caller can declare
+#:    ``X-Request-Id`` safe to forward; no caller can declare
+#:    ``Authorization`` safe, because a header this library is certain is
+#:    a credential is not a trade-off it offers.
+#: 2. **What a supplied session may not carry.** ``aiohttp`` merges
+#:    session defaults into every request and no hop can withhold them,
+#:    so ``logic.http_client.validated_session`` refuses them at the
+#:    boundary. It refuses on the allowlist for the same fail-closed
+#:    reason the hop does; this set is what makes the *diagnostic* say
+#:    "credential" and not merely "unrecognised".
+#:
+#: It stays derived from the redaction set for the reason it always was:
+#: two literals answering "is this a credential?" drifted once, and the
+#: drift was H1 -- ``x-api-key`` was redacted in the returned envelope
+#: while being forwarded verbatim to whatever host a hostile ``Location``
+#: named. Redacting a value asserts it is secret; forwarding it denies
+#: that. The union keeps the contradiction unrepresentable.
 CREDENTIAL_HEADERS: Final[FrozenSet[str]] = frozenset({
     'authorization',
     'cookie',

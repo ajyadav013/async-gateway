@@ -370,6 +370,7 @@ assumed for a caller who meant DELETE is worse than a rejected call.
 | `allow_redirects` | `bool` | `True` | Whether to follow redirects at all. |
 | `max_redirects` | non-negative `int` | `10` | How many hops to follow. |
 | `allowed_schemes` | collection of `str` | `{'http', 'https'}` | Schemes a redirect hop may target. Enforced **per hop**. |
+| `cross_origin_headers` | collection of `str` | `()` | Extra header names allowed to survive a cross-origin redirect. Cannot name a credential header. See [Redirects](#redirects). |
 | `http_file_upload_config` | `dict` | `{}` | Upload a local file; see [Local files](#local-files-downloads-uploads-and-overwrite). |
 | `http_file_download_config` | `dict` | absent | Stream the response to disk; see [Local files](#local-files-downloads-uploads-and-overwrite). |
 | `circuit_breaker_config` | `dict` | `{}` | Retry and breaker settings; see [Retry](#retry-timeout-and-circuit-breaker-behaviour). |
@@ -1057,12 +1058,62 @@ The redirect loop is this library's own, not aiohttp's, and that is what makes
 before it is issued, not only the initial URL. A hop to a scheme outside the
 allowlist is refused with `CONFIG`/400 and no second request is made.
 
-Credential headers — `Authorization`, `Cookie`, `Proxy-Authorization` — and the
-`auth` argument are **withheld on a hop that crosses an origin**. This is why a
-`session` you supply may not carry credentials of its own: aiohttp merges session
-defaults into every request and no hop can suppress them, so a hostile
-`Location` would receive them. Pass credentials per call instead, which is the
-route that gets the stripping.
+#### Headers on a cross-origin hop: an allowlist
+
+**A hop that crosses an origin forwards only headers on a fixed allowlist.
+Everything else — including your own custom headers — is dropped.** Your
+`cookies` and the `auth` argument are dropped outright. A hop that stays on the
+same origin forwards everything, unchanged.
+
+These are the headers that survive:
+
+| Group | Headers |
+|---|---|
+| Content negotiation | `Accept`, `Accept-Charset`, `Accept-Encoding`, `Accept-Language` |
+| The body | `Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Language`, `Content-Disposition` |
+| Ranged reads | `Range` |
+| Freshness | `Cache-Control`, `Pragma` |
+| Client identity | `User-Agent` |
+
+**Why an allowlist and not a list of secrets to strip.** A strip-list has to
+name every credential header that exists, and the one that leaks is always the
+one nobody thought of. This library shipped that list twice and leaked twice —
+the second time it was the union of every credential set in the codebase and
+still handed `X-Vault-Token`, `Private-Token`, `X-Goog-Api-Key` and seven more
+to a hostile host, verbatim. Every vendor that invents a new auth header
+silently re-opens the hole. Inverting the question makes a header this library
+has never heard of **not cross**, which is the only version of the guard that
+does not need to keep pace with the entire internet.
+
+**If you need a custom header to survive**, name it — and only do this for a
+header that is genuinely not a secret:
+
+```python
+from async_gateway.async_gateway import request
+
+result = await request(
+    url='https://api.example.com/v1/items',
+    protocol='HTTPS',
+    protocol_info={
+        'request_type': 'get',
+        'headers': {'X-Request-Id': 'correlation-id-1234'},
+        'cross_origin_headers': ['X-Request-Id'],
+    },
+)
+assert result['ok'] is True
+```
+
+`cross_origin_headers` widens the allowlist into the region this library has no
+opinion about. It **cannot** re-admit a header known to be a credential —
+`Authorization`, `Cookie`, `X-Api-Key`, `X-Vault-Token` and the rest are refused
+with `ConfigurationError` rather than honoured, because that is not a trade-off
+this library offers at any level of insistence.
+
+This is also why a `session` you supply may not carry any header off the
+allowlist: aiohttp merges session defaults into every request and no hop can
+suppress them, so a hostile `Location` would receive them regardless of what the
+loop decides. Pass headers per call instead — or, for a session default you have
+declared in `cross_origin_headers`, the pair is accepted.
 
 `max_redirects=0` and `allow_redirects=False` are **different asks**.
 `max_redirects=0` is a bound the chain overran: a 302 answers `ok=False`,

@@ -57,8 +57,8 @@ runtime.
   **per-destination** registry, keyed on `(family, host, port)`, so one flaky
   host cannot open the circuit for every destination.
 - **A library-owned redirect loop**, so the configured timeout bounds the whole
-  chain instead of each hop, and credentials are stripped when a hop crosses an
-  origin.
+  chain instead of each hop, and a hop that crosses an origin is reduced to an
+  allowlist of safe headers (see the breaking change below).
 - **Path containment on every local write** (`utils/paths.py`,
   `utils/contained_io.py`), including the recursive FTP and SFTP directory
   transfers, where a hostile server-supplied filename could previously write
@@ -104,6 +104,35 @@ runtime.
 
 ### Changed — BREAKING
 
+- **A cross-origin redirect now forwards only allowlisted headers.** A hop that
+  crosses an origin boundary carries `Accept`, `Accept-Charset`,
+  `Accept-Encoding`, `Accept-Language`, `Content-Type`, `Content-Length`,
+  `Content-Encoding`, `Content-Language`, `Content-Disposition`, `Range`,
+  `Cache-Control`, `Pragma` and `User-Agent`, and **drops everything else** —
+  including any custom header of yours. Same-origin hops are unchanged and
+  forward everything.
+
+  This replaces a list of credential headers to *strip*, which was the wrong
+  shape twice: naming the secrets requires having thought of all of them, and
+  the header that leaks is the one nobody thought of. The strip-list forwarded
+  `X-Api-Key` in its first form and, in its second — the union of every
+  credential set in the codebase — still handed `X-Vault-Token`,
+  `Private-Token`, `X-Goog-Api-Key`, `X-Access-Token`, `X-Auth-Key`,
+  `X-Session-Token`, `X-Functions-Key`, `Dd-Api-Key`, `X-Shopify-Access-Token`
+  and `Authentication` to a hostile host verbatim. Inverting to an allowlist
+  fails closed, so a header this library has never heard of does not cross.
+
+  **If you rely on a custom header surviving a cross-origin redirect**, name it
+  in the new `protocol_info['cross_origin_headers']`. That key widens the
+  allowlist into headers this library has no opinion about; it raises
+  `ConfigurationError` rather than re-admitting one it recognises as a
+  credential.
+
+  A supplied `session` is now validated against the same allowlist rather than
+  against the credential list, which closes the identical hole on that path:
+  aiohttp merges session defaults into every request and no hop can withhold
+  them, so a session carrying any header off the allowlist is refused unless it
+  is declared in `cross_origin_headers`.
 - **One response envelope, for every protocol and both outcomes.** `request()`
   now always returns the same key set — `ok`, `status_code`, `protocol`, `url`,
   `request_time`, `latency`, `payload`, `text`, `json`, `headers`, `cookies`,
