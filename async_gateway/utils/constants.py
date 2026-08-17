@@ -15,6 +15,12 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final, FrozenSet
 
+# The one intra-`utils` import, and it only goes this way: `redaction`
+# imports nothing from the package, so naming it here cannot cycle. It is
+# imported rather than duplicated because `CREDENTIAL_HEADERS` below is
+# *derived* from it -- see the reasoning there.
+from async_gateway.utils.redaction import SENSITIVE_HEADERS
+
 HTTP_TIMEOUT = 15
 
 # The lowest status a protocol treats as the remote side reporting failure.
@@ -114,10 +120,48 @@ REDIRECT_STATUSES: Final[FrozenSet[int]] = frozenset(
 POST_TO_GET_REDIRECTS: Final[FrozenSet[int]] = frozenset({301, 302})
 SEE_OTHER_STATUS: Final[int] = 303
 
+#: Credential-bearing request headers this module names in its own right,
+#: beyond the ones :data:`~async_gateway.utils.redaction.SENSITIVE_HEADERS`
+#: already classifies. Every entry is a header whose value is a bearer
+#: token in the plain sense: possessing it is sufficient to act as the
+#: caller, so a hostile ``Location`` receiving one is a full credential
+#: leak and not merely an information disclosure. Matched lower-cased.
+_EXTRA_CREDENTIAL_HEADERS: Final[FrozenSet[str]] = frozenset({
+    'x-api-key',
+    'x-auth-token',
+    'x-amz-security-token',
+    'api-key',
+    'x-csrf-token',
+})
+
 #: Request headers that carry a credential and must not cross an origin
 #: boundary on a redirect. Matched lower-cased.
+#:
+#: **Derived from the redaction set, not maintained beside it.** These two
+#: lists answer the same question -- "is this header a credential?" -- for
+#: two different surfaces: one decides what the envelope *masks*, this one
+#: decides what a cross-origin hop *strips*. Kept as independent literals
+#: they drifted, and the drift was the leak (H1): ``SENSITIVE_HEADERS``
+#: had classified ``x-api-key`` as a credential for as long as it existed,
+#: so the library redacted ``X-Api-Key`` in the envelope it returned while
+#: forwarding that same header verbatim to whatever host a hostile
+#: ``Location`` named. The envelope showed ``***redacted***``; the evil
+#: host got ``APIKEYSECRET``. Redacting a value is a *statement* that it is
+#: secret, and forwarding it across an origin contradicts that statement.
+#:
+#: Taking the union makes the contradiction unrepresentable rather than
+#: merely fixed: anything added to either set is stripped from the next
+#: cross-origin hop automatically, so the invariant "anything we redact,
+#: we also strip" holds by construction instead of by two reviewers
+#: remembering the other list exists. The union is the safe direction
+#: because over-stripping costs a caller one re-sent header on a
+#: cross-origin redirect, while under-stripping costs them the credential.
+#: ``set-cookie`` rides along from the redaction set: it is a response
+#: header and so is not normally present on a request at all, but a caller
+#: who does set one has it stripped, which is the same fail-closed
+#: direction as everything else here.
 CREDENTIAL_HEADERS: Final[FrozenSet[str]] = frozenset({
     'authorization',
     'cookie',
     'proxy-authorization',
-})
+}) | _EXTRA_CREDENTIAL_HEADERS | SENSITIVE_HEADERS

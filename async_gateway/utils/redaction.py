@@ -7,17 +7,25 @@ point of redacting it at all.
 
 Nothing here raises on the caller's data: a redactor that can fail turns a
 logging call into an outage. The one parse that can fail (``redact_url``)
-returns its input unchanged instead.
+falls back to the regex passes instead, which need no parse to succeed.
 
 The masking this module performs is deliberately bounded and the bound is
 part of the contract (invariant E9): header and cookie values, URL userinfo
-and sensitive-named query parameters, sensitive-named ``name=value`` pairs
-anywhere after a ``?`` or ``&`` -- whose names are matched percent-decoded,
-so ``api%5Fkey`` is the ``api_key`` every server will read it as -- URLs
+-- in a URL that parses *and* in one that does not -- and sensitive-named
+query parameters, sensitive-named ``name=value`` pairs
+anywhere after a ``?``, ``&`` or ``;`` -- whose names are matched
+percent-decoded, so ``api%5Fkey`` is the ``api_key`` every server will read
+it as -- URLs
 embedded anywhere inside a free-text string, and payload values whose
 *key name* is sensitive down to
 :data:`PAYLOAD_REDACTION_DEPTH`. Below that depth, and for a payload that
 is not a mapping, the caller's own data is echoed verbatim.
+
+No masker returns its input untouched on a parse failure. ``redact_url``
+used to, and the echo was a leak: the URL that fails to parse is precisely
+the one the caller is about to be told about by name, so the failure path
+is the *most* exposed surface rather than an obscure one. It now falls
+back to the regex passes, which need no parse to succeed.
 
 That query-pair rule asks nothing about the string around it, and the
 asking is what it replaces. A predicate classifying "is this a URL?"
@@ -98,8 +106,122 @@ _EMBEDDED_URL: Final[re.Pattern[str]] = re.compile(
 # runs after two different delimiters cannot overlap, and only `?` and
 # `&` can start a match at all. The work therefore sums to O(n) across
 # the string rather than multiplying the way the scheme run above did.
+# `;` joins the class because it is a query separator too. It is the
+# legacy form -- once recommended by the HTML 4.01 spec, still parsed by
+# PHP, Java servlet containers and CGI code -- and a server that reads it
+# reads `?a=1;api_key=S` as two parameters, the second of them secret.
+# This rule saw one (`?` or `&` only), so the secret stayed in the clear
+# in `error['message']` and the logged traceback (L1).
+#
+# `redact_url` needs no matching change and deliberately does not get one:
+# `parse_qsl` splits on `&` alone, which folds `;api_key=S` into the
+# *preceding* value and masks it along with that value whenever the
+# preceding name is sensitive. Where it is not -- `?a=1;api_key=S` --
+# this pass now masks it, and `redact_url` runs second on the composed
+# path with nothing left to find. Two rules with different bounds, and
+# the union of them is what either surface gets.
+#
+# The linearity argument above survives the addition unchanged: `;` is
+# excluded from both the name and the value class exactly as `?` and `&`
+# are, so a run is still capped by its own length and runs after
+# different delimiters still cannot overlap.
 _QUERY_PAIR: Final[re.Pattern[str]] = re.compile(
-    r'([?&])([^?&=\s]+)=([^?&\s]*)')
+    r'([?&;])([^?&;=\s]+)=([^?&;\s]*)')
+
+
+# `scheme://userinfo@` -- the credential a query-pair rule structurally
+# cannot see, because userinfo carries no `?` and no `=`.
+#
+# `redact_url` handles this for a URL it can *parse*, by dropping the
+# whole userinfo. That left the case this pattern exists for: a URL that
+# does not parse. `urlsplit('http://user:PASS@[::1/p')` raises on the
+# unclosed IPv6 bracket, and the whole-string masker had nothing to fall
+# back to, so the password was echoed verbatim into the
+# `ConfigurationError` a public `request()` call raises (M1/AGW-34).
+#
+# The scheme run is bounded at 32 for the same reason `_EMBEDDED_URL`'s
+# is: unbounded, it retries from every offset on a long string carrying
+# no `://`. Every class excludes `@` and `/?#`, so a userinfo run cannot
+# cross into the path or span a sentence, and the match ends at the first
+# `@` -- a netloc holding two of them masks the first, which is a
+# malformed netloc no server agrees on and still the fail-closed answer.
+_USERINFO: Final[re.Pattern[str]] = re.compile(
+    r'([A-Za-z][A-Za-z0-9+.\-]{0,31}://)([^/?#\s@]*?)(:[^/?#\s@]*)?@')
+
+
+def _mask_userinfo(match: 're.Match[str]') -> str:
+    """Mask the credential inside one ``scheme://userinfo@`` match.
+
+    Args:
+        match: The matched scheme, user part, and optional ``:password``.
+
+    Returns:
+        The userinfo with its secret masked. A ``user:password`` keeps
+        the user and masks the password, which is the same bargain
+        :func:`redact_headers` strikes -- a name is diagnostic, a value
+        is not. A userinfo with *no* colon is masked whole: a bare
+        ``https://TOKEN@host`` is how several APIs pass a token, nothing
+        distinguishes that from a username, and guessing wrong in the
+        other direction publishes the token.
+    """
+    scheme, user, password = match.groups()
+    if password is None:
+        return f'{scheme}{REDACTED}@'
+    return f'{scheme}{user}:{REDACTED}@'
+
+
+def _mask_in_string(text: str, sensitive: frozenset[str]) -> str:
+    """Apply the two masking passes that cannot recurse.
+
+    Split out of :func:`redact_text` so :func:`redact_url` can reuse it
+    as its parse-failure fallback without the two calling each other
+    forever: :func:`redact_text`'s third pass hands each embedded URL to
+    :func:`redact_url`, so a fallback that re-entered :func:`redact_text`
+    would hand the same unparseable URL straight back. Everything here
+    is pure regex substitution and re-enters nothing.
+
+    Args:
+        text: The string to mask.
+        sensitive: The casefolded names whose query values are masked,
+            already resolved by :func:`_sensitive_names`.
+
+    Returns:
+        ``text`` with sensitive query values and URL userinfo masked.
+    """
+    def mask_pair(match: 're.Match[str]') -> str:
+        """Redact the one query value this match spans, if it is secret.
+
+        The name is tested both as written and percent-decoded, because
+        ``api%5Fkey`` is ``api_key`` to every server that will read it
+        and a raw-text comparison sees two different names. Testing both
+        rather than only the decoded form keeps the extension point from
+        being the narrower of the two: a caller who declared a name
+        containing a literal ``%`` means that name, and decoding it away
+        would drop a secret the caller took the trouble to declare.
+        :func:`urllib.parse.unquote` never raises -- a malformed ``%zz``
+        comes back verbatim -- so this adds no way for a redactor to
+        fail. ``+`` is left alone deliberately: it means a space only
+        under the form-encoding convention, no sensitive name contains a
+        space, and decoding it could only ever lose a caller's literal
+        ``+``.
+
+        Args:
+            match: The matched delimiter, name and value.
+
+        Returns:
+            The pair with its value masked, or the match unchanged when
+            the name is not a sensitive one. A masked pair keeps the
+            caller's own spelling of the name, encoding and all, and its
+            own delimiter -- rewriting a legacy ``;`` to ``&`` would
+            change what the string says the caller sent.
+        """
+        delimiter, name, _value = match.groups()
+        if (name.casefold() not in sensitive
+                and unquote(name).casefold() not in sensitive):
+            return match.group(0)
+        return f'{delimiter}{name}={REDACTED}'
+
+    return _USERINFO.sub(_mask_userinfo, _QUERY_PAIR.sub(mask_pair, text))
 
 
 def _sensitive_names(extra_params: Collection[str]) -> frozenset[str]:
@@ -201,7 +323,11 @@ def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
     Parameters are split on ``&`` only, which is what ``parse_qsl`` does by
     default and is the hardened reading: a legacy ``;`` separator would be
     seen as part of the preceding value, so it is masked *with* it rather
-    than escaping as a name of its own.
+    than escaping as a name of its own. That holds only where the
+    preceding name is itself sensitive; ``?a=1;api_key=S`` is not covered
+    here and is covered by :func:`redact_text`, whose pair rule does split
+    on ``;``. Both surfaces get the union, because :func:`redact_value`
+    composes the two.
 
     Args:
         url: The URL to redact.
@@ -210,15 +336,32 @@ def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
             normalised by :func:`normalise_param_names`.
 
     Returns:
-        The redacted URL, or ``url`` unchanged when nothing needed masking
-        or when it cannot be parsed. An unparseable URL is kept rather than
-        discarded: it is diagnostic data, not a security boundary, and
-        losing it hurts more than the residual risk.
+        The redacted URL, or ``url`` unchanged when nothing needed
+        masking. A URL that cannot be *parsed* is still masked, by the
+        regex passes :func:`redact_text` uses -- it is kept rather than
+        discarded, because it is diagnostic data rather than a security
+        boundary, but keeping it is not the same as keeping its
+        credentials.
     """
     try:
         parts = urlsplit(url)
     except ValueError:
-        return url
+        # Echoing the input here was the leak (M1/AGW-34). The ticket
+        # accepted it on the condition that no caller-visible surface
+        # reached this function uncomposed, and that condition was
+        # false: `validated_url`'s own "url is not parseable" message
+        # calls it directly, so a public `request()` raised
+        # `ConfigurationError: url is not parseable:
+        # http://user:SUPERSECRET123@[::1/p` with the password intact --
+        # the one input that reaches this branch being, definitionally,
+        # the one the caller gets told about.
+        #
+        # The regex passes need no successful parse, which is exactly
+        # why they are the right fallback: an unclosed IPv6 bracket
+        # defeats `urlsplit` and not a character class. `_mask_in_string`
+        # rather than `redact_text` because the latter's third pass
+        # would hand this same URL back here and spin.
+        return _mask_in_string(url, _sensitive_names(extra_params))
 
     netloc = parts.netloc
     if '@' in netloc:
@@ -254,10 +397,10 @@ def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
     ``'RetriesExhausted: ftpx://host/p?api_key=...'`` -- and a
     whole-string test does not see that URL at all.
 
-    Two passes run, in this order.
+    Three passes run, in this order.
 
     The first masks the value of every ``name=value`` pair introduced by
-    ``?`` or ``&`` whose *name* is sensitive -- as written or
+    ``?``, ``&`` or ``;`` whose *name* is sensitive -- as written or
     percent-decoded, so ``?api%5Fkey=`` is masked exactly as
     ``?api_key=`` is -- wherever the pair appears.
     It never asks whether the text around the pair is a URL, so a
@@ -266,10 +409,15 @@ def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
     the predicate that used to decide it was this module's
     longest-lived leak, and the module docstring records how it failed.
 
-    The second redacts each embedded ``scheme://`` URL whole, which the
-    first cannot -- userinfo carries no ``?``, so ``user:pw@`` is
-    invisible to a query-pair rule. It runs *second* because the first
-    then leaves it nothing to rewrite: :func:`redact_url` rebuilds a
+    The second masks ``scheme://user:pw@`` userinfo, which the first
+    structurally cannot see -- userinfo carries no ``?`` and no ``=``.
+    Only :func:`redact_url` used to cover this, and only for a URL that
+    parses, which left ``http://user:pw@[::1/p`` echoing its password
+    (M1). Being a regex it needs no parse, so it covers both.
+
+    The third redacts each embedded ``scheme://`` URL whole. It runs
+    *last* because the first two then leave it nothing to rewrite:
+    :func:`redact_url` rebuilds a
     query only when its own masking changed something, so an
     already-masked query keeps the caller's percent-encoding rather than
     being normalised through :func:`urllib.parse.urlencode`.
@@ -301,37 +449,6 @@ def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
     """
     sensitive = _sensitive_names(extra_params)
 
-    def mask_pair(match: 're.Match[str]') -> str:
-        """Redact the one query value this match spans, if it is secret.
-
-        The name is tested both as written and percent-decoded, because
-        ``api%5Fkey`` is ``api_key`` to every server that will read it
-        and a raw-text comparison sees two different names. Testing both
-        rather than only the decoded form keeps the extension point from
-        being the narrower of the two: a caller who declared a name
-        containing a literal ``%`` means that name, and decoding it away
-        would drop a secret the caller took the trouble to declare.
-        :func:`urllib.parse.unquote` never raises -- a malformed ``%zz``
-        comes back verbatim -- so this adds no way for a redactor to
-        fail. ``+`` is left alone deliberately: it means a space only
-        under the form-encoding convention, no sensitive name contains a
-        space, and decoding it could only ever lose a caller's literal
-        ``+``.
-
-        Args:
-            match: The matched ``?``/``&``, name and value.
-
-        Returns:
-            The pair with its value masked, or the match unchanged when
-            the name is not a sensitive one. A masked pair keeps the
-            caller's own spelling of the name, encoding and all.
-        """
-        delimiter, name, _value = match.groups()
-        if (name.casefold() not in sensitive
-                and unquote(name).casefold() not in sensitive):
-            return match.group(0)
-        return f'{delimiter}{name}={REDACTED}'
-
     def mask_url(match: 're.Match[str]') -> str:
         """Redact the one URL this match spans.
 
@@ -343,7 +460,7 @@ def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
         """
         return redact_url(match.group(0), extra_params=extra_params)
 
-    return _EMBEDDED_URL.sub(mask_url, _QUERY_PAIR.sub(mask_pair, text))
+    return _EMBEDDED_URL.sub(mask_url, _mask_in_string(text, sensitive))
 
 
 def redact_payload(
