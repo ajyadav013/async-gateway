@@ -147,6 +147,19 @@ TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
 def tls_context_for(ssl_config: Mapping[Text, Any]) -> ssl.SSLContext:
     """Return the verifying TLS context an FTPS session connects with.
 
+    A plain ``def``, deliberately, and the same contract
+    ``filters_helper.build_client_ssl_context`` is held to: its fallback
+    branch calls ``ssl.create_default_context()``, which reads the whole
+    system CA bundle (194 certificates), so it is a module-level
+    blocking helper and :meth:`FTPRequest._tls_value` -- its only caller
+    -- reaches it through ``asyncio.to_thread``. Rewriting it as an
+    ``async def`` puts a banned ``ssl.`` call back inside a coroutine and
+    ``tests/test_no_blocking_io.py`` fails on it; leaving it a plain
+    ``def`` called *directly* from the coroutine is the defect that scan
+    structurally cannot see, and is what ticket **AGW-37** was
+    (``tests/logic/test_ftp_client.py`` pins the call site by thread
+    identity instead).
+
     Fail closed on two axes, because M2 has two halves and this seam has
     failed open on both.
 
@@ -460,6 +473,11 @@ class FTPRequest(BaseRequestClass):
     async def _tls_value(self) -> Union[ssl.SSLContext, bool]:
         """Return what this session hands ``aioftp`` as its ``ssl``.
 
+        Both blocking reads this needs happen off the event loop: the
+        caller's own certificate files inside ``get_ssl_config``
+        (AGW-36), and the system CA bundle the no-certificate fallback
+        reads inside :func:`tls_context_for` (AGW-37).
+
         Returns:
             A verifying TLS context, or ``False`` when the caller
             explicitly disabled verification. Never ``None``: that value
@@ -513,7 +531,13 @@ class FTPRequest(BaseRequestClass):
                 f'ftp tls configuration failed for '
                 f'{redact_url(self.url, extra_params=self.redact_params)}'
             ) from err
-        return tls_context_for(ssl_config)
+        # In a thread: the no-certificate branch of `tls_context_for`
+        # builds a default context, and that reads the whole system CA
+        # bundle synchronously -- on the event loop, once per FTPS
+        # session, blocking every other in-flight request while it runs
+        # (AGW-37). The same treatment `get_ssl_config` gives its own
+        # blocking builder, for the same reason.
+        return await asyncio.to_thread(tls_context_for, ssl_config)
 
     def _validate_server_path(self) -> None:
         """Check that the caller named the path on the server.

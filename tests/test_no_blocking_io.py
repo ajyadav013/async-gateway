@@ -8,10 +8,11 @@ and not in a module that does not exist yet, because the scan is a
 ``rglob`` over the package rather than a list of known files.
 
 That is narrower than "no blocking filesystem I/O anywhere on an async
-path", and the gap is not hypothetical: the package contains two
-blocking calls this scan cannot see and a third it is deliberately not
-failing on yet. All three are named under *Known limitations* below and
-in :data:`NOT_YET_REWRITTEN`. A green run of this module means the banned
+path", and the gap is not hypothetical: the package contains blocking
+calls this scan cannot see, named under *Known limitations* below.
+Nothing is excused any more -- :data:`NOT_YET_REWRITTEN` is empty and
+the AGW-37 site this module used to describe as a live defect has been
+fixed rather than documented -- but a green run still means the banned
 *forms* are absent, not that the property is held.
 
 What is banned inside an ``async def``:
@@ -83,25 +84,27 @@ The third one is the escape hatch above, used without its executor: a
 from a coroutine is never searched, so the blocking call is invisible
 here no matter which form it is written in. Two module-level helpers in
 the package are of exactly that shape and the scan can distinguish
-neither from the other:
+neither from the other; **both are now correct**, and neither is held
+correct by anything in this module:
 
-* ``filters_helper.build_client_ssl_context`` -- correct, because
-  ``get_ssl_config`` reaches it through ``asyncio.to_thread``. What holds
-  it correct is the *call site*, which is what this scan cannot see, so
-  ``tests/helpers/test_filters_helper.py`` pins it directly by asserting
-  the function body runs off the event-loop thread.
-* ``logic/ftp_client.tls_context_for`` -- a live defect: it calls
-  ``ssl.create_default_context()`` and is awaited straight from the
-  coroutine ``_tls_value`` with no executor, so the same CA-bundle read
-  the ``ssl.`` entry above describes still lands on the loop. It is
-  ticket **AGW-37**; its owner is not settled and is not S14. Adding it
-  to :data:`NOT_YET_REWRITTEN` would be worse than leaving it out -- the
-  scan never produces an offence for that site, so the entry would
-  suppress nothing and would falsely suggest the call is being tracked
-  by this check.
+* ``filters_helper.build_client_ssl_context`` -- ``get_ssl_config``
+  reaches it through ``asyncio.to_thread``.
+* ``logic/ftp_client.tls_context_for`` -- ``_tls_value`` reaches it
+  through ``asyncio.to_thread``. Until ticket **AGW-37** it did not:
+  the function was awaited straight from that coroutine, so the
+  CA-bundle read the ``ssl.`` entry above describes landed on the loop
+  while this scan reported the package clean.
 
-Closing this gap needs call-graph following, which is real new machinery
-and not something a table here can supply.
+What holds each of them correct is the *call site*, which is what this
+scan cannot see, so each is pinned where it lives by a test asserting
+the body runs off the event-loop thread --
+``tests/helpers/test_filters_helper.py`` for the first and
+``tests/logic/test_ftp_client.py`` for the second. Those thread-identity
+tests are the guard for this class of defect; this module is not, and a
+third helper of the same shape would need its own.
+
+Closing this gap *here* needs call-graph following, which is real new
+machinery and not something a table in this module can supply.
 
 This module also holds the behavioural proof for the one converted site
 outside ``request_helper`` -- ``delete_local_file_path`` -- which has no
