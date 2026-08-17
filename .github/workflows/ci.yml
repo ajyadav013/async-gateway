@@ -10,6 +10,9 @@
 #                       interpreter matrix (3.10 - 3.14).
 #   build-and-install   build, then import the submodule out of a clean venv
 #                       from the wheel and again from the sdist.
+#   changelog           on a pull request, require CHANGELOG.md alongside any
+#                       async_gateway/ change (escape: a `skip-changelog`
+#                       label).
 #   shuffled-order      the suite under five committed pytest-randomly seeds.
 #   coverage-ratchet    head's `fail_under` may never drop below base's.
 #   newer-python-minor  monthly: fails once CPython ships a minor newer than
@@ -87,6 +90,14 @@ jobs:
         # and the scanner runs unconfigured.
         run: bandit -c pyproject.toml -r async_gateway -ll
 
+      - name: compile the examples (R35-AC2)
+        # A second, independent check alongside the suite's own import test.
+        # It runs on every interpreter in the matrix and needs nothing
+        # importable, so an example using syntax valid on 3.12 but not on
+        # 3.10 fails here. Cheap, and it discharges R35-AC2 by a step that
+        # names it rather than by a side effect of the test run.
+        run: python -m compileall -q examples/
+
   build-and-install:
     name: build + clean-venv install of the real artifact
     runs-on: ubuntu-latest
@@ -141,6 +152,79 @@ jobs:
 
       - name: twine check
         run: twine check dist/*
+
+      - name: Assert examples/ ships in neither artifact (R35-AC4)
+        # The decision is that `examples/` is repository-only. The suite
+        # asserts the same thing, but skips where `build` is absent -- it is
+        # not in the dev extra -- so this job, which has already built both
+        # artifacts, carries the assertion unconditionally.
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import tarfile
+          import zipfile
+
+          leaked = []
+          for wheel in glob.glob('dist/*.whl'):
+              with zipfile.ZipFile(wheel) as archive:
+                  leaked += [n for n in archive.namelist()
+                             if 'example' in n.lower()]
+          for sdist in glob.glob('dist/*.tar.gz'):
+              with tarfile.open(sdist) as archive:
+                  leaked += [n for n in archive.getnames()
+                             if 'example' in n.lower()]
+          if leaked:
+              sys.exit(f'examples/ leaked into the artifacts: {leaked}')
+          print('examples/ ships in neither artifact.')
+          PY
+
+  changelog:
+    name: changelog touched alongside async_gateway/
+    # Pull requests only. A changelog entry is a statement about a *change
+    # under review*; on a bare push there is no base to diff against and no
+    # label to grant the escape, so the job would either be meaningless or
+    # unskippable.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a CHANGELOG.md change when async_gateway/ changes
+        # The escape (R33-AC6): label the pull request `skip-changelog`.
+        # It exists for the genuinely entry-less change -- a typo in a
+        # docstring, a comment, a pure refactor with no consumer-visible
+        # effect -- and it is deliberately a *label*, so taking it is
+        # visible on the pull request and in its history rather than
+        # buried in a commit message.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          case ",$LABELS," in
+            *,skip-changelog,*)
+              echo 'skip-changelog label present; not requiring an entry.'
+              exit 0
+              ;;
+          esac
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          if ! grep -q '^async_gateway/' <<<"$changed"; then
+            echo 'no async_gateway/ change; no entry required.'
+            exit 0
+          fi
+          if grep -qx 'CHANGELOG.md' <<<"$changed"; then
+            echo 'async_gateway/ changed and CHANGELOG.md was updated.'
+            exit 0
+          fi
+          echo 'This pull request changes async_gateway/ but not' >&2
+          echo 'CHANGELOG.md. Add an entry under [Unreleased], or apply' >&2
+          echo 'the `skip-changelog` label if the change is genuinely' >&2
+          echo 'not worth one.' >&2
+          exit 1
 
   shuffled-order:
     name: shuffled test order (seed ${{ matrix.seed }})
