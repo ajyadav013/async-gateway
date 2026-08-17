@@ -196,6 +196,34 @@ through `asyncssh`.
 
 **Verification.** `pytest -q`: 720 passed, 2 xfailed, coverage 95.88% (baseline at
 `c5026c9`: 671 passed / 2 xfailed / 95.74%; floor 95.70 unchanged and cleared).
-`mypy async_gateway`: clean, 24 files. `flake8 async_gateway tests`: output
-**byte-identical** to a `git archive c5026c9` baseline (23 pre-existing findings, no
-new ones). The `-O` proof and the CLIENT_AUTH grep are recorded under D1 and above.
+Identical across all five committed shuffle seeds (1, 20250816, 424242, 99991,
+2147483647). `mypy async_gateway`: clean, 24 files. `flake8 async_gateway tests`:
+output **byte-identical** to a `git archive c5026c9` baseline (23 pre-existing
+findings, no new ones). The CLIENT_AUTH grep returns the two `ftp_client.py` prose
+hits and nothing else.
+
+### Mutation evidence — every claim above was made falsifiable
+
+A test that cannot fail proves nothing, so each load-bearing assertion was checked by
+mutating the thing it protects, confirming red, and restoring from a `cp` backup. No
+`git checkout`/`restore`/`stash` was used at any point.
+
+| Mutation (inside the protected code) | Result |
+|---|---|
+| `Purpose.SERVER_AUTH` → `Purpose.CLIENT_AUTH` (reintroduce H28) | **15 failed**, incl. the client-socket reproduction and every live-handshake row |
+| `if verify_ssl is False:` → `if not verify_ssl:` (the plausible M1 mis-fix) | **5 failed** — the absent-flag row and all four falsy parametrisations |
+| the `raise` guard → `assert` (AC2 taken literally) | **2 failed**; run directly, the probe reports `ASSERTS-STRIPPED GUARD-STRIPPED` under `-O` versus `ASSERTS-LIVE`/`AssertionError` unoptimised — the guard is present in development and **gone in production**, which is D1's entire argument, executed |
+| `def build_client_ssl_context` → `async def` (AGW-36 containment) | ban fires: `helpers/internal/filters_helper.py:207: ssl.create_default_context (in build_client_ssl_context)` |
+| `await asyncio.to_thread(build_client_ssl_context, ...)` → direct call | **2 failed** — the thread-identity test and the loop-progress test |
+| `{'ssl': context}` → `{'ssl_context': context}` (revert AC3) | **9 failed**, including the re-pointed FTP test — confirming it pins the new key rather than tolerating both |
+
+The `async def` mutation is deliberately on the axis a previous attempt at this story
+got wrong: it mutates **inside** the function the allowance protected, so the offence
+reported is the leaked call in the function that leaked it — not a banned call in
+some other function the allowance never excused.
+
+The `to_thread` mutation initially failed only *one* of the two AGW-36 tests. The
+loop-progress test had awaited its companion task before asserting, which guarantees
+the companion ran regardless of what the code under test did. It was rewritten to
+read the flag **before** the await; both tests now catch the mutation, and the
+ordering is documented in the test as the reason it exists.

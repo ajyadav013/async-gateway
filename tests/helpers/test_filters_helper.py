@@ -1917,10 +1917,20 @@ async def test_agw36_the_loop_keeps_running_while_the_context_is_built(
 ) -> None:
     """The property the thread identity exists to buy.
 
-    Thread identity is a proxy; this is the thing itself. Another task
-    scheduled alongside the build must get to run before it finishes --
-    which is exactly what a blocking read on the loop prevents, and what
-    made the CA-bundle read cost every other in-flight request.
+    Thread identity is a proxy; this is the thing itself. A task
+    scheduled alongside the build must get its turn *while* the build is
+    still running -- which is exactly what a blocking read on the loop
+    denies it, and what made the CA-bundle read cost every other
+    in-flight request on every retried attempt.
+
+    The flag is read **before** the companion is awaited, and that
+    ordering is the whole test. Awaiting it first would guarantee it had
+    run, and the assertion would then hold no matter what
+    ``get_ssl_config`` did -- which is how this test was first written
+    and why it survived the mutation that removed ``asyncio.to_thread``.
+    Without the thread the coroutine reaches no suspension point at all:
+    it runs start to finish without yielding, and the companion is still
+    sitting unstarted when the build returns.
     """
     progressed = asyncio.Event()
 
@@ -1933,10 +1943,12 @@ async def test_agw36_the_loop_keeps_running_while_the_context_is_built(
         progressed.set()
 
     companion = asyncio.create_task(other_work())
-    await get_ssl_config(tls.client.as_pair(), True)
-    await companion
+    try:
+        await get_ssl_config(tls.client.as_pair(), True)
 
-    assert progressed.is_set()
+        assert progressed.is_set()
+    finally:
+        await companion
 
 
 def test_agw36_the_blocking_builder_is_a_plain_def() -> None:
