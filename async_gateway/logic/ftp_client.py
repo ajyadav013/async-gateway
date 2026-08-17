@@ -388,13 +388,13 @@ class FTPRequest(BaseRequestClass):
         command = self.command_.lower()
         operation = getattr(client, command)
         if self.client_path:
-            await self.circuit_breaker.failsafe.run(
+            await self.circuit_breaker.run(
                 operation,
                 self.server_path,
                 self.client_path,
                 write_into=True)
         else:
-            await self.circuit_breaker.failsafe.run(
+            await self.circuit_breaker.run(
                 operation,
                 self.server_path)
 
