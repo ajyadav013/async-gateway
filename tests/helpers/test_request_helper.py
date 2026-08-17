@@ -520,6 +520,73 @@ async def test_the_outer_level_keeps_counting_after_a_nested_part(
     assert accepted_bytes(refusal.value) > 4096
 
 
+async def test_a_multipart_body_exactly_at_the_cap_is_not_refused(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """The multipart cap is a ceiling, not a threshold below itself.
+
+    The pair below fixes a real hole. Every multipart cap test above
+    overshoots the ceiling by a wide margin, so all of them pass against
+    an off-by-one guard: changing ``total > max_response_bytes`` to
+    ``total > max_response_bytes + 1`` left the entire suite green.
+    Deleting the guard outright was caught, so the cap's *existence* was
+    tested and its *boundary* was not.
+
+    ``iter_capped`` has had exactly this pair since it was written
+    (``test_a_body_exactly_at_the_cap_is_not_refused`` and
+    ``test_iter_capped_stops_on_the_chunk_that_crosses_it``); this is the
+    same pair for the multipart path, which reads through a different
+    loop with its own copy of the comparison.
+
+    A body of exactly ``max_response_bytes`` is within the ceiling and
+    must be accepted whole.
+    """
+    target = tmp_path / 'exactly-at-cap.bin'
+    payload = b'z' * 2048
+    body = _multipart_body(payload)
+    http_server.respond(
+        '/multipart',
+        chunks=[body[at:at + 512] for at in range(0, len(body), 512)],
+        headers=_multipart_headers(),
+    )
+
+    await _fetch(
+        http_server.url_for('/multipart'),
+        max_response_bytes=len(payload),
+        http_file_download_config={'download_filepath': str(target)},
+    )
+
+    assert target.read_bytes() == payload
+
+
+async def test_a_multipart_body_one_byte_over_the_cap_is_refused(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """One byte past the ceiling is refused -- the other half of the pair.
+
+    Together with the test above this pins the comparison itself: accept
+    at ``n``, refuse at ``n + 1``. Either test alone still passes against
+    an off-by-one.
+    """
+    target = tmp_path / 'one-over-cap.bin'
+    payload = b'z' * 2048
+    body = _multipart_body(payload)
+    http_server.respond(
+        '/multipart',
+        chunks=[body[at:at + 512] for at in range(0, len(body), 512)],
+        headers=_multipart_headers(),
+    )
+
+    with pytest.raises(ResponseTooLargeError):
+        await _fetch(
+            http_server.url_for('/multipart'),
+            max_response_bytes=len(payload) - 1,
+            http_file_download_config={'download_filepath': str(target)},
+        )
+
+
 def _multipart_body_without_its_closing_boundary(part: bytes) -> bytes:
     """Assemble a multipart body whose final boundary never arrives.
 
