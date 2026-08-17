@@ -57,7 +57,10 @@ from async_gateway.utils.redaction import (
     redact_headers,
     redact_url,
 )
-from async_gateway.utils.request_tracer import request_tracer
+from async_gateway.utils.request_tracer import (
+    begin_trace_scope,
+    request_tracer,
+)
 from failsafe import CircuitOpen, FailsafeError, RetriesExhausted
 import orjson
 
@@ -559,12 +562,22 @@ def validated_trace_config(
 def trace_collectors_for(
     session: Optional[aiohttp.ClientSession],
     trace_config: Sequence[aiohttp.TraceConfig],
-) -> List[Dict[Text, Any]]:
-    """Return the collector mappings this call traces into.
+) -> List[MutableMapping[Text, Any]]:
+    """Bind and return the collector mappings this call traces into.
 
     Derived once, in one place, so the collectors the redirect loop
     writes into are provably the same objects the envelope reports --
-    they are literally the same dicts, not two reads of the same source.
+    they are literally the same mappings, not two reads of one source.
+
+    It **binds** rather than merely reads, and that is what makes the
+    results per-request. :func:`begin_trace_scope` puts a fresh mapping
+    in the running task's context for each of this
+    library's tracers and hands it straight back, so a tracer reused
+    across two concurrent calls yields two mappings and neither call can
+    see the other's events (H17). It must therefore be called from
+    inside the coroutine that will make the request -- a context set in
+    ``__init__`` belongs to whoever constructed the object, not to the
+    task that awaits it.
 
     A **supplied** session is read for its own tracers rather than
     skipped. ``validated_trace_config`` tells such a caller to
@@ -592,18 +605,17 @@ def trace_collectors_for(
             it builds; empty when the caller supplied one.
 
     Returns:
-        The ``results_collector`` mapping of every usable tracer, in the
-        order the tracers were given.
+        One mapping per usable tracer, in the order the tracers were
+        given: this call's freshly bound scope for a tracer this library
+        built, and the collector itself for one it did not.
     """
     if session is None:
-        return [tracer.results_collector for tracer in trace_config]
+        return begin_trace_scope(trace_config)
     attached: Iterable[Any] = getattr(session, 'trace_configs', ())
-    return [
-        tracer.results_collector
-        for tracer in attached
-        if isinstance(
-            getattr(tracer, 'results_collector', None), MutableMapping)
-    ]
+    return begin_trace_scope([
+        tracer for tracer in attached
+        if isinstance(tracer, aiohttp.TraceConfig)
+    ])
 
 
 def transport_error_for(
@@ -709,18 +721,23 @@ class HttpRequest(BaseRequestClass):
             self.info, self.session)
         self.trace_config: List[aiohttp.TraceConfig] = validated_trace_config(
             self.info, self.session)
-        # What the redirect loop writes its trace event into: the
-        # collectors of the tracers this library attaches, or -- for a
-        # caller-supplied session -- the ones already on it, which is the
-        # route `validated_trace_config`'s refusal names.
-        self.trace_collectors: List[Dict[Text, Any]] = trace_collectors_for(
-            self.session, self.trace_config)
-        # What the *envelope* reports, which is deliberately narrower: the
-        # collectors of the tracers this library attached, so a supplied
-        # session still reports `[]`. See `_copy_into_envelope`.
-        self.reported_collectors: List[Dict[Text, Any]] = [
-            tc.results_collector for tc in self.trace_config
-        ]
+        # Both collector lists are *bound per call*, in `_exchange`, not
+        # here. A tracer is a session-level object a caller may reuse
+        # across concurrent calls, so the mapping this call's results go
+        # into cannot be chosen at construction: `begin_trace_scope`
+        # binds a fresh one inside the running task, whose context is its
+        # own copy (H17). Empty until then, so a call that raises before
+        # dispatch still reports `[]` rather than a stale mapping.
+        #
+        # `trace_collectors` is what the redirect loop writes its trace
+        # event into: this call's mappings for the tracers this library
+        # attaches, or -- for a caller-supplied session -- the ones
+        # already on it, which is the route `validated_trace_config`'s
+        # refusal names. `reported_collectors` is what the *envelope*
+        # reports, deliberately narrower: only the tracers this library
+        # attached, so a supplied session still reports `[]`.
+        self.trace_collectors: List[MutableMapping[Text, Any]] = []
+        self.reported_collectors: List[MutableMapping[Text, Any]] = []
         self.max_response_bytes: int = validated_max_response_bytes(
             self.info.get('max_response_bytes', MAX_RESPONSE_BYTES))
         self.allow_redirects: bool = validated_allow_redirects(
@@ -784,6 +801,21 @@ class HttpRequest(BaseRequestClass):
                 the status has been judged, so a malformed body on a 404
                 is still reported as the 404 it was.
         """
+        # Bound here, inside the coroutine, and deliberately not in
+        # `__init__`: `trace_collectors_for` binds this call's trace
+        # results into the *running task's* context, and a task started
+        # by `asyncio.gather` gets its own copy of that context. Binding
+        # at construction would put every concurrent call's results in
+        # whichever context happened to build the objects -- which is
+        # exactly the shared mapping H17 is about.
+        self.trace_collectors = trace_collectors_for(
+            self.session, self.trace_config)
+        # Narrower on purpose: only the tracers this library attached, so
+        # a caller-supplied session reports `[]`. Read from the same
+        # bind, so the two lists cannot disagree about which mapping this
+        # call filled.
+        self.reported_collectors = (
+            [] if self.session is not None else list(self.trace_collectors))
         if self.session is not None:
             return await self._exchange(self.session)
         async with aiohttp.ClientSession(
