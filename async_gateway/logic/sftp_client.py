@@ -109,6 +109,7 @@ this library's bug and not a failed request.
 
 import asyncio
 import logging
+import os.path
 import socket
 from collections.abc import Collection
 from types import MappingProxyType
@@ -733,6 +734,27 @@ class SFTPRequest(BaseRequestClass):
             bound only inside the directory branch and read whatever the
             branch did is precisely H2, and returning them makes that
             shape unavailable rather than merely unused.
+
+        **When the remote is stat-ed depends on which way the transfer
+        goes** (AGW-40). It used to be unconditionally *before* the
+        operation, which is right for every mode whose ``remote_path``
+        is a source or a target that must already exist -- ``get``,
+        ``remove`` -- and wrong for the uploading modes, whose
+        ``remote_path`` is the **destination**. A ``put`` to a path that
+        does not exist yet is the ordinary case, and it failed with
+        ``SFTP_STATUS`` / "No such file" from a pre-flight ``lstat``
+        before the transfer was ever attempted: the library could only
+        upload over a file that was already there.
+
+        No unit test could see it. ``tests/fixtures/sftp.py``'s double
+        answers ``lstat`` with configured attributes for *any* path, so
+        the fixture reports every destination as pre-existing and the
+        pre-flight call always succeeded. It took a live server.
+
+        So an uploading mode runs the transfer first and stats the
+        destination afterwards -- which is also the only ordering under
+        which the reported ``file_stats`` describe the file that was
+        *written* rather than whatever happened to be there before.
         """
         # `_validate_mode` has already refused an absent or non-string
         # `remote_path`, and `handle_request` runs it before reaching
@@ -740,8 +762,28 @@ class SFTPRequest(BaseRequestClass):
         # re-narrows what the validator established rather than
         # re-asserting it.
         remote_path = str(self.remote_path)
+        mode = str(self.mode_).strip().lower()
+        uploading = LOCAL_IS_SOURCE.get(mode, False)
+
         async with asyncssh.connect(**self.connect_options) as conn:
             async with conn.start_sftp_client() as sftp:
+                if uploading:
+                    # The source is local, so that is what decides
+                    # whether this is a directory transfer. Reading it
+                    # off the *remote* would ask about the destination,
+                    # which for an upload may not exist at all.
+                    is_directory = await asyncio.to_thread(
+                        os.path.isdir, self.local_path) \
+                        if self.local_path else False
+                    await self._run_operation(
+                        sftp, is_directory=is_directory)
+                    attrs = await sftp.lstat(remote_path)
+                    remote_files = (
+                        await sftp.listdir(remote_path)
+                        if attrs.type == asyncssh.FILEXFER_TYPE_DIRECTORY
+                        else None)
+                    return attrs, remote_files
+
                 attrs = await sftp.lstat(remote_path)
                 is_directory = (
                     attrs.type == asyncssh.FILEXFER_TYPE_DIRECTORY)

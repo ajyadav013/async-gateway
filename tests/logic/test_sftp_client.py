@@ -1661,3 +1661,63 @@ async def test_a_normalised_mode_still_selects_the_recursing_branch(
     assert envelope['ok'] is True
     options = {name: kwargs for name, _, kwargs in double.sftp.calls}
     assert options['get'].get('recurse') is True
+
+
+async def test_agw40_a_put_to_a_path_the_server_does_not_have_yet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Uploading to a NEW remote path is the ordinary case, and it works.
+
+    AGW-40. ``_run_session`` used to ``lstat`` the remote path
+    unconditionally before running the operation. For ``get`` and
+    ``remove`` that is correct -- the path is a source and must exist.
+    For ``put`` the remote path is the **destination**, so the pre-flight
+    call asked the server for a file the transfer had not created yet,
+    and the upload failed with ``SFTP_STATUS`` / "No such file" before it
+    was attempted. The library could only ever upload over a file that
+    was already there.
+
+    Nothing in this suite could see it: the double answered ``lstat``
+    with attributes for *any* path, so every destination looked
+    pre-existing. It took a live OpenSSH server to surface, which is why
+    the fixture now takes ``absent_paths`` and this row uses it -- the
+    assertion is worthless against a double that cannot say "not there".
+
+    The paired ``get`` row below is what keeps the fix honest: stat-ing
+    after the transfer for *every* mode would fix this and break the
+    modes whose remote path genuinely has to exist first.
+    """
+    double = trusting_double(
+        monkeypatch,
+        StubSFTPClient(absent_paths=(REMOTE_PATH,)))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY, mode='put',
+        remote_path=REMOTE_PATH, local_path=LOCAL_PATH)
+
+    assert envelope['ok'] is True, envelope['error']
+    assert 'put' in double.sftp.names()
+
+
+async def test_agw40_a_get_of_an_absent_remote_path_still_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half: a download's source must still exist first.
+
+    The regression the AGW-40 fix could introduce is moving the ``lstat``
+    after the transfer for every mode, which would turn "the file you
+    asked to download is not there" into a confusing post-transfer
+    failure -- or, worse, into a success. A download's remote path is the
+    source, so an absent one is refused before anything is attempted.
+    """
+    double = trusting_double(
+        monkeypatch,
+        StubSFTPClient(absent_paths=(REMOTE_PATH,)))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY, mode='get',
+        remote_path=REMOTE_PATH, local_path=LOCAL_PATH)
+
+    assert envelope['ok'] is False
+    assert envelope['error']['code'] == 'SFTP_STATUS'
+    assert 'get' not in double.sftp.names()

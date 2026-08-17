@@ -624,6 +624,7 @@ class StubSFTPClient:
     def __init__(
         self,
         *,
+        absent_paths: Sequence[str] = (),
         attrs: asyncssh.SFTPAttrs = FILE_ATTRS,
         entries: Sequence[str] = ('f',),
         lstat_error: Optional[BaseException] = None,
@@ -633,6 +634,17 @@ class StubSFTPClient:
         """Build an SFTP client double.
 
         Args:
+            absent_paths: Paths this server does **not** have, for which
+                :meth:`lstat` raises ``SFTPNoSuchFile`` the way a real
+                server does. Empty by default, which is the historical
+                behaviour -- and that default is what hid AGW-40: a
+                double answering ``lstat`` with attributes for *every*
+                path reports an upload's not-yet-created destination as
+                already present, so the client's pre-flight ``lstat``
+                always succeeded here and failed against every real
+                server. A knob rather than a new default, because the
+                existing rows are about what happens once the target is
+                known to exist.
             attrs: What :meth:`lstat` reports for the target. The file
                 type in it is what selects the directory branch, so this
                 is the one knob a test turns to cover both sides of it.
@@ -656,6 +668,7 @@ class StubSFTPClient:
                 recording-only.
         """
         self.calls: list[SFTPCall] = []
+        self.absent_paths = set(absent_paths)
         self.attrs = attrs
         self.entries = entries
         self.lstat_error = lstat_error
@@ -719,10 +732,15 @@ class StubSFTPClient:
 
         Raises:
             BaseException: ``lstat_error``, when one was configured.
+            SFTPNoSuchFile: When ``path`` is in ``absent_paths``, which
+                is what a real server answers for a path it does not
+                have.
         """
         self.calls.append(('lstat', (path,), {}))
         if self.lstat_error is not None:
             raise self.lstat_error
+        if path in self.absent_paths:
+            raise asyncssh.SFTPNoSuchFile('No such file')
         return self.attrs
 
     async def listdir(self, path: str) -> list[str]:
@@ -815,6 +833,12 @@ class StubSFTPClient:
     async def put(self, *args: Any, **kwargs: Any) -> None:
         """Accept an upload and report success by not raising.
 
+        The destination stops being absent, because on a real server an
+        upload *creates* it. Without this the double contradicts itself
+        the moment a test uses ``absent_paths`` for an upload: the
+        transfer succeeds and the very next ``lstat`` of the path it just
+        wrote still says the file is not there.
+
         Args:
             args: The local and remote paths.
             kwargs: Transfer options such as ``recurse``.
@@ -823,6 +847,8 @@ class StubSFTPClient:
             None, as ``asyncssh`` does.
         """
         await self._invoked('put', args, kwargs)
+        if len(args) > 1:
+            self.absent_paths -= {args[1]}
 
     async def mput(self, *args: Any, **kwargs: Any) -> None:
         """Accept a glob upload and report success by not raising.
