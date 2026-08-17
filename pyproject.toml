@@ -149,7 +149,52 @@ junit_family = "legacy"
 # package. The rise is concentrated there rather than spread thin, which is why
 # it is the largest single-wave jump of the run so far.
 # Raised 82.89 -> 89.88, truncated for the reason above.
-fail_under = 92.37
+#
+# Re-measured after story S15 (HTTP transport resilience and the owned
+# redirect loop) (`coverage report --precision=6`): 95.223179%, identical
+# across all five seeds the shuffled-order CI job commits (1, 20250816,
+# 424242, 99991, 2147483647).
+# The rise is concentrated in the three modules the story rewrote:
+# `helpers/internal/request_helper` 81.481481% -> 91.176471%,
+# `utils/http_file_config` 33.333333% -> 93.939394%, and
+# `logic/http_client` 99.074074% -> 99.300000%. What is left uncovered in
+# the first two is dead code story S20 deletes -- `fetch_file` and the
+# duplicate `download_file_from_s3` -- plus two partial branches.
+# Raised 92.37 -> 95.22, truncated for the reason above.
+#
+# Re-measured after story S15's review round (the four blockers: a supplied
+# session's credential headers, the redirected upload's consumed body, the
+# three unvalidated redirect keys, the after_redirect table)
+# (`coverage report --precision=6`): 95.427286%, identical across the same
+# five seeds. The rise is in `logic/http_client` 99.300000% -> 99.492958%
+# (three new validators, all exercised) with `helpers/internal/request_helper`
+# at 91.256831%; what is left uncovered there is unchanged -- the dead
+# `fetch_file` story S20 deletes, plus the `CircuitOpen` arm of `_exchange`.
+# Raised 95.22 -> 95.42, truncated for the reason above.
+#
+# Re-measured after story S15's second review round (the chain-wide deadline,
+# the refused `trace_config` + `session` pair, and the redirect trace event
+# the owned loop has to write itself) (`coverage report --precision=6`):
+# 95.557174%, identical across the same five seeds. The rise is in
+# `helpers/internal/request_helper` 91.256831% -> 92.307692% (`hop_deadline`
+# and `record_redirect`, both exercised on every branch) with
+# `logic/http_client` at 99.516908%. What is left uncovered is unchanged --
+# the dead `fetch_file` story S20 deletes, plus the `CircuitOpen` arm of
+# `_exchange`, which no HTTP test drives (story S16 owns that seam).
+# Raised 95.42 -> 95.55, truncated for the reason above.
+#
+# Re-measured after story S15's third review round (the redirect trace event
+# written from a `finally` so an error-terminated chain still reports the hops
+# it followed; the collectors derived from a caller-supplied session; and
+# `trace_config` validated at construction) (`coverage report --precision=6`):
+# 95.661451%, identical across the same five seeds. The rise is in
+# `logic/http_client` 99.516908% -> 99.581590% (the new `trace_config`
+# validator and `trace_collectors_for`, both exercised on every branch) with
+# `helpers/internal/request_helper` at 92.340426%. What is left uncovered is
+# unchanged -- the dead `fetch_file` story S20 deletes, plus the `CircuitOpen`
+# arm of `_exchange`, which no HTTP test drives (story S16 owns that seam).
+# Raised 95.55 -> 95.66, truncated for the reason above.
+fail_under = 95.70
 # `fail_under` is compared against the total *rounded to `precision`*, so a
 # two-decimal ratchet needs two-decimal precision or the comparison silently
 # degrades to whole percents. Latent until now: earlier floors happened to round

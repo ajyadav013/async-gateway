@@ -1511,6 +1511,19 @@ orphaned on every failure.
 unable to write outside the directory I named, so that a directory download cannot become an arbitrary
 file write on my host.
 
+> **Operand order is normative (Revision 5, AGW-33).** For every transfer verb that moves a file
+> between the local filesystem and a remote host, the operands are passed in the direction the
+> underlying library defines for *that verb* — never one shared positional order across all of them.
+> For an **upload** the order is **LOCAL SOURCE → REMOTE DESTINATION**. The three verbs this
+> governs today are **FTP `upload`**, **SFTP `put`** and **SFTP `mput`**; all three currently pass
+> `(remote, local)` and are therefore inverted. The download-direction verbs (FTP `download`, SFTP
+> `get`/`mget`) take **REMOTE SOURCE → LOCAL DESTINATION** and are covered by the last criterion
+> below. This requirement is where the operand order is stated because it cannot discharge its own
+> first criterion — that every write path routes through `resolve_within(base, candidate)` before
+> any write — over a call whose source and destination were never established. *(`copy`/`mcopy` move
+> a file between two paths on the **same remote host**, so they are not local↔remote verbs and this
+> rule does not reach them; whether they are admitted at all remains R21's allowlist decision.)*
+
 **Acceptance Criteria**:
 - [ ] A single `resolve_within(base, candidate) -> Path` helper canonicalises (`Path.resolve()`,
       symlinks followed) and asserts containment via `Path.is_relative_to`/`os.path.commonpath` before
