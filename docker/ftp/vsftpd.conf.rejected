@@ -1,0 +1,71 @@
+# vsftpd for the FTPS integration lane. IMPLICIT FTPS, on port 990.
+#
+# Implicit and not explicit, and that is a finding rather than a
+# preference. `aioftp.Client(ssl=...)` -- which is the only knob
+# `logic/ftp_client.py` turns -- wraps the control connection in TLS from
+# the first byte. That is *implicit* FTPS (conventionally port 990).
+# Explicit FTPS, the far more common deployment, connects in plaintext on
+# 21 and issues `AUTH TLS` to upgrade; aioftp can do it, but only via
+# `upgrade_to_tls()`, which this library never calls.
+#
+# Pointing the client at an explicit-FTPS server therefore fails the
+# handshake with `WRONG_VERSION_NUMBER` -- it reads `220 ...` where a
+# ServerHello belongs. That failure is safe (it fails closed, no
+# credentials leak) but it means the library interoperates with implicit
+# FTPS only. See the README's Transport security section.
+#
+# So this server offers implicit FTPS, which is what the client under
+# test actually speaks. `implicit_ssl=YES` moves the whole session into
+# TLS immediately; `listen_port=990` is the convention that goes with it.
+
+listen=YES
+listen_port=990
+implicit_ssl=YES
+listen_ipv6=NO
+anonymous_enable=NO
+local_enable=YES
+write_enable=YES
+local_umask=022
+dirmessage_enable=YES
+use_localtime=YES
+seccomp_sandbox=NO
+
+# Confine the login to its home. `allow_writeable_chroot` is required
+# because the tests upload into the home directory itself.
+chroot_local_user=YES
+allow_writeable_chroot=YES
+
+# Passive mode on a fixed, narrow range so compose can publish it. The
+# client is on the same compose network, so the advertised address is the
+# service name's address and needs no NAT fixup.
+pasv_enable=YES
+pasv_min_port=30000
+pasv_max_port=30009
+
+# --- TLS -----------------------------------------------------------------
+# The point of this file. `ssl_enable` turns on AUTH TLS, and the three
+# `force_*` settings are what make a plaintext session *impossible* rather
+# than merely discouraged: a client that skipped AUTH TLS, or that
+# negotiated TLS for the control channel and then tried to move data in
+# the clear, is refused by the server. That is what lets the security
+# assertion be "the server rejected it" instead of "we trust the client
+# not to".
+ssl_enable=YES
+force_local_logins_ssl=YES
+force_local_data_ssl=YES
+# Only the three version toggles vsftpd 3.0.5 actually defines --
+# `ssl_tlsv1`, `ssl_sslv2`, `ssl_sslv3`. There is no `ssl_tlsv1_2` or
+# `ssl_tlsv1_3` in this build: vsftpd exits **2 with nothing on stderr**
+# on an unrecognised directive, which presents as "the FTP container
+# just won't start" and cost a bisect to find. The modern versions are
+# not lost by omitting them -- `ssl_tlsv1` enables the TLS family and
+# the linked OpenSSL negotiates 1.2/1.3 within it, while the two `NO`
+# lines below are what actually exclude the obsolete protocols.
+ssl_tlsv1=YES
+ssl_sslv2=NO
+ssl_sslv3=NO
+require_ssl_reuse=NO
+ssl_ciphers=HIGH
+
+rsa_cert_file=/pki/ftp-server.pem
+rsa_private_key_file=/pki/ftp-server-key.pem

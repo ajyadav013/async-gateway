@@ -983,6 +983,19 @@ plaintext.
 on every use: the session is opened in plaintext, so the credentials and every
 byte transferred cross the network in the clear.
 
+**It speaks implicit FTPS, not explicit FTPS.** The TLS value is handed to
+`aioftp.Client(ssl=...)`, which wraps the control connection from the first
+byte — implicit FTPS, conventionally port 990. *Explicit* FTPS, the more common
+deployment, connects in plaintext on port 21 and issues `AUTH TLS` to upgrade;
+this library never sends that command, so pointing it at an explicit-FTPS
+server fails the handshake with `error['code'] == 'TLS'` (it reads the server's
+plaintext `220` greeting where a ServerHello belongs).
+
+That failure is safe — it fails closed, and no credentials are sent — but it
+does mean this client interoperates with implicit FTPS only. If you need
+explicit FTPS, say so on the issue tracker; the change is confined to calling
+`aioftp`'s `upgrade_to_tls()` after a plaintext connect.
+
 ### SFTP host keys
 
 **Verification is on by default.** Omitting `known_hosts` is how asyncssh is
@@ -1379,6 +1392,45 @@ mypy async_gateway
 
 There is **no autoformatter** configured. Match the surrounding file by hand;
 `flake8` judges the result.
+
+### Docker: the wheel, and the four protocols against real servers
+
+Two assets, answering two different questions. Neither is a way to *deploy*
+this library — it is a library, there is nothing to serve — and both exist
+because a development checkout structurally cannot answer them.
+
+**Does the built artifact work?** `Dockerfile` builds the wheel, installs it
+into a clean image, and runs the whole suite against the *installed
+distribution* rather than the source tree:
+
+```text
+docker build -t async-gateway:test .
+docker run --rm async-gateway:test
+```
+
+This is the check that catches a packaging defect an editable install hides —
+an undeclared dependency imports fine in a tree that already has it, and fails
+on the first `import` for everyone else. `docker/run-tests.sh` refuses to start
+unless `async_gateway` resolves out of `site-packages`, so a green run cannot
+have quietly tested the checkout.
+
+**Do the protocols actually work?** `docker-compose.yml` stands up an HTTP/HTTPS
+server, a second HTTP origin, an implicit-FTPS server, an OpenSSH SFTP server
+and a SOAP endpoint, mints a throwaway CA for the TLS ones, and runs
+`docker/integration/test_integration.py` against all of them:
+
+```text
+docker compose up --build --abort-on-container-exit --exit-code-from integration integration
+docker compose down -v
+```
+
+The unit suite covers the same code far more exhaustively, but against doubles.
+These are the claims only a live peer can settle: that FTPS is really FTPS and
+is refused when downgraded, that an unknown SSH host key is really refused and
+the same connect succeeds once pinned, that an upload puts the **local** file's
+bytes at the **remote** path, and that a cross-origin redirect arrives at the
+second origin carrying no credentials — observed at that server, not asserted
+in-process.
 
 House rules worth knowing before you open a pull request:
 
