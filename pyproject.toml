@@ -15,7 +15,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "async-gateway"
-version = "2.7.3"
+# The single source of truth for the version (R5-AC1). `async_gateway.
+# __version__` reads it back off the installed distribution rather than
+# restating it, so a release edits exactly one line and the two cannot
+# disagree. The reset *down* from the fork-inherited 2.x version is a
+# one-way door, safe only because nothing has ever been published under
+# this name: `GET https://pypi.org/pypi/async-gateway/json` returned 404 on
+# 2026-08-17 (OQ4; the check is recorded in the AGW-28 work log). The old
+# number is deliberately not written here -- R5-AC3 requires it survive
+# only in the spec and the changelog history, and a packaging test asserts
+# that.
+version = "1.0.0"
 description = "Any microservice will be able to use the “async_gateway” can make an async request(HTTP/SOAP/XML/FTP/redis) with the given payload to given address"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -87,9 +97,12 @@ dev = [
     # five UserWarnings on each flake8 invocation. R27-AC2 requires `flake8 .`
     # to produce *no output*, not merely exit 0, so <81 is unachievable by
     # construction; <76 is a strict subset of it.
+    # `sphinx` and `sphinx-rtd-theme` were removed here with the three Sphinx
+    # files (R31-AC1, M24): the build had never succeeded -- no `.rst` root
+    # document existed, and `docs/source/Makefile` set `SOURCEDIR = source`
+    # from inside `docs/source/`, resolving to `docs/source/source`. Two dev
+    # dependencies for a build nobody could run.
     "setuptools<76",
-    "sphinx",
-    "sphinx-rtd-theme",
 ]
 
 [project.urls]
