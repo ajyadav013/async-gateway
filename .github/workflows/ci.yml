@@ -81,6 +81,26 @@ jobs:
       - name: pytest
         run: pytest
 
+      - name: R7 fitness behaviours 1-6 (the resilience-library evidence)
+        # R7-AC1's run-in-CI half, and R7-AC2's "on every interpreter in the
+        # declared range". These behaviours already run inside `pytest` above;
+        # this step exists so the evidence ADR 0001 rests on is a *named,
+        # required check per interpreter* rather than a line buried in a
+        # 1000-test summary. When one regresses, the job name says which
+        # interpreter -- which is the ADR's recorded revisit trigger, so the
+        # trigger has to be mechanically visible to be a trigger at all.
+        #
+        # Behaviour 7 is deliberately excluded: it is known-failed against
+        # `pyfailsafe` by execution (no injectable clock or sleep --
+        # `circuit_breaker.py:139,142`, `failsafe.py:103`) and is asserted
+        # against this library's own facade instead. It runs in `pytest`
+        # above; it is not a fitness input for the dependency.
+        run: >-
+          pytest tests/helpers/test_circuit_breaker.py
+          -k "behaviour_1 or behaviour_2 or behaviour_3 or behaviour_4
+          or behaviour_5 or behaviour_6"
+          --no-cov -p no:randomly -v
+
       - name: bandit
         # `-c pyproject.toml` is load-bearing: bandit reads only `.bandit`
         # files or an explicit `-c`, so without it `[tool.bandit]` is ignored

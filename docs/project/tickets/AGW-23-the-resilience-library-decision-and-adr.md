@@ -1,6 +1,6 @@
 # AGW-23: The resilience-library decision + ADR
 
-- **Status:** OPEN
+- **Status:** DONE (commit `0ef3923`, branch `lane/s23`)
 - **Story:** S23 — spec Step 22, size **S under KEEP** (`docs/specs/v1_release_stories.md` §4, Phase 5). *Step 21 is **vacated** and carries no story — the dependency upgrade moved to Step 1.5 (AGW-2).*
 - **Spec:** `docs/specs/v1_release_spec.md` — R7-AC2,3,4,5,6 (AC1 run-in-CI half) (Group B — Dependency upgrades and the resilience-library decision)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; Orchestrator Ruling D
@@ -62,8 +62,71 @@ Closes findings: MG1.
 
 ## Decisions
 
-_None recorded yet._
+- **OQ12 answered: KEEP (ratify keep-with-facade).** Recorded in
+  `docs/decisions/0001-resilience-library.md`. The story therefore stayed inside its KEEP file
+  boundary — docs + CI + one test — and no source module or dependency declaration was touched.
+  Escalation E-2 was **not** triggered.
+- **The residual is smaller than Ruling D stated, and the ADR says so.** Ruling D records
+  `retry_policy.py`, 136 of 539 lines, ~40 non-trivial. Measurement puts the executed figure at
+  **40 runtime lines across the whole package, 18 of them non-trivial**. R7-AC4 requires that an
+  ADR recording a *larger* residual has failed the criterion; this one records a smaller,
+  measured one and states the method. R7 also requires that a smaller residual be called out as
+  evidence for vendoring — the ADR does so explicitly, concluding that **vendoring is the better
+  end state on merit** and is held off only on scope (OQ12's KEEP boundary; the vendor branch
+  carries no scoped steps). Logged as an accepted cost with owner + revisit trigger, not buried.
 
 ## Work Log
 
-_Empty — opened at stage 1g, before implementation._
+**2026-08-17 — S23 implemented on `lane/s23`, commit `0ef3923`.**
+
+*Read the current code first, as the story required.* S16's facade has already landed, so the
+keep/replace/vendor question was answerable by measurement rather than by argument. It did not
+turn out to be already-settled in the sense of "the dependency is vestigial, rip it out" — the
+delegated arithmetic and classification are genuinely live and genuinely exercised (mutation A
+and C below prove it). But it *is* far more narrowly load-bearing than Ruling D forecast.
+
+**Behaviours 1–6 — the fitness evidence (R7-AC2).** One clean venv per interpreter, S2 dep set:
+
+```
+python 3.10.18 / 3.11.15 / 3.12.14 / 3.13.6 / 3.14.7 -> 17 passed, 64 deselected  (each)
+python -W error::DeprecationWarning -c "import failsafe"  -> clean on all five
+importlib.metadata: Requires-Dist: None  (no transitive weight); Requires-Python: None
+```
+
+The 3.14 ceiling passes, which is the reading that matters for a dormant distribution. **FIT.**
+
+**Behaviour 7 — not re-evaluated**, carried verbatim as executed evidence per R7-AC3
+(`circuit_breaker.py:139,142`, `failsafe.py:103`), confirmed against the installed 0.6.0.
+
+**The costing (coverage over the `failsafe` package, whole suite).** 40 runtime lines total.
+`circuit_breaker.py` and `failsafe.py` contribute **one runtime line each — both a module-level
+`logger =`**; their classes are imported and never run, confirming the facade owns the state
+machine and the retry loop. `retry_policy.py`: 30 runtime lines, 12 of them bare `self.x = x`,
+leaving **18 non-trivial**.
+
+**Mutation testing — proving the evidence can fail** (backed up, restored, diff-verified
+identical):
+
+| Mutation in `retry_policy.py` | Result |
+|---|---|
+| A — `for_attempt` exponential growth removed | **RED**, 2 failed |
+| B — `_is_retriable_exception` match → `return False` | **GREEN — survived** |
+| C — `should_abort` match → `return False` | **RED**, 1 failed |
+
+**Mutant B surviving was the most useful result.** `retry_policy.py:136` was never executed by
+any of the 1104 tests: every test left `retriable_exceptions` unset, so classification
+short-circuited on the `is None` guard at `:133`. Half the delegated classification was being
+paid for and never exercised. Closed by
+`test_behaviour_1_a_caller_named_retriable_list_excludes_others`; re-applying mutant B now turns
+it **RED** (verified), then restored to green.
+
+**R7-AC1 run-in-CI half.** Behaviours 1–6 added to `lint-type-test` as a named required step, so
+it runs on all five matrix interpreters and a regression names the interpreter — which is the
+ADR's own revisit trigger. No `continue-on-error`. `tests/test_packaging.py` (which parses the
+matrix line) still passes; the matrix line was not touched.
+
+**Files:** +`docs/decisions/0001-resilience-library.md` · ~`.github/workflows/ci.yml` ·
+~`tests/helpers/test_circuit_breaker.py` · ~this ticket. **Entirely within the KEEP boundary.**
+
+**Verify:** `pytest` 1105 passed (baseline 1104 +1), 98.41%, exit 0 · `mypy async_gateway`
+clean · `flake8 async_gateway tests` 19 findings = baseline, no new.
