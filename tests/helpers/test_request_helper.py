@@ -330,6 +330,196 @@ async def test_a_zero_part_multipart_body_writes_an_empty_file(
     assert result['text'] == ''
 
 
+NESTED_BOUNDARY = 'agwnestedboundary'
+
+
+def _flat_part(boundary: bytes, body: bytes) -> list[bytes]:
+    """Render one ordinary leaf part, without its closing boundary.
+
+    Args:
+        boundary: The boundary of the level this part belongs to.
+        body: The part's body bytes.
+
+    Returns:
+        The part's chunks, ready to be joined.
+    """
+    return [
+        b'--', boundary, b'\r\n',
+        b'Content-Type: application/octet-stream\r\n\r\n',
+        body, b'\r\n',
+    ]
+
+
+def _nested_multipart_body(
+    *inner_parts: bytes,
+    before: bytes = b'',
+    after: bytes = b'',
+) -> bytes:
+    """Assemble a multipart body carrying a nested multipart part.
+
+    ``MultipartReader.next()`` returns a ``MultipartReader`` rather than a
+    ``BodyPartReader`` for a part whose own media type is
+    ``multipart/...``, and only the second of those has ``read_chunk``.
+    Nothing in this suite built such a body, which is how the unhandled
+    union went unnoticed behind a ``# type: ignore`` (M7).
+
+    ``before`` and ``after`` put ordinary leaf parts either side of the
+    nested one, at the *outer* level. They are what make a running total
+    threaded through the recursion distinguishable from one that is not:
+    with every byte inside the nested part, a cap reset per level and a
+    returned total that is discarded both still refuse at the same point
+    as the correct code, and the test passes on a mutant.
+
+    Args:
+        inner_parts: The body bytes of each part inside the nested
+            reader, in order.
+        before: An outer-level leaf part preceding the nested one, or
+            empty for none.
+        after: An outer-level leaf part following it, or empty for none.
+
+    Returns:
+        A complete outer body carrying one nested multipart part.
+    """
+    outer, inner = BOUNDARY.encode(), NESTED_BOUNDARY.encode()
+    nested: list[bytes] = []
+    for part in inner_parts:
+        nested += _flat_part(inner, part)
+    nested += [b'--', inner, b'--\r\n']
+
+    chunks: list[bytes] = []
+    if before:
+        chunks += _flat_part(outer, before)
+    chunks += [
+        b'--', outer, b'\r\n',
+        b'Content-Type: multipart/mixed; boundary=', inner, b'\r\n\r\n',
+        b''.join(nested), b'\r\n',
+    ]
+    if after:
+        chunks += _flat_part(outer, after)
+    chunks += [b'--', outer, b'--\r\n']
+    return b''.join(chunks)
+
+
+async def test_a_nested_multipart_part_is_descended_into(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """A nested body arrives as data, not as a bare ``AttributeError``.
+
+    ``MultipartReader`` has no ``read_chunk``, so reading every part as
+    if it were a ``BodyPartReader`` raised ``AttributeError`` straight
+    past the envelope -- the caller got a Python builtin where every
+    other failure of this library is a uniform response (M7). The
+    ``# type: ignore[union-attr]`` is what let it ship: the annotation
+    said the union was possible and the ignore silenced the one check
+    that would have said so.
+
+    Descending rather than refusing, because the nested part's leaves are
+    ordinary parts carrying real content, and the contract for a
+    multipart response is the bytes, in order, on disk -- which nesting
+    does not change.
+
+    Leaf parts sit either side of the nested one, so the assertion also
+    pins the *order*: the tree is flattened depth-first and the leaves
+    concatenate in arrival order, exactly as sibling parts already do.
+    """
+    target = tmp_path / 'nested.bin'
+    http_server.respond(
+        '/multipart',
+        body=_nested_multipart_body(
+            b'inner-first', b'inner-second',
+            before=b'outer-before', after=b'outer-after'),
+        headers=_multipart_headers(),
+    )
+
+    result = await _fetch(
+        http_server.url_for('/multipart'),
+        http_file_download_config={'download_filepath': str(target)},
+    )
+
+    expected = b'outer-beforeinner-firstinner-secondouter-after'
+    assert target.read_bytes() == expected
+    assert result['text'] == expected.decode()
+    assert result['status_code'] == 200
+
+
+async def test_a_nested_multipart_part_still_honours_the_byte_cap(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """The cap spans the whole body rather than one nesting level.
+
+    A budget reset per nested reader would let a body choose this
+    process's allocation by nesting deeper, which is the bound R14 exists
+    to hold. The running total is threaded through the recursion and
+    returned, so the level above keeps counting from where the nested
+    read left off.
+
+    Served **chunked**, for the reason
+    ``test_a_multipart_body_over_the_cap_is_refused`` records: an
+    ordinary multipart response carries an honest ``Content-Length`` and
+    the pre-read guard refuses it before the reader is entered at all,
+    so the test would pass with the recursion's counter deleted. With no
+    declared length there is nothing but that counter to catch it.
+
+    The cap is crossed **inside** the nested reader, by bytes the *outer*
+    level already spent: 3 KiB outside, 2 KiB in, against a 4 KiB
+    ceiling, so neither half alone reaches it. That is what distinguishes
+    a total genuinely threaded through the recursion from one that is
+    not. Both mutants -- a budget reset per nesting level, and a returned
+    total the caller discards -- survived a version of this test whose
+    every byte lived inside the nested part.
+    """
+    target = tmp_path / 'nested-capped.bin'
+    body = _nested_multipart_body(b'z' * 2048, before=b'y' * 3072)
+    http_server.respond(
+        '/multipart',
+        chunks=[body[at:at + 512] for at in range(0, len(body), 512)],
+        headers=_multipart_headers(),
+    )
+
+    with pytest.raises(ResponseTooLargeError) as refusal:
+        await _fetch(
+            http_server.url_for('/multipart'),
+            max_response_bytes=4096,
+            http_file_download_config={'download_filepath': str(target)},
+        )
+
+    assert accepted_bytes(refusal.value) > 4096
+
+
+async def test_the_outer_level_keeps_counting_after_a_nested_part(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """Bytes read inside a nested part still count against later ones.
+
+    The companion to the test above, aimed at the other half of the same
+    guard. There the nested read had to *inherit* the outer total; here
+    it has to hand it back, so the leaf that follows resumes from it. A
+    recursion whose return value the caller drops restarts the outer
+    count at whatever it was before descending, and this body -- 2 KiB
+    nested, then 3 KiB after it, against a 4 KiB ceiling -- is then
+    accepted whole.
+    """
+    target = tmp_path / 'nested-resumed.bin'
+    body = _nested_multipart_body(b'z' * 2048, after=b'y' * 3072)
+    http_server.respond(
+        '/multipart',
+        chunks=[body[at:at + 512] for at in range(0, len(body), 512)],
+        headers=_multipart_headers(),
+    )
+
+    with pytest.raises(ResponseTooLargeError) as refusal:
+        await _fetch(
+            http_server.url_for('/multipart'),
+            max_response_bytes=4096,
+            http_file_download_config={'download_filepath': str(target)},
+        )
+
+    assert accepted_bytes(refusal.value) > 4096
+
+
 def _multipart_body_without_its_closing_boundary(part: bytes) -> bytes:
     """Assemble a multipart body whose final boundary never arrives.
 

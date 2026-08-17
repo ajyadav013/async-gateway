@@ -45,6 +45,7 @@ from typing import (
     Optional,
     Tuple,
     TypedDict,
+    Union,
 )
 from urllib.parse import urljoin, urlsplit
 
@@ -260,7 +261,14 @@ async def handle_multipart_response(
     The running total is bounded by ``max_response_bytes`` for the same
     reason the other two read paths are (R14): the accumulator below is an
     in-memory list of every part, so an endpoint choosing the body size
-    used to choose this process's allocation.
+    used to choose this process's allocation. That bound spans the whole
+    body rather than one nesting level, so a nested part cannot buy a
+    fresh budget.
+
+    A **nested** ``multipart/...`` part is descended into rather than
+    read as if it were a leaf: doing the latter raised a bare
+    ``AttributeError`` past the envelope, which is the second half of M7.
+    :func:`_drain_multipart` owns that recursion and records why.
 
     Args:
         resp: The response to read the multipart body from.
@@ -293,30 +301,101 @@ async def handle_multipart_response(
     async with safe_writer(
             target, overwrite=config.get('overwrite') is True
     ) as response_file:
-        while not reader.at_eof():
-            part = await reader.next()
-            if part is None:
-                break
-            while True:
-                # `type: ignore[union-attr]` -- `MultipartReader.next()`
-                # is typed `MultipartReader | BodyPartReader | None`,
-                # and only the `BodyPartReader` arm has `read_chunk`.
-                # The other arm is a *nested* `multipart/...` part, which
-                # this library does not descend into: today it would
-                # reach here and raise `AttributeError`. Making it
-                # descend, or refusing it with a typed error, is a
-                # behaviour change and is outside AGW-26's
-                # type-conformance-only boundary -- reported as a defect
-                # against the owning story rather than smuggled in here.
-                chunk = await part.read_chunk()  # type: ignore[union-attr]
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_response_bytes:
-                    raise response_too_large(total, max_response_bytes)
-                parts.append(chunk)
-                await response_file.write(chunk)
+        await _drain_multipart(
+            reader,
+            response_file,
+            parts,
+            total,
+            max_response_bytes=max_response_bytes,
+        )
     return b''.join(parts).decode(errors='replace')
+
+
+async def _drain_multipart(
+    reader: Union[
+        aiohttp.MultipartReader,
+        aiohttp.multipart.MultipartResponseWrapper,
+    ],
+    response_file: Any,
+    parts: List[bytes],
+    total: int,
+    *,
+    max_response_bytes: int,
+) -> int:
+    """Read every part of one multipart reader, descending into nested ones.
+
+    Split out of :func:`handle_multipart_response` so it can call itself:
+    ``MultipartReader.next()`` returns ``MultipartReader | BodyPartReader
+    | None``, and the first arm is a **nested** ``multipart/...`` part,
+    which has no ``read_chunk``. The caller used to read every part as if
+    it were the second arm behind a ``# type: ignore[union-attr]``, so a
+    nested body raised a bare ``AttributeError`` -- escaping ``request()``
+    instead of arriving as the uniform envelope every other failure gets
+    (M7).
+
+    The suppression is what let it ship. The annotation said the union was
+    possible, the ignore silenced the one check that would have said so,
+    and no test built a nested body. It is gone: mypy passing without it
+    is the proof the union is actually handled.
+
+    Descending is the fix rather than refusing, because refusing would be
+    the same lost data reported more politely. A nested part is a
+    well-formed multipart body carrying real content, its leaves are
+    ordinary ``BodyPartReader``s, and this library's contract for a
+    multipart response is "the bytes, in order, on disk" -- which nesting
+    does not change. So the tree is flattened depth-first and the leaves
+    are concatenated in arrival order, exactly as sibling parts already
+    are.
+
+    Args:
+        reader: The reader to drain, at any nesting level. The outermost
+            call gets the ``MultipartResponseWrapper`` that
+            ``from_response`` returns and every recursive one gets a
+            ``MultipartReader``; the two are distinct classes sharing the
+            ``at_eof``/``next`` pair this reads, which is why the
+            annotation names both rather than the reader alone.
+        response_file: The open ``aiofiles`` handle every leaf is written
+            to. Untyped because ``aiofiles.open`` returns a context-manager
+            union rather than one nameable handle type.
+        parts: The accumulator every leaf's bytes are appended to, shared
+            across nesting levels so order is arrival order.
+        total: Bytes read so far across the whole body, including the
+            levels above this one.
+        max_response_bytes: The ceiling on that running total. It spans
+            every level: a cap reset per nested reader would let a body
+            choose this process's allocation by nesting (R14).
+
+    Returns:
+        The new running total, so a caller resuming its own loop keeps
+        counting from where the nested read left off.
+
+    Raises:
+        ResponseTooLargeError: Once the total crosses
+            ``max_response_bytes``. The remainder of the body is not read.
+    """
+    while not reader.at_eof():
+        part = await reader.next()
+        if part is None:
+            break
+        if isinstance(part, aiohttp.MultipartReader):
+            total = await _drain_multipart(
+                part,
+                response_file,
+                parts,
+                total,
+                max_response_bytes=max_response_bytes,
+            )
+            continue
+        while True:
+            chunk = await part.read_chunk()
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_response_bytes:
+                raise response_too_large(total, max_response_bytes)
+            parts.append(chunk)
+            await response_file.write(chunk)
+    return total
 
 
 def redirect_target(

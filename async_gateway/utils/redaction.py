@@ -42,6 +42,7 @@ errs in too.
 """
 
 import re
+from bisect import bisect_left
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any, Final
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
@@ -129,45 +130,162 @@ _QUERY_PAIR: Final[re.Pattern[str]] = re.compile(
     r'([?&;])([^?&;=\s]+)=([^?&;\s]*)')
 
 
-# `scheme://userinfo@` -- the credential a query-pair rule structurally
-# cannot see, because userinfo carries no `?` and no `=`.
-#
-# `redact_url` handles this for a URL it can *parse*, by dropping the
-# whole userinfo. That left the case this pattern exists for: a URL that
-# does not parse. `urlsplit('http://user:PASS@[::1/p')` raises on the
-# unclosed IPv6 bracket, and the whole-string masker had nothing to fall
-# back to, so the password was echoed verbatim into the
-# `ConfigurationError` a public `request()` call raises (M1/AGW-34).
+# `scheme:` plus whatever separator run follows it, captured separately.
+# Only *this* much is a pattern; where the userinfo ends is decided by
+# `_mask_userinfo` below, offset by offset, and deliberately not by a
+# character class -- see that function for why.
 #
 # The scheme run is bounded at 32 for the same reason `_EMBEDDED_URL`'s
 # is: unbounded, it retries from every offset on a long string carrying
-# no `://`. Every class excludes `@` and `/?#`, so a userinfo run cannot
-# cross into the path or span a sentence, and the match ends at the first
-# `@` -- a netloc holding two of them masks the first, which is a
-# malformed netloc no server agrees on and still the fail-closed answer.
-_USERINFO: Final[re.Pattern[str]] = re.compile(
-    r'([A-Za-z][A-Za-z0-9+.\-]{0,31}://)([^/?#\s@]*?)(:[^/?#\s@]*)?@')
+# no `:`. 32 characters is far longer than any registered scheme.
+#
+# `//` is the separator RFC 3986 gives; every other spelling is what
+# group 2 exists to consume -- `/\/`, `\\`, `///`, or nothing at all. A
+# browser and `urlsplit` disagree about which of those introduce an
+# authority, and that disagreement is precisely the defect, so this
+# takes no side and accepts them all. The percent-encoded forms are
+# there because a *round trip* reintroduces them: `aiohttp` normalises
+# the backslash in `http:/\/user:PW@host/p` to `%5C`, and it is that
+# spelling -- `http:///%5C/user:PW@host/p` -- which reaches
+# `error['message']`, `error['cause']` and the logged traceback. Masking
+# one spelling and not the other would mask the URL the caller wrote and
+# publish the one the library reports.
+#
+# The run is a group of this pattern rather than a second pattern
+# matched at an offset, because `Pattern.match` returns `Optional` and a
+# run of `*` never fails -- so the None arm would be unreachable code
+# guarded by an untestable branch. A group cannot be absent.
+_SCHEME_PREFIX: Final[re.Pattern[str]] = re.compile(
+    r'([A-Za-z][A-Za-z0-9+.\-]{0,31}:)((?:[/\\]|%2[Ff]|%5[Cc])*)')
+
+# The three characters that end an authority in RFC 3986 -- the start of
+# the path, the query, or the fragment. Userinfo cannot reach past one.
+_AUTHORITY_END: Final[frozenset[str]] = frozenset('/?#')
+
+_AT_SIGN: Final[frozenset[str]] = frozenset('@')
 
 
-def _mask_userinfo(match: 're.Match[str]') -> str:
-    """Mask the credential inside one ``scheme://userinfo@`` match.
+def _offsets_of(text: str, characters: frozenset[str]) -> list[int]:
+    """List every offset in ``text`` holding one of ``characters``.
+
+    One linear pass, so :func:`_mask_userinfo` can answer "where is the
+    next one after here?" by bisection rather than by re-scanning from
+    each scheme. That is what keeps it linear overall: a per-scheme
+    ``str.find`` loop is quadratic on a string that is mostly schemes,
+    and this masker runs inside ``log_failure`` on the event loop, where
+    the previous pattern's backtracking measured 35s on 200KB.
 
     Args:
-        match: The matched scheme, user part, and optional ``:password``.
+        text: The string to index.
+        characters: The characters whose offsets are recorded.
 
     Returns:
-        The userinfo with its secret masked. A ``user:password`` keeps
-        the user and masks the password, which is the same bargain
-        :func:`redact_headers` strikes -- a name is diagnostic, a value
-        is not. A userinfo with *no* colon is masked whole: a bare
-        ``https://TOKEN@host`` is how several APIs pass a token, nothing
-        distinguishes that from a username, and guessing wrong in the
-        other direction publishes the token.
+        The offsets, ascending.
     """
-    scheme, user, password = match.groups()
-    if password is None:
-        return f'{scheme}{REDACTED}@'
-    return f'{scheme}{user}:{REDACTED}@'
+    return [offset for offset, char in enumerate(text) if char in characters]
+
+
+def _mask_userinfo(text: str) -> str:
+    r"""Mask the credential in every ``scheme:...userinfo@`` in ``text``.
+
+    The credential a query-pair rule structurally cannot see, because
+    userinfo carries no ``?`` and no ``=``. :func:`redact_url` drops it
+    for a URL it can *parse*; this covers the ones it cannot -- and it is
+    the third round of findings against that job. Each round was one more
+    input shape defeating one more character class:
+
+    * ``http://user:PASS@[::1/p`` -- ``urlsplit`` raises on the unclosed
+      bracket and the fallback had no userinfo rule at all, so the
+      password reached the ``ConfigurationError`` a public ``request()``
+      raises (M1/AGW-34).
+    * ``http://user:TAB<tab>SECRET@[::1/p`` -- the class excluded
+      ``\\s``, so the match failed and *nothing* was masked. ``urlsplit``
+      strips tabs, newlines and carriage returns outright, so the server
+      reads a password the pattern could not even see (NEW-M1b).
+    * ``http://u:PARTA@SSPARTB@[::1/p`` -- the pattern stopped at the
+      first ``@`` and published the tail. RFC 3986 ends userinfo at the
+      **last** ``@`` before the host, and so does ``urlsplit``: the real
+      password there is ``PARTA@SSPARTB`` (NEW-M1b).
+    * ``http:/\\/user:BACKSLASHPW@host/p`` -- ``//`` was required
+      literally. That URL *parses*, into an empty netloc, so neither this
+      rule nor the unparseable fallback ran and the password reached the
+      envelope ``url`` and the log record's ``extra['url']`` in the clear
+      (NEW-M1b).
+
+    So this stops asking what a userinfo *looks like*. It takes the two
+    facts RFC 3986 fixes -- an authority follows a scheme, and it ends at
+    the first ``/``, ``?`` or ``#`` -- and masks up to the **last** ``@``
+    before that end, whatever lies between. Three of the four bypasses
+    above are characters some class excluded, and there is no class here
+    to exclude them from: tab, newline, space, backslash, percent escape
+    and non-ASCII are all simply *inside* the credential. The fourth is
+    answered by accepting any separator run rather than ``//`` alone.
+
+    That is the fail-closed direction, and it is the point: over-masking
+    a string that merely looks like an authority costs a diagnostic,
+    under-masking one publishes a password. A rule that enumerates what
+    a credential may contain has to be right about every hostile
+    spelling; this one has to be right about where an authority ends,
+    which RFC 3986 already decided.
+
+    Two bounds keep it off prose. A scheme is required, so a bare
+    ``user:PASS@host`` and an email address in a sentence are untouched.
+    And a *bare* userinfo -- one with no ``:`` -- is masked only when a
+    separator run was present, so ``mailto:bob@corp.example`` keeps its
+    address while ``https://TOKEN@host`` is masked whole: that is how
+    several APIs pass a token, nothing distinguishes it from a username,
+    and guessing wrong in the other direction publishes the token.
+
+    A ``user:password`` keeps the user and masks the password -- the same
+    bargain :func:`redact_headers` strikes, that a name is diagnostic and
+    a value is not.
+
+    Args:
+        text: The string to mask.
+
+    Returns:
+        ``text`` with every such credential replaced by :data:`REDACTED`,
+        or ``text`` itself when it holds no ``@`` to mask before.
+    """
+    if '@' not in text:
+        return text
+
+    ats = _offsets_of(text, _AT_SIGN)
+    ends = _offsets_of(text, _AUTHORITY_END)
+    masked: list[str] = []
+    read = 0
+    for scheme in _SCHEME_PREFIX.finditer(text):
+        # A `scheme:` found *inside* a credential already masked is not a
+        # second authority; `read` is where the last mask ended.
+        if scheme.start() < read:
+            continue
+        start = scheme.end()
+        separators = scheme.group(2)
+
+        after = bisect_left(ends, start)
+        stop = ends[after] if after < len(ends) else len(text)
+        # The last `@` before the authority ends: RFC 3986's rule, and
+        # `urlsplit`'s. `bisect_left(ats, stop) - 1` is the last one at
+        # or before `stop`; it belongs to *this* authority only if it is
+        # also at or after `start`.
+        last = bisect_left(ats, stop) - 1
+        if last < 0 or ats[last] < start:
+            continue
+        credential = ats[last]
+
+        userinfo = text[start:credential]
+        colon = userinfo.find(':')
+        if colon < 0:
+            if not separators:
+                continue
+            masked.append(text[read:start])
+        else:
+            masked.append(text[read:start + colon + 1])
+        masked.append(REDACTED)
+        read = credential
+
+    masked.append(text[read:])
+    return ''.join(masked)
 
 
 def _mask_in_string(text: str, sensitive: frozenset[str]) -> str:
@@ -221,7 +339,7 @@ def _mask_in_string(text: str, sensitive: frozenset[str]) -> str:
             return match.group(0)
         return f'{delimiter}{name}={REDACTED}'
 
-    return _USERINFO.sub(_mask_userinfo, _QUERY_PAIR.sub(mask_pair, text))
+    return _mask_userinfo(_QUERY_PAIR.sub(mask_pair, text))
 
 
 def _sensitive_names(extra_params: Collection[str]) -> frozenset[str]:
@@ -366,6 +484,24 @@ def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
     netloc = parts.netloc
     if '@' in netloc:
         netloc = netloc.rsplit('@', 1)[1]
+    elif '@' in url:
+        # A parse that *succeeded* is not proof there is no credential to
+        # drop -- only proof that `urlsplit` found no authority to put it
+        # in. `http:/\/user:BACKSLASHPW@host/p` splits happily, into an
+        # empty netloc and a path holding the whole credential, so this
+        # branch dropped nothing and the password reached the envelope
+        # `url` and the log record's `extra['url']` in the clear
+        # (NEW-M1b). The unparseable fallback did not run either: there
+        # was no exception to trigger it.
+        #
+        # So the credential rule no longer hangs off the parse verdict at
+        # all. `urlsplit` decides where a credential goes when it finds
+        # an authority; where it does not, `_mask_userinfo` reads the
+        # string, which is the same masker the fallback below uses and
+        # needs no parse to agree with. Fail-closed: the parse being
+        # *unhelpful* now masks exactly as the parse being *impossible*
+        # does, rather than being the one case that masks nothing.
+        return _mask_in_string(url, _sensitive_names(extra_params))
 
     query = parts.query
     if query:

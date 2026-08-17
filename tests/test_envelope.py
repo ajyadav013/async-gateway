@@ -1125,6 +1125,298 @@ def test_redact_text_masks_url_userinfo(text: str, expected: str) -> None:
     assert redact_text(text) == expected
 
 
+# --- NEW-M1b: the three userinfo bypasses, and the class of them ----------
+#
+# Three inputs, each defeating the *previous* userinfo rule a different
+# way, and all three reproduced reaching a caller-visible surface. They
+# are parametrised together because the fix is one construction rather
+# than three patches: the rule stopped enumerating what a credential may
+# contain and now masks to the last `@` before the authority ends.
+
+USERINFO_BYPASSES = [
+    pytest.param(
+        'http://user:TAB\tSECRET@[::1/p',
+        'SECRET',
+        f'http://user:{REDACTED}@[::1/p',
+        id='whitespace-inside-the-userinfo'),
+    pytest.param(
+        'http://u:PARTA@SSPARTB@[::1/p',
+        'SSPARTB',
+        f'http://u:{REDACTED}@[::1/p',
+        id='two-at-signs-end-userinfo-at-the-last'),
+    pytest.param(
+        'http:/\\/user:BACKSLASHPW@host/p',
+        'BACKSLASHPW',
+        f'http:/\\/user:{REDACTED}@host/p',
+        id='backslash-escaped-scheme-separator'),
+]
+
+
+@pytest.mark.parametrize('url, secret, expected', USERINFO_BYPASSES)
+def test_redact_url_masks_every_userinfo_bypass(
+    url: str,
+    secret: str,
+    expected: str,
+) -> None:
+    r"""Each of these was echoed verbatim by the pattern this replaced.
+
+    The whitespace one matched nothing at all, because the character
+    class excluded ``\\s`` -- and ``urlsplit`` *strips* the tab, so the
+    server reads a password the pattern could not see. The two-``@`` one
+    matched but stopped at the first, publishing the tail of a password
+    ``urlsplit`` reads as ``PARTA@SSPARTB``. The backslash one parses,
+    into an empty netloc, so neither the pattern nor the unparseable
+    fallback ran.
+    """
+    masked = redact_url(url)
+
+    assert secret not in masked
+    assert masked == expected
+
+
+@pytest.mark.parametrize('url, secret, expected', USERINFO_BYPASSES)
+def test_redact_text_masks_every_userinfo_bypass(
+    url: str,
+    secret: str,
+    expected: str,
+) -> None:
+    """``redact_text`` serves the three surfaces that get no second pass.
+
+    ``error['message']``, ``error['cause']`` and the logged traceback are
+    masked by this function alone, so a bypass here is a bypass on all
+    three at once.
+    """
+    masked = redact_text(f'RetriesExhausted: {url} failed')
+
+    assert secret not in masked
+    assert masked == f'RetriesExhausted: {expected} failed'
+
+
+@pytest.mark.parametrize('url, secret, expected', USERINFO_BYPASSES)
+def test_redact_value_masks_every_userinfo_bypass(
+    url: str,
+    secret: str,
+    expected: str,
+) -> None:
+    """``redact_value`` is what writes ``extra['url']`` on a log record.
+
+    It composes both string maskers, so it agrees with the envelope by
+    construction -- but only where the maskers themselves agree, which
+    is what these rows check.
+    """
+    masked = redact_value(url)
+
+    assert secret not in masked
+    assert masked == expected
+
+
+def test_redact_url_masks_a_credential_a_successful_parse_missed() -> None:
+    r"""A parse that succeeds is not proof there is no credential.
+
+    ``http:/\\/user:PW@host/p`` splits happily -- into an *empty* netloc
+    and a path carrying the whole credential -- so the userinfo drop had
+    nothing to drop, and the unparseable fallback never ran because
+    nothing raised. It was the one shape that masked nothing at all
+    (NEW-M1b). The rule no longer hangs off the parse verdict: an
+    unhelpful parse now masks exactly as an impossible one does.
+    """
+    masked = redact_url('http:/\\/user:BACKSLASHPW@host/p')
+
+    assert 'BACKSLASHPW' not in masked
+
+
+def test_redact_text_masks_the_percent_encoded_spelling_of_a_separator(
+) -> None:
+    r"""A round trip through ``aiohttp`` rewrites ``\\`` as ``%5C``.
+
+    That normalised spelling is the one that reaches ``error['message']``,
+    ``error['cause']`` and the logged traceback, so masking only the
+    spelling the caller wrote would mask the URL nobody reads and publish
+    the one everybody does.
+    """
+    reported = 'RetriesExhausted: http:///%5C/user:ROUNDTRIPPW@host/p'
+
+    masked = redact_text(reported)
+
+    assert 'ROUNDTRIPPW' not in masked
+
+
+@pytest.mark.parametrize(
+    'url, secret',
+    [
+        pytest.param(
+            'http://user:PA SS@host/p', 'PA SS', id='space'),
+        pytest.param(
+            'http://user:PA\nSS@host/p', 'PA\nSS', id='newline'),
+        pytest.param(
+            'http://user:PA\rSS@host/p', 'PA\rSS', id='carriage-return'),
+        pytest.param(
+            'http://user:PA\x0bSS@host/p', 'PA\x0bSS', id='vertical-tab'),
+        pytest.param(
+            'http://user:PA SS@host/p', 'PA SS',
+            id='non-breaking-space'),
+        pytest.param(
+            'http://user:%73%65%63%72%65%74@host/p', '%73%65%63',
+            id='percent-encoded'),
+        pytest.param(
+            'http://üser:pässwörd@host/p', 'pässwörd', id='unicode'),
+        pytest.param(
+            'http://user:pw@ord@x@host/p', 'ord@x', id='three-at-signs'),
+        pytest.param(
+            'http://user:' + 'L' * 5000 + '@host/p', 'L' * 5000,
+            id='very-long-userinfo'),
+        pytest.param(
+            'http://' + 'u' * 5000 + ':PW@host/p', ':PW',
+            id='very-long-username'),
+        pytest.param(
+            'http:user:NOSEPARATORPW@host/p', 'NOSEPARATORPW',
+            id='no-separator-run-at-all'),
+        pytest.param(
+            'http:\\\\user:DOUBLEBACKPW@host/p', 'DOUBLEBACKPW',
+            id='double-backslash-separator'),
+        pytest.param(
+            'http:////user:MANYSLASHPW@host/p', 'MANYSLASHPW',
+            id='four-slash-separator'),
+        pytest.param(
+            'http://user:PW@host:8080/p', ':PW@', id='explicit-port'),
+        pytest.param(
+            'http://user:PW@[::1]:8080/p', ':PW@', id='bracketed-ipv6'),
+        pytest.param(
+            'HTTP://user:UPPERPW@host/p', 'UPPERPW',
+            id='uppercase-scheme'),
+        pytest.param(
+            'x-custom.scheme+v2://user:CUSTOMPW@host/p', 'CUSTOMPW',
+            id='exotic-but-legal-scheme'),
+    ],
+)
+def test_redact_text_masks_hostile_userinfo_spellings(
+    url: str,
+    secret: str,
+) -> None:
+    """The bound is where an authority *ends*, not what it contains.
+
+    Every row is a character or a shape that some enumerating rule would
+    have to have thought of in advance. None of them is enumerated: the
+    rule reads to the last ``@`` before the first ``/``, ``?`` or ``#``,
+    so what lies between is masked whatever it is. This is the property
+    the three shipped bypasses cost, stated as a test.
+    """
+    assert secret not in redact_text(url)
+
+
+@pytest.mark.parametrize(
+    'text',
+    [
+        pytest.param('mailto:bob@corp.example', id='an-email-uri'),
+        pytest.param(
+            'contact user@corp.example for access', id='an-address-in-prose'),
+        pytest.param(
+            'no scheme here user:PASS@host', id='no-scheme-at-all'),
+        pytest.param('http://host/p', id='a-url-with-no-credential'),
+        pytest.param(
+            'http://host/p@notuserinfo',
+            id='an-at-sign-after-the-path-begins'),
+        pytest.param(
+            'http://host/p?to=bob@corp.example',
+            id='an-at-sign-inside-the-query'),
+        pytest.param(
+            'http://host/p#frag@ment', id='an-at-sign-inside-the-fragment'),
+    ],
+)
+def test_redact_text_leaves_a_non_credential_at_sign_alone(
+    text: str,
+) -> None:
+    """Fail-closed is not fail-always: the bounds have to hold too.
+
+    A rule that masked every ``@`` would turn each of these into
+    asterisks and cost the diagnostic the string exists to provide. The
+    scheme requirement stops the first three; the authority-end rule
+    stops the last three, because an ``@`` after the path begins is not
+    in the authority at all.
+    """
+    assert redact_text(text) == text
+
+
+def test_redact_text_masks_an_empty_password_rather_than_skipping_it(
+) -> None:
+    """An empty ``user:@host`` credential is masked, not waved through.
+
+    Nothing is lost by masking an empty value, and the alternative is a
+    rule that has to decide *whether* a credential is worth hiding --
+    one more question this module declines to ask, and one more branch
+    for the next hostile input to aim at. The URL is unparseable so the
+    embedded-URL pass cannot reach it: a parseable one has its userinfo
+    dropped whole, which is stronger than masking and not what this row
+    is about.
+    """
+    assert redact_text('http://user:@[::1/p') == (
+        f'http://user:{REDACTED}@[::1/p')
+
+
+def test_redact_text_masks_each_of_several_urls_independently() -> None:
+    """One string can carry more than one credential, and often does."""
+    text = 'ftp://u1:FIRSTPW@h1/a failed over to sftp://u2:SECONDPW@h2/b'
+
+    masked = redact_text(text)
+
+    assert 'FIRSTPW' not in masked
+    assert 'SECONDPW' not in masked
+
+
+def test_redact_text_masking_userinfo_is_idempotent() -> None:
+    """A masked string masked again is unchanged.
+
+    ``redact_value`` composes two maskers over the same string and
+    ``redact_text`` runs its own passes in sequence, so a rule that
+    re-masked its own output would corrupt every composed surface.
+    """
+    once = redact_text('http://user:IDEMPOTENTPW@host/p')
+
+    assert redact_text(once) == once
+
+
+def test_redact_text_masks_userinfo_and_a_query_secret_together() -> None:
+    """The two rules are independent and both fire on one URL."""
+    masked = redact_text('http://user:BOTHPW@host/p?api_key=BOTHKEY')
+
+    assert 'BOTHPW' not in masked
+    assert 'BOTHKEY' not in masked
+
+
+@pytest.mark.parametrize(
+    'text',
+    [
+        pytest.param('http://' * 200 + 'u:p@h', id='200-nested-schemes'),
+        pytest.param(
+            'http://h/p?' + '&'.join(f'k{i}=v{i}' for i in range(500)),
+            id='500-query-pairs'),
+        pytest.param('a:' * 100000, id='200kb-of-bare-schemes'),
+        pytest.param('a:' * 100000 + '/@', id='200kb-of-schemes-then-an-at'),
+        pytest.param('@' * 100000, id='100k-at-signs'),
+    ],
+)
+def test_redact_text_stays_linear_on_a_hostile_string(text: str) -> None:
+    """This masker runs inside ``log_failure``, on the event loop.
+
+    The pattern this replaced backtracked for 35s on 200KB, which is an
+    outage rather than a slow log line, so the replacement's cost is part
+    of its contract. It is a scanner rather than a backtracking pattern:
+    the ``@`` and authority-end offsets are indexed in one pass and
+    answered by bisection, where a ``str.find`` per scheme would be
+    quadratic on a string that is mostly schemes.
+
+    A prior fixer also recorded that a naive fallback to ``redact_text``
+    recurses forever; the first two rows are that check, and the
+    non-recursive factoring through ``_mask_in_string`` is what keeps
+    them terminating.
+    """
+    started = monotonic_now()
+
+    redact_text(text)
+
+    assert elapsed_since(started) < 2.0
+
+
 def test_redact_text_masks_a_pair_after_a_legacy_semicolon_separator(
 ) -> None:
     """``;`` separates query parameters too, and servers still read it.
