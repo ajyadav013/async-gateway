@@ -16,9 +16,12 @@ the one that does exists because a fail-closed TLS claim cannot be proven
 by a double that never handshakes.
 """
 
+import asyncio
+import inspect
 import logging
 import socket
 import ssl
+import threading
 from pathlib import Path
 from typing import Any, Optional, Text
 
@@ -400,6 +403,117 @@ def test_tls_context_for_refuses_a_context_that_verifies_no_peer(
 
     with pytest.raises(TlsError):
         tls_context_for({'ssl_context': context})
+
+
+# --- AGW-37: the CA-bundle read is off the event loop ----------------------
+
+
+async def test_agw37_the_default_context_is_built_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The thread identity is the assertion, because nothing else is.
+
+    ``tls_context_for``'s no-certificate fallback calls
+    ``ssl.create_default_context()``, which reads the whole system CA
+    bundle -- 194 certificates -- synchronously. It was awaited straight
+    from ``_tls_value`` with no executor, so that read landed on the
+    event loop once per FTPS session, blocking every other in-flight
+    request for its duration (AGW-37).
+
+    ``asyncio.to_thread`` is what moves it, and *no observable output
+    changes* when it is removed: the context returned is identical
+    either way. The only thing that differs is which thread the work ran
+    on, so that is what is measured -- the same shape as
+    ``test_agw36_the_certificate_is_loaded_off_the_event_loop``, and for
+    the same reason.
+
+    The AST scan in ``tests/test_no_blocking_io.py`` structurally cannot
+    see this: ``tls_context_for`` is a *module-level plain* ``def``, so
+    the scan never searches it, and the coroutine that calls it contains
+    no banned call of its own. That scan used to carry a comment naming
+    this very site as a known live defect; this test replaces it,
+    because a guard that documents a hole reads as coverage while
+    catching nothing.
+
+    Args:
+        monkeypatch: Installs the thread-recording wrapper for the
+            duration of this test only.
+    """
+    ran_on: list[int] = []
+    real_resolver = ftp_client.tls_context_for
+
+    def record_thread(ssl_config: Any) -> ssl.SSLContext:
+        """Record the running thread, then resolve the context normally.
+
+        Args:
+            ssl_config: Forwarded unchanged.
+
+        Returns:
+            The context the real resolver produced.
+        """
+        ran_on.append(threading.get_ident())
+        return real_resolver(ssl_config)
+
+    monkeypatch.setattr(
+        'async_gateway.logic.ftp_client.tls_context_for', record_thread)
+    client, _ = ftp_request()
+
+    context = await client._tls_value()
+
+    assert isinstance(context, ssl.SSLContext)
+    assert len(ran_on) == 1
+    assert ran_on[0] != threading.get_ident()
+
+
+async def test_agw37_the_loop_keeps_running_while_the_context_is_built(
+) -> None:
+    """The property the thread identity exists to buy.
+
+    Thread identity is a proxy; this is the thing itself. A task
+    scheduled alongside the build must get its turn *while* the build is
+    still running -- which is exactly what a blocking CA-bundle read on
+    the loop denies it.
+
+    The flag is read **before** the companion is awaited, and that
+    ordering is the whole test. Awaiting it first would guarantee it had
+    run, and the assertion would then hold no matter what ``_tls_value``
+    did. Without the thread this coroutine reaches no suspension point
+    at all on the no-certificate branch -- ``get_ssl_config`` returns
+    ``{'ssl': True}`` without awaiting anything -- so it runs start to
+    finish without yielding, and the companion is still unstarted when
+    the context comes back.
+    """
+    progressed = asyncio.Event()
+
+    async def other_work() -> None:
+        """Set the flag as soon as the loop gives this task a turn.
+
+        Returns:
+            None.
+        """
+        progressed.set()
+
+    client, _ = ftp_request()
+    companion = asyncio.create_task(other_work())
+    try:
+        await client._tls_value()
+
+        assert progressed.is_set()
+    finally:
+        await companion
+
+
+def test_agw37_the_blocking_resolver_is_a_plain_def() -> None:
+    """The placement the executor contract depends on, pinned.
+
+    ``asyncio.to_thread`` on a coroutine function does not run it -- it
+    returns the coroutine object from the thread, unawaited, and the
+    blocking work never happens at all. Rewriting this as an ``async
+    def`` would also put a banned ``ssl.`` call back inside a coroutine,
+    which ``tests/test_no_blocking_io.py`` fails on; the two checks
+    approach the same regression from opposite sides.
+    """
+    assert not inspect.iscoroutinefunction(tls_context_for)
 
 
 async def test_r15_ac4_a_client_certificate_does_not_buy_an_unverified_peer(
