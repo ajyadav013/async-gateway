@@ -11,15 +11,50 @@ Every filter takes the same explicit, typed parameter set. None of them
 reads ``kwargs['request_type']`` -- a hard ``KeyError`` for any caller that
 did not supply one, which is every SOAP call -- and none of them writes to
 the payload it was handed.
+
+The other half of this module is :func:`get_ssl_config`, which decides the
+TLS posture of every outbound call (R23). Three defects lived in six lines
+of it and are repaired together, because each one hid the next:
+
+* **H28.** The client context was built for the *client-auth* purpose --
+  the one a **server** uses to authenticate incoming clients. It yields
+  ``PROTOCOL_TLS_SERVER``, and CPython refuses to build a client socket
+  from one, so the client-certificate path failed **closed** and had never
+  once succeeded. The purpose names the peer being *authenticated*: on an
+  outbound call that is the server, so ``ssl.Purpose.SERVER_AUTH`` is
+  correct and the other one reads as the opposite of what it means. (It
+  is spelled out here rather than written literally so that R23-AC1's
+  grep over this package stays meaningful; ``logic/ftp_client.py``
+  retains two prose mentions that predate this story.)
+* **M1.** ``{'ssl': verify_ssl or True}`` is ``True`` for every input,
+  including ``False``, so the documented flag was inoperative. The posture
+  was safe by accident, and the obvious cleanup -- ``{'ssl': verify_ssl}``
+  -- would have turned that accident into a live downgrade switch for
+  every caller passing ``None``. It is replaced by an explicit three-way
+  decision, not by a tidier expression.
+* **AGW-36.** Both ``ssl.create_default_context`` (which reads the whole
+  system CA bundle, 194 certificates) and ``load_cert_chain`` (which reads
+  the caller's two files) are blocking filesystem reads, and both ran
+  directly on the event loop -- on HTTP inside ``failsafe.run``, so once
+  per *attempt*. They now run in :func:`build_client_ssl_context`, a plain
+  ``def`` reached only through ``asyncio.to_thread``.
 """
 
+import asyncio
+import logging
+import os
 import ssl
+from collections.abc import Sequence
 from datetime import date, datetime, time
 from typing import Any, Dict, List, Optional, Text, Tuple, Union
 
 import aiohttp
 
+from async_gateway.utils.exceptions import ConfigurationError
+
 import orjson
+
+logger = logging.getLogger(__name__)
 
 #: ``aiohttp`` query parameters as pairs rather than as a mapping: a list
 #: value means a repeated parameter and a mapping cannot express one.
@@ -31,38 +66,236 @@ RequestFilters = Dict[Text, Any]
 #: What a payload may be by the time it reaches a filter.
 Payload = Optional[Union[Dict[Text, Any], Text, bytes]]
 
+#: What :func:`get_ssl_config` answers with. Always exactly one key --
+#: ``'ssl'``, the keyword ``aiohttp`` supports -- carrying either a
+#: verifying client context or the bare flag. The deprecated
+#: ``ssl_context=`` key this replaces is emitted by no branch (R23-AC3).
+SslFilters = Dict[Text, Union[bool, ssl.SSLContext]]
+
+#: One end of the caller's ``certificate`` pair, before normalisation.
+#: ``os.PathLike`` is accepted because ``load_cert_chain`` takes one
+#: natively, so refusing a ``pathlib.Path`` would invent a restriction
+#: OpenSSL does not have.
+CertificatePath = Union[Text, os.PathLike]
+
+
+class _PassphraseProtectedKey(Exception):
+    """Raised from the ``password`` callback when OpenSSL asks for one.
+
+    OpenSSL calls the ``password`` callback only for a key it cannot
+    decode unaided, so the callback firing *is* the detection: it is never
+    invoked for an unencrypted key. Without it, an encrypted key surfaces
+    as ``ssl.SSLError: [SSL] PEM lib``, which is the same message a
+    corrupt PEM produces and tells the caller nothing about what to fix.
+
+    Private, and never escapes this module: :func:`build_client_ssl_context`
+    converts it to a ``ConfigurationError`` naming the limitation.
+    """
+
+
+def _refuse_passphrase() -> Text:
+    """Report that a passphrase-protected key was supplied.
+
+    Returns:
+        Never; the annotation is the signature ``load_cert_chain``
+        requires of a ``password`` callable.
+
+    Raises:
+        _PassphraseProtectedKey: Always. Being called at all means
+            OpenSSL could not decode the key without a passphrase.
+    """
+    raise _PassphraseProtectedKey()
+
+
+def normalised_certificate(
+    certificate: Any,
+) -> Tuple[Text, Text]:
+    """Return the caller's ``certificate`` value as a ``(cert, key)`` pair.
+
+    Every rejection here is the caller's typo rather than a transport
+    fault, so all of them raise ``ConfigurationError`` -- 400, never
+    retried -- instead of reaching OpenSSL and coming back as a TLS
+    failure that suggests the network is at fault.
+
+    The rejections are ordered by *type* before *length*, because the
+    length test alone is actively misleading for the two types that have
+    one. ``b'ab'`` has length 2 and iterates as two integers; a 12-character
+    path string has length 12. Reporting "got 12 value(s)" for
+    ``certificate='/path/to/cert.pem'`` names the wrong problem, so the
+    type is named instead.
+
+    Args:
+        certificate: Whatever the caller put in ``protocol_info``. Any
+            type, because it arrives unvalidated.
+
+    Returns:
+        The certificate path and the key path, both as ``str``. An
+        ``os.PathLike`` element is converted with ``os.fspath``, which is
+        pure string manipulation and touches no filesystem.
+
+    Raises:
+        ConfigurationError: If the value is a single path rather than a
+            pair, is not a sequence at all, does not hold exactly two
+            elements, or holds an element that is not a path.
+    """
+    if isinstance(certificate, (Text, bytes, os.PathLike)):
+        raise ConfigurationError(
+            "protocol_info['certificate'] must be a (certificate path, "
+            f'key path) pair, not a single '
+            f'{type(certificate).__name__}')
+    if not isinstance(certificate, Sequence):
+        raise ConfigurationError(
+            "protocol_info['certificate'] must be a (certificate path, "
+            f'key path) pair, not a {type(certificate).__name__}')
+    if len(certificate) != 2:
+        raise ConfigurationError(
+            "protocol_info['certificate'] must be a (certificate path, "
+            f'key path) pair; got {len(certificate)} value(s)')
+
+    paths: List[Text] = []
+    for label, value in zip(('certificate path', 'key path'), certificate):
+        if not isinstance(value, (Text, os.PathLike)):
+            raise ConfigurationError(
+                f"protocol_info['certificate'] {label} must be a path, "
+                f'not a {type(value).__name__}')
+        paths.append(os.fspath(value))
+    return paths[0], paths[1]
+
+
+def build_client_ssl_context(
+    certificate_path: Text,
+    key_path: Text,
+) -> ssl.SSLContext:
+    """Build the verifying client context that carries a client cert.
+
+    A plain ``def``, deliberately: both calls in it read files
+    synchronously, so this is the module-level blocking helper
+    ``tests/test_no_blocking_io.py`` describes as the *intended* contract
+    for work handed to an executor. :func:`get_ssl_config` is the only
+    caller and reaches it through ``asyncio.to_thread``. Rewriting it as
+    an ``async def`` puts a banned ``ssl.`` call back inside a coroutine
+    and that scan fails -- which is the check that keeps this placement
+    from quietly regressing (AGW-36).
+
+    ``ssl.create_default_context`` is *outside* the ``try`` on purpose. It
+    reads the system CA bundle, which is the environment's problem and not
+    the caller's; failing it is a transport-level fault the protocol
+    clients report as ``TLS``. Everything inside the ``try`` reads the
+    caller's own two files, and every way those can fail is the caller's
+    configuration.
+
+    Args:
+        certificate_path: Path to the PEM certificate (or to a PEM holding
+            both the certificate and its key, which OpenSSL accepts when
+            both arguments name it).
+        key_path: Path to the PEM private key.
+
+    Returns:
+        A context built for ``ssl.Purpose.SERVER_AUTH`` -- so it can
+        actually open a client socket (H28) -- carrying the client
+        certificate, verifying the server's chain and its host name.
+
+    Raises:
+        ConfigurationError: If the key is passphrase-protected (an
+            unsupported case, named as such), or if either file is
+            missing, unreadable, not a valid PEM, or a certificate and key
+            that do not match. All of those arrive as ``OSError``
+            subclasses -- ``ssl.SSLError`` is itself an ``OSError``, so
+            catching both would be redundant -- and the message names the
+            two files, because OpenSSL's own does not.
+        OSError: If the system CA bundle cannot be read. Left to
+            propagate: nothing about the caller's request can fix it.
+    """
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    try:
+        context.load_cert_chain(
+            certificate_path, key_path, password=_refuse_passphrase)
+    except _PassphraseProtectedKey as err:
+        raise ConfigurationError(
+            f'client key {key_path!r} is passphrase-protected, which '
+            'async-gateway does not support: supply a decrypted PEM key'
+        ) from err
+    except OSError as err:
+        raise ConfigurationError(
+            f'client certificate {certificate_path!r} and key '
+            f'{key_path!r} could not be loaded: {err}') from err
+
+    # A `raise`, not an `assert`. `python -O` strips assert statements
+    # outright, so a security guard written as one is present in
+    # development and absent in exactly the optimised deployments that
+    # most need it. R23-AC2 asks for asserts; this is strictly stronger
+    # and the deviation is recorded in ticket AGW-17.
+    if not (context.check_hostname
+            and context.verify_mode == ssl.CERT_REQUIRED):
+        raise ConfigurationError(
+            'refusing a client TLS context that does not verify the '
+            f'server (check_hostname={context.check_hostname}, '
+            f'verify_mode={context.verify_mode!r}); this is a '
+            'library defect, not a configuration error')
+    return context
+
 
 async def get_ssl_config(
-        certificate: Tuple[Text] = None,
-        verify_ssl: bool = None) -> Dict:
-    """Get the SSL config.
+        certificate: Any = None,
+        verify_ssl: Optional[bool] = None) -> SslFilters:
+    """Decide the TLS posture of one outbound call.
 
-    :param certificate: Tuple[Text] - ('certificate path',
-        'certificate key path')
-    :param verify_ssl: bool - Flag to enable ssl verification
+    Three-way and explicit (M1), because the value it replaced --
+    ``verify_ssl or True`` -- collapsed to ``True`` for every input and
+    made the library's posture an accident:
+
+    * a **certificate** builds a verifying client context carrying it;
+    * ``verify_ssl`` **exactly** ``False`` disables verification and logs
+      a warning;
+    * anything else, including ``None`` and an absent argument, verifies.
+
+    "Exactly ``False``" is the identity test and not truthiness. ``0``,
+    ``''`` and ``None`` are all falsy and none of them is a caller asking
+    to talk to an unauthenticated peer, so only the ``False`` singleton
+    turns verification off. There is no other path to
+    ``check_hostname=False`` or ``CERT_NONE``.
+
+    The certificate branch **overrides** ``verify_ssl=False`` rather than
+    honouring it. That is deliberate and fail-secure: presenting a client
+    identity to a peer whose own identity is unverified hands that
+    identity to whoever answered, which is worse than the plain
+    unverified session the flag asked for. A caller who wants no
+    verification can have it by supplying no certificate.
+
+    Args:
+        certificate: The caller's ``(certificate path, key path)`` pair,
+            or None. Typed ``Any`` because it arrives unvalidated;
+            :func:`normalised_certificate` is what narrows it.
+        verify_ssl: The caller's flag, or None when they did not set one.
+
+    Returns:
+        Exactly one keyword for the transport call, always under
+        ``'ssl'`` -- ``aiohttp``'s supported key, never the deprecated
+        ``ssl_context=`` (R23-AC3) -- carrying a verifying client context,
+        or ``True``, or ``False``.
+
+    Raises:
+        ConfigurationError: If ``certificate`` is not a usable pair of
+            paths, or names files that will not load.
+        OSError: If the system CA bundle cannot be read.
     """
-    # verify_ssl, ssl_context, fingerprint and ssl parameters
-    # are mutually exclusive
-    # Some don't use ssl; but use an IP whereas some use
-    # SSL Certificate and those combined
-    # usage in aiohttp session_obj contradict each other
-    # thereby raising a ValueError Exception
     if certificate:
-        # `SERVER_AUTH` is the purpose of the peer being *authenticated*,
-        # which on an outbound call is the server. `CLIENT_AUTH` reads as
-        # "we are the client" and means the opposite: it is what a server
-        # builds with to authenticate its clients, and it yields
-        # `verify_mode=CERT_NONE` with `check_hostname` off. Supplying a
-        # client certificate therefore negotiated TLS against an entirely
-        # unauthenticated peer (M2).
-        ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ssl_context.load_cert_chain(certificate[0], certificate[1])
-        return {
-            'ssl_context': ssl_context
-        }
-    return {
-        'ssl': verify_ssl or True
-    }
+        certificate_path, key_path = normalised_certificate(certificate)
+        # In a thread: both calls inside read files, and on HTTP this
+        # coroutine runs inside `failsafe.run`, so on the event loop the
+        # CA-bundle read would repeat on every retried attempt (AGW-36).
+        context = await asyncio.to_thread(
+            build_client_ssl_context, certificate_path, key_path)
+        return {'ssl': context}
+
+    if verify_ssl is False:
+        logger.warning(
+            'verify_ssl is False: TLS certificate and host-name '
+            'verification are disabled for this call, so the connection '
+            'is not protected against an intercepting peer')
+        return {'ssl': False}
+
+    return {'ssl': True}
 
 
 def is_get(request_type: Text) -> bool:
