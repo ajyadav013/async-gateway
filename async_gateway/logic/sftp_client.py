@@ -211,6 +211,28 @@ TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
 RECURSING_MODES: Final[frozenset[Text]] = frozenset(
     {'copy', 'get', 'mcopy', 'mget', 'mput', 'put'})
 
+# The SFTP operations this library will dispatch, and the whole of what
+# `mode` may name (R21-AC1, R17-AC7). Exactly the three this release
+# documents -- the class docstring below and the README both say "'get',
+# 'put' or 'remove'" -- so the allowlist and the documentation state the
+# same thing, which is what R21-AC3 asks of them.
+#
+# The set is deliberately *narrower* than `RECURSING_MODES`, and the two
+# are not in conflict. `RECURSING_MODES` answers "which asyncssh
+# operations accept `recurse`", and is broad on purpose so that admitting
+# `mget` here later cannot reintroduce the `TypeError` it guards; this
+# set answers "which operations may a caller ask for", and admitting a
+# verb is a documentation and operand-order commitment, not a lookup.
+# `mput`, `mget`, `copy` and `mcopy` are therefore excluded until a story
+# owns them: R22 makes the local/remote operand order normative for
+# `mput` specifically, and admitting it here first would ship a verb
+# whose argument order this module is still passing inverted.
+#
+# `rmtree`, `chmod`, `symlink`, `exit` and every other attribute of an
+# open `asyncssh.SFTPClient` were reachable through the unbounded
+# `getattr` this replaces (M25).
+SFTP_MODES: Final[frozenset[Text]] = frozenset({'get', 'put', 'remove'})
+
 # Which way round each transfer mode's two operands go (AGW-33). The
 # real asyncssh signatures do **not** agree on one order:
 #
@@ -660,19 +682,36 @@ class SFTPRequest(BaseRequestClass):
 
         Returns:
             None.
+
+        Raises:
+            UnsupportedVerbError: If ``mode`` names nothing in
+                :data:`SFTP_MODES` (R17-AC7). Raised inside
+                ``handle_request``'s ``try``, so it reaches the caller as
+                a ``CONFIG`` envelope. :meth:`_validate_mode` has already
+                refused a mode that is absent or is not a string, before
+                the connect; this is the narrower question of whether the
+                name is one this library dispatches, and it is asked
+                *before* the attribute is read so an unadmitted name
+                never resolves against the open channel.
         """
+        # Resolved first, so nothing below acts on a mode the allowlist
+        # would refuse -- including the `recurse` decision, which would
+        # otherwise be made for an operation that is never run.
+        operation = self.resolve_verb(
+            sftp, self.mode_, allowed=SFTP_MODES, setting='mode')
+
         # A copy, always. `recurse` used to be written into the caller's
         # own `additional_arguments`, which arrives here by reference
         # through three layers, so one directory transfer left it set for
         # every later call sharing that `protocol_info` (M28).
         options: Dict[Text, Any] = dict(self.additional_arguments)
-        mode = self.mode_.lower()
+        mode = self.mode_.strip().lower()
         if is_directory and mode in RECURSING_MODES:
             options['recurse'] = True
 
         if not self.local_path:
             await self.circuit_breaker.run(
-                getattr(sftp, mode), self.remote_path, **options)
+                operation, self.remote_path, **options)
             return
 
         if mode in DOWNLOADING_MODES:
@@ -696,7 +735,7 @@ class SFTPRequest(BaseRequestClass):
 
         source, destination = self._operands(mode)
         await self.circuit_breaker.run(
-            getattr(sftp, mode), source, destination, **options)
+            operation, source, destination, **options)
 
     def _operands(self, mode: Text) -> Tuple[Text, Text]:
         """Return ``(source, destination)`` in this mode's own direction.

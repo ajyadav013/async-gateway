@@ -2563,3 +2563,140 @@ async def test_r22_download_file_from_url_refuses_to_overwrite(
         http_server.url_for('/file'), str(target), overwrite=True)
 
     assert target.read_bytes() == b'the replacement'
+
+
+# --- R21: the verb allowlist on both HTTP getattr sites -------------------
+
+
+@pytest.mark.parametrize(
+    'verb',
+    [
+        pytest.param('close', id='close'),
+        pytest.param('ws_connect', id='ws-connect'),
+        pytest.param('detach', id='detach'),
+        pytest.param('gett', id='typo'),
+        pytest.param('', id='empty'),
+        pytest.param(None, id='none'),
+    ],
+)
+async def test_the_transport_refuses_a_verb_outside_the_allowlist(
+    http_server: RecordingHTTPServer,
+    verb: Any,
+) -> None:
+    """``make_http_request`` fails closed on a caller-named non-verb.
+
+    ``close``, ``ws_connect`` and ``detach`` are all real attributes of a
+    live ``aiohttp.ClientSession``, which is the finding: the unbounded
+    ``getattr`` addressed the session's whole public API from a string
+    the caller chose (M25). ``close`` is the documented case -- it
+    resolved to ``ClientSession.close(url, **filters)`` and raised a
+    ``TypeError`` that belonged to no transport family, so the envelope
+    reported a fabricated status for what is a configuration error.
+    """
+    http_server.respond('/p', body=b'ok')
+
+    async with aiohttp.ClientSession(timeout=TEST_TIMEOUT) as session:
+        with pytest.raises(ConfigurationError) as caught:
+            await make_http_request(
+                session,
+                http_server.url_for('/p'),
+                _no_body,
+                verb,
+                redact_params=frozenset(),
+                **POLICY,
+            )
+
+    assert repr(verb) in str(caught.value)
+    assert 'get' in str(caught.value)
+    assert http_server.requests == [], 'a refused verb was still dispatched'
+
+
+async def test_a_refused_verb_leaves_the_session_usable(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """``request_type='close'`` must not actually close the session.
+
+    The sharpest reading of the ``close`` row, and the one an envelope
+    assertion cannot make. Under the old ``getattr`` the attribute was
+    resolved and *called* -- with the URL as its first positional
+    argument -- so the failure mode was never merely a bad status: it was
+    a caller-supplied string invoking a lifecycle method on the library's
+    own transport. A subsequent request over the same session succeeding
+    is what proves nothing was invoked.
+    """
+    http_server.respond('/p', body=b'ok')
+
+    async with aiohttp.ClientSession(timeout=TEST_TIMEOUT) as session:
+        with pytest.raises(ConfigurationError):
+            await make_http_request(
+                session, http_server.url_for('/p'), _no_body, 'close',
+                redact_params=frozenset(), **POLICY)
+
+        assert not session.closed
+        result = await make_http_request(
+            session, http_server.url_for('/p'), _no_body, 'GET',
+            redact_params=frozenset(), **POLICY)
+
+    assert result['status_code'] == 200
+
+
+@pytest.mark.parametrize(
+    'verb',
+    [
+        pytest.param(' get ', id='surrounding-whitespace'),
+        pytest.param('GeT', id='mixed-case'),
+    ],
+)
+async def test_the_transport_admits_an_allowlisted_verb_in_any_casing(
+    http_server: RecordingHTTPServer,
+    verb: Text,
+) -> None:
+    """Normalisation is the allowlist's, not each call site's own.
+
+    ``request_type`` reaches this function in the caller's own spelling
+    -- it is echoed back in the envelope and in error messages -- so the
+    allowlist has to do the normalising, and has to do it the same way
+    ``is_get`` and ``resolve_protocol`` already do.
+    """
+    http_server.respond('/p', body=b'ok')
+
+    async with aiohttp.ClientSession(timeout=TEST_TIMEOUT) as session:
+        result = await make_http_request(
+            session, http_server.url_for('/p'), _no_body, verb,
+            redact_params=frozenset(), **POLICY)
+
+    assert result['status_code'] == 200
+    assert http_server.requests[0].method == 'GET'
+
+
+@pytest.mark.parametrize(
+    'verb',
+    [
+        pytest.param('close', id='close'),
+        pytest.param('gett', id='typo'),
+        pytest.param(None, id='none'),
+    ],
+)
+async def test_a_url_download_refuses_a_verb_outside_the_allowlist(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+    verb: Any,
+) -> None:
+    """The fifth ``getattr`` site, and it fails closed like the others.
+
+    ``download_file_from_url`` builds its own session and reached the
+    same unbounded lookup on it. Nothing must be written: a refused verb
+    is a call that never happened, and a zero-length file left behind
+    would be indistinguishable to the caller from a legitimate empty
+    download.
+    """
+    target = tmp_path / 'never-written.bin'
+    http_server.respond('/file', body=b'payload')
+
+    with pytest.raises(ConfigurationError) as caught:
+        await download_file_from_url(
+            http_server.url_for('/file'), str(target), request_type=verb)
+
+    assert repr(verb) in str(caught.value)
+    assert not target.exists()
+    assert http_server.requests == []

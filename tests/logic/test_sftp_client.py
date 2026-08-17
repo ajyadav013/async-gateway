@@ -1220,17 +1220,8 @@ async def test_a_library_bug_propagates_instead_of_becoming_an_envelope(
 # --- AGW-33: the operand order, per mode -----------------------------------
 
 
-@pytest.mark.parametrize(
-    'mode, expected',
-    [
-        pytest.param('put', (LOCAL_PATH, REMOTE_PATH), id='put'),
-        pytest.param('mput', (LOCAL_PATH, REMOTE_PATH), id='mput'),
-    ],
-)
 async def test_agw33_an_upload_mode_passes_local_first(
     monkeypatch: pytest.MonkeyPatch,
-    mode: Text,
-    expected: tuple[Text, Text],
 ) -> None:
     """The asyncssh signatures disagree on order, so one cannot serve.
 
@@ -1238,18 +1229,39 @@ async def test_agw33_an_upload_mode_passes_local_first(
     ``put(localpaths, remotepath)``. The client passed
     ``(remote_path, local_path)`` positionally to **every** mode, which
     is correct for ``get``/``mget`` and inverted for ``put``/``mput``.
-
-    ``mput`` is a row rather than an afterthought: R21's allowlist (S19)
-    admits it carrying the identical defect, so a table covering only
-    the mode dispatched today would leave it live the day it lands.
     """
     double = trusting_double(monkeypatch)
 
     await sftp_call(
-        host_key=SERVER_HOST_KEY, mode=mode, local_path=LOCAL_PATH)
+        host_key=SERVER_HOST_KEY, mode='put', local_path=LOCAL_PATH)
 
     passed = {name: args for name, args, _ in double.sftp.calls}
-    assert passed[mode] == expected
+    assert passed['put'] == (LOCAL_PATH, REMOTE_PATH)
+
+
+def test_agw33_mput_is_tabled_local_first_before_it_is_dispatchable(
+) -> None:
+    """``mput``'s direction is pinned even though S19 will not dispatch it.
+
+    This was an end-to-end row of the ``put`` test above until S19's
+    allowlist landed. The two stories are both right and do not
+    actually disagree: AGW-33 says *if* ``mput`` runs, its local operand
+    goes first; R21 says ``mput`` may not be asked for yet, precisely
+    because -- as :data:`SFTP_MODES` records -- admitting a verb is an
+    operand-order commitment. Driving it through ``sftp_call`` after
+    S19 asserts the allowlist is broken, not that the order is right.
+
+    So the assertion moves down to the table that owns the property.
+    That keeps AGW-33's guarantee live and load-bearing for the day a
+    story admits ``mput``: whoever adds it to :data:`SFTP_MODES` gets a
+    correct operand order already tested, which is the whole reason the
+    table carries a row for a mode nothing dispatches.
+    """
+    client, _ = sftp_request(mode='put', local_path=LOCAL_PATH)
+
+    assert client._operands('mput') == (LOCAL_PATH, REMOTE_PATH)
+    assert client._operands('put') == (LOCAL_PATH, REMOTE_PATH)
+    assert client._operands('get') == (REMOTE_PATH, LOCAL_PATH)
 
 
 async def test_agw33_a_download_keeps_remote_first(
@@ -1485,3 +1497,117 @@ async def test_r22_an_option_asyncssh_would_refuse_is_still_refused(
             mode='get',
             local_path=str(tmp_path / 'f'),
             additional_arguments={'no_such_option': True})
+
+
+# --- the verb allowlist (R21-AC1,2 · R17-AC7) -------------------------------
+
+
+@pytest.mark.parametrize(
+    'mode',
+    [
+        pytest.param('rmtree', id='destructive-not-admitted'),
+        pytest.param('exit', id='session-attribute'),
+        pytest.param('mget', id='real-but-not-admitted'),
+        pytest.param('gett', id='typo'),
+    ],
+)
+async def test_r17_ac7_an_unadmitted_mode_is_refused_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: Text,
+) -> None:
+    """An unknown mode is CONFIG, and the allowed set is named.
+
+    ``rmtree`` is the row that matters most. It is a real, recursive,
+    destructive method of ``asyncssh.SFTPClient``, and the unbounded
+    ``getattr`` this replaces resolved it happily -- so a caller one
+    character away from ``remove`` deleted a tree. The spec is explicit
+    that this crosses no privilege boundary (a caller who can ask for
+    ``remove`` can ask for ``rmtree``), which is exactly why the fix is
+    an allowlist rather than a permission check: the defect is an
+    unbounded capability surface, and bounding it is the whole remedy.
+    """
+    trusting_double(monkeypatch)
+
+    envelope = await sftp_call(mode=mode, host_key=SERVER_HOST_KEY)
+
+    assert envelope['ok'] is False
+    assert envelope['error'] is not None
+    assert envelope['error']['code'] == 'CONFIG'
+    assert envelope['status_code'] == 400
+    assert repr(mode) in envelope['error']['message']
+    for allowed in ('get', 'put', 'remove'):
+        assert allowed in envelope['error']['message']
+
+
+async def test_an_unadmitted_mode_runs_nothing_on_the_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed: ``rmtree`` is refused before the channel is addressed.
+
+    The envelope assertion above would hold just as well for a check
+    placed after the attribute was resolved. This one would not: the stub
+    records every operation asked of it, so an empty log is what
+    distinguishes "refused the name" from "resolved the name and then
+    declined to call it".
+
+    ``lstat`` and ``listdir`` still run -- they are the session prologue,
+    not the caller's operation -- so the assertion names the operation
+    rather than requiring silence.
+    """
+    double = trusting_double(monkeypatch)
+
+    envelope = await sftp_call(mode='rmtree', host_key=SERVER_HOST_KEY)
+
+    assert envelope['ok'] is False
+    assert 'rmtree' not in double.sftp.names()
+
+
+@pytest.mark.parametrize(
+    'mode',
+    [
+        pytest.param(' get ', id='surrounding-whitespace'),
+        pytest.param('GET', id='upper'),
+        pytest.param('Get', id='mixed'),
+    ],
+)
+async def test_an_admitted_mode_is_matched_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: Text,
+) -> None:
+    """One reading of a verb, matching the protocol name's (R21).
+
+    The normalisation has to reach the ``RECURSING_MODES`` test too, not
+    only the allowlist: ``'GET'`` admitted by a case-insensitive
+    allowlist but compared case-sensitively against the recursing set
+    would run a directory ``get`` without ``recurse``, which is the
+    silent half-failure the two lookups agreeing prevents.
+    """
+    double = trusting_double(monkeypatch)
+
+    envelope = await sftp_call(
+        mode=mode, local_path=LOCAL_PATH, host_key=SERVER_HOST_KEY)
+
+    assert envelope['ok'] is True
+    assert 'get' in double.sftp.names()
+
+
+async def test_a_normalised_mode_still_selects_the_recursing_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``'GET'`` on a directory recurses exactly as ``'get'`` does.
+
+    The companion to the case test above, and the reason the mode is
+    normalised once and read twice rather than lower-cased at the
+    allowlist alone. Delete the ``.strip().lower()`` feeding the
+    ``RECURSING_MODES`` test and this goes red while every other SFTP
+    test stays green.
+    """
+    double = trusting_double(
+        monkeypatch, StubSFTPClient(attrs=DIRECTORY_ATTRS))
+
+    envelope = await sftp_call(
+        mode='GET', local_path=LOCAL_PATH, host_key=SERVER_HOST_KEY)
+
+    assert envelope['ok'] is True
+    options = {name: kwargs for name, _, kwargs in double.sftp.calls}
+    assert options['get'].get('recurse') is True

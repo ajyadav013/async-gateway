@@ -50,8 +50,10 @@ from async_gateway.utils.exceptions import (
     SerializationError,
     TlsError,
     TransportError,
+    UnsupportedVerbError,
     unwrap_cause,
 )
+from async_gateway.utils.http_file_config import HTTP_VERBS
 from async_gateway.utils.redaction import (
     redact_cookies,
     redact_headers,
@@ -129,6 +131,53 @@ def validated_json_serializer(serialization: JsonSerializer) -> JsonSerializer:
             f'{getattr(serialization, "__name__", serialization)!r} '
             f'returned {type(probe).__name__}')
     return serialization
+
+
+def validated_request_type(request_type: Any) -> Text:
+    """Return ``request_type`` once the HTTP allowlist admits it.
+
+    R21's allowlist decision for the HTTP family, asked here rather than
+    at the transport's own ``resolve_verb`` call for the reason R11 gives
+    generally: a caller's configuration is judged once, where the
+    caller's values are first read. The placement is what decides how the
+    caller hears about it. This constructor runs *outside* the entry
+    point's ``AsyncGatewayError`` block, so a bad verb escapes
+    synchronously and unlogged, before a socket is opened -- which is the
+    contract ``request()`` documents for every other configuration error,
+    and which the transport-level check cannot honour because by then the
+    call is inside the block that turns a raise into an envelope.
+
+    The transport still checks. That is not redundancy: it runs per
+    redirect hop against a verb ``after_redirect`` may have rewritten,
+    and it also guards the two file paths that never construct an
+    ``HttpRequest`` at all.
+
+    Args:
+        request_type: ``protocol_info['request_type']`` exactly as the
+            caller supplied it, of whatever type they passed.
+
+    Returns:
+        The verb unchanged, in the caller's own spelling. Not normalised:
+        it is echoed back in ``protocol_details`` and in the
+        ``HttpStatusError`` message, and a caller who wrote ``'Post'``
+        should read ``'Post'`` there. Every *use* of it lower-cases at
+        the point of use, which is what makes the two safe to differ.
+
+    Raises:
+        UnsupportedVerbError: If it names no verb in
+            :data:`~async_gateway.utils.http_file_config.HTTP_VERBS`.
+            ``request_type='close'`` is the documented case: it used to
+            resolve to ``ClientSession.close(url, **filters)`` and raise
+            a ``TypeError`` that belonged to no transport family and was
+            reported as a fabricated status (M25).
+    """
+    name = (request_type.strip().lower()
+            if isinstance(request_type, str) else None)
+    if not name or name not in HTTP_VERBS:
+        raise UnsupportedVerbError(
+            f'protocol_info["request_type"] must name one of '
+            f'{sorted(HTTP_VERBS)}, got {request_type!r}')
+    return request_type
 
 
 def validated_upload_config(
@@ -676,7 +725,9 @@ class HttpRequest(BaseRequestClass):
                 "max_redirects" that is not a non-negative int; a
                 "timeout" that is not a positive number of seconds; or an
                 "allowed_schemes" that is not a non-empty collection of
-                scheme names. All are raised here, in the
+                scheme names. ``UnsupportedVerbError`` -- a
+                ``ConfigurationError`` -- for a "request_type" naming no
+                verb in the R21 allowlist. All are raised here, in the
                 constructor, because
                 the entry point builds the protocol object *outside* the
                 block that converts an ``AsyncGatewayError`` into an
@@ -686,7 +737,8 @@ class HttpRequest(BaseRequestClass):
         """
         super(HttpRequest, self).__init__(*args, **kwargs)
 
-        self.request_type: Text = self.info['request_type']
+        self.request_type: Text = validated_request_type(
+            self.info['request_type'])
         self.cookies: Any = self.info.get('cookies')
         self.headers: Dict = self.info.get('headers', {})
         self.verify_ssl: bool = self.info.get('verify_ssl', True)

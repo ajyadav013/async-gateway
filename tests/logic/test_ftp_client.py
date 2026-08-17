@@ -936,3 +936,97 @@ async def test_r22_a_downloaded_file_is_not_world_readable(
 
     mode = (target / 'tree' / 'harmless.txt').stat().st_mode & 0o777
     assert mode == 0o600
+
+
+# --- the verb allowlist (R21-AC1,2 · R15-AC8) -------------------------------
+
+
+@pytest.mark.parametrize(
+    'command',
+    [
+        pytest.param('close', id='session-attribute'),
+        pytest.param('list', id='real-but-not-admitted'),
+        pytest.param('downlaod', id='typo'),
+        pytest.param('', id='empty'),
+        pytest.param(None, id='absent'),
+        pytest.param(42, id='not-a-string'),
+    ],
+)
+async def test_an_unadmitted_command_is_refused_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+    command: Any,
+) -> None:
+    """R15-AC8: an unknown command is CONFIG, not a fabricated status.
+
+    The rows are the four shapes the unbounded ``getattr`` failed open
+    on, and they failed differently, which is why they are all here.
+    ``close`` and ``list`` are real attributes of a connected
+    ``aioftp.Client``, so the lookup *succeeded* and the caller reached a
+    method this library never meant to expose; the typo raised an
+    ``AttributeError``; ``None`` died on ``None.lower()`` before the
+    lookup. All four are now one answer.
+
+    The message must name the allowed set. A rejection that says only
+    "bad command" leaves a caller guessing at the spelling, which is the
+    difference between a fail-closed guardrail and an obstacle.
+    """
+    install_ftp_double(monkeypatch)
+
+    result = await ftp_call(command=command)
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == 'CONFIG'
+    assert result['status_code'] == 400
+    assert repr(command) in result['error']['message']
+    for allowed in ('download', 'upload', 'remove'):
+        assert allowed in result['error']['message']
+
+
+async def test_an_unadmitted_command_never_reaches_the_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed: the refusal happens before the attribute is read.
+
+    The property this criterion is really about. Asserting only that the
+    envelope says CONFIG would pass just as well against a check placed
+    *after* ``getattr`` resolved the caller's name -- and the whole
+    finding (M25) is that resolving it at all is the capability surface.
+    ``RecordingFTPClient`` records every command it is asked for, so an
+    empty log is the proof that nothing was addressed on it.
+    """
+    client = RecordingFTPClient()
+    install_ftp_double(monkeypatch, client=client)
+
+    result = await ftp_call(command='close')
+
+    assert result['ok'] is False
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    'command',
+    [
+        pytest.param(' download ', id='surrounding-whitespace'),
+        pytest.param('DOWNLOAD', id='upper'),
+        pytest.param('Download', id='mixed'),
+    ],
+)
+async def test_an_admitted_command_is_matched_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch,
+    command: Text,
+) -> None:
+    """Normalisation matches the protocol name's, per R21's edge cases.
+
+    One reading of a verb across the library, so a caller who writes
+    ``'DOWNLOAD'`` -- as the README's own prose spells FTP commands --
+    is not refused by the allowlist for a difference in case that every
+    other lookup here already ignores.
+    """
+    client = RecordingFTPClient()
+    install_ftp_double(monkeypatch, client=client)
+
+    result = await ftp_call(command=command, client_path='/tmp/f')
+
+    assert result['ok'] is True
+    assert [name for name, _ in client.calls] == ['download', 'stat']

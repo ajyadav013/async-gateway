@@ -25,6 +25,7 @@ from async_gateway.utils.constants import (DEFAULT_PORTS, HTTP_TIMEOUT,
                                            UNKNOWN_PORT)
 from async_gateway.utils.envelope import GatewayResponse
 from async_gateway.utils.exceptions import ConfigurationError
+from async_gateway.utils.http_file_config import resolve_verb
 
 
 def validated_protocol_info(
@@ -210,6 +211,46 @@ class BaseRequestClass(abc.ABC):
             ),
             self.circuit_breaker_config,
         )
+
+    def resolve_verb(
+        self,
+        client: Any,
+        verb: Any,
+        *,
+        allowed: Collection[Text],
+        setting: Text,
+    ) -> Any:
+        """Return the operation ``verb`` names, once the allowlist admits it.
+
+        The contract R21 puts on this base class, so every protocol
+        subclass reaches a caller-named operation the same way and no
+        subclass has to remember to check first. The rule the check
+        enforces is that the allowlist is consulted *in the same
+        function* as the attribute read, which is what a shared
+        implementation gives and a per-subclass one only promises.
+
+        Which verbs a protocol admits is the protocol's own knowledge and
+        is passed in, exactly as
+        :attr:`BaseRequestClass.REQUIRED_INFO_KEYS` is declared by the
+        subclass: this class holds the *mechanism* and names no verb of
+        any protocol.
+
+        Args:
+            client: The transport client the operation is read off.
+            verb: The verb exactly as the caller supplied it.
+            allowed: The verbs this protocol admits, lower-cased.
+            setting: The ``protocol_info`` key the verb came from.
+
+        Returns:
+            The bound operation, ready to call.
+
+        Raises:
+            UnsupportedVerbError: If ``verb`` names nothing in
+                ``allowed``. A ``ConfigurationError``, so a subclass
+                raising it from inside ``handle_request`` reports
+                ``CONFIG``/400.
+        """
+        return resolve_verb(client, verb, allowed=allowed, setting=setting)
 
     @abc.abstractmethod
     async def handle_request(self) -> GatewayResponse:

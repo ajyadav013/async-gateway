@@ -7,10 +7,19 @@ them and ``helpers/`` may import ``utils/`` while the reverse direction
 would be a layering inversion. One implementation means the transport
 boundary and this module cannot disagree about what "too large" is, or
 report it differently when they refuse (R14).
+
+:func:`resolve_verb` is here for that same layering reason, and it is the
+more load-bearing case. R21's rule is that *no* caller-named verb reaches
+``getattr`` without an allowlist consulted in the same function, and the
+five sites that did span both layers: two in ``helpers/`` (the transport
+loop and the protocol classes' shared base) and one here. A second
+implementation for the ``utils/`` side is how one of them comes to admit
+what the other refuses, which is the whole defect (M25) reopened under a
+different name.
 """
 
-from collections.abc import AsyncIterator, Mapping
-from typing import Optional, Text
+from collections.abc import AsyncIterator, Collection, Mapping
+from typing import Any, Final, Optional, Text
 
 import aioboto3
 import aiohttp
@@ -21,8 +30,111 @@ from .constants import (
     MAX_RESPONSE_BYTES,
     STATUS_CODE_403,
 )
-from .exceptions import HttpStatusError, ResponseTooLargeError
+from .exceptions import (
+    HttpStatusError,
+    ResponseTooLargeError,
+    UnsupportedVerbError,
+)
 from .paths import resolve_caller_path, safe_unlink, safe_writer
+
+#: The HTTP methods this library will dispatch on, and the whole of what
+#: ``request_type`` may name. Every one is a method ``aiohttp.ClientSession``
+#: exposes as a request shortcut, so the allowlist and the transport agree
+#: by construction rather than by two lists being kept in step.
+#:
+#: What it excludes is the point. ``ClientSession`` carries ``close``,
+#: ``ws_connect``, ``detach`` and every other attribute of a live session
+#: object, and an unbounded ``getattr`` reached all of them: the documented
+#: failure is ``request_type='close'``, which resolved to
+#: ``ClientSession.close(url, **filters)`` and produced a ``TypeError`` the
+#: envelope reported as a fabricated status rather than as the caller's
+#: configuration error it is (M25).
+#:
+#: ``head`` is admitted and the README's table does not yet list it. That
+#: is a documentation gap for R29 to close from this set -- the allowlist
+#: is the source (R21-AC3) -- and not a licence to narrow the set: ``HEAD``
+#: is an ordinary HTTP method that works today, and refusing it here would
+#: turn a documentation fix into a breaking change for every caller
+#: probing a resource without fetching it.
+HTTP_VERBS: Final[frozenset[Text]] = frozenset(
+    {'delete', 'get', 'head', 'options', 'patch', 'post', 'put'})
+
+
+def resolve_verb(
+    client: Any,
+    verb: Any,
+    *,
+    allowed: Collection[Text],
+    setting: Text,
+) -> Any:
+    """Return the operation ``verb`` names, once the allowlist admits it.
+
+    The one answer to "which attribute of a client object may a caller
+    reach by name", called from every site that used to reach one with a
+    bare ``getattr`` (M25). Those sites named an attribute of a live
+    ``aiohttp``, ``aioftp`` or ``asyncssh`` object from a caller-supplied
+    string with nothing consulted in between, so the surface a caller
+    could address was the client class's whole public API and a typo
+    failed *open* -- into whatever else that name happened to mean.
+
+    Fail closed is the property, and it is why the allowlist is checked
+    before the attribute is read rather than after: a name the allowlist
+    does not carry is refused without ``client`` being touched at all, so
+    there is no ordering in which a refused name still resolves to
+    something.
+
+    Normalisation matches the rest of the library: surrounding whitespace
+    is stripped and the name is lower-cased, the same reading
+    :func:`~async_gateway.helpers.internal.filters_helper.is_get` and
+    :func:`~async_gateway.async_gateway.resolve_protocol` take, so
+    ``' GET '`` and ``'get'`` are one verb here exactly as they are one
+    verb there.
+
+    Args:
+        client: The transport client the operation is read off -- an
+            ``aiohttp.ClientSession``, an ``aioftp.Client`` or an
+            ``asyncssh.SFTPClient``.
+        verb: The verb exactly as the caller supplied it, of whatever
+            type they actually passed. None and non-strings arrive here
+            in practice and are refused rather than crashing on
+            ``.lower()``.
+        allowed: The verbs this protocol admits, already lower-cased.
+        setting: The ``protocol_info`` key the verb came from, named in
+            the failure so the caller is told which of their own keys to
+            fix rather than being told a verb is wrong somewhere.
+
+    Returns:
+        The bound operation, ready to call.
+
+    Raises:
+        UnsupportedVerbError: If ``verb`` is not a non-empty string, or
+            names nothing in ``allowed``. The message names the verb and
+            lists every allowed value, because a rejection that does not
+            say what *was* acceptable leaves the caller guessing at the
+            spelling. It is a ``ConfigurationError`` subclass, so it
+            carries ``CONFIG``/400 and is reported as the caller's own
+            error and not as a failure of the remote side.
+    """
+    name = verb.strip().lower() if isinstance(verb, str) else None
+    if not name or name not in allowed:
+        raise UnsupportedVerbError(
+            f'protocol_info[{setting!r}] must name one of '
+            f'{sorted(allowed)}, got {verb!r}')
+
+    operation = getattr(client, name, None)
+    if not callable(operation):
+        # Reachable only if an allowlist names something the installed
+        # transport library does not offer as an operation -- a version
+        # skew, not a caller error. Refused rather than returned, because
+        # the alternative is an `AttributeError` or a "not callable" from
+        # somewhere further in, raised against a caller who supplied a
+        # verb this library told them was allowed.
+        raise UnsupportedVerbError(
+            f'protocol_info[{setting!r}]={verb!r} is allowed but '
+            f'{type(client).__name__} offers no callable {name!r}; the '
+            f'installed transport library does not support it')
+    return operation
+
 
 #: The response header that declares a body's length before it is read.
 #: Matched case-insensitively, because a plain ``dict`` of headers does not
@@ -225,6 +337,11 @@ async def download_file_from_url(
         link, or names a directory rather than a file.
     :raises ConfigurationError: if ``local_filepath`` already exists and
         ``overwrite`` is False.
+    :raises UnsupportedVerbError: if ``request_type`` names no verb in
+        :data:`HTTP_VERBS`. Fail closed (R21): the unbounded ``getattr``
+        this replaces reached every attribute of the open session, so
+        ``request_type='close'`` resolved to ``ClientSession.close`` and
+        died inside the transport instead of being refused by name.
     """
     if headers is None:
         headers = {}
@@ -233,7 +350,9 @@ async def download_file_from_url(
         total=HTTP_TIMEOUT if timeout is None else timeout)
     async with aiohttp.ClientSession(
             headers=headers, timeout=client_timeout) as session:
-        request_obj = getattr(session, request_type.lower())
+        request_obj = resolve_verb(
+            session, request_type, allowed=HTTP_VERBS,
+            setting='request_type')
         session_obj = request_obj(file_download_path)
         async with session_obj as response:
             if response.status == STATUS_CODE_403:

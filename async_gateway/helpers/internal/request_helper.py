@@ -70,8 +70,10 @@ from async_gateway.utils.exceptions import (
     TransportError,
 )
 from async_gateway.utils.http_file_config import (
+    HTTP_VERBS,
     guard_declared_length,
     iter_capped,
+    resolve_verb,
     response_too_large,
 )
 from async_gateway.utils.paths import resolve_caller_path, safe_writer
@@ -197,6 +199,8 @@ async def fetch_file(file_config: Dict):
     :raises PathContainmentError: if ``local_filepath`` is a symbolic
     link, or names a directory rather than a file.
     :raises ConfigurationError: if it exists and ``overwrite`` is False.
+    :raises UnsupportedVerbError: If ``request_type`` names no verb in
+    ``HTTP_VERBS``.
     """
     if file_config.get('s3_config'):
         await download_file_from_s3(
@@ -210,7 +214,16 @@ async def fetch_file(file_config: Dict):
         async with aiohttp.ClientSession(
                 headers=file_config.get('headers'),
                 timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as session:
-            request_obj = getattr(session, request_type.lower())
+            # R21 covers this site too, even though R25 deletes the whole
+            # function one story later. Leaving the *last* unbounded
+            # `getattr` behind on the grounds that it is scheduled for
+            # removal is how the grep this criterion is written against
+            # comes back non-empty, and it would make the story's own
+            # claim -- that no caller-named verb reaches an attribute
+            # unchecked -- false for as long as the deletion is pending.
+            request_obj = resolve_verb(
+                session, request_type, allowed=HTTP_VERBS,
+                setting='request_type')
             session_obj = request_obj(file_config['file_download_path'])
             async with session_obj as response:
                 contents = await response.content.read()
@@ -854,7 +867,16 @@ async def make_http_request(
     # it followed, and `aiohttp` reported `is_redirect` True on all three.
     try:
         while True:
-            request_obj = getattr(session, verb.lower())
+            # Checked on every hop rather than once before the loop, and
+            # that is not belt-and-braces: `after_redirect` *rewrites*
+            # `verb` -- a 303 turns any verb into a GET -- so the name
+            # resolved here on hop two is not always the one the caller
+            # supplied, and a check that ran only on the way in would be
+            # checking a value this loop then replaced. Both readings are
+            # in `HTTP_VERBS`, so the repeat costs a set membership test
+            # per hop and closes the case where they would not be (R21).
+            request_obj = resolve_verb(
+                session, verb, allowed=HTTP_VERBS, setting='request_type')
             session_obj = request_obj(
                 target,
                 allow_redirects=False,
