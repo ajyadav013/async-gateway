@@ -242,6 +242,43 @@ async def test_behaviour_2_a_caller_named_abortable_also_aborts() -> None:
     assert subject.failures == 0
 
 
+async def test_behaviour_1_a_caller_named_retriable_list_excludes_others(
+) -> None:
+    """A caller who names ``retriable_exceptions`` excludes everything else.
+
+    The delegated classifier's *matching* branch, which nothing else in
+    the suite reached. Step 22's costing found
+    ``retry_policy.py:136`` -- the ``any(isinstance(...))`` that answers
+    "is this one of the caller's retriable classes?" -- never executed:
+    every other test leaves ``retriable_exceptions`` unset, so
+    classification short-circuits at ``:133`` on the ``is None`` guard
+    and returns True without consulting a list. Replacing line 136 with
+    ``return False`` therefore left the whole suite green, which means
+    half of the residual this ADR is costing was being paid for and not
+    exercised.
+
+    Two calls, one breaker config, so the assertion is about the list and
+    not about the budget: a ``Boom`` is named retriable and is retried; a
+    ``ConnectionResetError`` -- retriable to the *facade*, since it is an
+    ``OSError``, but absent from the caller's list -- is not.
+    """
+    named = counting(Boom('named retriable'), succeed_after=1)
+    subject = breaker(
+        maximum_failures=99,
+        retry_config={'name': 'r', 'allowed_retries': 3, 'delay': 0.1,
+                      'retriable_exceptions': [Boom]})
+
+    assert await subject.run(named) == 'ok'
+    assert named.calls == 2
+
+    unnamed = counting(ConnectionResetError('not on the list'),
+                       succeed_after=1)
+    with pytest.raises(RetriesExhausted):
+        await subject.run(unnamed)
+
+    assert unnamed.calls == 1
+
+
 async def test_a_library_bug_is_not_a_transport_failure() -> None:
     """A ``KeyError`` is this package's bug and propagates untouched.
 
