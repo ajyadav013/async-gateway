@@ -1,23 +1,29 @@
 # AGW-30: Correct the repository's own agent-facing instructions
 
-- **Status:** OPEN
+- **Status:** DONE (commit `7f87275`)
 - **Story:** S30 — spec Step 29, size S (`docs/specs/v1_release_stories.md` §4, Phase 7). *Free-floating lane: fully file-disjoint from all 31 other stories (§7) — developable in any wave from W0 onward, merged at step-order position 29.*
 - **Spec:** `docs/specs/v1_release_spec.md` — R32 all (Group N — Documentation)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation
-- **Decisions:** none — **blocked on the human answer to OQ8** (see the gate box below)
+- **Decisions:** OQ8 **approved by the human on 2026-08-16**, scoped to the stack-specific sections
 - **Files (declared scope):** ~`CLAUDE.md`, `.claude/rules/fastapi-patterns.md`
 
-> ## 🚦 HUMAN GATE — OQ8 (`docs/specs/v1_release_spec.md` §Open questions, OQ8)
+> ## ✅ HUMAN GATE — OQ8: **APPROVED** (2026-08-16)
 >
 > **Question:** *"approve the edit, or decline and accept that every future agent session starts from a
 > wrong command block."* Both files describe a FastAPI service (`uvicorn app.main:app`, `ruff`, an
 > `app/` package, a router → service → repository recipe) that this library does not have, and both are
 > on the **project-wide-files list requiring explicit approval**. *(Spec recommendation: approve.)*
 >
-> **When it must be answered (§9):** *"Before W22."*
+> **Answer:** **approved**, before the edit was made, scoped to the stack-specific sections; the
+> agnostic SDLC content was left untouched. Recorded in the commit body of `7f87275`.
 >
-> **If unanswered / declined (§9, verbatim):** *"MG7 is recorded **'rejected by human'** in the
-> traceability table — **not silently dropped**."* This ticket then closes as **rejected**, not skipped.
+> **Consequence:** the declined branch below did **not** occur. MG7 is **closed as implemented**, and
+> the "rejected by human" wording the spec pre-committed to is therefore not the outcome to record —
+> see the *Decisions* section.
+>
+> *(Superseded, retained for the audit trail — the pre-answer text read:* "**If unanswered / declined
+> (§9, verbatim):** *MG7 is recorded 'rejected by human' in the traceability table — not silently
+> dropped.* This ticket then closes as **rejected**, not skipped."*)*
 
 ## Why
 
@@ -44,8 +50,47 @@ Closes findings: MG7 *(or records it "rejected by human" if OQ8 declines)*.
 
 ## Decisions
 
-_None recorded yet._
+- **OQ8: approved (2026-08-16), before the edit.** Both files are on the project-wide list, so the
+  approval was obtained first and scoped to the stack-specific sections only; the agnostic SDLC
+  content was not touched. Recorded in the commit body of `7f87275`.
+- **MG7 is recorded as *implemented*, not "rejected by human".** The spec's §9 contingency
+  pre-committed to the rejected wording *if OQ8 went unanswered or was declined*. It was neither, so
+  recording MG7 as rejected would now assert the opposite of what happened. The stale note in
+  `docs/specs/v1_release_spec.md` was corrected alongside this ticket.
+- **The rule file keeps the name `fastapi-patterns.md`.** Its contents describe this library, but
+  `CLAUDE.md` references it by path, so renaming it was outside this story's boundary. The filename
+  is a leftover from the claude-kit template and is retained deliberately.
 
 ## Work Log
 
-_Empty — opened at stage 1g, before implementation._
+**2026-08-16 — OQ8 approved by the human.** Scoped to the stack-specific sections of both
+project-wide files. This is the approval the Definition of Done requires *before* the edit; it
+preceded the commit below.
+
+**2026-08-17 — implemented in commit `7f87275`,** `docs(agents): describe the library this
+repository actually is [AGW-30]`. Three files, +481 lines: `CLAUDE.md` (+301),
+`.claude/rules/fastapi-patterns.md` (+176), `.gitignore` (+4). Only these two agent-facing files
+were added to version control; whether the rest of the claude-kit install should be tracked was left
+as a separate, untaken decision.
+
+The Commands block now names the real commands and — as importantly — the ones that do **not** exist
+here: there is no run command (this is a library, not a service) and no autoformatter is configured.
+It also records that `python -m build` needs `build` installed separately, that `flake8 .` still
+exits non-zero on findings a later story owns, and that `mypy async_gateway` reported clean at the
+time only because `ignore_errors = true` was still set — so a green run would not be mistaken for a
+clean one. The FastAPI resource recipe was replaced by the adding-a-protocol recipe (protocol class →
+registry entry → envelope mapping → error mapping → tests → README section).
+
+**2026-08-18 — ledger corrected to match the tree.** This ticket had remained `OPEN` with an empty
+work log for a story whose code had already shipped, and the spec still carried the pre-committed
+"rejected by human" note. Both were stale, not wrong-in-substance: the audit trail disagreed with the
+repository. Definition of Done re-verified against the working tree at the time of this correction:
+
+```
+grep -cE 'uvicorn|app\.main|ruff|app/' CLAUDE.md                        -> 0
+grep -cE 'uvicorn|app\.main|ruff'      .claude/rules/fastapi-patterns.md -> 0
+grep -c  'no run command'              CLAUDE.md                        -> 1
+```
+
+All four DoD bullets are met, including the approval-recorded-before-the-edit bullet (see the
+2026-08-16 entry). Closes MG7 as **implemented**.

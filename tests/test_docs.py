@@ -1620,26 +1620,53 @@ def test_handle_request_everywhere_returns_the_envelope() -> None:
         f'{wrong}')
 
 
-def test_typing_text_is_not_reintroduced_as_an_alias() -> None:
-    """``typing.Text`` is used as ``Text``, never re-exported as its own.
+def test_typing_text_appears_nowhere() -> None:
+    """``typing.Text`` is gone from the package: no import, no use.
 
-    R30 retires ``typing.Text`` -- a Python 2 compatibility alias for
-    ``str`` that has been redundant since Python 3.0. The package still
-    imports it widely and that is a separate, mechanical rename this
-    story does not perform; what this guards is the shape that would
-    make the rename harder: a module defining its own ``Text = ...``
-    alias, so a later ``grep`` for the import misses a use site.
+    R30's criterion is unconditional -- "``typing.Text`` appears
+    nowhere". ``Text`` is a Python 2 compatibility alias that has been
+    exactly ``str`` since Python 3.0, so retiring it is a pure
+    mechanical substitution with no type change; ``mypy`` reporting
+    clean across the substitution is the proof of that.
+
+    This enforces the criterion as written, in the three shapes that
+    could reintroduce it:
+
+    * ``from typing import Text`` -- the import itself,
+    * ``Text`` used as a name (an annotation, a subscript, a base) --
+      which after the substitution can only come from a fresh import,
+    * ``Text = ...`` -- a module defining its own alias, which would
+      hide a use from a ``grep`` for the import.
+
+    It deliberately walks the AST rather than grepping the text, so
+    that the SOAP client's genuine ``Reason/Text`` element name and
+    the English word "Text" in prose are not false positives -- they
+    are string and comment content, never a ``Name`` node.
     """
-    findings = [
-        Finding(f'{relative(path)}:{node.lineno}', 'Text',
-                'module defines its own "Text" alias, which hides a '
-                'typing.Text use from the rename that retires it')
-        for path in module_paths()
-        for node in ast.walk(parse(path))
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == 'Text'
-                for target in node.targets)
-    ]
+    findings: List[Finding] = []
+
+    for path in module_paths():
+        tree = parse(path)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.ImportFrom)
+                    and node.module == 'typing'
+                    and any(alias.name == 'Text' for alias in node.names)):
+                findings.append(Finding(
+                    f'{relative(path)}:{node.lineno}', 'Text',
+                    'imports typing.Text, which R30 retires; it is an '
+                    'alias for str and must be spelled str'))
+            elif isinstance(node, ast.Name) and node.id == 'Text':
+                findings.append(Finding(
+                    f'{relative(path)}:{node.lineno}', 'Text',
+                    'uses the name Text as a type; R30 requires str'))
+            elif (isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name)
+                            and target.id == 'Text'
+                            for target in node.targets)):
+                findings.append(Finding(
+                    f'{relative(path)}:{node.lineno}', 'Text',
+                    'module defines its own "Text" alias, which hides a '
+                    'typing.Text use from the rename that retires it'))
 
     assert not findings, _report(findings)
 

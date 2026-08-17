@@ -49,7 +49,6 @@ from typing import (
     Final,
     Mapping,
     Optional,
-    Text,
     Tuple,
 )
 
@@ -71,10 +70,10 @@ from async_gateway.utils.paths import (
 #: Only these get the guarded opener: an ``upload`` reads its local
 #: source, and applying ``O_EXCL`` to that would refuse every file that
 #: exists, which is all of them.
-WRITING_MODES: Final[frozenset[Text]] = frozenset({'w', 'x', 'a'})
+WRITING_MODES: Final[frozenset[str]] = frozenset({'w', 'x', 'a'})
 
 
-def _writes(mode: Text) -> bool:
+def _writes(mode: str) -> bool:
     """Report whether an open mode creates or modifies a file.
 
     Args:
@@ -86,7 +85,7 @@ def _writes(mode: Text) -> bool:
     return bool(mode) and mode[0] in WRITING_MODES
 
 
-def _shown(path: BytesOrPathLike) -> Text:
+def _shown(path: BytesOrPathLike) -> str:
     """Render a path for a diagnostic message.
 
     Pure string work -- ``os.fsdecode`` touches no filesystem -- but the
@@ -106,7 +105,7 @@ def _shown(path: BytesOrPathLike) -> Text:
     return os.fsdecode(path)
 
 
-def _open_guarded(path: Path, mode: Text, overwrite: bool) -> io.BytesIO:
+def _open_guarded(path: Path, mode: str, overwrite: bool) -> io.BytesIO:
     """Open ``path`` synchronously with the containment flags applied.
 
     Blocking by design: both callers already run their opens in a
@@ -354,7 +353,7 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
     async def _open(  # type: ignore[override]
         self,
         path: Path,
-        mode: Text = 'rb',
+        mode: str = 'rb',
         **kwargs: Any,
     ) -> io.BytesIO:
         """Open a contained path, under the write guarantees for a write.
@@ -667,7 +666,7 @@ class ContainedLocalFS:
     async def open(
         self,
         path: bytes,
-        mode: Text,
+        mode: str,
         block_size: int = -1,
     ) -> LocalFile:
         """Open a contained local path, guarded when it is a write.
@@ -721,7 +720,7 @@ def _make_sparse(handle: io.BytesIO) -> None:
 #: The download modes, and whether each expands a glob in its remote
 #: operand. Read off asyncssh's own call sites: ``get`` passes
 #: ``expand_glob=False`` to ``_begin_copy`` and ``mget`` passes True.
-GLOB_EXPANDING: Final[Mapping[Text, bool]] = MappingProxyType({
+GLOB_EXPANDING: Final[Mapping[str, bool]] = MappingProxyType({
     'get': False,
     'mget': True,
 })
@@ -731,7 +730,7 @@ GLOB_EXPANDING: Final[Mapping[Text, bool]] = MappingProxyType({
 #: They are exactly the keyword-only parameters of ``get`` -- which is
 #: what lets a caller's options be validated against the *public*
 #: signature and then forwarded to the private one positionally.
-COPY_OPTIONS: Final[Tuple[Text, ...]] = (
+COPY_OPTIONS: Final[Tuple[str, ...]] = (
     'preserve',
     'recurse',
     'follow_symlinks',
@@ -745,7 +744,7 @@ COPY_OPTIONS: Final[Tuple[Text, ...]] = (
 
 async def contained_download(
     sftp: Any,
-    mode: Text,
+    mode: str,
     remote_paths: Any,
     local_path: PathLike,
     *,

@@ -11,7 +11,7 @@ failed network call.
 import logging
 import traceback
 from collections.abc import Collection
-from typing import Any, Dict, Final, Optional, Text, Tuple, Union
+from typing import Any, Dict, Final, Optional, Tuple, Union
 from urllib.parse import urlsplit
 
 from async_gateway.helpers.internal.base import (
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # `'HTTPS'` allowing only `https` is the whole of H6: the two names used to
 # map to the same class with nothing distinguishing them, so a caller who
 # explicitly asked for TLS and passed an `http://` URL got silent plaintext.
-HTTP_FAMILY_SCHEMES: Final[dict[Text, frozenset[Text]]] = {
+HTTP_FAMILY_SCHEMES: Final[dict[str, frozenset[str]]] = {
     'HTTP': frozenset({'http', 'https'}),
     'HTTPS': frozenset({'https'}),
 }
@@ -53,7 +53,7 @@ HTTP_FAMILY_SCHEMES: Final[dict[Text, frozenset[Text]]] = {
 
 def resolve_protocol(
     protocol: object,
-) -> Tuple[Text, type[BaseRequestClass]]:
+) -> Tuple[str, type[BaseRequestClass]]:
     """Normalise a caller's protocol name once and find its strategy.
 
     Once, and in one place: the guard and the registry lookup read the same
@@ -86,11 +86,11 @@ def resolve_protocol(
 
 
 def dispatch_url_for(
-    protocol: Text,
-    url: Text,
+    protocol: str,
+    url: str,
     *,
     redact_params: Collection[str] = (),
-) -> Text:
+) -> str:
     """Return the URL this call will be dispatched to, scheme enforced.
 
     A schemeless URL under ``'HTTPS'`` is upgraded rather than rejected:
@@ -143,8 +143,8 @@ def dispatch_url_for(
 
 
 def log_failure(
-    protocol: Text,
-    url: Text,
+    protocol: str,
+    url: str,
     envelope: GatewayResponse,
     exc: AsyncGatewayError,
     redact_query_params: Collection[str] = (),
@@ -209,13 +209,13 @@ def log_failure(
 
 
 async def request(
-        url: Text,
-        data: Optional[Union[Dict, Text]] = None,
+        url: str,
+        data: Optional[Union[Dict, str]] = None,
         auth: object = None,
-        protocol: Text = '',
-        protocol_info: Optional[Dict[Text, Any]] = None,
-        pre_processor_config: Optional[Dict[Text, Any]] = None,
-        post_processor_config: Optional[Dict[Text, Any]] = None,
+        protocol: str = '',
+        protocol_info: Optional[Dict[str, Any]] = None,
+        pre_processor_config: Optional[Dict[str, Any]] = None,
+        post_processor_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
 ) -> GatewayResponse:
     """Multiple protocols.
@@ -369,7 +369,7 @@ async def request(
     # The URL's *scheme* is the one exception and is deliberately not
     # checked here; see FI-14 below.
     protocol_name, protocol_class = resolve_protocol(protocol)
-    info: Dict[Text, Any] = validated_protocol_info(
+    info: Dict[str, Any] = validated_protocol_info(
         protocol_info, required=protocol_class.REQUIRED_INFO_KEYS)
 
     if data is None:

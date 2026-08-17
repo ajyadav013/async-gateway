@@ -766,6 +766,62 @@ def test_examples_ship_in_neither_artifact(tmp_path: Path) -> None:
     assert not in_sdist, f'examples leaked into the sdist: {in_sdist}'
 
 
+def test_the_readme_states_where_the_examples_live() -> None:
+    """The exclusion is documented, not just enforced.
+
+    ``test_examples_ship_in_neither_artifact`` proves ``examples/``
+    stays out of both artifacts. That guarantee is invisible to the one
+    person it affects: a consumer who installs from the wheel, goes
+    looking for the scripts the project wrote for them, and finds
+    nothing on disk with no explanation anywhere in the README.
+
+    So the decision is only half-made until the README says it. This
+    test is the other half, and it is deliberately paired with the
+    artifact test rather than folded into it -- one asserts what the
+    build does, this asserts that the document tells the truth about
+    it. Each can regress without the other: an edit could ship the
+    examples and leave this prose stale, or drop the prose and leave
+    the exclusion unexplained.
+
+    The check is behavioural rather than a fixed-string match: it
+    requires the README to name the directory, point at the repository
+    for it, and state that it is absent from an install -- without
+    prescribing the wording that carries those three facts.
+    """
+    readme = (REPO_ROOT / 'README.md').read_text(encoding='utf-8')
+
+    assert 'examples/' in readme, (
+        'the README never names the examples/ directory, so a consumer '
+        'who cannot find the scripts in their install has nothing to '
+        'read; see test_examples_ship_in_neither_artifact')
+
+    linked = 'github.com/ajyadav013/async-gateway' in readme and (
+        'tree/main/examples' in readme)
+    assert linked, (
+        'the README names examples/ but does not link it in the '
+        'repository, which is the only place a consumer can now read it')
+
+    lowered = readme.lower()
+    states_exclusion = any(
+        phrase in lowered for phrase in (
+            'not** shipped in the wheel',
+            'not shipped in the wheel',
+            'ships in neither',
+            'repository, not in the package',
+        ))
+    assert states_exclusion, (
+        'the README links examples/ but never says they are absent from '
+        'the wheel and the sdist -- the fact a consumer actually trips '
+        'over. Keep the sentence that states it, or change '
+        'test_examples_ship_in_neither_artifact instead')
+
+    for name in EXAMPLE_NAMES:
+        assert name in readme, (
+            f'{name} exists in examples/ but the README does not name '
+            f'it, so it is unreachable for a consumer reading only the '
+            f'installed documentation')
+
+
 def test_py_typed_ships_in_both_artifacts(tmp_path: Path) -> None:
     """R4-AC5: the PEP 561 marker reaches the consumer.
 

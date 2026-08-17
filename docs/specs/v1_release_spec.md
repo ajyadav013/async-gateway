@@ -2101,15 +2101,20 @@ by running a command that cannot exist here.
       appropriate to this repository (adding a protocol: registry entry → protocol class → envelope
       mapping → error mapping → tests → README section).
 - [ ] `grep -n "uvicorn\|app.main\|ruff\|app/" CLAUDE.md` returns no stale command references.
-- [ ] **This edit requires explicit user approval before it is made** — `CLAUDE.md` is on the
+- [x] **This edit requires explicit user approval before it is made** — `CLAUDE.md` is on the
       project-wide-files list in `.claude/rules/mandatory-workflow.md`. The approval is recorded in the
-      ticket work log. Until approved, the requirement is blocked, not skipped.
+      ticket work log. Until approved, the requirement is blocked, not skipped. **Approved 2026-08-16**,
+      before the edit; recorded in `docs/project/tickets/AGW-30-*.md` and in `7f87275`'s commit body.
 
 **Edge Cases**:
-- If the human declines the edit, this requirement is recorded as **rejected by the human**, not
-  silently dropped, and MG7 stays open in the traceability table with that status.
+- ~~If the human declines the edit, this requirement is recorded as **rejected by the human**, not
+  silently dropped, and MG7 stays open in the traceability table with that status.~~ **Did not
+  occur** — OQ8 was **approved on 2026-08-16** and R32 was implemented in commit `7f87275`, so MG7
+  is recorded **implemented**. Struck through rather than deleted: the contingency is part of the
+  audit trail for how the decision was framed before it was answered.
 - The stack overlay rule `.claude/rules/fastapi-patterns.md` is also mismatched to this repository;
-  changing `.claude/rules/*` likewise requires approval and is raised in the same ask.
+  changing `.claude/rules/*` likewise requires approval and is raised in the same ask. *(Also
+  corrected in `7f87275`, under the same approval.)*
 
 ---
 
@@ -2717,13 +2722,20 @@ needed:** retain the upstream copyright line, extend it to name both parties, or
 conservative reading of MIT's "the above copyright notice … shall be included".* **Blocks:** R34; the
 first publish.
 
-**OQ8 — Approval to edit `CLAUDE.md` and `.claude/rules/fastapi-patterns.md`.**
+**OQ8 — Approval to edit `CLAUDE.md` and `.claude/rules/fastapi-patterns.md`. — ANSWERED:
+APPROVED (2026-08-16).**
 Both describe a FastAPI service (`uvicorn app.main:app`, `ruff`, an `app/` package, a router → service
 → repository recipe) that this library does not have, and both are on the project-wide-files list
 requiring explicit approval. **Decision needed:** approve the edit, or decline and accept that every
-future agent session starts from a wrong command block. *Recommendation: approve.* **Blocks:** R32. If
-declined, MG7 stays open in the traceability table with status "rejected by human" — it is not
-silently dropped.
+future agent session starts from a wrong command block. *Recommendation: approve.* **Blocks:** R32.
+
+**Answer: approved**, before the edit was made, scoped to the stack-specific sections; the agnostic
+SDLC content was left untouched. Implemented in commit `7f87275` (S30 / AGW-30), which corrected both
+files. **MG7 is therefore recorded as *implemented*, not "rejected by human"** — the declined branch
+did not occur, and recording it now would assert the opposite of what happened.
+
+*(Superseded contingency, retained for the audit trail: "If declined, MG7 stays open in the
+traceability table with status 'rejected by human' — it is not silently dropped.")*
 
 **OQ9 — Is `logic/*.py` → `logic/*_client.py` acceptable?**
 R27 resolves the `A005` stdlib-shadowing finding (`logic/http.py` shadows stdlib `http`) by renaming
@@ -3769,7 +3781,7 @@ negotiate down.
 
 **Step 27 — Version, provenance, docs scaffolding.** *(R5, R31, R34 · H22, H25, M24 · OQ4, OQ7)*
 **Step 28 — README rewrite, with the compile/import/signature tests.** *(R29 · H24, MG6, MG8)*
-**Step 29 — `CLAUDE.md` commands block** *(R32 · MG7 — **blocked on OQ8 approval**)*
+**Step 29 — `CLAUDE.md` commands block** *(R32 · MG7 — **OQ8 approved 2026-08-16; done in `7f87275`**)*
 **Step 30 — CHANGELOG and examples.** *(R33, R35)*
 **Step 31 — Final gate run and the tag.** *(R1, R4, R5)*
 *Verify:* the five-item PR gate passes on a clean checkout; `v1.0.0` is tagged; nothing is uploaded.

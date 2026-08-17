@@ -330,7 +330,7 @@ Named explicitly, as required. Two concurrent stories may never share any of the
 | **OQ12** — keep-with-facade vs replace vs vendor | **S23** (Step 22) | **At ticket creation (1g)** — it sets S23's file boundary | KEEP → S23 stays docs+CI. REPLACE/VENDOR → **re-plan** (§11-E2). S16's facade proceeds regardless |
 | **OQ4** — the version reset is still a safe one-way door | **S28** (Step 27) | Immediately before S28; re-verify the PyPI 404 and log it | R5's reset becomes impossible; the version must go forward and R8's "breaking is free" argument changes shape |
 | **OQ7** — the LICENSE copyright line | **S28**, read by **S29** | Before W22 (both lanes read the answer) | S28 blocks; an agent cannot make this call |
-| **OQ8** — approval to edit `CLAUDE.md` + `.claude/rules/fastapi-patterns.md` | **S30** (Step 29) | Before W22 | MG7 is recorded **"rejected by human"** in the traceability table — **not silently dropped** |
+| **OQ8** — approval to edit `CLAUDE.md` + `.claude/rules/fastapi-patterns.md` | **S30** (Step 29) | **ANSWERED — APPROVED 2026-08-16** *(was: before W22)* | *Contingency did not fire.* MG7 is recorded **implemented** (commit `7f87275`), **not** "rejected by human" |
 | **OQ3** — `requires-python` floor and the matrix ceiling | S3 / S4 | Before W2 | Defaults to the spec's recommendation (`>=3.10`, maintained list) |
 | OQ1 · OQ2 · OQ5 · OQ6 · OQ10 · OQ11 | ratification only | any time before S32 | Blocks nothing; the spec records the recommendation for each |
 

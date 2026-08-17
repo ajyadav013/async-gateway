@@ -9,7 +9,7 @@ a truncated or HTML response as though the server had answered with an
 empty object.
 """
 
-from typing import Text, Union
+from typing import Union
 
 import orjson
 
@@ -32,7 +32,7 @@ DecodedJsonBody = JsonBody
 
 
 async def application_json_response(
-    response: Union[Text, bytes],
+    response: Union[str, bytes],
 ) -> DecodedJsonBody:
     """Decode a JSON response body.
 

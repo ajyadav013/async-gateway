@@ -19,7 +19,6 @@ from typing import (
     List,
     Optional,
     Sequence,
-    Text,
     Tuple,
 )
 
@@ -69,7 +68,7 @@ from async_gateway.utils.request_tracer import (
     request_tracer,
 )
 
-JsonSerializer = Callable[[Any], Text]
+JsonSerializer = Callable[[Any], str]
 
 # Ordered, because the families overlap: `ServerTimeoutError` is also a
 # `ClientConnectionError`, and `ClientConnectorCertificateError` is also a
@@ -85,7 +84,7 @@ TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
 )
 
 
-def default_json_serialize(obj: Any) -> Text:
+def default_json_serialize(obj: Any) -> str:
     """Serialise ``obj`` to a JSON string.
 
     The default for ``ClientSession(json_serialize=...)``, which requires a
@@ -139,7 +138,7 @@ def validated_json_serializer(serialization: JsonSerializer) -> JsonSerializer:
     return serialization
 
 
-def validated_request_type(request_type: Any) -> Text:
+def validated_request_type(request_type: Any) -> str:
     """Return ``request_type`` once the HTTP allowlist admits it.
 
     R21's allowlist decision for the HTTP family, asked here rather than
@@ -187,9 +186,9 @@ def validated_request_type(request_type: Any) -> Text:
 
 
 def validated_upload_config(
-    http_file_upload_config: Dict[Text, Any],
-    request_type: Text,
-) -> Dict[Text, Any]:
+    http_file_upload_config: Dict[str, Any],
+    request_type: str,
+) -> Dict[str, Any]:
     """Return ``http_file_upload_config`` once proven usable on this verb.
 
     A file upload on a GET had no defined behaviour: a dead ``if ...: pass``
@@ -438,7 +437,7 @@ def validated_max_redirects(max_redirects: object) -> int:
     return max_redirects
 
 
-def validated_allowed_schemes(allowed_schemes: object) -> frozenset[Text]:
+def validated_allowed_schemes(allowed_schemes: object) -> frozenset[str]:
     """Return the scheme allowlist once proven a set of scheme names.
 
     A bare ``str`` is rejected before anything else, because it is the
@@ -477,7 +476,7 @@ def validated_allowed_schemes(allowed_schemes: object) -> frozenset[Text]:
             'protocol_info["allowed_schemes"] must name at least one '
             'scheme; an empty allowlist refuses every url, including the '
             'one the call was made to')
-    names: List[Text] = []
+    names: List[str] = []
     for name in allowed_schemes:
         if not isinstance(name, str):
             raise ConfigurationError(
@@ -530,7 +529,7 @@ def validated_trace_config(
     protocol_info: Dict,
     session: Optional[aiohttp.ClientSession],
     *,
-    redact_params: Collection[Text] = (),
+    redact_params: Collection[str] = (),
 ) -> List[aiohttp.TraceConfig]:
     """Return the tracers to attach, once proven attachable and usable.
 
@@ -621,7 +620,7 @@ def validated_trace_config(
 def trace_collectors_for(
     session: Optional[aiohttp.ClientSession],
     trace_config: Sequence[aiohttp.TraceConfig],
-) -> List[MutableMapping[Text, Any]]:
+) -> List[MutableMapping[str, Any]]:
     """Bind and return the collector mappings this call traces into.
 
     Derived once, in one place, so the collectors the redirect loop
@@ -680,7 +679,7 @@ def trace_collectors_for(
 def transport_error_for(
     err: BaseException,
     *,
-    redact_params: Collection[Text] = (),
+    redact_params: Collection[str] = (),
 ) -> AsyncGatewayError:
     """Return the typed transport error for ``err``, or propagate a bug.
 
@@ -726,7 +725,7 @@ class HttpRequest(BaseRequestClass):
     # There is no default verb to fall back on: a GET assumed for a caller
     # who meant DELETE is worse than a rejected call, so the key is
     # required and `BaseRequestClass` rejects the call without it.
-    REQUIRED_INFO_KEYS: ClassVar[frozenset[Text]] = frozenset(
+    REQUIRED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset(
         {'request_type'})
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -772,7 +771,7 @@ class HttpRequest(BaseRequestClass):
         """
         super(HttpRequest, self).__init__(*args, **kwargs)
 
-        self.request_type: Text = validated_request_type(
+        self.request_type: str = validated_request_type(
             self.info['request_type'])
         self.cookies: Any = self.info.get('cookies')
         self.headers: Dict = self.info.get('headers', {})
@@ -811,15 +810,15 @@ class HttpRequest(BaseRequestClass):
         # refusal names. `reported_collectors` is what the *envelope*
         # reports, deliberately narrower: only the tracers this library
         # attached, so a supplied session still reports `[]`.
-        self.trace_collectors: List[MutableMapping[Text, Any]] = []
-        self.reported_collectors: List[MutableMapping[Text, Any]] = []
+        self.trace_collectors: List[MutableMapping[str, Any]] = []
+        self.reported_collectors: List[MutableMapping[str, Any]] = []
         self.max_response_bytes: int = validated_max_response_bytes(
             self.info.get('max_response_bytes', MAX_RESPONSE_BYTES))
         self.allow_redirects: bool = validated_allow_redirects(
             self.info.get('allow_redirects', True))
         self.max_redirects: int = validated_max_redirects(
             self.info.get('max_redirects', MAX_REDIRECTS))
-        self.allowed_schemes: frozenset[Text] = validated_allowed_schemes(
+        self.allowed_schemes: frozenset[str] = validated_allowed_schemes(
             self.info.get('allowed_schemes', ALLOWED_SCHEMES))
 
     async def handle_request(self) -> GatewayResponse:
@@ -1022,7 +1021,7 @@ class HttpRequest(BaseRequestClass):
         self.response['cookies'] = redact_cookies(result['cookies'])
         self.response['text'] = result['text']
 
-        decode_error: Optional[Text] = result.get('decode_error')
+        decode_error: Optional[str] = result.get('decode_error')
         if decode_error is not None:
             return SerializationError(decode_error)
 

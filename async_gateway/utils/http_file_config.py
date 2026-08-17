@@ -19,7 +19,7 @@ different name.
 """
 
 from collections.abc import AsyncIterator, Collection, Mapping
-from typing import Any, Final, Optional, Text
+from typing import Any, Final, Optional
 
 import aioboto3
 
@@ -60,16 +60,16 @@ from .paths import resolve_caller_path, safe_unlink, safe_writer
 #: is an ordinary HTTP method that works today, and refusing it here would
 #: turn a documentation fix into a breaking change for every caller
 #: probing a resource without fetching it.
-HTTP_VERBS: Final[frozenset[Text]] = frozenset(
+HTTP_VERBS: Final[frozenset[str]] = frozenset(
     {'delete', 'get', 'head', 'options', 'patch', 'post', 'put'})
 
 
 def validated_verb(
     verb: Any,
     *,
-    allowed: Collection[Text],
-    setting: Text,
-) -> Text:
+    allowed: Collection[str],
+    setting: str,
+) -> str:
     """Return the normalised verb, once the allowlist admits the name.
 
     The allowlist half of :func:`resolve_verb`, split out so a protocol
@@ -117,8 +117,8 @@ def resolve_verb(
     client: Any,
     verb: Any,
     *,
-    allowed: Collection[Text],
-    setting: Text,
+    allowed: Collection[str],
+    setting: str,
 ) -> Any:
     """Return the operation ``verb`` names, once the allowlist admits it.
 
@@ -193,7 +193,7 @@ CONTENT_LENGTH_HEADER = 'content-length'
 
 
 def guard_declared_length(
-    headers: Mapping[Text, Text],
+    headers: Mapping[str, str],
     max_response_bytes: int,
 ) -> None:
     """Refuse a response whose declared length already exceeds the cap.
@@ -305,12 +305,12 @@ async def iter_capped(
 
 async def download_file_from_s3(
     *,
-    bucket_name: Text,
-    s3_filepath: Text,
-    local_filepath: Text,
-    access_key: Optional[Text] = None,
-    secret_key: Optional[Text] = None,
-    region: Optional[Text] = None,
+    bucket_name: str,
+    s3_filepath: str,
+    local_filepath: str,
+    access_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    region: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Download an object from AWS S3 to a local path.
@@ -374,10 +374,10 @@ async def download_file_from_s3(
 
 
 async def download_file_from_url(
-        file_download_path: Text,
-        local_filepath: Text,
-        request_type: Text = 'get',
-        headers: Optional[Mapping[Text, Text]] = None,
+        file_download_path: str,
+        local_filepath: str,
+        request_type: str = 'get',
+        headers: Optional[Mapping[str, str]] = None,
         timeout: Optional[float] = None,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
         chunk_size: int = CHUNK_SIZE_CONSTANT,
@@ -482,7 +482,7 @@ async def download_file_from_url(
 
 
 async def delete_local_file_path(
-        local_filepath: Text, **kwargs: Any) -> None:
+        local_filepath: str, **kwargs: Any) -> None:
     """Delete a downloaded file, succeeding when it is already gone.
 
     The unlink goes through ``aiofiles.os`` rather than ``os.remove``:
