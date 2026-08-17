@@ -40,7 +40,10 @@ import aioftp
 
 from failsafe import CircuitOpen, FailsafeError
 
-from async_gateway.helpers.internal.base import BaseRequestClass
+from async_gateway.helpers.internal.base import (
+    BaseRequestClass,
+    credentials_of,
+)
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.contained_io import (
     contained_path_io_factory,
@@ -59,6 +62,7 @@ from async_gateway.utils.exceptions import (
     TransportError,
     unwrap_cause,
 )
+from async_gateway.utils.http_file_config import validated_verb
 from async_gateway.utils.redaction import redact_url, redact_value
 
 logger = logging.getLogger(__name__)
@@ -289,16 +293,27 @@ class FTPRequest(BaseRequestClass):
         Raises:
             ConfigurationError: From the base, if ``info`` is neither
                 None nor a mapping, or omits a key this protocol
-                requires. FTP's own ``command`` is deliberately *not*
-                checked here: it is validated once the request runs,
-                because ``protocol_info`` is optional for this protocol
-                and the object must stay constructible without one.
+                requires; and from
+                :func:`~async_gateway.helpers.internal.base.credentials_of`
+                if ``auth`` carries no credentials, which FTP cannot
+                connect without. Both escape synchronously, because the
+                entry point constructs this object outside its one
+                conversion ``try``. FTP's own ``command`` is deliberately
+                *not* checked here: it is validated once the request
+                runs, because ``protocol_info`` is optional for this
+                protocol and the object must stay constructible without
+                one.
         """
         super(FTPRequest, self).__init__(*args, **kwargs)
 
         self.port: int = self.info.get('port', DEFAULT_FTP_PORT)
-        self.user: Text = self.auth.login
-        self.password: Text = self.auth.password
+        # Not `self.auth.login`: `auth` defaults to None at the entry
+        # point and is documented optional, so the read that looks
+        # unconditional here is the documented default call crashing with
+        # an `AttributeError` that escapes the envelope entirely (H5).
+        self.user: Text
+        self.password: Text
+        self.user, self.password = credentials_of(self.auth, protocol='FTP')
         # Optional, and genuinely so: `protocol_info` is optional for this
         # protocol (R11-AC3), so an `FTPRequest` stays constructible with
         # none of these present. `resolve_verb` is what refuses a missing
@@ -394,7 +409,7 @@ class FTPRequest(BaseRequestClass):
             ConnectError: When the connection is refused or reset.
             TransportError: For any other transport failure.
         """
-        self._validate_server_path()
+        self._validate_request()
         try:
             # Inside the `try`, so a certificate that will not load is
             # reported through the same contract as everything else
@@ -539,8 +554,8 @@ class FTPRequest(BaseRequestClass):
         # blocking builder, for the same reason.
         return await asyncio.to_thread(tls_context_for, ssl_config)
 
-    def _validate_server_path(self) -> None:
-        """Check that the caller named the path on the server.
+    def _validate_request(self) -> None:
+        """Check that the caller named a command and a path to run it on.
 
         Called at the top of :meth:`handle_request` rather than from the
         constructor, and for the same reason ``SFTPRequest`` validates
@@ -548,6 +563,18 @@ class FTPRequest(BaseRequestClass):
         protocol at the entry point (R11-AC3), so an ``FTPRequest`` has
         to remain constructible without one. Called before the connect
         all the same, so nothing is opened for a call that cannot run.
+
+        ``command`` is checked here as well as at the ``getattr`` in
+        :meth:`_run_command`, and the redundancy is the point: the
+        allowlist reading is one function
+        (:func:`~async_gateway.utils.http_file_config.validated_verb`,
+        which ``resolve_verb`` also calls), but deferring the *only*
+        check to the attribute lookup meant an unreachable host reported
+        a caller's typo as ``CONNECT``/502 -- a transport verdict, on a
+        call that could never have run, inviting a retry of a spelling
+        mistake. Checked before the socket, the caller's own error is
+        what they are told about; the lookup keeps its own check so no
+        ordering resolves an unadmitted name against a live client.
 
         Surfaced by removing mypy's ``ignore_errors``: with
         ``server_path`` annotated honestly as ``Optional[Text]``, the
@@ -560,18 +587,23 @@ class FTPRequest(BaseRequestClass):
         reported as the caller's configuration error it is.
 
         Returns:
-            None. Which *commands* are dispatchable is R21's allowlist,
-            checked separately in :meth:`_run_command`; what is checked
-            here is only that there is a remote path to act on.
+            None.
 
         Raises:
             ConfigurationError: If ``server_path`` is absent or is not a
                 non-empty string.
+            UnsupportedVerbError: If ``command`` names nothing in
+                :data:`FTP_COMMANDS` (R15-AC8). A
+                ``ConfigurationError``, so it reaches the caller as a
+                ``CONFIG``/400 envelope like the path rejection beside
+                it.
         """
         if not isinstance(self.server_path, str) or not self.server_path:
             raise ConfigurationError(
                 "protocol_info['server_path'] must be a non-empty string "
                 f'naming the path on the server, got {self.server_path!r}')
+        validated_verb(
+            self.command_, allowed=FTP_COMMANDS, setting='command')
 
     async def _run_command(
         self,

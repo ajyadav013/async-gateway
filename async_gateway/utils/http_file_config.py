@@ -64,6 +64,55 @@ HTTP_VERBS: Final[frozenset[Text]] = frozenset(
     {'delete', 'get', 'head', 'options', 'patch', 'post', 'put'})
 
 
+def validated_verb(
+    verb: Any,
+    *,
+    allowed: Collection[Text],
+    setting: Text,
+) -> Text:
+    """Return the normalised verb, once the allowlist admits the name.
+
+    The allowlist half of :func:`resolve_verb`, split out so a protocol
+    that connects before it dispatches can refuse an inadmissible name
+    *before* opening the session, and still refuse it against the same
+    set and with the same message. ``resolve_verb`` calls this rather
+    than repeating the check, so there is one allowlist reading and not
+    two that can drift.
+
+    The split exists because deferring the whole check to the attribute
+    lookup meant a caller's configuration mistake was reported as
+    whatever the *connect* did first: an unreachable host turned an
+    unknown FTP ``command`` into ``CONNECT``/502, and an SFTP ``mode``
+    typo into ``HOST_KEY``/495 -- transport verdicts, on calls that could
+    never have run, telling the caller to retry their own typo.
+
+    Args:
+        verb: The verb exactly as the caller supplied it, of whatever
+            type they actually passed. None and non-strings arrive here
+            in practice and are refused rather than crashing on
+            ``.lower()``.
+        allowed: The verbs this protocol admits, already lower-cased.
+        setting: The ``protocol_info`` key the verb came from, named in
+            the failure so the caller is told which of their own keys to
+            fix.
+
+    Returns:
+        The verb, stripped and lower-cased -- the spelling the transport
+        client is addressed by.
+
+    Raises:
+        UnsupportedVerbError: If ``verb`` is not a non-empty string, or
+            names nothing in ``allowed``. The message names the verb and
+            lists every allowed value.
+    """
+    name = verb.strip().lower() if isinstance(verb, str) else None
+    if not name or name not in allowed:
+        raise UnsupportedVerbError(
+            f'protocol_info[{setting!r}] must name one of '
+            f'{sorted(allowed)}, got {verb!r}')
+    return name
+
+
 def resolve_verb(
     client: Any,
     verb: Any,
@@ -119,11 +168,7 @@ def resolve_verb(
             carries ``CONFIG``/400 and is reported as the caller's own
             error and not as a failure of the remote side.
     """
-    name = verb.strip().lower() if isinstance(verb, str) else None
-    if not name or name not in allowed:
-        raise UnsupportedVerbError(
-            f'protocol_info[{setting!r}] must name one of '
-            f'{sorted(allowed)}, got {verb!r}')
+    name = validated_verb(verb, allowed=allowed, setting=setting)
 
     operation = getattr(client, name, None)
     if not callable(operation):

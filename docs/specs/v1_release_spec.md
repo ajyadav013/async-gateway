@@ -3833,6 +3833,8 @@ test, which only checks that the *keys* are present. Hence E11, and hence R8's n
 | Missing required `protocol_info` key | `BaseRequestClass.__init__` | `ConfigurationError` | — (**raises**) | — | — *(raises; never logged — single-report principle, Rev 4)* | No |
 | `HTTPS` + `http://` URL | `request()` | `ConfigurationError` | — (**raises**) | — | — *(raises; never logged — single-report principle, Rev 4)* | No |
 | Unknown verb / unknown breaker key | allowlist / config parser | `ConfigurationError` | — (**raises**) | — | — *(raises; never logged — single-report principle, Rev 4)* | No |
+| `auth` carrying no `login`/`password`, on FTP or SFTP | `base.credentials_of`, from the protocol constructor | `ConfigurationError` | — (**raises**) | — | — *(raises; never logged — single-report principle, Rev 4)* | No |
+| FTP `command`/`server_path`, SFTP `mode`/`remote_path` — absent, malformed, or outside the allowlist | `ftp_client._validate_request`, `sftp_client._validate_mode` | `ConfigurationError` / `UnsupportedVerbError` | 400 | False | `error` | No |
 | DNS failure | `http_client` | `DnsError` | 502 | False | `error` + redacted `traceback` | Yes (transient) |
 | Connect refused / reset | `http_client`, `ftp_client`, `sftp_client` | `ConnectError` | 502 | False | `error` + redacted `traceback` | Yes |
 | TLS handshake / cert failure | `filters_helper`, protocol clients | `TlsError` | 502 | False | `error` + redacted `traceback` | No (config) |

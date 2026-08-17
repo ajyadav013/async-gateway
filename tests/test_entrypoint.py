@@ -265,6 +265,97 @@ async def test_r11_ac3_non_mapping_protocol_info_is_a_configuration_error(
         await request('host', protocol='FTP', auth=AUTH, protocol_info=info)
 
 
+# --- H5: `auth` is optional in the signature, required by FTP and SFTP ----
+
+
+@pytest.mark.parametrize('name', ['FTP', 'SFTP'])
+async def test_h5_the_documented_default_call_is_configuration_not_a_crash(
+    caplog: pytest.LogCaptureFixture,
+    name: str,
+) -> None:
+    """``auth=None`` is the caller's mistake, reported as one (H5).
+
+    ``request()`` defaults ``auth`` to None and documents it optional, so
+    this *is* the documented default call -- and for the two protocols
+    that interpolate credentials into their connect it used to die on
+    ``self.auth.login`` with an ``AttributeError``. That escaped the
+    envelope and, being no ``AsyncGatewayError``, told the caller through
+    this library's own contract that it had hit a bug in here. A missing
+    credential is the caller's configuration.
+
+    Raised rather than enveloped, and so not logged: the constructor runs
+    outside the entry point's one conversion ``try``, which is the rule
+    that decides (AGW-35), and the single-report principle gives a
+    raising path no log line.
+    """
+    caplog.set_level(logging.DEBUG, logger='async_gateway')
+
+    with pytest.raises(ConfigurationError) as raised:
+        await request('host', protocol=name, protocol_info=None)
+
+    assert name in str(raised.value)
+    assert 'auth' in str(raised.value)
+    assert gateway_records(caplog) == []
+
+
+@pytest.mark.parametrize('name', ['FTP', 'SFTP'])
+@pytest.mark.parametrize(
+    'auth',
+    [
+        pytest.param(None, id='absent'),
+        pytest.param(object(), id='no-credential-attributes'),
+        pytest.param('user:password', id='a-string-not-an-auth-object'),
+    ],
+)
+async def test_h5_auth_without_string_credentials_is_refused(
+    auth: object,
+    name: str,
+) -> None:
+    """Every shape that cannot yield a login and a password is refused."""
+    with pytest.raises(ConfigurationError) as raised:
+        await request('host', protocol=name, auth=auth, protocol_info=None)
+
+    assert 'login' in str(raised.value)
+    assert 'password' in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    'protocol_class', [FTPRequest, SFTPRequest], ids=['ftp', 'sftp'])
+def test_h5_an_empty_password_is_a_password(protocol_class: type) -> None:
+    """The boundary is pinned from the accepting side too.
+
+    An empty password is one a server may well accept, so refusing it
+    here would be this library inventing a policy the transport does not
+    have. Asserted beside the rejections so a guard tightened into
+    ``if not password`` fails rather than quietly narrowing what callers
+    may send.
+    """
+    built = protocol_class(
+        'host', BasicAuth('user', ''), {}, info=None,
+        redact_params=frozenset())
+
+    assert (built.user, built.password) == ('user', '')
+
+
+@pytest.mark.parametrize('name', ['HTTP', 'HTTPS'])
+async def test_h5_the_http_family_still_accepts_no_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    """The guard is FTP's and SFTP's, not a new requirement everywhere.
+
+    HTTP forwards ``auth`` to aiohttp untouched and None means "send no
+    credentials", which is the overwhelmingly common call. A guard that
+    leaked into this path would break every anonymous HTTP request.
+    """
+    dispatched = capture_dispatch(monkeypatch)
+
+    result = await request(**VALID_CALL[name], protocol=name)
+
+    assert result['ok'] is True
+    assert dispatched[0].auth is None
+
+
 def test_h5_the_constructor_reads_only_the_guarded_info() -> None:
     """Every post-guard read goes through ``self.info``, so None is fine."""
     ftp = FTPRequest(
@@ -612,3 +703,99 @@ async def test_r10_ac3_a_programming_error_escapes_request(
     # Not caught means not converted *and* not logged: the caller's own
     # traceback is the report.
     assert gateway_records(caplog) == []
+
+
+# --- AGW-35: which side of the one conversion `try` a config error is on ---
+
+
+@pytest.mark.parametrize(
+    ('name', 'info'),
+    [
+        pytest.param(
+            'HTTP',
+            {
+                'request_type': 'get',
+                'http_file_upload_config': {
+                    'local_filepath': '/tmp/x', 'file_key': 'f'},
+            },
+            id='http-upload-config-on-a-get'),
+        pytest.param(
+            'HTTP', {'request_type': 'frobnicate'}, id='http-unknown-verb'),
+        pytest.param(
+            'HTTPS', {'request_type': 'get', 'timeout': 'ten'},
+            id='https-non-numeric-timeout'),
+    ],
+)
+async def test_agw35_a_constructor_rejection_raises_and_does_not_log(
+    caplog: pytest.LogCaptureFixture,
+    name: str,
+    info: dict[str, Any],
+) -> None:
+    """Outside the ``try`` means: escapes, and is reported exactly once.
+
+    The rule AGW-35 settled is mechanical -- an ``AsyncGatewayError``
+    raised *outside* the entry point's one conversion ``try`` escapes,
+    one raised inside becomes an envelope. Everything checked in a
+    protocol constructor is outside it, because ``request()`` builds the
+    protocol object before the ``try``.
+
+    The empty log is half the assertion, not decoration: the
+    single-report principle says a path never both raises and logs, and
+    a check moved inside the ``try`` would start doing both.
+    """
+    caplog.set_level(logging.DEBUG, logger='async_gateway')
+
+    with pytest.raises(ConfigurationError):
+        await request(
+            VALID_CALL[name]['url'], protocol=name, protocol_info=info)
+
+    assert gateway_records(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ('name', 'info'),
+    [
+        pytest.param('FTP', {'server_path': '/f'}, id='ftp-absent-command'),
+        pytest.param(
+            'FTP', {'command': 'frobnicate', 'server_path': '/f'},
+            id='ftp-unknown-command'),
+        pytest.param('FTP', {'command': 'download'}, id='ftp-absent-path'),
+        pytest.param('SFTP', {'remote_path': '/f'}, id='sftp-absent-mode'),
+        pytest.param(
+            'SFTP', {'mode': 'frobnicate', 'remote_path': '/f'},
+            id='sftp-unknown-mode'),
+        pytest.param('SFTP', {'mode': 'get'}, id='sftp-absent-path'),
+    ],
+)
+async def test_agw35_a_deferred_rejection_envelopes_at_config_400(
+    caplog: pytest.LogCaptureFixture,
+    name: str,
+    info: dict[str, Any],
+) -> None:
+    """Inside the ``try`` means: a ``CONFIG``/400 envelope, logged once.
+
+    FTP's ``command`` and SFTP's ``mode`` are the deferred set, and they
+    are deferred for a reason that is not stylistic: R11-AC3 requires
+    both objects to be constructible with ``protocol_info=None``, so
+    neither key can be checked in ``__init__``.
+
+    The status is the whole point of the row. Each of these used to
+    report whatever the *connect* failed with first -- an unreachable
+    host made an unknown FTP command ``CONNECT``/502, an unverified host
+    key made an unknown SFTP mode ``HOST_KEY``/495 -- so a caller was
+    handed a transport verdict, and an invitation to retry, for a typo
+    that could never have run. No socket is mocked here deliberately:
+    these must resolve as configuration *before* anything is opened, and
+    against a host that does not answer, a transport verdict is exactly
+    what a regression would produce.
+    """
+    caplog.set_level(logging.DEBUG, logger='async_gateway')
+
+    result = await request(
+        'host', protocol=name, auth=AUTH, protocol_info=info)
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == 'CONFIG'
+    assert result['status_code'] == 400
+    assert len(gateway_records(caplog)) == 1

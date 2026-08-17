@@ -648,7 +648,7 @@
     {
       "id": "AGW-35",
       "title": "Two unpredictable ConfigurationError contracts across protocols",
-      "status": "OPEN",
+      "status": "CLOSED",
       "story": "none - acceptance gate",
       "step": "acceptance gate",
       "file": "docs/project/tickets/AGW-35-two-unpredictable-configuration-error-contracts.md",
@@ -658,7 +658,7 @@
         "blocks": []
       },
       "commits": [],
-      "note": "Medium. HTTP config errors raise unlogged; SFTP's mode error returns a logged CONFIG envelope, while async_gateway.py:298-311 documents synchronous escape as universal. Overturns Ruling T's pre/post-dispatch rationale. Owner: entry point / S12 lane."
+      "note": "Medium. RESOLVED on fix/auth-none with H5. The rule is placement relative to the entry point's one conversion try: a constructor rejection raises unlogged, one from handle_request envelopes as CONFIG/400 and logs once. Re-measurement found the divergence was four outcomes, not two -- FTP command and SFTP mode were checked after the connect, so a typo reported CONNECT/502 and HOST_KEY/495. All four deferred keys now validate pre-connect. Docstring, README and spec failure table state the rule."
     }
   ]
 }

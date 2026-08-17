@@ -298,7 +298,7 @@ async def request(
 |---|---|
 | `url` | An absolute URL for HTTP/HTTPS/SOAP; a **bare host name** for FTP/SFTP. |
 | `data` | The request payload. For SOAP it is the XML body (`str` or `Element`). Defaults to `{}`. |
-| `auth` | Any auth object aiohttp accepts, e.g. `aiohttp.BasicAuth(user, password)`. FTP and SFTP read `.login` and `.password` off it. |
+| `auth` | Any auth object aiohttp accepts, e.g. `aiohttp.BasicAuth(user, password)`. Optional for HTTP/HTTPS/SOAP, where `None` sends no credentials. **Required for FTP and SFTP**, which read `.login` and `.password` off it to connect; omitted there, the call raises `ConfigurationError`. |
 | `protocol` | One of `'HTTP'`, `'HTTPS'`, `'FTP'`, `'SFTP'`, `'SOAP'`. Matched with surrounding whitespace stripped and without regard to case, so `'http'`, `' HTTP '` and `'Http'` are one protocol. |
 | `protocol_info` | Per-protocol configuration; see the tables below. `None` is a valid call for every protocol that requires no key. |
 | `pre_processor_config` | `{'function': async_callable, 'params': {...}}`. Awaited before dispatch with `response=<envelope>` plus `params`; its return value lands in `pre_processor_response`. |
@@ -682,12 +682,27 @@ except ConfigurationError as exc:
 The errors that escape this way are: a `protocol` that is not a registered name;
 a `protocol_info` that is not a mapping or that omits a required key; a URL whose
 scheme the protocol will not dispatch on; an HTTP `request_type` outside the
-allowlist; and every other malformed value the HTTP and SOAP constructors check.
+allowlist; an `http_file_upload_config` combined with a GET; an `auth` carrying
+no `login` and `password` on **FTP or SFTP**, which cannot connect without them
+(`auth` is optional in the signature, but not for those two protocols); and
+every other malformed value the HTTP and SOAP constructors check.
 
 **Everything else is an `ok=False` envelope** — every remote failure, every
-transport failure, and the configuration errors two protocols defer by contract
-(FTP's `command` and SFTP's `mode`, which are checked once the protocol object
-is running). Those arrive as `error['code'] == 'CONFIG'` with status 400.
+transport failure, and the four configuration keys two protocols defer by
+contract: FTP's `command` and `server_path`, and SFTP's `mode` and
+`remote_path`. Those arrive as `error['code'] == 'CONFIG'` with status 400.
+
+Why those four and nothing else: `protocol_info` is optional for FTP and SFTP,
+so their request objects must stay constructible without one — which puts the
+check after construction, and construction is what runs outside the `try`. All
+four are still checked **before** their protocol opens a connection, so an
+unreachable host never answers for your typo with a `CONNECT`/502 you might
+then retry.
+
+**The rule in one line:** whether a configuration error raises or envelopes is
+decided by *where* it is detected — in a protocol's constructor (raises) or once
+its `handle_request` is running (envelopes) — never by which kind of mistake it
+was.
 
 Code that wants to handle both alike catches `ConfigurationError` **and**
 branches on `result['error']['code']`.

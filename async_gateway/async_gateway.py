@@ -229,8 +229,13 @@ async def request(
         regard to case, so 'http', ' HTTP ' and 'Http' are the same
         protocol. HTTPS additionally requires that the call go out over
         TLS; see :raises: below
-    :param auth: aiohttp.BasicAuth(username, password)
-        Optional field any auth abject is accepted supported by aiohttp
+    :param auth: aiohttp.BasicAuth(username, password), or any auth
+        object aiohttp accepts. Optional for the HTTP family and SOAP,
+        where None means "send no credentials" and is the common case.
+        **Required for FTP and SFTP**, which read ``.login`` and
+        ``.password`` off it to build their connect: omitted there, the
+        call raises ``ConfigurationError`` before anything is dispatched
+        rather than crashing on ``None.login`` as it once did (H5)
     :param protocol_info: {
         "request_type": "GET", #required
         "timeout": int, #Optional
@@ -307,15 +312,20 @@ async def request(
         scheme the chosen protocol will not dispatch on, which for
         ``protocol='HTTPS'`` includes a plain ``http://`` URL; a
         "serialization" value that is not callable or does not return
-        str; and an HTTP "request_type" naming no verb in the R21
-        allowlist (``UnsupportedVerbError``, a subclass). These are
-        programming errors on the caller's side and are not retryable, so
-        they escape synchronously rather than becoming an envelope a
-        retry loop would re-attempt forever -- and, escaping, they are
+        str; an HTTP "request_type" naming no verb in the R21 allowlist
+        (``UnsupportedVerbError``, a subclass); an
+        "http_file_upload_config" combined with a GET, which has no body
+        to carry it; every other malformed value the HTTP and SOAP
+        constructors check; and an ``auth`` carrying no string ``login``
+        and ``password`` on FTP or SFTP, which cannot form a connect at
+        all -- note that ``auth`` is optional in this signature but
+        **required by those two protocols**. These are programming
+        errors on the caller's side and are not retryable, so they
+        escape synchronously rather than becoming an envelope a retry
+        loop would re-attempt forever -- and, escaping, they are
         reported to the caller exactly once and are not also logged.
-        Every one of them is raised before anything is dispatched. Every
-        *remote* or *transport* failure, by contrast, is reported as an
-        ``ok=False`` envelope.
+        Every *remote* or *transport* failure, by contrast, is reported
+        as an ``ok=False`` envelope.
 
         **This is not every ``ConfigurationError`` the library can
         produce, and what separates them is placement rather than kind**
@@ -327,12 +337,22 @@ async def request(
         and is logged, because every envelope-producing failure is. The
         list above is the escaping set, not the whole set.
 
-        The configuration errors that arrive the second way are the ones
-        a protocol defers by contract: FTP's ``command`` and SFTP's
-        ``mode`` -- absent, malformed, or outside the R21 allowlist --
-        which are checked once the protocol object is running, because
-        ``protocol_info`` is optional for those protocols at this
-        boundary and the object must stay constructible without one.
+        The configuration errors that arrive the second way are exactly
+        the ones a protocol defers by contract, and they are the whole
+        of that set: FTP's ``command`` and ``server_path``, and SFTP's
+        ``mode`` and ``remote_path`` -- absent, malformed, or outside
+        the R21 allowlist. They are checked once the protocol object is
+        running because ``protocol_info`` is optional for those two
+        protocols at this boundary, so the object must stay
+        constructible without one and the keys cannot be checked in the
+        constructor with everything else.
+
+        All four are nonetheless checked *before* their protocol opens a
+        connection, so an unreachable host cannot answer for a caller's
+        typo. Getting that ordering wrong is what made an unknown FTP
+        ``command`` report ``CONNECT``/502 and an unknown SFTP ``mode``
+        report ``HOST_KEY``/495: transport verdicts, carrying a retry
+        recommendation, for calls that could never have run.
 
         A caller who wants to handle both alike should catch
         ``ConfigurationError`` *and* branch on

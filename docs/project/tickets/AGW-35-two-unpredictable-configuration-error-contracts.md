@@ -1,6 +1,6 @@
 # AGW-35: two unpredictable `ConfigurationError` contracts across protocols
 
-- **Status:** OPEN
+- **Status:** CLOSED
 - **Severity: Medium.** Blocks the **acceptance gate**. Does not block any code-review gate — the
   two stories that exposed it are each internally correct and were each approved on their own
   boundary.
@@ -111,3 +111,54 @@ with the main fix.
 ## Work Log
 
 _Opened at the close of wave W10, when S12 and S13 first sat in one tree._
+
+### Resolved on `fix/auth-none`, with H5 (AGW-35 + H5 are one lane)
+
+Resolved as recommended — the docstring tells the truth — **plus one behavioural fix the
+recommendation did not anticipate**, because re-measuring the two contracts turned up a third
+outcome neither the ticket nor Ruling T had recorded.
+
+**What was measured before touching anything** (public `request()`, host `127.0.0.1`, no mocks):
+
+```
+FTP  absent-command : ok=False status=502 code=CONNECT
+FTP  bad-command    : ok=False status=502 code=CONNECT
+SFTP absent-mode    : ok=False status=400 code=CONFIG
+SFTP bad-mode       : ok=False status=495 code=HOST_KEY
+```
+
+So the divergence was not two contracts but **four outcomes across two protocols**. FTP checked
+`command` at the `getattr` *inside* the connected session, and SFTP checked `mode`'s allowlist
+inside `_run_session`, so in both cases whatever the **connect** did first decided the verdict. A
+caller's typo was reported as a transport failure — `CONNECT`/502 and `HOST_KEY`/495, both of which
+a documented retry policy re-attempts, for a call that could never have run. The ticket recorded
+only SFTP's `absent-mode` row, which is the one case that happened to be checked before the connect.
+
+**Fix.** The allowlist reading was split into `validated_verb` (name only) in
+`utils/http_file_config.py`; `resolve_verb` now calls it rather than repeating it, so there is one
+allowlist and the fail-closed lookup keeps its own check. FTP's `_validate_server_path` became
+`_validate_request` and checks `command` too; SFTP's `_validate_mode` checks `mode` against
+`SFTP_MODES`. Both run before their protocol opens a connection. All four now report `CONFIG`/400.
+
+**Which side of the rule.** Unchanged, and deliberately: the four deferred keys stay **inside** the
+`try` and stay envelopes, because R11-AC3 still requires both objects to be constructible with
+`protocol_info=None`. The alternative in the ticket — amend R11-AC3 and unify on synchronous escape
+— is **not taken**: it reopens an approved, tested criterion, and the divergence a caller actually
+tripped over was the *unpredictability*, which naming the rule fixes. H5's credentials check lands
+on the **raise** side, in the constructor, matching the spec's edge-case mapping row that names
+`auth=None` for `base.py` (R11) alongside the other pre-dispatch rejections.
+
+**Definition of Done:**
+
+- [x] `async_gateway.py` states the real rule and no longer claims "every one of them" is
+      pre-dispatch; the deferred set is named exhaustively (four keys, not two)
+- [x] the `:raises:` enumeration is extended with S13's GET + `http_file_upload_config` rejection
+      (the Low below) and with H5's credentials rejection
+- [x] `sftp_client.py`'s module docstring no longer contradicts itself — the "dispatch, not method"
+      framing is replaced by the `try` rule, with the measurement that refutes it recorded
+- [x] `test_agw35_*` in `tests/test_entrypoint.py` pins **both** contracts through the public
+      `request()` — 3 raising rows, 6 enveloping rows, asserting code, status *and* log count
+- [x] the README's error-handling section documents both paths and states the rule in one line
+- [x] the spec's failure table gains the two rows it was missing
+
+**Status: CLOSED.**
