@@ -119,6 +119,109 @@ async def large(request: web.Request) -> web.StreamResponse:
     return response
 
 
+def nested_multipart_body(
+    depth: int, leaf: bytes, per_level: int = 0,
+) -> tuple[bytes, str]:
+    """Build a genuinely nested ``multipart/mixed`` body ``depth`` levels deep.
+
+    Each level gets its own boundary, because a nested part whose boundary
+    repeated its parent's would be terminated by the parent's closing
+    delimiter rather than nesting under it.
+
+    With ``per_level`` at its default the body is almost entirely
+    boundaries, which is the shape NEW-H2 is about: 2000 levels is ~221 KB,
+    three orders of magnitude under the client's byte ceiling, so the depth
+    cap is the only thing that can refuse it.
+
+    ``per_level`` instead puts an ordinary leaf part of that many bytes at
+    *every* level, alongside the nested one. That is what makes a byte
+    total genuinely accumulated across levels distinguishable from one
+    reset at each: no single level's payload reaches the ceiling, only the
+    sum does.
+
+    Args:
+        depth: How many reader levels the body should have, counting the
+            outermost as 1.
+        leaf: The body bytes of the single ordinary part at the bottom.
+        per_level: Bytes of additional leaf payload to place at each
+            level, or 0 for none.
+
+    Returns:
+        The complete body and the outermost boundary, which the response
+        ``Content-Type`` has to name.
+    """
+    boundaries = [f'agwdeep{level}'.encode() for level in range(depth)]
+
+    def leaf_part(boundary: bytes, payload: bytes) -> bytes:
+        """Render one ordinary part.
+
+        Args:
+            boundary: The boundary of the level the part sits at.
+            payload: The part's body bytes.
+
+        Returns:
+            The delimiter, headers and body, ready to concatenate.
+        """
+        return b''.join([
+            b'--', boundary, b'\r\n',
+            b'Content-Type: text/plain\r\n\r\n', payload, b'\r\n',
+        ])
+
+    filler = b'p' * per_level
+    body = b''.join([
+        leaf_part(boundaries[-1], leaf),
+        leaf_part(boundaries[-1], filler) if per_level else b'',
+        b'--', boundaries[-1], b'--\r\n',
+    ])
+    for level in range(depth - 2, -1, -1):
+        outer, inner = boundaries[level], boundaries[level + 1]
+        body = b''.join([
+            b'--', outer, b'\r\n',
+            b'Content-Type: multipart/mixed; boundary=', inner, b'\r\n\r\n',
+            body, b'\r\n',
+            leaf_part(outer, filler) if per_level else b'',
+            b'--', outer, b'--\r\n',
+        ])
+    return body, boundaries[0].decode()
+
+
+async def nested_multipart(request: web.Request) -> web.StreamResponse:
+    """Serve a real nested multipart body at a caller-chosen depth.
+
+    The in-process suite already pins the depth cap against a loopback
+    server, but the walk this drives is the one NEW-H2 rewrote from
+    recursive to iterative, and the failure it fixed was the interpreter
+    refusing to go further -- a resource the wire can influence through
+    chunking and arrival timing. So it is worth watching the same cap hold
+    over a real socket, at ``MAX_MULTIPART_DEPTH`` and past it.
+
+    Streamed in chunks with no declared ``Content-Length`` on purpose: a
+    client that refused deep bodies by reading a length header would pass
+    a buffered version of this test while the depth guard itself was
+    dead.
+
+    Args:
+        request: The inbound aiohttp request.
+
+    Returns:
+        A streamed multipart response nested to the requested depth.
+    """
+    depth = int(request.query.get('depth', '1'))
+    leaf = request.query.get('leaf', 'bottom').encode()
+    per_level = int(request.query.get('per_level', '0'))
+    body, boundary = nested_multipart_body(depth, leaf, per_level)
+
+    response = web.StreamResponse(
+        status=200,
+        headers={'Content-Type': f'multipart/mixed; boundary={boundary}'},
+    )
+    await response.prepare(request)
+    for at in range(0, len(body), 512):
+        await response.write(body[at:at + 512])
+    await response.write_eof()
+    return response
+
+
 async def redirect(request: web.Request) -> web.Response:
     """Redirect to an arbitrary absolute URL.
 
@@ -160,6 +263,7 @@ def build_app() -> web.Application:
     app.router.add_route('*', '/status/{code:\\d+}', status)
     app.router.add_get('/slow', slow)
     app.router.add_get('/large', large)
+    app.router.add_get('/nested-multipart', nested_multipart)
     app.router.add_route('*', '/redirect', redirect)
     app.router.add_get('/health', health)
     return app

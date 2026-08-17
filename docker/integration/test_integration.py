@@ -16,7 +16,15 @@ right for 1475 tests but leaves a specific residue this file exists for:
   bytes arrived at the remote path*, read back from the server; and
 * **credential stripping on a cross-origin redirect** has to be observed
   at the second origin. In-process you can only assert what the client
-  intended to send.
+  intended to send;
+* **the multipart depth cap** (NEW-H2) protects the interpreter's stack,
+  and a body arriving chunked over a socket drives the reader through a
+  different await path than an in-memory one -- so the cap is watched
+  holding at 64 and refusing past it over a real wire; and
+* **URL userinfo masking** (NEW-M1c) is a disagreement between readers of
+  one string, and ``aiohttp`` is a third reader that *re-spells* what it
+  is given. The string reaching the envelope and the logged traceback is
+  therefore only observable after a round trip.
 
 Each protocol also gets at least one error path, because a library whose
 whole contract is "one envelope shape, on success and on failure" is not
@@ -25,6 +33,7 @@ demonstrated by success alone.
 
 import asyncio
 import contextlib
+import logging
 import os
 import pathlib
 import subprocess
@@ -41,6 +50,7 @@ import conftest as cfg
 import pytest
 
 from async_gateway.async_gateway import request
+from async_gateway.utils.constants import MAX_MULTIPART_DEPTH
 from async_gateway.utils.exceptions import ConfigurationError
 
 BASE_HTTP = cfg.BASE_HTTP
@@ -306,6 +316,233 @@ async def test_cross_origin_redirect_drops_credential_headers() -> None:
     assert 'authorization' not in arrived
     assert 'cookie' not in arrived
     assert 'proxy-authorization' not in arrived
+
+
+# ------------------------------------ security: hostile multipart nesting --
+#
+# The depth cap and the iterative walk (NEW-H2) are pinned exhaustively in
+# process, against a loopback server. These rows exist because the
+# resource that fix protects -- the interpreter's stack -- is one the wire
+# can influence: a body arriving in 512-byte chunks across a real socket
+# drives the reader through a different await path than an in-memory one,
+# and a depth guard placed in the buffered branch alone would pass the
+# unit suite. The bodies are streamed with no declared Content-Length, so
+# nothing can be refused by reading a length header.
+
+
+async def fetch_nested(
+    depth: int,
+    tmp_path: pathlib.Path,
+    per_level: int = 0,
+    **info: Any,
+) -> Dict[str, Any]:
+    """Read a live nested multipart body ``depth`` levels deep.
+
+    Args:
+        depth: How many reader levels the server should nest.
+        tmp_path: Where the multipart download lands.
+        per_level: Bytes of leaf payload to place at every level, for the
+            byte-cap row; 0 leaves the body all boundaries.
+        **info: Extra ``protocol_info`` keys.
+
+    Returns:
+        The envelope ``request()`` returned.
+    """
+    return await request(
+        f'{BASE_HTTP}/nested-multipart'
+        f'?depth={depth}&per_level={per_level}',
+        protocol='HTTP',
+        protocol_info={
+            'request_type': 'GET',
+            'timeout': 60,
+            'http_file_download_config': {
+                'download_filepath': str(tmp_path / f'deep-{depth}.bin'),
+                'overwrite': True,
+            },
+            **info,
+        },
+    )
+
+
+@pytest.mark.parametrize('depth', [60, MAX_MULTIPART_DEPTH])
+async def test_nesting_within_the_cap_is_read_from_a_real_server(
+    depth: int, tmp_path: pathlib.Path,
+) -> None:
+    """At and below the cap the leaf arrives, over a real socket.
+
+    The half that stops the guard being "fixed" by refusing everything.
+    ``MAX_MULTIPART_DEPTH`` is read from the library rather than restated,
+    so lowering the cap fails this row instead of quietly narrowing what
+    the library accepts.
+
+    Args:
+        depth: The nesting depth to serve.
+        tmp_path: Where the download lands.
+    """
+    result = await fetch_nested(depth, tmp_path)
+
+    assert_envelope(result, 'HTTP')
+    assert result['ok'] is True, result['error']
+    assert result['status_code'] == 200
+    assert result['text'] == 'bottom'
+
+
+@pytest.mark.parametrize('depth', [MAX_MULTIPART_DEPTH + 1, 2000])
+async def test_nesting_past_the_cap_is_an_envelope_not_an_exception(
+    depth: int, tmp_path: pathlib.Path,
+) -> None:
+    """Past the cap the caller gets an envelope, never a bare exception.
+
+    2000 is the depth as NEW-H2 reported it -- ~221 KB, far under any byte
+    ceiling, and enough to exhaust the interpreter's stack before the walk
+    was made iterative. The assertion that matters is as much that
+    ``request()`` *returned* as what it returned: a ``RecursionError``
+    escaping here would fail this row by propagating out of the await
+    rather than by comparing unequal.
+
+    Args:
+        depth: The nesting depth to serve.
+        tmp_path: Where the download would have landed.
+    """
+    result = await fetch_nested(depth, tmp_path)
+
+    assert_envelope(result, 'HTTP')
+    assert result['ok'] is False
+    assert result['error']['code'] == 'RESPONSE_TOO_DEEP'
+    assert result['status_code'] == 502
+    assert f'max_multipart_depth={MAX_MULTIPART_DEPTH}' in (
+        result['error']['message'])
+
+
+async def test_the_byte_cap_still_spans_nesting_levels_over_the_wire(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A nested body cannot buy a fresh byte budget by nesting (R14).
+
+    The two bounds are independent, so the depth cap must not have
+    displaced the byte one: this body is well inside
+    ``MAX_MULTIPART_DEPTH`` and is refused for its *size*.
+
+    The payload is spread across the levels rather than concentrated in
+    one, and that is the whole design of the row: 8 levels of 512 bytes
+    against a 2 KiB ceiling means no single level reaches the cap and only
+    the running sum does. A budget reset per nested reader -- the mutant
+    R14 exists to exclude -- would read this body happily, whereas a body
+    with all its bytes at one level would refuse under both the correct
+    code and the mutant.
+    """
+    result = await fetch_nested(
+        8, tmp_path, per_level=512, max_response_bytes=2048)
+
+    assert_envelope(result, 'HTTP')
+    assert result['ok'] is False
+    assert result['error']['code'] == 'RESPONSE_TOO_LARGE'
+
+
+# ---------------------------------- security: userinfo on a real round trip --
+
+
+AUTHORITY = f'{cfg.HTTP_HOST}:{cfg.HTTP_PORT}/status/404'
+
+# The separator spellings NEW-M1c is about, each written as a prefix and a
+# suffix so the credential can be inserted between them.
+#
+# The last two matter most and are the reason this row is parametrized by
+# *spelling* rather than by route. Measured against this live server with
+# redaction stubbed out, the canonical `http://` shape never puts the
+# credential in the rendered traceback at all -- so asserting its absence
+# there is vacuous, and a deleted `redact_text` call passes. Under
+# `http:/\/` and `http: //` the raw traceback does carry it, because
+# `urlsplit` finds no authority, the URL is carried as an opaque string
+# and a chained exception stringifies it. Those are the rows where the
+# traceback assertion has teeth.
+SPELLINGS = {
+    'canonical': ('http://', AUTHORITY),
+    'backslash': ('http:/\\/', AUTHORITY),
+    'space': ('http: //', AUTHORITY),
+    'tab': ('http:\t//', AUTHORITY),
+    'closed-port': ('http://', f'{cfg.HTTP_HOST}:9/echo'),
+}
+
+
+@pytest.mark.parametrize(
+    ('prefix', 'authority'), SPELLINGS.values(), ids=list(SPELLINGS))
+async def test_userinfo_is_masked_on_a_real_request(
+    prefix: str,
+    authority: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A URL's password must not survive an aiohttp round trip anywhere.
+
+    NEW-M1c is a disagreement bug: a hand-rolled scanner and a URL parser
+    reading one string differently, four times, each fix teaching the
+    scanner one more spelling. ``aiohttp`` is a *third* reader, and it
+    re-spells what it is given -- normalising separators, percent-encoding
+    them back -- so the string that reaches ``error['message']`` and the
+    logged traceback is not always the string the caller passed. A
+    backslash arrives back as ``%5C`` and a space as ``%20``, and it is
+    those spellings, not the caller's, that the envelope reports. That
+    round trip only happens against a real server, which is why this row
+    is here and not only in the unit suite.
+
+    Three surfaces, because each is produced by a different call:
+    ``redact_url`` for the envelope, ``redact_value`` for
+    ``extra['url']``, and ``redact_text`` for ``extra['traceback']`` --
+    the last being the one that leaked in three of the four rounds.
+
+    The request fails in every row, deliberately: the failure path is the
+    exposed one, being the only path that renders a traceback at all.
+
+    Args:
+        prefix: The scheme and separator run, one of the spellings above.
+        authority: The host, port and path to aim at.
+        caplog: Captures the library's own log record.
+    """
+    secret = 'sup3rs3cr3t-pw'
+    url = f'{prefix}user:{secret}@{authority}'
+
+    with caplog.at_level(logging.WARNING, logger='async_gateway'):
+        result = await request(
+            url,
+            protocol='HTTP',
+            protocol_info={'request_type': 'GET', 'timeout': 15},
+        )
+
+    assert_envelope(result, 'HTTP')
+    assert result['ok'] is False
+
+    # 1. The envelope: the URL handed back, and the error prose that
+    #    names it.
+    assert secret not in result['url']
+    assert secret not in str(result['error'])
+
+    records = [
+        record for record in caplog.records
+        if record.name.startswith('async_gateway')
+        and hasattr(record, 'traceback')
+    ]
+    assert records, 'the failure logged no record to inspect'
+    record = records[-1]
+
+    # 2. `extra['url']`, and 3. `extra['traceback']` -- the surface that
+    #    leaked in three of the four rounds.
+    assert secret not in record.url
+    assert secret not in record.traceback
+
+    # "Absent" must not be allowed to mean "the field is empty" or "the
+    # URL never reached the record", which would make every assertion
+    # above pass against a library that reported nothing at all. So each
+    # surface must still carry the part of the URL that is safe to report.
+    #
+    # Only the host is required, not a fixed shape: the two masking paths
+    # legitimately differ. Where `urlsplit` finds an authority the
+    # credential is *dropped* (`http://host/p`), and where it does not the
+    # string is masked in place (`http:/\/user:***redacted***@host/p`).
+    # Both satisfy the invariant -- the secret is gone and the diagnostic
+    # survives -- so pinning either spelling here would encode an
+    # implementation detail as a requirement.
+    for surface in (result['url'], record.url, record.traceback):
+        assert cfg.HTTP_HOST in surface
 
 
 # ------------------------------------------------------------------- FTP --
