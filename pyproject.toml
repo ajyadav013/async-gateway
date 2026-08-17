@@ -112,6 +112,25 @@ ignore_missing_imports = true
 # Removing this is R27's job (Step 24); it currently hides ~44 errors.
 ignore_errors = true
 
+# R30's annotation criterion. Every function in `async_gateway` carries a
+# full signature as of story S24, and these two keep it that way:
+# `disallow_untyped_defs` refuses a def with no annotations at all,
+# `disallow_incomplete_defs` refuses the more common regression -- a def
+# that annotates some of its parameters and forgets one.
+#
+# Both are INERT until `ignore_errors` above is removed, and that was
+# measured rather than assumed: with both settings present,
+# `mypy async_gateway` reports "Success: no issues found in 27 source
+# files" while seven functions are missing annotations. `ignore_errors`
+# suppresses the whole check, these two included. They are declared here
+# anyway so that removing `ignore_errors` in S25 turns the criterion on
+# without also having to remember to add them -- and `tests/test_docs.py`
+# enforces the same property independently, by AST, in the meantime. A
+# gate that an unrelated setting in the same file can switch off is not
+# by itself a gate.
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=async_gateway --cov-branch"
