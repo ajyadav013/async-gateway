@@ -276,31 +276,23 @@ async def test_e1_a_transport_failure_returns_the_same_key_set() -> None:
 # --- R8-AC2: one key set, five protocols, both paths -----------------------
 
 # The five contract rows, shared by the success and the failure test below
-# so that a protocol's marker is one line to remove rather than two.
+# so that a protocol's marker was one line to remove rather than two.
 #
-# Three of them are `xfail(strict=True)`, because their clients do not
-# satisfy the contract yet -- which is the whole reason for writing these
-# before the protocol work rather than after it. `strict` is what makes a
-# marker a ratchet instead of a note: the moment a protocol story fixes its
-# client, both of that protocol's rows pass unexpectedly, the suite fails,
-# and the marker has to come off in the same story that earned it. Each
-# story removes exactly the one row naming its own protocol and no other.
+# **The list is now unmarked, and that is the criterion, not a tidy-up.**
+# Three rows began as `xfail(strict=True)` because their clients did not
+# satisfy the contract yet -- which is why these were written before the
+# protocol work rather than after it. `strict` is what made a marker a
+# ratchet instead of a note: the moment a protocol story fixed its client,
+# both of that protocol's rows passed unexpectedly, the suite failed, and
+# the marker had to come off in the story that earned it. S10 took FTP,
+# S11 took SFTP, and S22 -- writing `logic/soap_client.py` from nothing --
+# took the last one. All five protocols satisfy E1 and E11 here.
 CONTRACT_ROWS = [
     pytest.param('HTTP', id='HTTP'),
     pytest.param('HTTPS', id='HTTPS'),
     pytest.param('FTP', id='FTP'),
     pytest.param('SFTP', id='SFTP'),
-    pytest.param(
-        'SOAP',
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason='there is no logic/soap_client.py, so `SOAP` is absent '
-                   'from protocol_mapping and the call is rejected as an '
-                   'unknown protocol before an envelope exists. Registering '
-                   'it early would be worse than the gap -- an entry that '
-                   'dispatches nothing. S22 (Step 20) writes the client and '
-                   'takes this row with it.'),
-        id='SOAP'),
+    pytest.param('SOAP', id='SOAP'),
 ]
 
 

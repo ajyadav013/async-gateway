@@ -593,6 +593,7 @@ async def read_response(
     redact_params: Collection[Text],
     max_response_bytes: int,
     http_file_download_config: Optional[Dict[Text, Any]],
+    refuse_multipart: bool = False,
 ) -> HttpResult:
     """Read one final (non-redirect) response into an :class:`HttpResult`.
 
@@ -609,12 +610,21 @@ async def read_response(
         max_response_bytes: Ceiling on the bytes read from the body.
         http_file_download_config: The caller's download config, or None
             when they asked for no download.
+        refuse_multipart: Refuse a ``multipart/*`` response instead of
+            reading it. SOAP sets this because MTOM is out of scope
+            (R18), and it has to be refused *here* rather than by the
+            protocol client: reading a multipart body writes its parts to
+            disk as it goes, so by the time a caller could inspect the
+            media type the file nobody asked for already exists. Defaults
+            False, which is every other caller's behaviour unchanged.
 
     Returns:
         The status, headers, cookies and decoded text, plus a
         ``decode_error`` when the body was not decodable text.
 
     Raises:
+        ConfigurationError: If the response is ``multipart/*`` and
+            ``refuse_multipart`` is set.
         ResponseTooLargeError: If the body declares, or streams, more than
             ``max_response_bytes``.
     """
@@ -632,6 +642,15 @@ async def read_response(
     guard_declared_length(resp.headers, max_response_bytes)
 
     if media_type_of(headers).startswith(MULTIPART_MEDIA_PREFIX):
+        if refuse_multipart:
+            raise ConfigurationError(
+                f'response from '
+                f'{redact_url(url, extra_params=redact_params)} is '
+                f'{media_type_of(headers)!r}, which this protocol does '
+                f'not support: SOAP with attachments (MTOM, '
+                f'multipart/related) is out of scope for async-gateway. '
+                f'The body is refused rather than mis-parsed, and no '
+                f'part of it is written to disk')
         result['text'] = await handle_multipart_response(
             resp,
             http_file_download_config,
@@ -782,6 +801,10 @@ async def make_http_request(
     as it reports one raised by the transport itself.
     """
     http_file_download_config = kwargs.get('http_file_download_config')
+    # SOAP sets this; every other caller leaves it absent. See
+    # `read_response` for why the refusal cannot live in the protocol
+    # client that wants it.
+    refuse_multipart: bool = bool(kwargs.get('refuse_multipart'))
     ssl_filters: Dict = await get_ssl_config(
         certificate=kwargs.get('certificate'),
         verify_ssl=kwargs.get('verify_ssl'))
@@ -843,7 +866,8 @@ async def make_http_request(
                         url=target,
                         redact_params=redact_params,
                         max_response_bytes=max_response_bytes,
-                        http_file_download_config=http_file_download_config)
+                        http_file_download_config=http_file_download_config,
+                        refuse_multipart=refuse_multipart)
                 if hop >= max_redirects:
                     raise TransportError(
                         f'redirect chain from '

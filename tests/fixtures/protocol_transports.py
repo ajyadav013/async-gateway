@@ -6,7 +6,11 @@ actually *reach* both paths, and none of them may open a socket doing so,
 so every row is driven through ``request()`` with the last seam before the
 wire replaced: ``handle_http_request`` for the HTTP family,
 ``aioftp.Client.context`` for FTP and ``asyncssh.connect`` for SFTP.
-``'SOAP'`` has no client module and therefore no seam.
+``'SOAP'`` rides the same transport boundary as the HTTP family but
+imports it into its own module, so its seam is that module's name for it
+-- patching ``http_client.handle_http_request`` alone would leave a SOAP
+row opening a real socket, which is why the two are installed separately
+rather than sharing one branch.
 
 Doubling *there* and no deeper is the point. Everything between the seam
 and the caller still runs for real -- the protocol client's own envelope
@@ -37,7 +41,7 @@ import aiohttp
 from aiohttp import BasicAuth
 
 from async_gateway.helpers.internal.request_helper import HttpResult
-from async_gateway.logic import http_client
+from async_gateway.logic import http_client, soap_client
 
 import asyncssh
 
@@ -49,14 +53,27 @@ REFUSED = 'the transport double refused the connection'
 
 JSON_BODY = b'{"value": 1}'
 
+#: What the SOAP double answers with: a minimal, well-formed 1.1 envelope.
+#: The SOAP row cannot be served :data:`JSON_BODY` like the HTTP rows are
+#: -- a body that is not an envelope is a `SERIALIZATION` failure by R19,
+#: so the "success" row would take the failure path and assert nothing it
+#: meant to.
+SOAP_BODY = (
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b'<soap:Envelope '
+    b'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+    b'<soap:Body><Result>1</Result></soap:Body>'
+    b'</soap:Envelope>'
+)
+
 AUTH = BasicAuth('user', 'password')
 
 # One `request()` call per protocol that is valid for that protocol and for
 # no other reason. FTP and SFTP address a bare host and name the operation
 # they want in `protocol_info`; the HTTP family addresses a schemed URL and
-# names a verb. `'SOAP'` is dispatched exactly as a caller would dispatch
-# it today, which is the whole of its contract row: there is nothing
-# registered to receive it.
+# names a verb. `'SOAP'` addresses a schemed URL and needs no
+# `protocol_info` at all: the version defaults to 1.1 and the verb is not
+# the caller's to choose.
 CONTRACT_CALL: dict[str, dict[str, Any]] = {
     'HTTP': {
         'url': 'http://host/p',
@@ -76,7 +93,7 @@ CONTRACT_CALL: dict[str, dict[str, Any]] = {
     },
     'SOAP': {
         'url': 'http://host/p',
-        'protocol_info': {'request_type': 'GET'},
+        'protocol_info': {},
     },
 }
 
@@ -237,12 +254,18 @@ class StubSSHConnection:
 def _http_transport(
     *,
     succeeds: bool,
+    media_type: str = 'application/json',
+    body: bytes = JSON_BODY,
 ) -> Callable[..., Any]:
     """Build a stand-in for the HTTP family's transport boundary.
 
     Args:
         succeeds: True for a transport that answers, False for one that
             refuses the connection.
+        media_type: The ``Content-Type`` the answer announces. SOAP needs
+            an XML one, because its client reads the media type and warns
+            on a non-conformant answer.
+        body: The response body the answer carries.
 
     Returns:
         A coroutine function with ``handle_http_request``'s signature.
@@ -255,7 +278,7 @@ def _http_transport(
             kwargs: Per-call transport configuration, unused.
 
         Returns:
-            One decoded JSON exchange.
+            One decoded exchange.
 
         Raises:
             aiohttp.ClientConnectionError: When built to refuse.
@@ -264,10 +287,10 @@ def _http_transport(
             raise aiohttp.ClientConnectionError(REFUSED)
         return HttpResult(
             status_code=200,
-            headers={'Content-Type': 'application/json'},
+            headers={'Content-Type': media_type},
             cookies={},
-            text=JSON_BODY.decode(),
-            body=JSON_BODY,
+            text=body.decode(),
+            body=body,
             redirect_chain=[],
         )
     return transport
@@ -336,10 +359,9 @@ def install_transport(
 
     Args:
         monkeypatch: The pytest patcher, which undoes this on teardown.
-        protocol: A normalised protocol name. ``'SOAP'`` has no client
-            module, owns no seam, and is the one name deliberately left
-            alone, so the call reaches the entry point's own protocol
-            guard unaltered. Every other name must own a seam.
+        protocol: A normalised protocol name. Every name must own a seam
+            -- including ``'SOAP'``, which was exempt only while it had
+            no client module to own one.
         succeeds: True to install a transport that completes the
             operation, False to install one that refuses the connection.
 
@@ -347,24 +369,34 @@ def install_transport(
         None.
 
     Raises:
-        ValueError: If ``protocol`` names no seam and is not the one
-            exempt name. Installing nothing for a name this function
-            does not recognise would let the row reach the real
-            network, so an unrecognised name fails closed here.
+        ValueError: If ``protocol`` names no seam. Installing nothing for
+            a name this function does not recognise would let the row
+            reach the real network, so an unrecognised name fails closed
+            here.
     """
     if protocol in {'HTTP', 'HTTPS'}:
         monkeypatch.setattr(
             http_client, 'handle_http_request',
             _http_transport(succeeds=succeeds))
+    elif protocol == 'SOAP':
+        # Patched on `soap_client`, not on `http_client`: both modules
+        # bound `handle_http_request` into their own namespace at import,
+        # so replacing one leaves the other pointing at the real
+        # transport.
+        monkeypatch.setattr(
+            soap_client, 'handle_http_request',
+            _http_transport(
+                succeeds=succeeds,
+                media_type='text/xml; charset=utf-8',
+                body=SOAP_BODY))
     elif protocol == 'FTP':
         monkeypatch.setattr(
             aioftp.Client, 'context', _ftp_transport(succeeds=succeeds))
     elif protocol == 'SFTP':
         monkeypatch.setattr(
             asyncssh, 'connect', _sftp_transport(succeeds=succeeds))
-    elif protocol != 'SOAP':
+    else:
         raise ValueError(
-            f'{protocol!r} owns no transport seam, and `SOAP` is the only'
-            ' protocol exempt from owning one. Returning quietly here'
+            f'{protocol!r} owns no transport seam. Returning quietly here'
             ' would install nothing and let the row open a real'
             ' connection.')
