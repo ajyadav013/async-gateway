@@ -67,32 +67,41 @@ The structural one, which no addition to the tables above can repair: a
 filesystem method invoked on a **bare variable** cannot be caught here.
 The scan sees ``x.load_cert_chain(a, b)`` and has no way to know what
 ``x`` is without type inference, so it matches only calls rooted in a
-module name or in a constructor call it can read in place. That is
-exactly the shape of ``async_gateway/helpers/internal/filters_helper.py``
-line 59, where ``load_cert_chain`` reads two files off a local
-``ssl_context`` inside ``get_ssl_config`` -- blocking filesystem I/O on
-an async path, reached inside ``failsafe.run`` on HTTP and outside it on
-FTP, that this scan reports clean. It is raised as ticket **AGW-36** and
-owned by story **S17**, which rewrites ``get_ssl_config``. The
-``ssl.create_default_context`` call one line above it *is* a form this
-scan catches, and is the single entry in :data:`NOT_YET_REWRITTEN`.
+module name or in a constructor call it can read in place. Until story
+S17 that was a live instance -- ``load_cert_chain`` reading two files off
+a local ``ssl_context`` inside the coroutine ``get_ssl_config``, which
+this scan reported clean (ticket **AGW-36**). S17 moved both that call
+and the ``ssl.create_default_context`` above it into the module-level
+plain ``def`` ``build_client_ssl_context``, reached only through
+``asyncio.to_thread``, so the site is gone and :data:`NOT_YET_REWRITTEN`
+is now empty. **The gap in the scan is not** -- another
+``x.load_cert_chain(...)`` written into a coroutine tomorrow would be
+just as invisible.
 
 The third one is the escape hatch above, used without its executor: a
 **module-level plain** ``def`` that performs blocking I/O and is called
 from a coroutine is never searched, so the blocking call is invisible
-here no matter which form it is written in.
-``async_gateway/logic/ftp_client.py`` is a live instance -- line 145,
-``ssl.create_default_context()`` inside the module-level
-``tls_context_for``, called from the coroutine ``_tls_value`` and
-awaited on the request path. It is the same CA-bundle read the ``ssl.``
-entry above describes, on an async path, and this scan reports it
-clean. It is raised as ticket **AGW-37**; its owner is not settled and
-is not S14. Adding it to :data:`NOT_YET_REWRITTEN` would be worse than
-leaving it out -- the scan never produces an offence for that site, so
-the entry would suppress nothing and would falsely suggest the call is
-being tracked by this check. Closing this gap needs call-graph
-following, which is real new machinery and not something a table here
-can supply.
+here no matter which form it is written in. Two module-level helpers in
+the package are of exactly that shape and the scan can distinguish
+neither from the other:
+
+* ``filters_helper.build_client_ssl_context`` -- correct, because
+  ``get_ssl_config`` reaches it through ``asyncio.to_thread``. What holds
+  it correct is the *call site*, which is what this scan cannot see, so
+  ``tests/helpers/test_filters_helper.py`` pins it directly by asserting
+  the function body runs off the event-loop thread.
+* ``logic/ftp_client.tls_context_for`` -- a live defect: it calls
+  ``ssl.create_default_context()`` and is awaited straight from the
+  coroutine ``_tls_value`` with no executor, so the same CA-bundle read
+  the ``ssl.`` entry above describes still lands on the loop. It is
+  ticket **AGW-37**; its owner is not settled and is not S14. Adding it
+  to :data:`NOT_YET_REWRITTEN` would be worse than leaving it out -- the
+  scan never produces an offence for that site, so the entry would
+  suppress nothing and would falsely suggest the call is being tracked
+  by this check.
+
+Closing this gap needs call-graph following, which is real new machinery
+and not something a table here can supply.
 
 This module also holds the behavioural proof for the one converted site
 outside ``request_helper`` -- ``delete_local_file_path`` -- which has no
@@ -125,46 +134,35 @@ BLOCKING_MODULE_PREFIXES = (
     'tempfile.',
 )
 
-#: The one blocking call in the package this ban does not fail on yet,
-#: keyed as ``(package-relative module path, enclosing coroutine name,
-#: call spelling)``.
+#: Blocking calls the ban does not fail on yet, keyed as
+#: ``(package-relative module path, enclosing coroutine name, call
+#: spelling)``. **Empty, and the empty state is the goal state.**
 #:
-#: ``filters_helper.get_ssl_config`` calls
-#: ``ssl.create_default_context(ssl.Purpose.SERVER_AUTH)``, which reads
-#: the system CA bundle off disk, and both transports reach it. On HTTP
-#: it runs inside ``make_http_request`` -- that is, inside
-#: ``failsafe.run``, on every attempt of every certificate-configured
-#: request. On FTP it runs at ``logic/ftp_client.py`` line 353, in
-#: ``_tls_value``, which is awaited at line 291 and is *outside*
-#: ``failsafe.run`` -- FTP's only ``failsafe.run`` calls are at lines 391
-#: and 397 -- so it runs once per request rather than once per attempt.
-#: It is ticket **AGW-36** and it belongs to story **S17**, which
-#: rewrites ``get_ssl_config`` for R23 and must cover both of those
-#: call sites. S14 owns this scan and not that function, and a scan its
-#: own package fails is a scan that gets deleted rather than obeyed --
-#: so the call is contained here instead.
+#: It held exactly one entry when S14 introduced it:
+#: ``filters_helper.get_ssl_config`` called
+#: ``ssl.create_default_context(ssl.Purpose.SERVER_AUTH)`` directly on the
+#: event loop, reading the whole system CA bundle -- on HTTP inside
+#: ``failsafe.run``, so once per *attempt* of every
+#: certificate-configured request. S14 owned this scan and not that
+#: function, and a scan its own package fails is a scan that gets deleted
+#: rather than obeyed, so the call was contained here as **temporary
+#: scaffolding for story S17**.
 #:
-#: All three parts of the key are load-bearing. A ``(module, function)``
-#: key would excuse *every* banned call in ``get_ssl_config``, so an
-#: ``os.remove`` written into that function would be reported clean;
-#: naming the call as well means exactly one spelling is excused, in
-#: exactly one function of one module, and everything else in that
-#: function is still an offence.
+#: **S17 (ticket AGW-36) discharged it.** ``get_ssl_config`` now performs
+#: both of its blocking reads inside ``build_client_ssl_context``, a
+#: module-level plain ``def`` in the same module, reached only through
+#: ``asyncio.to_thread`` -- so there is no banned call left inside any
+#: coroutine to excuse, and the scan passes without the allowance rather
+#: than through it.
 #:
-#: **S17 must delete this allowance** in the change that rewrites
-#: ``get_ssl_config``.
-#: :func:`test_the_allowance_holds_exactly_one_entry` is the test that
-#: fails if it does not, and
-#: :func:`test_the_allowance_is_a_pinhole_not_a_mute_switch` is the test
-#: that fails if anyone widens it to another call, another function or
-#: another file.
-NOT_YET_REWRITTEN = frozenset({
-    (
-        'helpers/internal/filters_helper.py',
-        'get_ssl_config',
-        'ssl.create_default_context',
-    ),
-})
+#: All three parts of a key were load-bearing and the shape is kept for
+#: that reason: a ``(module, function)`` key would excuse *every* banned
+#: call in the named function, so an ``os.remove`` written into it would
+#: be reported clean.
+#: :func:`test_the_allowance_is_empty` fails if anything is added back,
+#: and :func:`test_the_allowance_is_a_pinhole_not_a_mute_switch` proves
+#: that if one ever is, it excuses exactly the triple it names.
+NOT_YET_REWRITTEN: frozenset[tuple[str, str, str]] = frozenset()
 
 #: The exceptions to :data:`BLOCKING_MODULE_PREFIXES`: these compute on
 #: path *strings* and never touch a filesystem, so they are free to call
@@ -371,10 +369,11 @@ def test_no_blocking_filesystem_call_sits_inside_any_async_def() -> None:
     over the package rather than over those four, because the next one
     would otherwise be written the same way.
 
-    It passes *through* :data:`NOT_YET_REWRITTEN`, which excuses one
-    named ``(module, function, call)`` triple and nothing else -- see
-    that constant for the ticket, the owner, and the two tests that keep
-    it from growing.
+    It passes *through* :data:`NOT_YET_REWRITTEN`, which is now empty
+    (AGW-36, discharged by story S17), so the package is clean on its
+    own merits and not by exemption. Were an entry ever added back, it
+    would excuse one named ``(module, function, call)`` triple and
+    nothing else -- see that constant and the two tests below it.
 
     An empty ``offenders`` is the pass condition and is also what a scan
     of *nothing* produces, so the file list is materialised and asserted
@@ -396,42 +395,59 @@ def test_no_blocking_filesystem_call_sits_inside_any_async_def() -> None:
     assert offenders == []
 
 
-def test_the_allowance_holds_exactly_one_entry() -> None:
-    """The containment: the allowance may shrink to nothing, never grow.
+def test_the_allowance_is_empty() -> None:
+    """The containment, now discharged: nothing is excused at all.
 
     An allowance with no test on its own size is a mute switch waiting to
     be used, because the cheapest way past a failing scan is to add a
-    second line to the list that made it pass the first time. Pinning the
-    exact entry means the next blocking call has to be argued for in
-    review -- and it means story S17 deleting ``get_ssl_config``'s
-    blocking build must delete this line too, or fail here.
+    line to the list that made it pass the first time. It held one entry
+    -- ``get_ssl_config``'s CA-bundle read -- as scaffolding for story
+    S17, which has since moved that read into a module-level plain
+    ``def`` behind ``asyncio.to_thread`` (AGW-36).
+
+    Asserting emptiness rather than deleting this test is the point:
+    re-adding an entry now has to fail a named assertion and be argued
+    for in review, instead of slipping past a check nobody is running.
     """
-    assert len(NOT_YET_REWRITTEN) == 1
-    assert NOT_YET_REWRITTEN == frozenset({
-        (
-            'helpers/internal/filters_helper.py',
-            'get_ssl_config',
-            'ssl.create_default_context',
-        ),
-    })
+    assert NOT_YET_REWRITTEN == frozenset()
 
 
-def test_the_allowance_is_a_pinhole_not_a_mute_switch() -> None:
-    """The excused call is still an offence anywhere else.
+def test_the_allowance_is_a_pinhole_not_a_mute_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An excused call would still be an offence anywhere else.
+
+    :data:`NOT_YET_REWRITTEN` is empty, so this drives a *hypothetical*
+    one-entry allowance instead of the real one. The property it proves
+    is the reason the key has three parts, and it has to keep being
+    proven while the mechanism exists: the next person to reach for the
+    allowance needs it to be a pinhole, and a mechanism whose containment
+    is only tested while it happens to be in use is untested at exactly
+    the moment it gets used again.
 
     All three parts of the key are load-bearing and all three are
     asserted: a *different* banned call inside the allowed function is
-    reported, the same ``ssl.create_default_context`` in another
-    function of the allowed module is reported, and so is the one in
+    reported, the same ``ssl.create_default_context`` in another function
+    of the allowed module is reported, and so is the one in
     ``get_ssl_config`` when ``get_ssl_config`` is written in some other
     module.
 
     The first of those is the axis a ``(module, function)`` key loses
-    silently, and it is the reason the key names the call: that key
-    mutes the whole of ``get_ssl_config``, so the ``os.remove`` below
-    would be reported clean while the function it sits in kept its
-    allowance for one unrelated call.
+    silently, and it is the reason the key names the call: that key mutes
+    the whole of ``get_ssl_config``, so the ``os.remove`` below would be
+    reported clean while the function it sits in kept its allowance for
+    one unrelated call.
+
+    Args:
+        monkeypatch: Installs the hypothetical allowance for the duration
+            of this test only, so the real empty one is what every other
+            test -- and the package scan itself -- still sees.
     """
+    allowed = 'helpers/internal/filters_helper.py'
+    monkeypatch.setattr(
+        'tests.test_no_blocking_io.NOT_YET_REWRITTEN',
+        frozenset({(allowed, 'get_ssl_config', 'ssl.create_default_context')}),
+    )
     source = (
         'async def get_ssl_config(certificate):\n'
         '    os.remove(certificate[0])\n'
@@ -439,7 +455,6 @@ def test_the_allowance_is_a_pinhole_not_a_mute_switch() -> None:
         'async def somewhere_else(certificate):\n'
         '    return ssl.create_default_context(ssl.Purpose.SERVER_AUTH)\n'
     )
-    allowed = 'helpers/internal/filters_helper.py'
 
     assert blocking_calls_in_async_defs(source, allowed) == [
         f'{allowed}:2: os.remove (in get_ssl_config)',

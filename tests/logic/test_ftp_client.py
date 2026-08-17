@@ -19,6 +19,7 @@ by a double that never handshakes.
 import logging
 import socket
 import ssl
+from pathlib import Path
 from typing import Any, Optional, Text
 
 import aioftp
@@ -138,19 +139,10 @@ async def test_r15_ac1_an_ftp_download_returns_a_populated_envelope(
 # --- R15-AC2: the TLS configuration follows the error contract -------------
 
 
-@pytest.mark.parametrize(
-    'failure',
-    [
-        pytest.param(ssl.SSLError('cert chain refused'), id='bad-chain'),
-        pytest.param(
-            FileNotFoundError('cert.pem'), id='missing-cert-file'),
-    ],
-)
-async def test_r15_ac2_a_tls_configuration_failure_becomes_a_tls_envelope(
+async def test_r15_ac2_a_broken_system_ca_store_becomes_a_tls_envelope(
     monkeypatch: pytest.MonkeyPatch,
-    failure: BaseException,
 ) -> None:
-    """A certificate that will not load is reported, not thrown raw.
+    """The one TLS-configuration failure that is still a *transport* fault.
 
     The SSL block used to sit *above* the ``try``, so its failures were
     the one class of failure that escaped the client as a bare
@@ -159,37 +151,90 @@ async def test_r15_ac2_a_tls_configuration_failure_becomes_a_tls_envelope(
     the block back out of the ``try`` and this test raises rather than
     asserting.
 
-    The missing-file row is the reason the client classifies the failure
-    itself rather than leaning on the transport table below it: a
-    ``FileNotFoundError`` is an ``OSError``, and the table would read it
-    as a refused *connection* and report ``CONNECT`` for a call that
-    never left the process.
+    **What reaches this handler changed with R23**, and the failure
+    driven here is chosen to match. ``get_ssl_config`` now converts every
+    way the *caller's own* certificate files can fail -- missing,
+    unreadable, mismatched, not a PEM, passphrase-protected -- into a
+    ``ConfigurationError``, which is not an ``OSError`` and so passes
+    straight through this ``except`` to the 400 envelope the test below
+    asserts. The single ``OSError`` still able to arrive is the *system*
+    CA bundle failing to read: it is raised by
+    ``ssl.create_default_context``, which sits deliberately outside
+    ``build_client_ssl_context``'s own ``try`` because a broken trust
+    store is the environment's problem and not the caller's. That is a
+    genuine transport-level fault, so it is ``TLS``/502 and retriable.
+
+    Driven by breaking the real factory rather than by replacing
+    ``get_ssl_config`` wholesale, so the ``OSError`` travels the actual
+    path -- out of the thread, out of the helper, into this handler --
+    instead of being posted directly to the seam under test.
     """
-    async def refuse_the_chain(*args: Any, **kwargs: Any) -> dict:
-        """Fail the way a certificate that will not load fails.
+    def unreadable_trust_store(*args: Any, **kwargs: Any) -> ssl.SSLContext:
+        """Fail the way a missing system CA bundle fails.
 
         Args:
-            args: The certificate pair and flag, unused.
+            args: The purpose, ignored.
             kwargs: Unused.
 
         Returns:
             Never; this always raises.
 
         Raises:
-            BaseException: The parametrised failure, always.
+            OSError: Always.
         """
-        raise failure
+        raise OSError(2, 'No such file or directory')
 
     install_ftp_double(monkeypatch)
-    monkeypatch.setattr(ftp_client, 'get_ssl_config', refuse_the_chain)
+    monkeypatch.setattr(
+        'async_gateway.helpers.internal.filters_helper.'
+        'ssl.create_default_context',
+        unreadable_trust_store)
 
-    result = await ftp_call(certificate=('cert.pem', 'key.pem'))
+    with certificate_pair() as pair:
+        result = await ftp_call(certificate=pair)
 
     assert result['ok'] is False
     assert result['error'] is not None
     assert result['error']['code'] == 'TLS'
     assert result['error']['message']
     assert result['status_code'] == 502
+
+
+async def test_r15_ac2_an_unloadable_certificate_becomes_a_config_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The half of the contract R23 moved, pinned so the move is visible.
+
+    **This is a deliberate, reviewed change to FTP's live error
+    contract** (ticket AGW-17). Before R23, a certificate path that did
+    not exist reached ``load_cert_chain`` as a bare
+    ``FileNotFoundError`` -- an ``OSError`` -- and the handler above
+    reported it as ``TLS``/502. It is now ``CONFIG``/400.
+
+    400 is the better answer and the reasoning is the same one the
+    one-element-tuple case already used: nothing was attempted, no packet
+    left the process, and no retry can turn a path that does not exist
+    into one that does. 502 additionally puts the failure in the
+    retriable transport family, so a caller with a typo in their
+    configuration would have had it retried. It also matches what the
+    HTTP client already reports for the same mistake, which the split
+    contract did not.
+
+    Asserted on the real filesystem rather than through a double: the
+    whole point is that ``get_ssl_config`` classifies this itself now, so
+    substituting it would test the assertion instead of the behaviour.
+    """
+    install_ftp_double(monkeypatch)
+    missing = tmp_path / 'never-created.pem'
+
+    result = await ftp_call(certificate=(str(missing), str(missing)))
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == 'CONFIG'
+    assert result['status_code'] == 400
+    assert str(missing) in result['error']['message']
 
 
 # --- R15-AC3 / AC4: FTPS by default, and never a downgrade -----------------
@@ -304,12 +349,22 @@ async def test_tls_context_for_keeps_the_callers_own_certificate_context(
     the helper never produces a default context, so a test that passed
     one in asserted pass-through against a shape the code under test
     never sees.
+
+    The key is ``'ssl'``, and **only** ``'ssl'``. R23-AC3 moved the
+    certificate branch off the deprecated ``ssl_context=`` key that this
+    test used to read, so pinning the new one is the point rather than
+    incidental. Accepting either would prove nothing:
+    :data:`~async_gateway.logic.ftp_client.TLS_CONFIG_KEYS` still reads
+    both, so a test that tolerated the old key would keep passing if the
+    migration were reverted -- which is exactly the regression it is here
+    to catch.
     """
     with certificate_pair() as pair:
         config = await get_ssl_config(pair, True)
 
-    assert isinstance(config['ssl_context'], ssl.SSLContext)
-    assert tls_context_for(config) is config['ssl_context']
+    assert set(config) == {'ssl'}
+    assert isinstance(config['ssl'], ssl.SSLContext)
+    assert tls_context_for(config) is config['ssl']
 
 
 def test_tls_context_for_refuses_a_context_that_verifies_no_peer(
@@ -521,13 +576,23 @@ async def test_a_malformed_certificate_is_a_configuration_error(
 ) -> None:
     """A caller's typo is the caller's fault, and says so.
 
-    ``get_ssl_config`` indexes ``certificate[0]`` and ``[1]``
-    unguarded, so a one-element tuple raises ``IndexError`` and a
-    non-sequence raises ``TypeError``. Neither is an ``OSError``, so both
+    The pre-fix ``get_ssl_config`` indexed ``certificate[0]`` and ``[1]``
+    unguarded, so a one-element tuple raised ``IndexError`` and a
+    non-sequence raised ``TypeError``. Neither is an ``OSError``, so both
     escaped the client's TLS handler raw -- a caller who wrote the
     documented ``result['ok']`` check got an exception instead of an
     envelope, and one that named no useful cause. ``CONFIG``/400 rather
     than ``TLS``/502 because nothing was attempted and no retry can help.
+
+    The envelope is unchanged; **where** it is produced is not. This used
+    to be an ``except (IndexError, TypeError)`` arm inside
+    ``_tls_value``, translating the two raw exceptions after the fact.
+    R23 made ``normalised_certificate`` reject these shapes itself, with
+    a ``ConfigurationError`` that names the offending *type*, so the arm
+    became unreachable and was deleted rather than left as a branch no
+    input can enter (AGW-17). This test is what proves the deletion was
+    safe: it asserts the caller-visible contract, not the mechanism, so
+    it held across the move.
     """
     install_ftp_double(monkeypatch)
 

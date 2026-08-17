@@ -43,7 +43,6 @@ from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
     CircuitOpenError,
-    ConfigurationError,
     ConnectError,
     DnsError,
     FtpStatusError,
@@ -279,7 +278,9 @@ class FTPRequest(BaseRequestClass):
             GatewayTimeoutError: When the connect, or any one socket
                 operation of the transfer, exceeds ``timeout``.
             ConfigurationError: When ``certificate`` is not a
-                ``(certificate path, key path)`` pair.
+                ``(certificate path, key path)`` pair, or names files
+                that will not load. Raised by ``get_ssl_config`` and
+                deliberately not caught here -- see :meth:`_tls_value`.
             DnsError: When the host name does not resolve.
             ConnectError: When the connection is refused or reset.
             TransportError: For any other transport failure.
@@ -327,14 +328,21 @@ class FTPRequest(BaseRequestClass):
             by accident is the downgrade this method exists to refuse.
 
         Raises:
-            TlsError: If the TLS configuration cannot be built -- a
-                certificate file that is missing, unreadable, or not a
-                usable chain -- or if it is built but authenticates no
-                peer.
+            TlsError: If the system CA bundle cannot be read, or if the
+                configuration is built but authenticates no peer.
             ConfigurationError: If ``certificate`` is not a
-                ``(certificate path, key path)`` pair. That is the
-                caller's typo rather than a transport fault, so it is
-                reported at 400 and never retried.
+                ``(certificate path, key path)`` pair, or names files
+                that will not load -- missing, unreadable, not a valid
+                PEM, a mismatched pair, or a passphrase-protected key.
+                ``get_ssl_config`` raises it directly and it is *not*
+                caught here: that is the caller's typo rather than a
+                transport fault, so it is reported at 400 and never
+                retried. R23 widened it from the two malformed-shape
+                cases to every unloadable certificate, which moved the
+                unloadable-file case from ``TLS``/502 to ``CONFIG``/400 --
+                a deliberate contract change recorded in ticket AGW-17,
+                on the same reasoning: nothing was attempted, so no retry
+                can help, and it is what the HTTP client already reports.
         """
         if not self.verify_ssl:
             logger.warning(
@@ -352,21 +360,19 @@ class FTPRequest(BaseRequestClass):
         try:
             ssl_config = await get_ssl_config(self.certificate, True)
         except OSError as err:
+            # The one `OSError` that still reaches here. Everything the
+            # caller's own certificate files can do to fail is converted
+            # to a `ConfigurationError` inside `get_ssl_config`, which is
+            # not an `OSError` and so passes through untouched; what is
+            # left is the *system* CA bundle failing to read, which is
+            # the environment's fault and is a transport-level TLS
+            # failure. The `(IndexError, TypeError)` arm that used to sit
+            # below became unreachable when R23 made
+            # `normalised_certificate` reject those shapes itself, and is
+            # deleted rather than left as a branch no input can enter.
             raise TlsError(
                 f'ftp tls configuration failed for '
                 f'{redact_url(self.url, extra_params=self.redact_params)}'
-            ) from err
-        except (IndexError, TypeError) as err:
-            # `get_ssl_config` indexes `certificate[0]` and `[1]`
-            # unguarded, so a one-element pair raises `IndexError` and a
-            # non-sequence raises `TypeError`. Neither is an `OSError`,
-            # so both used to escape this method raw. Caught around this
-            # one call and no wider: the only subscripting inside it is
-            # of the caller's own value, so nothing here can mask a bug
-            # of this library's making.
-            raise ConfigurationError(
-                "protocol_info['certificate'] must be a (certificate "
-                'path, key path) pair'
             ) from err
         return tls_context_for(ssl_config)
 

@@ -60,6 +60,14 @@ dev = [
     # >=3.10, so on the 3.10 CI leg bare bandit would fail to load `-c
     # pyproject.toml` — a silently unconfigured scanner.
     "bandit[toml]",
+    # Mints the throwaway PKI `tests/fixtures/tls.py` runs R23's mutual-TLS
+    # handshake against, and the client certificates `tests/fixtures/ftp.py`
+    # already used. It was resolving here transitively via `asyncssh`, which
+    # is exactly why it has to be declared: a direct import resting on
+    # someone else's dependency breaks the day that dependency drops it, and
+    # the break surfaces as a collection error in an unrelated suite rather
+    # than as a missing requirement.
+    "cryptography",
     "flake8==7.1.0",
     "flake8-builtins==2.5.0",
     "flake8-docstrings==1.7.0",
