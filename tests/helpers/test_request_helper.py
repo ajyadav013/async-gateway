@@ -327,6 +327,129 @@ async def test_a_zero_part_multipart_body_writes_an_empty_file(
     assert result['text'] == ''
 
 
+def _multipart_body_without_its_closing_boundary(part: bytes) -> bytes:
+    """Assemble a multipart body whose final boundary never arrives.
+
+    A length-declaring part with no closing ``--boundary--`` after it.
+    The declared length is what makes it useful: ``BodyPartReader``
+    stops the part on its own byte count, and the reader then finds the
+    stream exhausted where the terminator should have been -- so
+    ``at_eof()`` is already True at the top of the next iteration.
+
+    Args:
+        part: The body bytes of the single part.
+
+    Returns:
+        The truncated multipart body.
+    """
+    boundary = BOUNDARY.encode()
+    return b''.join([
+        b'--', boundary, b'\r\n',
+        b'Content-Type: application/octet-stream\r\n',
+        b'Content-Length: ', str(len(part)).encode(), b'\r\n\r\n',
+        part, b'\r\n',
+    ])
+
+
+async def test_a_truncated_multipart_body_terminates_on_at_eof(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R28: the loop's *other* exit -- the ``while`` condition, not the break.
+
+    ``test_a_reader_returning_none_terminates_the_loop_cleanly`` covers a
+    well-formed body, where ``next()`` answers None before ``at_eof()``
+    goes True and the ``break`` is what ends the loop. A body whose
+    closing boundary never arrives ends the other way round: the part
+    declares its own ``Content-Length``, so the reader finishes it and
+    then finds the stream exhausted, and ``at_eof()`` is already True
+    when the ``while`` is re-tested. ``next()`` is never called again.
+
+    That ordering is the whole point of the guard. Verified against the
+    real reader rather than assumed: calling ``next()`` on this body
+    after the first part raises ``ValueError: Invalid boundary b'',
+    expected b'--agwtestboundary'``. So a loop rewritten as
+    ``while True`` with only the None check to end it would turn a
+    truncated response -- a connection cut mid-body, which is an ordinary
+    network event -- into an unhandled ``ValueError`` escaping
+    ``request()`` as this library's own bug rather than as a completed
+    read of everything that did arrive.
+
+    Delete this and only the well-formed exit is exercised, so that
+    rewrite ships green. The parts that *did* arrive are asserted written
+    and returned, because refusing them would be the opposite failure:
+    discarding a body the caller received in full up to the cut.
+    """
+    target = tmp_path / 'truncated.bin'
+    http_server.respond(
+        '/multipart',
+        body=_multipart_body_without_its_closing_boundary(b'arrived'),
+        headers=_multipart_headers(),
+    )
+    observed: list[Text] = []
+    build_reader = aiohttp.MultipartReader.from_response
+
+    def recording(response: aiohttp.ClientResponse) -> Any:
+        """Wrap the real reader, noting which exit the loop takes.
+
+        The two exits are indistinguishable from the outside: both end
+        the loop and both return what arrived. Recording the calls is
+        what tells them apart, and without it this row would pass
+        against the ``next()``-returned-None exit the well-formed case
+        already covers.
+
+        Args:
+            response: The response to read the multipart body from.
+
+        Returns:
+            The real reader, with its two loop-controlling methods
+            recording before they delegate.
+        """
+        reader = build_reader(response)
+        at_eof, next_part = reader.at_eof, reader.next
+
+        def watched_at_eof() -> bool:
+            """Note the answer, then give it.
+
+            Returns:
+                Whatever the real ``at_eof`` answers.
+            """
+            answer = at_eof()
+            observed.append(f'at_eof={answer}')
+            return answer
+
+        async def watched_next() -> Any:
+            """Note whether a part came back, then hand it on.
+
+            Returns:
+                Whatever the real ``next`` answers.
+            """
+            part = await next_part()
+            observed.append(f'next={part is not None}')
+            return part
+
+        reader.at_eof, reader.next = watched_at_eof, watched_next
+        return reader
+
+    monkeypatch.setattr(
+        aiohttp.MultipartReader, 'from_response', staticmethod(recording))
+
+    async with aiohttp.ClientSession(timeout=TEST_TIMEOUT) as session:
+        async with session.get(
+            http_server.url_for('/multipart'),
+        ) as response:
+            text = await handle_multipart_response(
+                response, {'download_filepath': str(target)})
+
+    assert text == 'arrived'
+    assert target.read_bytes() == b'arrived'
+    assert observed == ['at_eof=False', 'next=True', 'at_eof=True'], (
+        'the loop must end on the while condition, not on the break: a '
+        'trailing next=False would mean this row is re-covering the '
+        'well-formed exit instead of the truncated one')
+
+
 async def test_multipart_falls_back_to_the_documented_default_path(
     http_server: RecordingHTTPServer,
     tmp_path: Path,

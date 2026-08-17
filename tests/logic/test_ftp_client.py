@@ -26,14 +26,18 @@ import aioftp
 
 from aiohttp import BasicAuth
 
+from failsafe import FailsafeError, RetriesExhausted
+
 import pytest
 
 from async_gateway.async_gateway import request
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.logic import ftp_client
-from async_gateway.logic.ftp_client import FTPRequest, tls_context_for
+from async_gateway.logic.ftp_client import (
+    FTPRequest, reply_status, tls_context_for, transport_error_for)
 from async_gateway.utils.envelope import GatewayResponse, new_envelope
-from async_gateway.utils.exceptions import TlsError
+from async_gateway.utils.exceptions import (
+    ConfigurationError, FtpStatusError, TlsError, TransportError)
 
 from tests.fixtures.ftp import (
     FILE_STATS,
@@ -704,6 +708,144 @@ async def test_a_transport_failure_maps_to_its_typed_error(
     assert result['error']['message']
 
 
+@pytest.mark.parametrize(
+    'received, expected',
+    [
+        pytest.param(('550',), 550, id='one-numeric-code'),
+        pytest.param(('220-', '550'), 550, id='a-continuation-then-the-code'),
+        pytest.param(('220-', 'x'), None, id='nothing-that-reads-as-a-number'),
+        pytest.param((), None, id='no-code-at-all'),
+    ],
+)
+def test_r28_a_reply_code_is_reported_only_when_the_server_gave_one(
+    received: tuple[Text, ...],
+    expected: Optional[int],
+) -> None:
+    """R28: the whole of ``reply_status``, including the answer ``None``.
+
+    A unit test on the module function rather than an envelope, because
+    the interesting rows cannot be told apart from outside: every one of
+    them that answers ``None`` reaches the caller as the same 500
+    ``FtpStatusError`` takes by default, so an envelope assertion cannot
+    distinguish "the server said nothing numeric" from "the server said
+    500". The row below drives that default end to end; these rows pin
+    which received codes produce it.
+
+    ``aioftp`` hands this a tuple of ``Code``, which is a ``str``
+    subclass and is *not* guaranteed to be digits: a multi-line reply
+    puts the continuation marker ``220-`` in it, and a server answering
+    with anything else at all puts that in it verbatim. So the search
+    keeps going past a non-numeric entry -- the second row is the one
+    that proves it does -- and gives up rather than inventing a code when
+    it runs out. Replace the loop with ``received_codes[0]`` and the
+    second row reports ``None`` for a server that plainly said 550;
+    delete the trailing ``return None`` and rows three and four raise
+    ``TypeError`` from the envelope's status lookup instead.
+    """
+    error = aioftp.StatusCodeError(
+        aioftp.Code('2xx'), tuple(aioftp.Code(code) for code in received),
+        ['whatever the server said'])
+
+    assert reply_status(error) == expected
+
+
+async def test_r28_an_unreadable_reply_code_falls_back_to_the_class_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller still gets a status, and it is not a fabricated one.
+
+    The companion to the unit rows above, and the reason answering
+    ``None`` is safe: ``FtpStatusError`` takes its documented default
+    from ``utils/status_map.py`` when no reply code is supplied, so a
+    server whose codes this library cannot read is reported as
+    ``FTP_STATUS``/500 rather than as a number invented at the call site
+    -- which is the ``999`` this whole error contract replaces. Make
+    ``reply_status`` return something other than None on this input and
+    the caller is told the server said a code it never said.
+    """
+    unreadable = aioftp.StatusCodeError(
+        aioftp.Code('2xx'), aioftp.Code('x'), ['not a numeric reply'])
+    install_ftp_double(monkeypatch, connect_error=unreadable)
+
+    result = await ftp_call()
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == 'FTP_STATUS'
+    assert result['error']['type'] == FtpStatusError.__name__
+    assert result['status_code'] == 500
+
+
+@pytest.mark.parametrize(
+    'wrapper',
+    [
+        pytest.param(RetriesExhausted, id='retries-exhausted'),
+        pytest.param(FailsafeError, id='the-bare-wrapper'),
+    ],
+)
+def test_r28_a_causeless_failsafe_wrapper_is_a_transport_error(
+    wrapper: type[FailsafeError],
+) -> None:
+    """R28: the arm that keeps ``transport_error_for`` total.
+
+    A direct call on the module function, which the rest of this module
+    avoids, and it is deliberate: ``handle_request`` cannot reach this
+    arm. The only ``FailsafeError`` the breaker raises with no
+    ``__cause__`` is a ``CircuitOpen`` on a destination that has not
+    failed in *this* call, and that class is caught one ``except`` higher
+    and becomes a ``CircuitOpenError`` -- so through the public surface
+    every wrapper that arrives here carries a cause.
+
+    Worth having rather than pragma-ing away, for the same reason the
+    guard exists. Without it a causeless wrapper falls through to
+    ``raise cause from None`` and raises ``TypeError: exceptions must
+    derive from BaseException`` on ``None``, from inside the classifier
+    -- so the caller of a library whose one job is typed errors gets an
+    untyped one, raised from the least legible place in this module. The
+    message is asserted non-empty because ``str(RetriesExhausted())`` is
+    ``''``, and an empty error message reads to a consumer as success.
+    """
+    error = transport_error_for(wrapper())
+
+    assert isinstance(error, TransportError)
+    assert type(error) is TransportError
+    assert error.code == 'TRANSPORT'
+    assert error.status_code == 502
+    assert str(error)
+
+
+async def test_r28_an_open_circuit_is_reported_as_an_open_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The breaker's own refusal is not a transport failure.
+
+    ``CircuitOpen`` is a ``FailsafeError`` with nothing under it the
+    generic unwrap can classify, so without its own clause it would land
+    as a ``CONNECT``/502 -- retriable -- and the caller would retry into
+    a circuit that is open precisely to stop them. 503 says "not now".
+
+    The breaker is configured to open on the first failure and to retry
+    twice, so the second attempt of the *same* call finds the circuit
+    already open: that is what makes this reachable without a second
+    ``request()``, and what makes the assertion about this library's
+    dispatch rather than about test ordering.
+    """
+    client = RecordingFTPClient(command_error=ConnectionResetError('reset'))
+    install_ftp_double(monkeypatch, client=client)
+
+    result = await ftp_call(
+        circuit_breaker_config={
+            'maximum_failures': 1,
+            'retry_config': {'name': 'delay', 'allowed_retries': 2,
+                             'delay': 0},
+        })
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == 'CIRCUIT_OPEN'
+    assert result['status_code'] == 503
+
+
 async def test_a_library_bug_propagates_instead_of_becoming_an_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1002,6 +1144,54 @@ async def test_an_unadmitted_command_never_reaches_the_client(
 
     assert result['ok'] is False
     assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    'server_path',
+    [
+        pytest.param(None, id='absent'),
+        pytest.param('', id='empty'),
+        pytest.param(42, id='not-a-string'),
+    ],
+)
+async def test_r28_a_missing_server_path_is_refused_before_the_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    server_path: Any,
+) -> None:
+    """``TypeError`` from inside ``PurePosixPath`` is not a diagnosis.
+
+    ``server_path`` has no default, and every command acts on it. Absent,
+    it used to reach ``aioftp.Client.stat`` -- whose signature is ``str |
+    PurePosixPath`` -- as ``None`` and raise ``TypeError: argument should
+    be a str or an os.PathLike object`` from inside ``PurePosixPath``. A
+    ``TypeError`` belongs to no transport family, so it escaped
+    ``request()`` un-enveloped as a library bug rather than being
+    reported as the caller's configuration error it is. Surfaced by
+    removing mypy's ``ignore_errors``, which is what made the honest
+    ``Optional[Text]`` annotation visible.
+
+    The empty and non-string rows are here because ``server_path`` comes
+    out of a config file as often as out of a literal: ``''`` is a
+    perfectly good string that names no path, and a path written as a
+    number is the same mistake one keystroke away.
+
+    The empty session log is the load-bearing half. An envelope
+    assertion alone would hold just as well for a check placed after the
+    connect -- and the point is that nothing is opened, no credentials
+    are put on the wire, for a call that cannot run.
+    """
+    double = install_ftp_double(monkeypatch)
+
+    result = await ftp_call(server_path=server_path)
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == 'CONFIG'
+    assert result['error']['type'] == ConfigurationError.__name__
+    assert result['status_code'] == 400
+    assert 'server_path' in result['error']['message']
+    assert repr(server_path) in result['error']['message']
+    assert double.calls == []
 
 
 @pytest.mark.parametrize(

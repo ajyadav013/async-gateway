@@ -260,6 +260,41 @@ async def test_the_ftp_layer_refuses_to_overwrite_unless_asked(
     assert (base / 'f.bin').read_bytes() == b'replaced'
 
 
+async def test_an_unrecognised_ftp_open_failure_arrives_as_itself(
+    tmp_path: Path,
+) -> None:
+    """R28: an OSError the classifier does not recognise is re-raised.
+
+    The guarded open earns three different kinds of ``OSError`` and only
+    two of them mean something to this library: ``ELOOP``/``EMLINK`` is a
+    refused symlink and ``EEXIST`` is a refused overwrite. Everything
+    else -- a parent directory that is not there, a plain file standing
+    where a directory component was expected -- belongs to the caller's
+    environment, not to containment, and
+    :func:`~async_gateway.utils.paths.classify_refusal` answers None for
+    it so the original error propagates untranslated.
+
+    Delete this and the wrapper is free to report a missing directory as
+    a ``PathContainmentError``: an operator would read a filesystem
+    mistake as a hostile server, and would have no ``errno`` left to fix
+    it by. Both errno families are driven because they reach the
+    classifier through its two different arms -- ``ENOENT`` is refused
+    before the ``EEXIST`` test, ``ENOTDIR`` after it.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    (base / 'plain').write_bytes(b'a file, not a directory')
+    layer = path_io(base)
+
+    with pytest.raises(FileNotFoundError):
+        async with layer.open(base / 'absent' / 'f.bin', mode='wb'):
+            pass
+
+    with pytest.raises(NotADirectoryError):
+        async with layer.open(base / 'plain' / 'f.bin', mode='wb'):
+            pass
+
+
 async def test_the_ftp_layer_permits_the_bases_own_parent_exactly(
     tmp_path: Path,
 ) -> None:
@@ -624,6 +659,27 @@ async def test_the_local_fs_reads_without_the_write_guards(
         assert await handle.read(100, 0) == b'existing contents'
     finally:
         await handle.close()
+
+
+async def test_an_unrecognised_local_fs_open_failure_arrives_as_itself(
+    tmp_path: Path,
+) -> None:
+    """R28: the same untranslated propagation, on the SFTP wrapper.
+
+    Both wrappers share one guarded open, and the row above proves the
+    re-raise through the FTP one. This is the second caller, asserted
+    because the sharing is an implementation detail a future change is
+    free to undo: the day ``ContainedLocalFS.open`` grows its own
+    handling, a wrapper that swallowed a ``FileNotFoundError`` into a
+    containment error would pass every other row in this module.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+
+    with pytest.raises(FileNotFoundError):
+        await filesystem.open(
+            os.fsencode(str(base / 'absent' / 'f.bin')), 'wb')
 
 
 async def test_the_local_fs_opens_off_the_event_loop(

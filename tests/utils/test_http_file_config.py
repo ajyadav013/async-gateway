@@ -35,7 +35,7 @@ aioboto3's real surface without the signature test noticing.
 import ast
 import importlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Text
 
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 
@@ -44,10 +44,13 @@ import pytest
 from async_gateway.utils.exceptions import (
     ConfigurationError,
     HttpStatusError,
+    UnsupportedVerbError,
 )
 from async_gateway.utils.http_file_config import (
+    HTTP_VERBS,
     download_file_from_s3,
     download_file_from_url,
+    resolve_verb,
 )
 
 from tests.fixtures.http_server import RecordingHTTPServer
@@ -499,6 +502,103 @@ async def test_an_s3_failure_that_is_not_credentials_is_not_wrapped(
             bucket_name='b', s3_filepath='k', local_filepath='/tmp/f')
 
     assert caught.value is raised
+
+
+# --- R21: the version-skew arm of the verb resolver -----------------------
+
+
+class TransportWithoutTheVerb:
+    """A transport client offering none of the operations HTTP names.
+
+    The shape a *future* ``aiohttp`` takes if it renames or withdraws a
+    request shortcut: the allowlist still carries the verb, and the
+    object no longer answers to it.
+    """
+
+
+class TransportWhereTheVerbIsNotCallable:
+    """A transport client whose ``get`` is an attribute, not a method.
+
+    The near miss the ``callable`` test exists for rather than a plain
+    ``hasattr``: ``getattr`` finds something, so a resolver checking only
+    for presence would hand this back and the caller would earn
+    ``TypeError: 'str' object is not callable`` from inside the request
+    loop.
+
+    Attributes:
+        get: A string standing where a bound method belongs.
+    """
+
+    get = 'not an operation'
+
+
+@pytest.mark.parametrize(
+    'client',
+    [
+        pytest.param(TransportWithoutTheVerb(), id='attribute-absent'),
+        pytest.param(
+            TransportWhereTheVerbIsNotCallable(), id='attribute-not-callable'),
+    ],
+)
+def test_an_allowed_verb_the_transport_lacks_is_refused_by_name(
+    client: Any,
+) -> None:
+    """R28: version skew is refused here, not discovered further in.
+
+    This arm is unreachable through the public path with the pinned
+    ``aiohttp``, because :data:`HTTP_VERBS` is derived from the request
+    shortcuts ``ClientSession`` actually exposes -- so it is driven by
+    handing :func:`resolve_verb` a stand-in client directly, which is the
+    only way to express a transport library that has moved on.
+
+    Delete this and the arm is free to be dropped as dead code, and the
+    day a release withdraws a shortcut the caller no longer gets a
+    ``CONFIG``/400 naming the verb: they get an ``AttributeError`` -- or,
+    for the non-callable case, a ``TypeError`` -- raised from somewhere
+    inside the transport, against a verb *this library told them was
+    allowed*. The message therefore has to name three things a caller
+    can act on: which ``protocol_info`` key, which verb, and which client
+    class came up short.
+    """
+    with pytest.raises(UnsupportedVerbError) as caught:
+        resolve_verb(
+            client, 'get', allowed=HTTP_VERBS, setting='request_type')
+
+    message = str(caught.value)
+    assert 'request_type' in message
+    assert type(client).__name__ in message
+    assert "'get'" in message
+    assert caught.value.code == 'CONFIG'
+    assert caught.value.status_code == 400
+
+
+def test_the_verb_resolver_still_returns_a_real_transport_operation() -> None:
+    """The control: the skew arm refuses, it does not refuse everything.
+
+    A resolver that raised for every client would satisfy both rows above
+    while making every HTTP call impossible, so the admitted case is
+    asserted beside them -- and asserted as *identity* with the bound
+    attribute, because returning some other callable would be the same
+    defect wearing a different mask.
+    """
+    class Transport:
+        """A client that does offer the operation."""
+
+        def get(self) -> Text:
+            """Stand in for a request shortcut.
+
+            Returns:
+                A marker proving this exact attribute was handed back.
+            """
+            return 'the real operation'
+
+    client = Transport()
+
+    operation = resolve_verb(
+        client, ' GET ', allowed=HTTP_VERBS, setting='request_type')
+
+    assert operation == client.get
+    assert operation() == 'the real operation'
 
 
 # --- H16: every non-success status refuses to write -----------------------

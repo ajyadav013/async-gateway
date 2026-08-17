@@ -30,7 +30,10 @@ import pytest
 from async_gateway.async_gateway import request
 from async_gateway.utils.constants import HTTP_TIMEOUT
 from async_gateway.utils.envelope import GatewayResponse
-from async_gateway.utils.exceptions import ConfigurationError
+from async_gateway.utils.exceptions import (
+    ConfigurationError,
+    UnsupportedVerbError,
+)
 from async_gateway.utils.request_tracer import request_tracer
 
 from tests.fixtures.http_server import RecordingHTTPServer
@@ -1712,3 +1715,160 @@ async def test_an_uppercased_scheme_allowlist_admits_the_scheme_it_names(
 
     assert envelope['ok'] is True
     assert envelope['text'] == 'arrived'
+
+
+# --- R28: the verb is checked at construction, in every shape it comes in --
+
+
+@pytest.mark.parametrize(
+    'request_type',
+    [
+        pytest.param('close', id='an-attribute-that-is-not-a-verb'),
+        pytest.param('FETCH', id='a-verb-of-no-protocol'),
+        pytest.param('', id='empty-string'),
+        pytest.param('   ', id='whitespace-only'),
+        pytest.param(None, id='none'),
+        pytest.param(7, id='int'),
+        pytest.param(['GET'], id='a-list-holding-a-verb'),
+        pytest.param(b'GET', id='bytes'),
+    ],
+)
+async def test_a_request_type_naming_no_verb_is_refused_before_dispatch(
+    http_server: RecordingHTTPServer,
+    request_type: Any,
+) -> None:
+    """R28: every non-verb is rejected by name, and none reaches the wire.
+
+    The guard is one condition covering two distinct mistakes, so both
+    are driven here. ``'close'`` is the measured one (M25): it used to
+    resolve to ``ClientSession.close(url, **filters)`` through an
+    unbounded ``getattr`` and die inside the transport as a ``TypeError``
+    belonging to no error family, which the envelope then reported as a
+    fabricated status. The non-string rows are the other half -- ``None``
+    and ``7`` have no ``.strip()``, so without the ``isinstance`` arm the
+    check itself raises ``AttributeError`` out of the constructor, and
+    the caller of a library whose one job is typed errors gets an untyped
+    one. ``b'GET'`` is the near-miss that makes the arm worth having
+    rather than looking redundant: it *reads* as a verb and is not a
+    ``str``.
+
+    Whitespace-only and empty are the ``not name`` half of the guard,
+    which cannot be reached by an unknown verb: ``''.strip().lower()`` is
+    falsy before the membership test runs.
+
+    The refusal is at construction, which is outside the block
+    ``request()`` converts an ``AsyncGatewayError`` into an envelope in,
+    so it escapes as an exception rather than as ``ok=False`` -- and the
+    recorded request count is what proves nothing was dispatched. Delete
+    this and a bad verb becomes a retriable-looking envelope for a call
+    that can never succeed.
+    """
+    http_server.respond('/body', body=b'never reached')
+
+    with pytest.raises(UnsupportedVerbError) as caught:
+        await _get_with(http_server, request_type=request_type)
+
+    assert caught.value.code == 'CONFIG'
+    assert caught.value.status_code == 400
+    assert repr(request_type) in str(caught.value)
+    assert http_server.requests == []
+
+
+async def test_a_verb_the_allowlist_admits_is_echoed_in_the_callers_spelling(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """The pair to the refusals: the guard normalises to *check*, not to keep.
+
+    ``'Post'`` is admitted -- the membership test lower-cases first -- and
+    the value stored is the caller's own spelling, because it is echoed
+    back to them in ``protocol_details`` and in the ``HttpStatusError``
+    message. Normalise the return and a caller who wrote ``'Post'`` reads
+    ``'post'`` there; widen the check instead and ``'Post'`` is refused as
+    an unknown verb, which is the same guardrail turned against the
+    caller.
+    """
+    http_server.respond('/body', body=b'created')
+
+    envelope = await _get_with(http_server, request_type='Post')
+
+    assert envelope['ok'] is True
+    assert [r.method for r in http_server.requests] == ['POST']
+
+
+# --- R28: the breaker's own refusal is not a transport failure ------------
+
+
+async def test_an_open_circuit_refuses_an_http_call_without_dispatching_it(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """R28: ``CircuitOpen`` becomes ``CIRCUIT_OPEN``/503, not a 502.
+
+    ``CircuitOpen`` is a ``failsafe`` exception with nothing under it the
+    generic classifier can read, so without its own ``except`` clause in
+    ``_exchange`` it falls through to ``transport_error_for`` and reaches
+    the caller as a ``TRANSPORT``/502 -- a status a client retries, into
+    a circuit that is open precisely to stop them retrying. 503 says
+    "not now" instead, and it is the only status that does.
+
+    Driven with two real calls rather than by raising the exception at a
+    seam: the first has to *fail and be counted* for the second to be
+    refused, so a breaker that never counted an HTTP failure could not
+    pass this, where an injected refusal would. The recorded request
+    count is what proves the second call never reached the wire -- the
+    whole behaviour a fast-fail exists for, and the thing a status
+    assertion alone cannot see.
+
+    ``max_redirects=0`` against a self-redirecting path is the cheapest
+    failure this server can produce that the breaker counts: it is a
+    ``TRANSPORT`` failure raised after exactly one recorded hop, with no
+    clock to wait on.
+    """
+    http_server.respond('/loop', status=302, headers={'Location': '/loop'})
+    info: dict[str, Any] = {
+        'max_redirects': 0,
+        'circuit_breaker_config': {'maximum_failures': 1},
+    }
+
+    first = await _get_with(http_server, '/loop', **info)
+    second = await _get_with(http_server, '/loop', **info)
+
+    assert first['ok'] is False
+    assert first['error'] is not None
+    assert first['error']['code'] == 'TRANSPORT'
+    assert second['ok'] is False
+    assert second['error'] is not None
+    assert second['error']['code'] == 'CIRCUIT_OPEN'
+    assert second['status_code'] == 503
+    assert [r.path for r in http_server.requests] == ['/loop']
+
+
+async def test_an_open_circuits_refusal_names_the_destination_redacted(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """R28: the refusal says *which* circuit, without leaking the secret.
+
+    The message is the only place a caller learns which destination was
+    refused, and it interpolates the URL -- so it is exactly the seam
+    where a credential in the query string escapes into an exception a
+    consumer logs. The handler builds it through ``redact_url`` with the
+    caller's own ``redact_query_params`` set for that reason. Drop the
+    redaction and the token is echoed in clear text by the one code path
+    that runs when a destination is already failing, which is when logs
+    are being read most closely.
+    """
+    http_server.respond('/loop', status=302, headers={'Location': '/loop'})
+    info: dict[str, Any] = {
+        'max_redirects': 0,
+        'circuit_breaker_config': {'maximum_failures': 1},
+        'redact_query_params': ['token'],
+    }
+
+    await _get_with(http_server, '/loop?token=s3cret', **info)
+    refused = await _get_with(http_server, '/loop?token=s3cret', **info)
+
+    assert refused['error'] is not None
+    assert refused['error']['code'] == 'CIRCUIT_OPEN'
+    message = refused['error']['message']
+    assert 'circuit open for' in message
+    assert '/loop' in message
+    assert 's3cret' not in message

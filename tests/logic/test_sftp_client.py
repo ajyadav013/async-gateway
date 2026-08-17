@@ -1074,6 +1074,56 @@ async def test_r17_a_missing_mode_is_a_configuration_error(
 
 
 @pytest.mark.parametrize(
+    'remote_path',
+    [
+        pytest.param(None, id='absent'),
+        pytest.param('', id='empty'),
+        pytest.param(42, id='not-a-string'),
+    ],
+)
+async def test_r28_a_missing_remote_path_is_a_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+    remote_path: Any,
+) -> None:
+    """The same check as ``mode``, on the path every mode acts on.
+
+    Surfaced by removing mypy's ``ignore_errors``: with ``remote_path``
+    annotated honestly as ``Optional[Text]``, the checker showed it
+    reaching ``sftp.lstat(...)``, whose signature is ``bytes | str |
+    PurePath``. Absent, it arrived there as ``None`` and raised
+    ``TypeError: expected str, bytes or os.PathLike object`` from inside
+    asyncssh -- which belongs to no transport family, so it escaped
+    ``request()`` un-enveloped as this library's bug rather than being
+    reported as the caller's configuration error it is.
+
+    The empty and non-string rows are the same mistake arriving from a
+    config file rather than a literal: ``''`` is a good string that names
+    no path, and a path written as a number is one keystroke away.
+
+    Checked beside ``mode`` and *before* the connect, which is what the
+    empty connection log asserts -- an envelope assertion alone would
+    hold for a check placed after ``lstat`` had already run against the
+    server, and the whole point of validating here is that nothing is
+    opened for a call that cannot run.
+    """
+    double = trusting_double(monkeypatch)
+
+    envelope = await request(
+        HOST, data={}, auth=AUTH, protocol='SFTP',
+        protocol_info={'mode': 'get', 'remote_path': remote_path,
+                       'host_key': SERVER_HOST_KEY})
+
+    assert envelope['ok'] is False
+    assert envelope['error'] is not None
+    assert envelope['error']['code'] == 'CONFIG'
+    assert envelope['error']['type'] == ConfigurationError.__name__
+    assert envelope['status_code'] == 400
+    assert 'remote_path' in envelope['error']['message']
+    assert repr(remote_path) in envelope['error']['message']
+    assert double.connections == []
+
+
+@pytest.mark.parametrize(
     'attrs, entries, files',
     [
         pytest.param(FILE_ATTRS, ('f',), None, id='file'),

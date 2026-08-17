@@ -515,6 +515,59 @@ def test_r11_ac6_every_registry_entry_is_a_protocol_class() -> None:
         assert issubclass(protocol_class, BaseRequestClass), name
 
 
+# --- R28: the strategy contract's own body, for a subclass that defers -----
+
+
+class DeferringProtocol(BaseRequestClass):
+    """A protocol class that overrides ``handle_request`` and then defers.
+
+    The shape a half-written protocol takes: the abstract method is
+    declared, so the class instantiates and the registry's own
+    ``issubclass`` check passes, but the body hands the work back to the
+    base rather than dispatching anything. Written out as a real class
+    rather than assembled with ``type()`` because that is how the mistake
+    it stands in for is actually written.
+    """
+
+    async def handle_request(self) -> GatewayResponse:
+        """Defer to the base class instead of dispatching.
+
+        Returns:
+            Never; the base class's body raises.
+
+        Raises:
+            NotImplementedError: Always, from the base class.
+        """
+        return await super().handle_request()
+
+
+async def test_r28_a_subclass_that_defers_to_the_base_gets_a_named_error(
+) -> None:
+    """R28: the contract's body is a named refusal, not a silent ``None``.
+
+    ``@abc.abstractmethod`` stops a subclass that declares *nothing* from
+    instantiating at all -- but it does nothing about the subclass that
+    declares the method and never finishes it, which is the case this
+    line exists for and the only one that reaches production. Delete the
+    ``raise`` and the body is a bare docstring: ``handle_request``
+    returns ``None``, ``request()`` hands that ``None`` back as the
+    envelope, and the caller reads ``envelope['ok']`` and gets a
+    ``TypeError`` from somewhere with no protocol in the traceback. The
+    ``NotImplementedError`` names the contract that was not met, at the
+    class that did not meet it.
+
+    Driven as a direct construction rather than through ``request()``:
+    the public path can only reach a *registered* protocol, and a
+    protocol that reached the registry unfinished is a defect this test
+    would then be unable to describe.
+    """
+    deferring = DeferringProtocol(
+        'host', AUTH, {}, info=None, redact_params=frozenset())
+
+    with pytest.raises(NotImplementedError):
+        await deferring.handle_request()
+
+
 # --- R10-AC3: a library bug escapes; it is not reported as a failed call ---
 
 

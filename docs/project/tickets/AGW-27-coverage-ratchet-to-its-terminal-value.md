@@ -1,6 +1,6 @@
 # AGW-27: Coverage ratchet to its terminal value
 
-- **Status:** OPEN
+- **Status:** DONE
 - **Story:** S27 — spec Step 26, size M (`docs/specs/v1_release_stories.md` §4, Phase 6)
 - **Spec:** `docs/specs/v1_release_spec.md` — R28-AC4,5,6,7,8 (Group M — Quality gates turned on)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; Reaching branch coverage on the hard shapes
@@ -33,8 +33,56 @@ Closes findings: H20.
 
 ## Decisions
 
-_None recorded yet._
+- **The last uncovered arc was a coverage.py defect, and it is fixed by pinning the
+  measurement core rather than by a pragma.** coverage.py 7.15.4 defaults to the
+  `sysmon` core on CPython 3.12+; on 3.14.7 that core reports a false missing arc out
+  of an `async with` body nested three deep whose context managers await in
+  `__aenter__`. `download_file_from_url` is exactly that shape (`ClientSession` →
+  `response` → `safe_writer`), which is why `429->431` was the last gap. Reduced to a
+  24-line reproduction containing no project code: `sysmon` reports the arc missing
+  while the runner's own assertion proves the line ran; `ctrace` reports 100%.
+  `core = "ctrace"` is set in `[tool.coverage.run]`. This is not a relaxation —
+  `ctrace` is coverage.py's own C tracer and remains its default on every interpreter
+  in the matrix below 3.14, so the pin makes 3.10–3.14 measure identically. A
+  `# pragma: no cover` here would have bought the number by hiding a *working* test
+  behind a tool defect, which is the exact trade R28 exists to forbid.
+- **`fail_under = 100`, untruncated.** Every earlier floor was truncated because a
+  rounded value could land above the run that measured it. 100 has no such headroom,
+  and the ratchet has no further step to take: from here the number is defended, not
+  raised.
+- **Zero pragmas, against a ceiling of 10.** Both categories the spec pre-authorised
+  went unused. The `@abstractmethod` body on `handle_request` is covered by a subclass
+  that calls `super()` — worth a test rather than a pragma, because `@abstractmethod`
+  only blocks a subclass that declares *nothing*, and the half-written subclass that
+  declares the method and never finishes it would otherwise return `None` into the
+  envelope.
 
 ## Work Log
 
-_Empty — opened at stage 1g, before implementation._
+- **Measured before touching anything.** 98.90% line+branch: 13 missed statements and
+  14 partial branches across 8 modules, and zero pragmas in the tree.
+- **Closed all eighteen gaps with tests only.** `logic/ftp_client` (the non-digit reply
+  code and the loop exhausting to `None`, the causeless `FailsafeError`, the
+  `CircuitOpen` arm, the absent `server_path`), `logic/sftp_client` (the absent
+  `remote_path`), `logic/soap_client` (a 1.2 Fault with no `Code` and with no `Reason`,
+  the caller-supplied session, the `CircuitOpen` arm, the `decode_error` raise, and the
+  abortable-transport arm), `logic/http_client` (both halves of the verb guard, the
+  `CircuitOpen` arm and its redaction), `helpers/internal/base` (the abstract body),
+  `helpers/internal/request_helper` (the `at_eof` loop exit, distinguished from the
+  inner `break` by asserting the reader's exact call sequence), `utils/contained_io`
+  (an `OSError` the classifier does not recognise, driven with real `ENOENT`/`ENOTDIR`
+  rather than a mock) and `utils/http_file_config` (the version-skew arm).
+- **The no-source-edit boundary held.** `git diff --name-only -- async_gateway/`
+  returns nothing. Nothing needed a source change to become testable, so there was no
+  defect to loop back.
+- **Added the two pragma CI checks (R28-AC7)** and proved each in both directions
+  rather than only observing them pass on a tree that has no pragmas: an unjustified
+  `# pragma: no cover` exits 1 and is printed, a `--`-justified one exits 0, and a
+  twelfth pragma trips the ceiling. Without the negative case a grep that matches
+  nothing is indistinguishable from a grep that is broken.
+- **Verify (green).** `pytest` → 1380 passed, **100.00%** line+branch (1899 statements,
+  562 branches, 0 missed, 0 partial), exit 0. Identical under all five committed seeds
+  (1, 20250816, 424242, 99991, 2147483647). The negative half of the DoD holds too:
+  below 100 the suite exits 1, and `precision = 2` means the comparison is against
+  `100.00`, so 99.9% cannot round up into a pass. `flake8 .` → exit 0, silent.
+  `mypy async_gateway` → clean, no `ignore_errors`. Pragma count 0.

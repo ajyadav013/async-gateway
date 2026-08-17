@@ -135,6 +135,55 @@ jobs:
       - name: pytest
         run: pytest
 
+      - name: no unjustified coverage pragma (R28-AC7)
+        # `fail_under = 100` is only worth what the pragmas cost. A
+        # `# pragma: no cover` does not fail a build, it *removes lines
+        # from the denominator* -- so the one way to hold 100 while
+        # quietly shipping untested code is to pragma the code away, and
+        # the number would stay green the whole time. This step and the
+        # one below are what make that visible.
+        #
+        # Same shape as the suppression check above: every pragma names
+        # its reason after a `--`. The tree currently has zero pragmas,
+        # so this is a check against reintroduction rather than a check
+        # on anything present -- which is exactly when it is cheapest to
+        # add and easiest to forget.
+        run: |
+          offenders=$(grep -rn 'pragma:[[:space:]]*no[[:space:]]*cover' \
+            async_gateway tests examples \
+            | grep -v -- '--' || true)
+          if [ -n "$offenders" ]; then
+            echo '::error::a `# pragma: no cover` carries no `--`' \
+                 'justification; the permitted categories are' \
+                 '`if TYPE_CHECKING:`, an `@abstractmethod` body, and a' \
+                 'platform-guarded fallback (R28-AC7)' >&2
+            echo "$offenders" >&2
+            exit 1
+          fi
+
+      - name: coverage pragma ceiling of 10 (R28-AC7)
+        # The count, not just the justification. A justified pragma is
+        # still a line nobody tests, and a policy with no ceiling can be
+        # applied one well-argued line at a time until 100% means
+        # nothing. Ten is the spec's number: ~4 `if TYPE_CHECKING:`
+        # blocks, the one `@abstractmethod` body, the `O_NOFOLLOW`
+        # platform fallback (~2), and a slot of headroom.
+        #
+        # Raising the ceiling requires editing this line in a reviewed
+        # PR with a written justification, which is the entire point of
+        # having a number rather than a convention.
+        run: |
+          count=$(grep -rc 'pragma:[[:space:]]*no[[:space:]]*cover' \
+            async_gateway tests examples \
+            | awk -F: '{total += $2} END {print total + 0}')
+          echo "pragma count: $count (ceiling 10)"
+          if [ "$count" -gt 10 ]; then
+            echo "::error::$count coverage pragmas exceeds the ceiling" \
+                 'of 10; the ceiling is what stops 100% coverage being' \
+                 'bought a line at a time (R28-AC7)' >&2
+            exit 1
+          fi
+
       - name: R7 fitness behaviours 1-6 (the resilience-library evidence)
         # R7-AC1's run-in-CI half, and R7-AC2's "on every interpreter in the
         # declared range". These behaviours already run inside `pytest` above;

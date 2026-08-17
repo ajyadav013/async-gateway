@@ -40,6 +40,8 @@ import logging
 from typing import Any, Final
 from xml.etree.ElementTree import Element, fromstring, tostring
 
+import aiohttp
+
 import pytest
 
 from async_gateway.async_gateway import request
@@ -51,7 +53,10 @@ from async_gateway.logic.soap_client import (
     build_envelope,
     parse_soap_response,
     soap_transport_headers,
+    validated_soap_action,
+    validated_soap_headers,
 )
+from async_gateway.utils.constants import HTTP_TIMEOUT
 from async_gateway.utils.envelope import GatewayResponse
 from async_gateway.utils.exceptions import ConfigurationError
 from async_gateway.utils.request_tracer import request_tracer
@@ -1292,3 +1297,399 @@ async def test_grep_lxml_finds_nothing_in_the_package() -> None:
     ]
 
     assert offenders == []
+
+
+# --- R28: the type arms of the two SOAP config validators ------------------
+
+
+@pytest.mark.parametrize(
+    'soap_action',
+    [
+        pytest.param(b'urn:Order', id='bytes'),
+        pytest.param(['urn:Order'], id='list'),
+        pytest.param(42, id='int'),
+        pytest.param(Element('Action'), id='element'),
+    ],
+)
+def test_a_non_string_soap_action_is_refused_by_type(
+    soap_action: Any,
+) -> None:
+    """R28: ``soap_action`` must be a ``str`` or None, and nothing else.
+
+    The type arm, distinct from the character arm below it. Without it a
+    ``bytes`` action reaches the ``for char in ...`` scan, where
+    ``'"' in b'...'`` raises ``TypeError`` rather than the
+    ``ConfigurationError`` this key's other rejections produce -- so one
+    wrong type would be reported as a library bug and every other as the
+    caller's error. The message names the type it got, because that is
+    the thing the caller has to change.
+    """
+    with pytest.raises(ConfigurationError) as refusal:
+        validated_soap_action(soap_action)
+
+    assert 'protocol_info["soap_action"]' in str(refusal.value)
+    assert type(soap_action).__name__ in str(refusal.value)
+
+
+@pytest.mark.parametrize(
+    'soap_action, expected',
+    [
+        pytest.param(None, None, id='absent'),
+        pytest.param('', None, id='empty-is-absent'),
+        pytest.param('urn:Order#place', 'urn:Order#place', id='ordinary'),
+    ],
+)
+def test_an_acceptable_soap_action_passes_through(
+    soap_action: Any,
+    expected: Any,
+) -> None:
+    """R28: the accepting arms, so the refusals above are not vacuous.
+
+    An empty string normalises to None rather than being sent as an
+    empty ``SOAPAction`` header: the two mean the same thing to a
+    server, and collapsing them here is what keeps the header builder
+    from having to know it.
+    """
+    assert validated_soap_action(soap_action) == expected
+
+
+@pytest.mark.parametrize(
+    'soap_headers',
+    [
+        pytest.param('<Security/>', id='xml-as-text'),
+        pytest.param({'Security': {}}, id='mapping'),
+        pytest.param([Element('Security')], id='list-of-elements'),
+        pytest.param(7, id='int'),
+    ],
+)
+def test_non_element_soap_headers_are_refused(soap_headers: Any) -> None:
+    """R28: the header block is an ``Element``, never text or a mapping.
+
+    ``'<Security/>'`` is the case worth naming: it is what a caller
+    reaches for first, and accepting it would mean concatenating
+    caller-supplied text into an envelope this library then claims is
+    well formed. Refusing it at the boundary is what makes
+    ``build_envelope`` unable to emit malformed XML at all, so the
+    message says to build the block with ElementTree rather than only
+    that the value was wrong.
+    """
+    with pytest.raises(ConfigurationError) as refusal:
+        validated_soap_headers(soap_headers)
+
+    assert 'protocol_info["soap_headers"]' in str(refusal.value)
+    assert 'ElementTree' in str(refusal.value)
+
+
+def test_an_element_or_none_is_accepted_as_the_soap_header_block() -> None:
+    """R28: the accepting arms of the header validator.
+
+    Returned by identity, not copied: the caller's element is what
+    ``build_envelope`` appends, so a mutation after this call is the
+    caller's own and this library does not silently snapshot it.
+    """
+    block = Element('Security')
+
+    assert validated_soap_headers(None) is None
+    assert validated_soap_headers(block) is block
+
+
+# --- R28: a 1.2 Fault missing the child the reader looks for ---------------
+
+
+def fault_12_of(children: str) -> bytes:
+    """Return a 1.2 Fault envelope carrying exactly ``children``.
+
+    :func:`fault_12` always emits ``Code``, ``Reason`` and ``Role``, so it
+    cannot express the partial faults R28 needs. This one places whatever
+    it is handed and nothing else.
+
+    Args:
+        children: The ``<Fault>`` children as XML text, possibly empty.
+
+    Returns:
+        The Fault envelope as UTF-8 bytes.
+    """
+    return envelope_for(SOAP_12, f'<e:Fault>{children}</e:Fault>')
+
+
+async def test_a_12_fault_with_no_code_element_reports_an_empty_code(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """R28: a Fault whose ``Code`` is absent is read, not crashed on.
+
+    ``Code`` is mandatory in the 1.2 schema, which is exactly why the
+    arm that copes without one is never reached by a conformant server
+    and is therefore the arm that rots. A non-conformant endpoint -- or
+    an intermediary that rewrites a fault -- sends this, and the reader
+    must still produce the flat shape every consumer branches on.
+    Delete the ``if code is not None`` guard and ``fault.find(...)``
+    returns None, so ``code.findtext(...)`` raises ``AttributeError``
+    from inside a thread: this library's own bug, reported to the caller
+    as neither a Fault nor a parse failure.
+
+    ``reason`` is asserted beside the empty code so the test also proves
+    the surrounding read still ran; a guard that bailed out of the whole
+    function on a missing ``Code`` would satisfy the first assertion
+    alone.
+    """
+    body = fault_12_of(
+        '<e:Reason><e:Text xml:lang="en">no code here</e:Text></e:Reason>')
+
+    result = await soap_call(
+        http_server,
+        body=body,
+        headers=XML_12,
+        status=500,
+        soap_version=SOAP_12)
+
+    assert result['error']['code'] == 'SOAP_FAULT'
+    fault = result['protocol_details']['soap_fault']
+    assert fault['code'] == ''
+    assert fault['subcodes'] == []
+    assert fault['reason'] == 'no code here'
+    # The message says so out loud rather than showing a blank where the
+    # code belongs, which is what a caller reading the log needs.
+    assert '<no code>' in result['error']['message']
+
+
+async def test_a_12_fault_with_no_reason_element_reports_an_empty_reason(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """R28: the same for ``Reason``, and it fails the same way.
+
+    The pair to the test above, and not redundant with it: the two
+    guards are separate statements over separate elements, so a reader
+    that dropped only the ``Reason`` one would pass the ``Code`` test
+    and raise ``AttributeError`` here. The ``Code`` side is asserted
+    beside the empty reason for the same reason as above -- to prove the
+    rest of the read survived the missing element.
+    """
+    body = fault_12_of('<e:Code><e:Value>e:Receiver</e:Value></e:Code>')
+
+    result = await soap_call(
+        http_server,
+        body=body,
+        headers=XML_12,
+        status=500,
+        soap_version=SOAP_12)
+
+    assert result['error']['code'] == 'SOAP_FAULT'
+    fault = result['protocol_details']['soap_fault']
+    assert fault['reason'] == ''
+    assert fault['code'] == 'e:Receiver'
+    assert '<no reason>' in result['error']['message']
+
+
+async def test_a_12_fault_with_neither_code_nor_reason_is_still_a_fault(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """R28: both arms at once, which is the case a bare ``<Fault/>`` is.
+
+    Worth its own row because the two guards could each be correct and
+    the *combination* still be reported as a success: a reader that
+    treated "no code and no reason" as "not really a fault" would return
+    ``(body, None)`` here, and an ``ok=True`` envelope is the one outcome
+    an empty fault must never produce.
+    """
+    result = await soap_call(
+        http_server,
+        body=fault_12_of(''),
+        headers=XML_12,
+        status=500,
+        soap_version=SOAP_12)
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'SOAP_FAULT'
+    fault = result['protocol_details']['soap_fault']
+    assert fault == {
+        'code': '', 'subcodes': [], 'reason': '', 'actor': None,
+        'detail': None}
+
+
+# --- R28: the caller-supplied-session arm of handle_request ----------------
+
+
+async def test_a_caller_supplied_session_carries_the_soap_call(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """R28: a supplied session is dispatched on, and left open.
+
+    The arm above the ``async with aiohttp.ClientSession(...)`` block,
+    and it is the arm a caller reaches for to get connection pooling
+    across consecutive calls -- so closing it, or quietly building a
+    second session and ignoring theirs, defeats the only reason the key
+    exists. Untested, either regression is invisible: the call still
+    succeeds and only the pool is gone.
+
+    ``request_tracer`` is asserted empty in the same breath because that
+    is the documented consequence of supplying one: trace configs are a
+    session-level thing, so this library attaches none to a session it
+    does not own and must not report collectors it never collected.
+    """
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT))
+    try:
+        result = await soap_call(http_server, session=session)
+
+        assert result['ok'] is True
+        assert result['protocol_details']['soap_body'].tag == 'Result'
+        assert session.closed is False
+        assert result['request_tracer'] == []
+    finally:
+        await session.close()
+
+
+async def test_two_soap_calls_on_one_supplied_session_reuse_its_pool(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """R28: pooling is the point of the arm above, so it is measured.
+
+    Read off the tracer's ``on_connection_reuseconn`` event, which fires
+    only when a connection came out of the pool rather than being
+    dialled. The tracer is attached to the caller's own session, because
+    a session this library created is closed on the way out and could
+    not show reuse at all -- which is precisely the property the
+    supplied-session arm exists to provide, and the one a test asserting
+    only ``ok is True`` would let regress.
+    """
+    tracer = request_tracer()
+    session = aiohttp.ClientSession(
+        trace_configs=[tracer],
+        timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT))
+    try:
+        await soap_call(http_server, session=session)
+        assert 'on_connection_reuseconn' not in tracer.results_collector
+
+        await soap_call(http_server, session=session)
+
+        assert 'on_connection_reuseconn' in tracer.results_collector
+        assert session.closed is False
+    finally:
+        await session.close()
+
+
+# --- R28: the breaker's own refusal, and an undecodable body ---------------
+
+
+async def test_an_open_circuit_refuses_a_soap_call_without_dispatching_it(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """R28: ``CircuitOpen`` becomes ``CIRCUIT_OPEN``/503, not a 502.
+
+    ``CircuitOpen`` is a ``failsafe`` exception with nothing underneath
+    it the generic transport classifier can read, so without its own
+    ``except`` clause it falls through to ``transport_error_for`` and
+    reaches the caller as a 502 -- a status a client retries, into a
+    circuit that is open precisely to stop them retrying. 503 says "not
+    now" instead.
+
+    Driven with two real calls rather than by raising the exception at a
+    seam: the first has to *fail and be counted* for the second to be
+    refused, and a breaker that never counted a SOAP failure would pass
+    a test that injected the refusal directly. The recorded request count
+    is what proves the second call never reached the wire -- the
+    behaviour a fast-fail exists for, and the thing a status assertion
+    alone cannot see.
+    """
+    http_server.respond('/loop', status=302, headers={'Location': '/loop'})
+    info: dict[str, Any] = {
+        'max_redirects': 0,
+        'circuit_breaker_config': {'maximum_failures': 1},
+    }
+
+    first = await request(
+        url=http_server.url_for('/loop'),
+        data='<Ping/>',
+        protocol='SOAP',
+        protocol_info=info,
+    )
+    second = await request(
+        url=http_server.url_for('/loop'),
+        data='<Ping/>',
+        protocol='SOAP',
+        protocol_info=info,
+    )
+
+    assert first['error']['code'] == 'TRANSPORT'
+    assert second['ok'] is False
+    assert second['error']['code'] == 'CIRCUIT_OPEN'
+    assert second['status_code'] == 503
+    assert len(http_server.requests) == 1
+
+
+async def test_a_transport_failure_the_breaker_aborted_on_is_still_mapped(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """R28: the arm that catches a transport error the retry loop re-raised.
+
+    Two routes lead out of ``_exchange`` for the same underlying fault
+    and they need separate clauses. When the retry loop *counts* the
+    failure it wraps it in ``RetriesExhausted``; when the caller marks
+    the exception **abortable** the loop re-raises it as itself, so an
+    ``aiohttp.ClientError`` or an ``asyncio.TimeoutError`` arrives here
+    unwrapped. Drop this clause and that second route escapes
+    ``_exchange`` entirely -- past the one conversion point, out of
+    ``request()`` as a raw ``aiohttp`` exception -- which is the shape
+    this library exists to stop a caller having to handle per protocol.
+
+    Driven with a gated handler and a deadline of tens of milliseconds,
+    so the timeout is the only thing awaited: the behaviour under test,
+    not a sleep to let unrelated async work settle.
+    """
+    http_server.gate('/slow')
+
+    result = await request(
+        url=http_server.url_for('/slow'),
+        data='<Ping/>',
+        protocol='SOAP',
+        protocol_info={
+            'timeout': SHORT_DEADLINE,
+            'circuit_breaker_config': {
+                'retry_config': {
+                    'allowed_retries': 0,
+                    # Abortable, so the loop re-raises the timeout as
+                    # itself instead of wrapping it -- which is the whole
+                    # point of the row.
+                    'abortable_exceptions': [
+                        aiohttp.ClientError, asyncio.TimeoutError],
+                },
+            },
+        },
+    )
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'TIMEOUT'
+    assert result['status_code'] == 504
+
+
+async def test_an_undecodable_response_body_is_reported_before_any_parse(
+    http_server: RecordingHTTPServer,
+    never_parsed: list[str],
+) -> None:
+    """R28: bytes that are not text are ``SERIALIZATION``, and are not parsed.
+
+    The transport decodes lossily and records *why* rather than raising,
+    so that the salvageable text still reaches the envelope (R13/M9). It
+    is this client that has to act on that record. Drop the check and the
+    lossy text -- with U+FFFD where the undecodable bytes were -- is
+    handed to the parser as though it were the server's answer, which
+    either raises a misleading "not well-formed XML" naming a position
+    that does not exist in what the server sent, or, worse, parses into a
+    document the server never sent.
+
+    ``never_parsed`` is what makes that a *pre-parse* assertion rather
+    than a claim about the error code alone, which a check placed after
+    the parse would satisfy just as well.
+    """
+    result = await soap_call(
+        http_server, body=b'\xff\xfe<e:Envelope/>', headers=XML_11)
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'SERIALIZATION'
+    assert 'not decodable text' in result['error']['message']
+    assert never_parsed == []
+    # E11: the lossily-decoded body is still the caller's to inspect,
+    # which is the whole reason the transport records the failure rather
+    # than raising and losing the body with it.
+    assert result['text']
+    assert result['protocol_details']['soap_body'] is None

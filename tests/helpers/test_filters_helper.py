@@ -2055,3 +2055,85 @@ def test_no_expression_in_the_package_is_or_ed_with_a_literal_true() -> None:
 
     assert scanned, f'no modules scanned under {package}'
     assert offenders == []
+
+
+# --- R28: the last uncovered branches of the three filter helpers ----------
+
+
+def test_coerce_query_value_serialises_a_top_level_mapping() -> None:
+    """R28: a nested container is JSON, not ``str()`` of a Python repr.
+
+    The last uncovered line of :func:`coerce_query_value`, and the one
+    where the difference is visible on the wire. ``str({'a': 1})`` is
+    ``"{'a': 1}"`` -- single-quoted, which no JSON parser accepts -- so a
+    server receiving it gets something that merely looks structured.
+    Asserted against the exact rendering rather than "is parseable",
+    because the defect this guards is a plausible-looking wrong string.
+    """
+    assert coerce_query_value({'a': 1, 'b': [2, 3]}) == '{"a":1,"b":[2,3]}'
+    assert coerce_query_value([1, 'two']) == '[1,"two"]'
+    assert coerce_query_value((1, 2)) == '[1,2]'
+
+
+def test_coerce_query_value_falls_back_to_str_for_an_unknown_type() -> None:
+    """R28: the final fallback, for a type none of the arms name.
+
+    Reached by anything that is not None, a string, a date/time, a
+    number or a container -- a UUID, an Enum, a caller's own object. It
+    must not raise: a query parameter this library cannot render
+    natively is still the caller's to send.
+    """
+    class Opaque:
+        """A type with a custom string form and nothing else."""
+
+        def __str__(self) -> str:
+            """Return the rendering the fallback is expected to use.
+
+            Returns:
+                A fixed sentinel.
+            """
+            return 'opaque-value'
+
+    assert coerce_query_value(Opaque()) == 'opaque-value'
+
+
+async def test_application_json_filters_drops_a_non_mapping_get_payload(
+) -> None:
+    """R28: a GET whose payload is not a mapping contributes nothing.
+
+    There is no query-string spelling for a bare list or string, so the
+    filter returns ``{}`` rather than inventing one. The alternative --
+    falling through to the ``{'json': ...}`` arm below -- would put a
+    body on a GET, which is the shape this branch exists to prevent.
+    """
+    assert await application_json_filters(
+        ['a', 'b'], request_type='GET') == {}
+    assert await application_json_filters(
+        'raw', request_type='get') == {}
+    assert await application_json_filters(
+        None, request_type='GET') == {}
+
+
+async def test_raw_body_filters_sends_nothing_when_there_is_no_payload(
+) -> None:
+    """R28: ``data=None`` contributes no body at all.
+
+    ``{'data': None}`` is not the same request: aiohttp would still be
+    handed a ``data`` keyword. The empty mapping is what makes "no
+    payload" mean no body key.
+    """
+    assert await raw_body_filters(None, request_type='POST') == {}
+
+
+async def test_raw_body_filters_passes_a_payload_through_verbatim() -> None:
+    """R28: the body reaches the wire byte-identical.
+
+    The property SOAP depends on: an envelope built by
+    ``validated_soap_body`` must not be re-encoded on the way out.
+    """
+    envelope = '<soap:Envelope><soap:Body/></soap:Envelope>'
+
+    assert await raw_body_filters(
+        envelope, request_type='POST') == {'data': envelope}
+    assert await raw_body_filters(
+        b'\x00\x01', request_type='PUT') == {'data': b'\x00\x01'}

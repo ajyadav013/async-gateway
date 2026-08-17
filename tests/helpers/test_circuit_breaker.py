@@ -1336,3 +1336,76 @@ def test_the_default_abortable_set_is_this_library_s_own_refusals() -> None:
     """
     assert ConfigurationError in DEFAULT_ABORTABLE_EXCEPTIONS
     assert ResponseTooLargeError in DEFAULT_ABORTABLE_EXCEPTIONS
+
+
+# --- R28: the last two uncovered lines of the facade -----------------------
+
+
+@pytest.mark.parametrize(
+    'backoff',
+    [
+        pytest.param('exponentail', id='typo'),
+        pytest.param('EXPONENTIAL', id='wrong-case'),
+        pytest.param('linear', id='plausible-but-absent'),
+        pytest.param(None, id='none'),
+        pytest.param(2, id='non-string'),
+    ],
+)
+def test_get_retry_policy_refuses_a_backoff_it_does_not_implement(
+    backoff: Any,
+) -> None:
+    """R28: an unrecognised ``backoff`` is refused, not defaulted.
+
+    The failure this replaces is silent: falling through to the
+    ``constant`` arm would give a caller who asked for ``'exponentail'``
+    a *working* retry loop with the wrong spacing, and nothing would ever
+    say so. The message names the key and lists what is accepted, because
+    a rejection that does not say what *was* acceptable leaves the caller
+    guessing at the spelling -- which is how the typo was written.
+    """
+    with pytest.raises(ConfigurationError) as refusal:
+        get_retry_policy('r', allowed_retries=2, backoff=backoff)
+
+    assert 'retry_config["backoff"]' in str(refusal.value)
+    assert repr(backoff) in str(refusal.value)
+    for name in BACKOFF_NAMES:
+        assert name in str(refusal.value)
+
+
+async def test_a_breaker_without_a_retry_policy_never_waits() -> None:
+    """R28, the observable half: no policy means no backoff wait.
+
+    A breaker configured without ``retry_config`` fails on the first
+    attempt and sleeps for nothing. This is the property a consumer can
+    see; the guard that implements it is asserted directly below,
+    because ``run`` cannot reach it.
+    """
+    sleeper = RecordingSleep()
+    subject = breaker(maximum_failures=99, sleep=sleeper)
+
+    with pytest.raises(RetriesExhausted):
+        await subject.run(failing(Boom('once')))
+
+    assert sleeper.waits == []
+
+
+def test_the_backoff_wait_is_zero_when_no_retry_policy_exists() -> None:
+    """R28: ``_backoff_for``'s guard arm, called directly.
+
+    Deliberately a private-method test, which the rest of this module
+    avoids. ``run`` cannot reach this line: with no policy,
+    ``_should_retry`` is False and the loop raises ``RetriesExhausted``
+    two statements earlier, so the guard is unreachable through the
+    public surface -- as the test above demonstrates by observing the
+    empty wait list rather than the return value.
+
+    It is still worth having rather than pragma-ing away. The guard is
+    what makes ``_backoff_for`` total: the day a caller-facing change
+    lets a retry-less breaker reach the sleep, the alternative is an
+    ``AttributeError`` on ``None`` raised from inside the retry loop,
+    which is the least legible place in this module for one.
+    """
+    subject = breaker(maximum_failures=99)
+
+    assert subject.retry_policy is None
+    assert subject._backoff_for(1) == 0.0
