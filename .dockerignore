@@ -1,0 +1,19 @@
+# Local state that would invalidate the build cache without changing the
+# artifact. Note what is NOT excluded: `docs/`, `examples/`, `.github/`,
+# `LICENSE` and the top-level Markdown are all read as *data* by the suite
+# (see the Dockerfile header), so excluding them would break collection
+# rather than slim the image.
+.git
+.claude
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+dist
+build
+*.egg-info
+**/__pycache__
+**/*.py[cod]
+.venv
+venv
