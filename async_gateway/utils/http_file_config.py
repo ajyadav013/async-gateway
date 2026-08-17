@@ -10,19 +10,25 @@ report it differently when they refuse (R14).
 """
 
 from collections.abc import AsyncIterator, Mapping
-from typing import Optional, Text
+from typing import Any, Optional, Text
 
 import aioboto3
 import aiofiles.os
 import aiohttp
 
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError
+
 from .constants import (
     CHUNK_SIZE_CONSTANT,
+    HTTP_ERROR_STATUS,
     HTTP_TIMEOUT,
     MAX_RESPONSE_BYTES,
-    STATUS_CODE_403,
 )
-from .exceptions import HttpStatusError, ResponseTooLargeError
+from .exceptions import (
+    ConfigurationError,
+    HttpStatusError,
+    ResponseTooLargeError,
+)
 
 #: The response header that declares a body's length before it is read.
 #: Matched case-insensitively, because a plain ``dict`` of headers does not
@@ -142,31 +148,74 @@ async def iter_capped(
         yield chunk
 
 
-async def download_file_from_s3(bucket_name: Text,
-                                s3_filepath: Text,
-                                local_filepath: Text,
-                                access_key: Text = None,
-                                secret_key: Text = None,
-                                region: Text = None, **kwargs):
-    """Download file from AWS S3.
+async def download_file_from_s3(
+    *,
+    bucket_name: Text,
+    s3_filepath: Text,
+    local_filepath: Text,
+    access_key: Optional[Text] = None,
+    secret_key: Optional[Text] = None,
+    region: Optional[Text] = None,
+    **kwargs: Any,
+) -> None:
+    """Download an object from AWS S3 to a local path.
 
-    :param access_key: S3 access key
-    :param region: S3 region
-    :param secret_key: S3 secret key
-    :param bucket_name: bucket name of S3.
-    :param s3_filepath: S3 filepath to be downloaded.
-    :param local_filepath: local filepath where the file will be saved.
-    :param kwargs
+    This function could not previously have succeeded, in either of the
+    two copies it existed in (H15). It called ``aioboto3.client(...)``,
+    a module-level factory **removed in aioboto3 9.0**, and it passed
+    the destination as ``file_save_path=`` to ``download_file``, whose
+    keyword is ``Filename=``. Both are corrected here, against the
+    aioboto3 15.x API this release ships with, and this is now the only
+    copy: ``helpers/common/file_helper.py`` held a second one whose
+    parameters were in a *different order*, so a caller who imported the
+    wrong module and called positionally wrote their bucket name to a
+    local path (MG5).
+
+    Every parameter is **keyword-only**. That is the structural half of
+    the same fix: with the duplicate gone there is no longer a second
+    order to get wrong, and with ``*`` there is no positional order to
+    get wrong either -- a positional call is now a ``TypeError`` at the
+    call site rather than a silently misdirected download.
+
+    Args:
+        bucket_name: The S3 bucket holding the object.
+        s3_filepath: The object's key within the bucket.
+        local_filepath: Where to write the downloaded object.
+        access_key: AWS access key id, or None to let botocore's
+            credential chain resolve one (environment, shared config,
+            instance metadata).
+        secret_key: AWS secret access key, paired with ``access_key``.
+        region: AWS region name, or None to take it from the same chain.
+        **kwargs: Ignored. Accepted because the README documents this
+            function as a ``pre_processor_config`` callable, which is
+            invoked with the caller's whole parameter mapping.
+
+    Returns:
+        None. The object's bytes are at ``local_filepath``.
+
+    Raises:
+        ConfigurationError: If no usable credentials can be resolved.
+            The credential chain's own error is the caller's
+            misconfiguration rather than a transport failure, so it is
+            wrapped and re-raised under this library's vocabulary
+            instead of surfacing as a bare botocore type.
     """
-    client = aioboto3.client(
-        's3',
+    session = aioboto3.Session(
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
-        region_name=region)
-    async with client as s3_client:
-        await s3_client.download_file(Bucket=bucket_name,
-                                      Key=s3_filepath,
-                                      file_save_path=local_filepath)
+        region_name=region,
+    )
+    try:
+        async with session.client('s3') as s3_client:
+            await s3_client.download_file(
+                Bucket=bucket_name,
+                Key=s3_filepath,
+                Filename=local_filepath,
+            )
+    except (NoCredentialsError, PartialCredentialsError) as exc:
+        raise ConfigurationError(
+            f'S3 credentials could not be resolved for bucket '
+            f'{bucket_name!r}: {exc}') from exc
 
 
 async def download_file_from_url(
@@ -193,6 +242,24 @@ async def download_file_from_url(
     The status is judged *before* the body is touched. It was judged after,
     which meant the whole body of a 403 was read and then discarded.
 
+    **Every** non-success status is refused, not only 403 (H16). The check
+    used to be ``status == 403`` alone, so a 404 body, a 500 stack trace or
+    an HTML login-redirect page was written to ``local_filepath`` as though
+    it were the requested file -- and any later upload step then shipped
+    that error page to the destination as the caller's data. Nothing is
+    written unless the status says the body is the file that was asked
+    for; on refusal no file is created at all, so a failure cannot be
+    mistaken for a zero-length success by whatever runs next.
+
+    A success carrying a **zero-length body is legitimate** and is written
+    as an empty file. An empty object is a real thing to download, and
+    refusing it here would mean this library, not the endpoint, deciding
+    that the caller's file is invalid.
+
+    Redirects are followed by ``aiohttp`` within its own cap, so
+    ``response.status`` is the status of the *final* hop and that is the
+    one that decides.
+
     :param file_download_path: complete url from where to download
     :param local_filepath: machine file path to download and store it
     :param request_type: HTTP method
@@ -202,7 +269,8 @@ async def download_file_from_url(
     :param max_response_bytes: ceiling on the bytes read from the response
     :param chunk_size: bytes requested per read
     :param kwargs
-    :raises HttpStatusError: if the endpoint answers 403.
+    :raises HttpStatusError: if the final status is not a success, carrying
+        that real status rather than a synthesised one.
     :raises ResponseTooLargeError: if the response declares, or streams,
         more than ``max_response_bytes``.
     """
@@ -215,10 +283,10 @@ async def download_file_from_url(
         request_obj = getattr(session, request_type.lower())
         session_obj = request_obj(file_download_path)
         async with session_obj as response:
-            if response.status == STATUS_CODE_403:
+            if response.status >= HTTP_ERROR_STATUS:
                 raise HttpStatusError(
-                    'Access to the requested file is forbidden.',
-                    STATUS_CODE_403)
+                    f'the endpoint answered {response.status}; no file was '
+                    f'written', response.status)
             guard_declared_length(response.headers, max_response_bytes)
             async with aiofiles.open(local_filepath, 'wb') as file_obj:
                 async for chunk in iter_capped(

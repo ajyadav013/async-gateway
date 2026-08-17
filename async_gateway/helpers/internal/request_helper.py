@@ -49,7 +49,6 @@ from urllib.parse import urljoin, urlsplit
 
 import aiofiles
 import aiohttp
-from async_gateway.helpers.common.file_helper import download_file_from_s3
 from async_gateway.helpers.internal import (
     MULTIPART_MEDIA_PREFIX,
     filter_for_media_type,
@@ -59,7 +58,6 @@ from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.constants import (
     CHUNK_SIZE_CONSTANT,
     CREDENTIAL_HEADERS,
-    HTTP_TIMEOUT,
     MAX_RESPONSE_BYTES,
     POST_TO_GET_REDIRECTS,
     REDIRECT_STATUSES,
@@ -174,34 +172,6 @@ class HttpResult(_HttpResultOptional):
     headers: Dict[Text, Text]
     cookies: Dict[Text, Text]
     text: Text
-
-
-async def fetch_file(file_config: Dict):
-    """Download file from s3 or from given link or.
-
-    just read from the local pod file path.
-    :param file_config: Dict contains s3 config,
-    download link, local filepath etc.
-    file_config[local_filepath] is mandatory
-    """
-    if file_config.get('s3_config'):
-        await download_file_from_s3(
-            file_config['local_filepath'],
-            **file_config['s3_config'],
-        )
-    elif file_config.get('file_download_path'):
-        # Add separate aio params when required
-        request_type = file_config.get('request_type', 'get')
-        async with aiohttp.ClientSession(
-                headers=file_config.get('headers'),
-                timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as session:
-            request_obj = getattr(session, request_type.lower())
-            session_obj = request_obj(file_config['file_download_path'])
-            async with session_obj as response:
-                contents = await response.content.read()
-                async with aiofiles.open(
-                        file_config['local_filepath'], 'wb') as file_obj:
-                    await file_obj.write(contents)
 
 
 async def file_upload(
