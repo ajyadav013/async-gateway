@@ -42,7 +42,9 @@ STATUS_BY_CODE: Final[Mapping[str, int]] = MappingProxyType({
     'HOST_KEY': 495,
     'TIMEOUT': 504,
     'RESPONSE_TOO_LARGE': 502,
+    'RESPONSE_TOO_DEEP': 502,
     'CIRCUIT_OPEN': 503,
+    'STACK_EXHAUSTED': 502,
 
     # A protocol error always carries the real remote status, so these
     # defaults apply only when the remote side supplied none.

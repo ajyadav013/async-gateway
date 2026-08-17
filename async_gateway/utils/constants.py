@@ -100,6 +100,25 @@ MAX_RESPONSE_BYTES: Final[int] = 67108864
 #: per call through ``protocol_info['max_redirects']``.
 MAX_REDIRECTS: Final[int] = 10
 
+#: How deep a ``multipart/*`` response may nest before the read is
+#: refused. The byte cap above bounds how *much* a hostile body can make
+#: this process read; this bounds how far *down* it can make it walk, and
+#: the two are independent: 2000 levels of empty nesting is 221 KB, far
+#: under any realistic byte ceiling, and it exhausted the interpreter's
+#: stack outright -- a ``RecursionError`` escaping ``request()`` where the
+#: contract says every failure arrives as an ``ok=False`` envelope
+#: (NEW-H2).
+#:
+#: 64 is generous past anything real. RFC 2046 nests ``multipart/mixed``
+#: inside ``multipart/related`` inside ``multipart/signed`` in the deepest
+#: shapes email and MTOM actually produce -- a handful of levels -- so a
+#: legitimate body has orders of magnitude of headroom, and no honest
+#: sender is anywhere near it. It is deliberately not derived from
+#: ``sys.getrecursionlimit()``: the walk is iterative and has no frame
+#: budget to track, so tying the limit to one would restate a dependency
+#: that no longer exists.
+MAX_MULTIPART_DEPTH: Final[int] = 64
+
 #: The URL schemes an HTTP-family call may be dispatched to, on the initial
 #: URL and on every redirect hop alike. R21 (a later story) reads it for
 #: the initial URL; the owned redirect loop in ``request_helper`` reads it

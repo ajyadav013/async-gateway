@@ -705,6 +705,73 @@ async def test_r10_ac3_a_programming_error_escapes_request(
     assert gateway_records(caplog) == []
 
 
+# --- NEW-H2: a RecursionError is a failure, not a library bug --------------
+
+
+@pytest.mark.parametrize(
+    'protocol_class', [HttpRequest, FTPRequest, SFTPRequest],
+    ids=['http', 'ftp', 'sftp'])
+async def test_a_recursion_error_becomes_an_envelope_like_any_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    protocol_class: type[BaseRequestClass],
+) -> None:
+    """The one exception to the row above, and it is not an inconsistency.
+
+    A ``KeyError`` escapes because it is a mistake in a line of this
+    library's code and reporting it as a failed network call is what hid
+    an audit's worth of defects. A ``RecursionError`` is a different
+    animal: the interpreter refusing to go further, driven by **what the
+    remote side sent**. A 221 KB multipart body of 2000 nesting levels
+    produced exactly that and it escaped ``request()`` as a bare builtin
+    where the contract says every failure arrives as an ``ok=False``
+    envelope (NEW-H2) -- so remote input got to choose which of the two
+    kinds of report a caller received.
+
+    Injected here rather than driven from a real body, deliberately.
+    The multipart walk that provoked it is iterative and depth-capped
+    now, so no input reaches this arm any more -- and the arm exists for
+    the *next* unbounded descent, not that one. Injecting is the only way
+    to test a backstop whose whole purpose is to catch something not yet
+    written; the real hostile body is asserted end to end in
+    ``tests/helpers/test_request_helper.py``.
+
+    Every protocol, because the conversion sits in the entry point and a
+    guard placed in one protocol client would be three-quarters absent.
+    """
+    caplog.set_level(logging.DEBUG, logger='async_gateway')
+
+    async def handle_request(self: BaseRequestClass) -> GatewayResponse:
+        """Fail the way an unbounded descent fails.
+
+        Args:
+            self: The protocol object under test.
+
+        Returns:
+            Never; this always raises.
+
+        Raises:
+            RecursionError: Always.
+        """
+        raise RecursionError('maximum recursion depth exceeded')
+
+    monkeypatch.setattr(protocol_class, 'handle_request', handle_request)
+    name = next(
+        key for key, value in protocol_mapping.items()
+        if value is protocol_class
+    )
+
+    result = await request(protocol=name, auth=AUTH, **VALID_CALL[name])
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == 'STACK_EXHAUSTED'
+    assert result['status_code'] == 502
+    # Converted means logged, exactly as every other envelope-producing
+    # failure is -- the mirror of the empty-log assertion above.
+    assert len(gateway_records(caplog)) == 1
+
+
 # --- AGW-35: which side of the one conversion `try` a config error is on ---
 
 

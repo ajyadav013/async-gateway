@@ -36,6 +36,7 @@ from .constants import (
 from .exceptions import (
     ConfigurationError,
     HttpStatusError,
+    ResponseTooDeepError,
     ResponseTooLargeError,
     UnsupportedVerbError,
 )
@@ -267,6 +268,31 @@ def response_too_large(
     return ResponseTooLargeError(
         f'response body exceeds max_response_bytes={max_response_bytes}; '
         f'the read was abandoned after {read_bytes} bytes')
+
+
+def response_too_deep(
+    depth: int,
+    max_multipart_depth: int,
+) -> ResponseTooDeepError:
+    """Build the error a multipart walk raises when it nests too far.
+
+    Beside :func:`response_too_large` for the reason that one is a
+    function: a refusal this library issues is worded in one place, so a
+    caller reads the same shape of sentence whichever bound they crossed.
+
+    Args:
+        depth: The nesting level the walk had reached, counting the
+            outermost reader as 1.
+        max_multipart_depth: The ceiling that was crossed.
+
+    Returns:
+        The error to raise; it is not raised here, so the traceback points
+        at the walk that abandoned rather than at this line.
+    """
+    return ResponseTooDeepError(
+        f'multipart response nests deeper than '
+        f'max_multipart_depth={max_multipart_depth}; the read was '
+        f'abandoned at nesting level {depth}')
 
 
 async def iter_capped(

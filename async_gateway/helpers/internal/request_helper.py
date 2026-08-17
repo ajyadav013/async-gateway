@@ -65,6 +65,7 @@ from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.utils.constants import (
     CHUNK_SIZE_CONSTANT,
     CROSS_ORIGIN_SAFE_HEADERS,
+    MAX_MULTIPART_DEPTH,
     MAX_RESPONSE_BYTES,
     POST_TO_GET_REDIRECTS,
     REDIRECT_STATUSES,
@@ -79,6 +80,7 @@ from async_gateway.utils.http_file_config import (
     guard_declared_length,
     iter_capped,
     resolve_verb,
+    response_too_deep,
     response_too_large,
 )
 from async_gateway.utils.paths import (
@@ -268,7 +270,13 @@ async def handle_multipart_response(
     A **nested** ``multipart/...`` part is descended into rather than
     read as if it were a leaf: doing the latter raised a bare
     ``AttributeError`` past the envelope, which is the second half of M7.
-    :func:`_drain_multipart` owns that recursion and records why.
+    :func:`_drain_multipart` owns that descent and records why.
+
+    How *far* down it descends is bounded by
+    :data:`~async_gateway.utils.constants.MAX_MULTIPART_DEPTH`, and that
+    bound is independent of the byte cap because the two resources are:
+    2000 levels of empty nesting is 221 KB, far under any realistic byte
+    ceiling, and it exhausted the interpreter's stack (NEW-H2).
 
     Args:
         resp: The response to read the multipart body from.
@@ -286,6 +294,9 @@ async def handle_multipart_response(
     Raises:
         ResponseTooLargeError: Once the parts read exceed
             ``max_response_bytes``. The remainder of the body is not read.
+        ResponseTooDeepError: Once the parts nest past
+            :data:`~async_gateway.utils.constants.MAX_MULTIPART_DEPTH`.
+            The remainder of the body is not read either.
         PathContainmentError: If ``download_filepath`` is a symbolic
             link, or names a directory rather than a file.
         ConfigurationError: If it exists and the config does not carry
@@ -297,7 +308,6 @@ async def handle_multipart_response(
     target = await resolve_caller_path(response_file_name)
     reader = aiohttp.MultipartReader.from_response(resp)
     parts: List[bytes] = []
-    total = 0
     async with safe_writer(
             target, overwrite=config.get('overwrite') is True
     ) as response_file:
@@ -305,8 +315,8 @@ async def handle_multipart_response(
             reader,
             response_file,
             parts,
-            total,
             max_response_bytes=max_response_bytes,
+            max_multipart_depth=MAX_MULTIPART_DEPTH,
         )
     return b''.join(parts).decode(errors='replace')
 
@@ -318,13 +328,13 @@ async def _drain_multipart(
     ],
     response_file: Any,
     parts: List[bytes],
-    total: int,
     *,
     max_response_bytes: int,
-) -> int:
-    """Read every part of one multipart reader, descending into nested ones.
+    max_multipart_depth: int,
+) -> None:
+    """Read every part of a multipart body, descending into nested ones.
 
-    Split out of :func:`handle_multipart_response` so it can call itself:
+    Split out of :func:`handle_multipart_response` because
     ``MultipartReader.next()`` returns ``MultipartReader | BodyPartReader
     | None``, and the first arm is a **nested** ``multipart/...`` part,
     which has no ``read_chunk``. The caller used to read every part as if
@@ -347,44 +357,83 @@ async def _drain_multipart(
     are concatenated in arrival order, exactly as sibling parts already
     are.
 
+    **The descent is iterative, over an explicit stack, and that is a
+    security property rather than a style preference.** It used to recurse
+    -- one Python frame per nesting level, at a measured ~0.81 frames per
+    level -- and the depth is chosen by whoever sent the body. A 221 KB
+    response of 2000 empty nesting levels exhausted the interpreter's
+    stack and a ``RecursionError`` escaped ``request()``, where the
+    library's contract is that every failure arrives as an ``ok=False``
+    envelope (NEW-H2). A stack held in a list has no frame budget to
+    exhaust, so the interpreter limit stops being an input-reachable
+    bound at all: with it gone the only ceiling left is
+    ``max_multipart_depth``, which this library chose and states.
+
+    That is why the depth cap and the iterative shape are one fix and not
+    two. A cap alone would leave the frame ceiling in place -- correct
+    only for as long as the cap stays comfortably under whatever
+    ``sys.setrecursionlimit`` the *application* happens to have set, which
+    is not this library's to know.
+
+    The two bounds are independent because they bound different
+    resources. ``max_response_bytes`` caps how much a body can make this
+    process read; ``max_multipart_depth`` caps how far down it can make
+    this walk go. Deep empty nesting is cheap in bytes and expensive in
+    depth, which is exactly the shape the byte cap could not see.
+
     Args:
-        reader: The reader to drain, at any nesting level. The outermost
-            call gets the ``MultipartResponseWrapper`` that
-            ``from_response`` returns and every recursive one gets a
+        reader: The outermost reader, the ``MultipartResponseWrapper``
+            that ``from_response`` returns. Nested levels arrive as
             ``MultipartReader``; the two are distinct classes sharing the
             ``at_eof``/``next`` pair this reads, which is why the
-            annotation names both rather than the reader alone.
+            annotation names both rather than the wrapper alone.
         response_file: The open ``aiofiles`` handle every leaf is written
             to. Untyped because ``aiofiles.open`` returns a context-manager
             union rather than one nameable handle type.
         parts: The accumulator every leaf's bytes are appended to, shared
             across nesting levels so order is arrival order.
-        total: Bytes read so far across the whole body, including the
-            levels above this one.
-        max_response_bytes: The ceiling on that running total. It spans
-            every level: a cap reset per nested reader would let a body
-            choose this process's allocation by nesting (R14).
+        max_response_bytes: The ceiling on the running byte total. It
+            spans every level: a cap reset per nested reader would let a
+            body choose this process's allocation by nesting (R14).
+        max_multipart_depth: The ceiling on how deep the parts may nest,
+            counting the outermost reader as level 1.
 
     Returns:
-        The new running total, so a caller resuming its own loop keeps
-        counting from where the nested read left off.
+        None. The bytes leave through ``parts`` and ``response_file``, and
+        with the recursion gone there is no running total to hand back to
+        a level above.
 
     Raises:
         ResponseTooLargeError: Once the total crosses
             ``max_response_bytes``. The remainder of the body is not read.
+        ResponseTooDeepError: On the part that would nest past
+            ``max_multipart_depth``. It is refused *before* it is
+            descended into, so the level that would have overflowed is
+            never entered.
     """
-    while not reader.at_eof():
-        part = await reader.next()
+    # The stack *is* the nesting path: its length is the current depth,
+    # counting the outermost reader as level 1, and its last entry is the
+    # reader being drained. Popping on exhaustion resumes the level above
+    # exactly where a returning recursive call did.
+    stack: List[Union[
+        aiohttp.MultipartReader,
+        aiohttp.multipart.MultipartResponseWrapper,
+    ]] = [reader]
+    total = 0
+    while stack:
+        current = stack[-1]
+        if current.at_eof():
+            stack.pop()
+            continue
+        part = await current.next()
         if part is None:
-            break
+            stack.pop()
+            continue
         if isinstance(part, aiohttp.MultipartReader):
-            total = await _drain_multipart(
-                part,
-                response_file,
-                parts,
-                total,
-                max_response_bytes=max_response_bytes,
-            )
+            depth = len(stack) + 1
+            if depth > max_multipart_depth:
+                raise response_too_deep(depth, max_multipart_depth)
+            stack.append(part)
             continue
         while True:
             chunk = await part.read_chunk()
@@ -395,7 +444,6 @@ async def _drain_multipart(
                 raise response_too_large(total, max_response_bytes)
             parts.append(chunk)
             await response_file.write(chunk)
-    return total
 
 
 def redirect_target(

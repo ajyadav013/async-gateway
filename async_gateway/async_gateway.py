@@ -27,6 +27,7 @@ from async_gateway.utils.envelope import (
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
     ConfigurationError,
+    StackExhaustedError,
 )
 from async_gateway.utils.redaction import (
     normalise_param_names,
@@ -423,7 +424,37 @@ async def request(
     # closes the envelope.
     started = protocol_obj.start_time
     try:
-        response = await protocol_obj.handle_request()
+        try:
+            response = await protocol_obj.handle_request()
+        except RecursionError as err:
+            # Named, and *only* this one. A KeyError or a TypeError here
+            # is this library's bug and still propagates untouched --
+            # that is the invariant, and widening this to `Exception`
+            # would restore exactly the blindness the one-conversion-point
+            # rule exists to prevent.
+            #
+            # A RecursionError is different in kind: it is not a mistake
+            # in a line of code, it is the interpreter refusing to go
+            # further, and *what drives it is the response* -- a hostile
+            # 221 KB multipart body of 2000 nesting levels exhausted the
+            # stack and this exception escaped `request()` as a bare
+            # builtin, where the library's contract is that every failure
+            # arrives as an `ok=False` envelope (NEW-H2). Remote input
+            # deciding which of those two a caller gets is the defect.
+            #
+            # The multipart walk that provoked it is now iterative and
+            # depth-capped, so nothing known reaches this line. That is
+            # the point of keeping it: the *next* unbounded descent --
+            # a cause chain, a nested payload, a parser yet to be written
+            # -- fails as an envelope rather than as a stack trace, and
+            # the contract holds without depending on having found every
+            # recursion in advance. Converted rather than re-raised
+            # because a caller cannot act on the difference, and a
+            # `raise from` here would still be a non-`AsyncGatewayError`
+            # escaping the one conversion point.
+            raise StackExhaustedError(
+                'dispatching this call exhausted the interpreter stack; '
+                'the response was abandoned') from err
     except AsyncGatewayError as exc:
         # The one conversion point. Every other exception propagates,
         # deliberately: a KeyError here is this library's bug, not a

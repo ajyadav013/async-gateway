@@ -166,10 +166,49 @@ class ResponseTooLargeError(TransportError):
     code: ClassVar[str] = 'RESPONSE_TOO_LARGE'
 
 
+class ResponseTooDeepError(TransportError):
+    """Raised when a multipart response nests past the depth cap.
+
+    The sibling of :class:`ResponseTooLargeError`, and separate from it
+    because the two bound different resources: that one caps how many
+    *bytes* a body may make this process read, this one caps how far
+    *down* it may make it walk. A 221 KB body of 2000 empty nesting
+    levels is nowhere near any realistic byte ceiling and still exhausted
+    the interpreter's stack (NEW-H2), so the byte cap could not have
+    caught it and a caller cannot tell the two refusals apart from a
+    shared code.
+    """
+
+    code: ClassVar[str] = 'RESPONSE_TOO_DEEP'
+
+
 class CircuitOpenError(AsyncGatewayError):
     """Raised when the breaker for a destination is open."""
 
     code: ClassVar[str] = 'CIRCUIT_OPEN'
+
+
+class StackExhaustedError(AsyncGatewayError):
+    """Raised when dispatching a call exhausted the interpreter stack.
+
+    The backstop for the one-conversion-point invariant. A
+    ``RecursionError`` raised inside ``handle_request`` is a failure like
+    any other and the contract says a failure arrives as an ``ok=False``
+    envelope -- but it is not an ``AsyncGatewayError``, so it escaped
+    ``request()`` as a bare interpreter exception, which is precisely what
+    a hostile 221 KB multipart body of 2000 nesting levels produced
+    (NEW-H2).
+
+    Distinct from :class:`ResponseTooDeepError` because they answer
+    different questions. That one is a *bound this library states and
+    enforces*: a named ceiling, crossed, refused before any harm. This one
+    is a bound the **interpreter** imposed, reached by a path no cap
+    anticipated -- so a caller seeing it is being told the library ran out
+    of stack somewhere it did not expect to, which is worth a code of its
+    own rather than being dressed up as a response that nested too far.
+    """
+
+    code: ClassVar[str] = 'STACK_EXHAUSTED'
 
 
 class ProtocolError(AsyncGatewayError):

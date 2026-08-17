@@ -29,6 +29,7 @@ received invalidates every assertion built on it.
 
 import ast
 import asyncio
+import inspect
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -65,6 +66,7 @@ from async_gateway.utils.constants import (
     CHUNK_SIZE_CONSTANT,
     CREDENTIAL_HEADERS,
     CROSS_ORIGIN_SAFE_HEADERS,
+    MAX_MULTIPART_DEPTH,
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
 )
@@ -72,6 +74,7 @@ from async_gateway.utils.exceptions import (
     ConfigurationError,
     HttpStatusError,
     PathContainmentError,
+    ResponseTooDeepError,
     ResponseTooLargeError,
 )
 from async_gateway.utils.http_file_config import (
@@ -585,6 +588,232 @@ async def test_a_multipart_body_one_byte_over_the_cap_is_refused(
             max_response_bytes=len(payload) - 1,
             http_file_download_config={'download_filepath': str(target)},
         )
+
+
+def _deeply_nested_multipart_body(
+    depth: int,
+    leaf: bytes = b'bottom',
+) -> tuple[bytes, str]:
+    """Assemble a multipart body nested exactly ``depth`` levels deep.
+
+    ``_nested_multipart_body`` above builds exactly two levels, which is
+    the shape the byte-cap rows need. This builds an arbitrary one,
+    because the defect NEW-H2 records is *depth* rather than size: the
+    body is almost entirely boundaries, so 2000 levels is 221 KB -- three
+    orders of magnitude under the default byte ceiling, and it exhausted
+    the interpreter's stack anyway.
+
+    Every level gets its own boundary, because a nested part whose
+    boundary repeated its parent's would be terminated by the parent's
+    closing delimiter rather than nesting under it.
+
+    Args:
+        depth: How many reader levels the body should have, counting the
+            outermost as 1. Must be at least 1.
+        leaf: The body bytes of the single ordinary part at the bottom.
+
+    Returns:
+        The complete body and the outermost boundary, which the response
+        ``Content-Type`` has to name.
+    """
+    boundaries = [f'agwdeep{level}'.encode() for level in range(depth)]
+    body = b''.join([
+        *_flat_part(boundaries[-1], leaf),
+        b'--', boundaries[-1], b'--\r\n',
+    ])
+    for level in range(depth - 2, -1, -1):
+        outer, inner = boundaries[level], boundaries[level + 1]
+        body = b''.join([
+            b'--', outer, b'\r\n',
+            b'Content-Type: multipart/mixed; boundary=', inner, b'\r\n\r\n',
+            body, b'\r\n',
+            b'--', outer, b'--\r\n',
+        ])
+    return body, boundaries[0].decode()
+
+
+async def _fetch_nested(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+    depth: int,
+) -> HttpResult:
+    """Serve a body nested ``depth`` levels and read it through the boundary.
+
+    Chunked, with no declared length, for the reason the byte-cap rows
+    record: a pre-read guard on ``Content-Length`` must not be what
+    decides these, or a deleted depth guard would still pass.
+
+    Args:
+        http_server: The loopback server to register the body on.
+        tmp_path: Where the download lands.
+        depth: How many reader levels the body should have.
+
+    Returns:
+        The ``HttpResult`` the transport boundary produced.
+    """
+    body, boundary = _deeply_nested_multipart_body(depth)
+    http_server.respond(
+        '/multipart',
+        chunks=[body[at:at + 512] for at in range(0, len(body), 512)],
+        headers={
+            'Content-Type': f'multipart/mixed; boundary={boundary}'},
+    )
+    return await _fetch(
+        http_server.url_for('/multipart'),
+        http_file_download_config={
+            'download_filepath': str(tmp_path / f'deep-{depth}.bin')},
+    )
+
+
+async def test_a_multipart_body_exactly_at_the_depth_cap_is_read(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """The depth cap is a ceiling, not a threshold below itself.
+
+    Half of the boundary pair, and the half that stops the guard being
+    "fixed" by refusing everything: a body nesting exactly
+    ``MAX_MULTIPART_DEPTH`` levels is within the cap and its leaf must
+    arrive. Real MIME never comes close, so this row is about the
+    comparison rather than about the number.
+    """
+    result = await _fetch_nested(
+        http_server, tmp_path, MAX_MULTIPART_DEPTH)
+
+    assert result['text'] == 'bottom'
+    assert result['status_code'] == 200
+
+
+async def test_a_multipart_body_one_level_past_the_depth_cap_is_refused(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """The other half: accept at ``n``, refuse at ``n + 1``.
+
+    Either row alone passes against an off-by-one -- the same hole the
+    byte cap had before its own boundary pair was written.
+
+    The refusal names the level it stopped at, and that is asserted
+    rather than only the type: a guard that refused on the *outermost*
+    reader would raise the same class for the same body while being a
+    different, much stricter rule.
+    """
+    with pytest.raises(ResponseTooDeepError) as refusal:
+        await _fetch_nested(
+            http_server, tmp_path, MAX_MULTIPART_DEPTH + 1)
+
+    assert f'max_multipart_depth={MAX_MULTIPART_DEPTH}' in str(refusal.value)
+    assert f'nesting level {MAX_MULTIPART_DEPTH + 1}' in str(refusal.value)
+
+
+async def test_a_hostile_nesting_depth_answers_an_envelope_not_recursion(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """NEW-H2, end to end: 2000 levels, through the public entry point.
+
+    This is the reproduction as it was reported, and it is the row the
+    whole fix exists for. A 221 KB body of 2000 nesting levels used to
+    raise ``RecursionError`` straight out of ``request()`` -- measured at
+    ~488 frames per 600 levels, so the stack ran out long before any
+    byte cap noticed 221 KB. A caller got a bare interpreter exception
+    where this library's contract is that every failure arrives as an
+    ``ok=False`` envelope.
+
+    It goes through ``request()`` rather than the transport boundary
+    because that contract is the entry point's, and because the two
+    halves of the fix meet there: the depth cap refuses the body, and the
+    envelope is what proves the refusal was converted rather than
+    escaping.
+
+    Deliberately far past the cap rather than one level over it. The
+    boundary pair above pins *where* the guard fires; this pins that the
+    specific hostile input from the report is now survivable, and it
+    would still be the honest reproduction if the cap were later
+    retuned.
+    """
+    body, boundary = _deeply_nested_multipart_body(2000)
+    assert len(body) < MAX_RESPONSE_BYTES // 100, (
+        'the point of this row is that the body is large in *depth* and '
+        'unremarkable in *size* -- about 170 KB, two orders of magnitude '
+        'under the default byte ceiling. A body big enough to trip the '
+        'byte cap would be testing that cap instead of this one')
+    http_server.respond(
+        '/multipart',
+        chunks=[body[at:at + 512] for at in range(0, len(body), 512)],
+        headers={'Content-Type': f'multipart/mixed; boundary={boundary}'},
+    )
+
+    envelope = await request(
+        url=http_server.url_for('/multipart'),
+        protocol='HTTP',
+        protocol_info={
+            'request_type': 'GET',
+            'http_file_download_config': {
+                'download_filepath': str(tmp_path / 'hostile.bin'),
+            },
+        },
+    )
+
+    assert envelope['ok'] is False
+    assert envelope['error'] is not None
+    assert envelope['error']['code'] == 'RESPONSE_TOO_DEEP'
+    assert envelope['status_code'] == 502
+
+
+async def test_the_multipart_walk_costs_no_stack_frames_per_level(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """The descent is iterative, and *that* is what removes the ceiling.
+
+    The depth cap alone would not have fixed NEW-H2. A recursive walk
+    still spends one frame per level, so the real ceiling would stay
+    ``sys.getrecursionlimit()`` minus whatever the *application* has
+    already spent -- a bound this library does not set and cannot see. A
+    cap of 64 is safe under the default 1000 and not under an
+    application that lowered it, or under a deep call stack that arrived
+    here with little headroom left.
+
+    So this row measures the stack rather than the outcome: the depth
+    reached inside the innermost leaf read is asserted to be the *same*
+    whether the body nests 2 levels or 60. A reintroduced recursion
+    fails it immediately, while every behavioural row above would still
+    pass -- which is precisely why the behavioural rows are not enough.
+    """
+    depths: dict[int, int] = {}
+    real_read_chunk = aiohttp.multipart.BodyPartReader.read_chunk
+
+    async def measuring(
+        self: aiohttp.multipart.BodyPartReader,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bytes:
+        """Record the live stack depth, then read as usual.
+
+        Args:
+            self: The leaf reader being read.
+            args: Forwarded to the real ``read_chunk``.
+            kwargs: Forwarded to the real ``read_chunk``.
+
+        Returns:
+            Whatever the real ``read_chunk`` returns.
+        """
+        depths[nesting] = max(
+            depths.get(nesting, 0), len(inspect.stack()))
+        return await real_read_chunk(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            aiohttp.multipart.BodyPartReader, 'read_chunk', measuring)
+        for nesting in (2, 60):
+            await _fetch_nested(http_server, tmp_path, nesting)
+
+    assert depths[2] == depths[60], (
+        f'reading a leaf 60 levels down cost {depths[60] - depths[2]} '
+        f'more stack frames than one 2 levels down, so the walk is '
+        f'recursive again and the interpreter limit is once more '
+        f'reachable from a response body (NEW-H2)')
 
 
 def _multipart_body_without_its_closing_boundary(part: bytes) -> bytes:

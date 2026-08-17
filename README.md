@@ -692,6 +692,8 @@ explicitly rather than inventing a sentinel.
 | Circuit open | `503` | `CIRCUIT_OPEN` | `False` |
 | DNS / connect / TLS failure | `502` | `DNS` / `CONNECT` / `TLS` | `False` |
 | Response over the size cap | `502` | `RESPONSE_TOO_LARGE` | `False` |
+| Multipart response nested past the depth cap | `502` | `RESPONSE_TOO_DEEP` | `False` |
+| Dispatch exhausted the interpreter stack | `502` | `STACK_EXHAUSTED` | `False` |
 | Body will not parse (response side) | `502` | `SERIALIZATION` | `False` |
 | Body will not serialise (request side) | `400` | `SERIALIZATION` | `False` |
 | XML refused before parse (DOCTYPE) | `502` | `XML_UNSAFE` | `False` |
@@ -795,8 +797,10 @@ AsyncGatewayError                 GATEWAY              502
 │   ├── TlsError                  TLS                  502
 │   ├── HostKeyError              HOST_KEY             495
 │   ├── GatewayTimeoutError       TIMEOUT              504
-│   └── ResponseTooLargeError     RESPONSE_TOO_LARGE   502
+│   ├── ResponseTooLargeError     RESPONSE_TOO_LARGE   502
+│   └── ResponseTooDeepError      RESPONSE_TOO_DEEP    502
 ├── CircuitOpenError              CIRCUIT_OPEN         503
+├── StackExhaustedError           STACK_EXHAUSTED      502
 └── ProtocolError                 PROTOCOL             502
     ├── HttpStatusError           HTTP_STATUS          the real status
     ├── FtpStatusError            FTP_STATUS           the reply code
@@ -826,6 +830,8 @@ message text.
 | `HOST_KEY` | An SSH host key is unknown or does not match | No |
 | `TIMEOUT` | A connect, read or total deadline expired | Yes |
 | `RESPONSE_TOO_LARGE` | The body exceeded `max_response_bytes` | No |
+| `RESPONSE_TOO_DEEP` | A multipart body nested past the 64-level depth cap | No |
+| `STACK_EXHAUSTED` | Dispatching the call exhausted the interpreter stack | No |
 | `CIRCUIT_OPEN` | The breaker for this destination is open | Later |
 | `HTTP_STATUS` | An HTTP 4xx or 5xx | Depends |
 | `FTP_STATUS` | An FTP 4xx or 5xx reply | Depends |
@@ -1063,6 +1069,19 @@ that declares nothing is refused on the chunk that crosses it. There is
 deliberately **no sentinel that disables the cap** — no 0, no -1, no None — so
 "unbounded" is never one typo away. A caller who needs more names a bigger
 number.
+
+### Multipart nesting depth
+
+A `multipart/*` response may nest — a part whose own media type is
+`multipart/...` carries parts of its own — and this library descends into it
+rather than refusing, because its leaves are ordinary parts carrying real
+content. That descent is capped at **64 levels**, and the cap is separate from
+`max_response_bytes` because the two bound different resources: 2000 levels of
+empty nesting is 221 KB, nowhere near any realistic byte ceiling, and walking
+it exhausted the interpreter's stack. A body past the cap answers
+`RESPONSE_TOO_DEEP`/502; the level that would have overflowed is never entered.
+Real MIME nests a handful of levels at most, so the cap is not reachable by
+anything honest and there is no knob to raise it.
 
 ### Redirects
 
