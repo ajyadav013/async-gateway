@@ -160,6 +160,12 @@ assert result['protocol_details']['command'] == 'download'
 `url` is a **bare host name** for FTP and SFTP, not a URL with a scheme; the
 port comes from `protocol_info['port']`.
 
+`protocol_info['port']` must be an **integer in `0..65535`**, on every
+protocol. Anything else — a string, a float, a `bool`, a negative number, or an
+unhashable value such as a list — is refused with a `ConfigurationError`
+(`code='CONFIG'`, status `400`) before the call is dispatched. Omit the key to
+take the port from the URL, or from the protocol family's default.
+
 **FTP and SFTP need only `.login` and `.password`.** Any object carrying those
 two attributes works — the example uses `types.SimpleNamespace` from the
 standard library. `aiohttp.BasicAuth` also has them and is still accepted, but

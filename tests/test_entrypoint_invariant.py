@@ -291,6 +291,33 @@ HOSTILE_PROTOCOL_INFO: Final[tuple[Any, ...]] = (
     {'circuit_breaker_config': 'not a mapping'},
     {'retry_config': 'not a mapping'},
     {'port': 'not a port'},
+    # NEW-2, and the reason the row above did not catch it. A string
+    # port is *hashable*, so it flowed into the breaker registry's
+    # `(family, host, port)` dict key without complaint and merely
+    # opened a second key for a destination that already had one. An
+    # **unhashable** port is the shape that actually crashed:
+    # `_BREAKERS.get(key)` raised `TypeError: cannot use 'tuple' as a
+    # dict key (unhashable type: 'list')` out of `request()`
+    # un-enveloped, on all five protocols.
+    #
+    # All three unhashable builtins, because it is the container-ness
+    # and not the list-ness that does it, and a guard written against
+    # `list` alone would leave the other two.
+    {'port': ['a', 'list']},
+    {'port': {'a': 'dict'}},
+    {'port': {'a', 'set'}},
+    # The boundary values a *range* check has to get right, and the
+    # reason this validator does not stop at hashability. `True` is an
+    # `int` of value 1 and would silently dispatch to port 1; `-1` is
+    # `UNKNOWN_PORT`, the registry's own "no port known" sentinel, so
+    # accepting it lets a caller collide with it; `65536` is one past
+    # the 16-bit ceiling and reaches the transport as an
+    # `OverflowError` from inside `aioftp`/`asyncssh`; a float is not a
+    # port however round it looks.
+    {'port': True},
+    {'port': -1},
+    {'port': 65536},
+    {'port': 21.0},
     {'server_path': 42},
     {'client_path': 42},
     {'remote_path': 42},

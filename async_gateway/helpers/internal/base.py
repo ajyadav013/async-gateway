@@ -23,6 +23,7 @@ from async_gateway.helpers.internal.circuit_breaker_helper import (
     CircuitBreakerHelper,
 )
 from async_gateway.utils.constants import (DEFAULT_PORTS, HTTP_TIMEOUT,
+                                           PORT_RANGE_HIGH, PORT_RANGE_LOW,
                                            UNKNOWN_PORT)
 from async_gateway.utils.envelope import GatewayResponse
 from async_gateway.utils.exceptions import ConfigurationError
@@ -79,6 +80,72 @@ def validated_protocol_info(
         raise ConfigurationError(
             f'protocol_info is missing required key(s) {missing}')
     return dict(info)
+
+
+def validated_port(port: Any) -> Optional[int]:
+    """Return ``protocol_info['port']`` once proven a usable port number.
+
+    The ``validated_*`` family's newest member, and it exists for the
+    reason every other one does: ``protocol_info['port']`` was read with
+    no checking at all and handed straight to
+    :func:`destination_of`, whose return value becomes the breaker
+    registry's ``(family, host, port)`` **dict key**. An unhashable
+    value -- a list, a dict, a set -- therefore reached
+    ``_BREAKERS.get(key)`` and raised ``TypeError: cannot use 'tuple' as
+    a dict key (unhashable type: 'list')`` out of ``request()``
+    un-enveloped, on every one of the five protocols. A caller cannot be
+    asked to catch a builtin for a configuration mistake the contract
+    does not name.
+
+    **Hashability is not the check, though, and checking only that is
+    the trap this validator is written to avoid.** A ``port='21'`` is
+    perfectly hashable and would have sailed past a hashability guard
+    straight into a *second* key for a destination that already has one:
+    ``('ftp', 'h', '21')`` and ``('ftp', 'h', 21)`` are distinct keys, so
+    the two calls accumulate their failure counts separately and neither
+    reaches the threshold -- H8's "the circuit can never open", restored
+    quietly for one caller. Worse, FTP passes the value on to
+    ``aioftp``'s connect call, and SFTP puts it in its
+    ``protocol_details``. So the type is checked, and so is the range.
+
+    ``bool`` is rejected for the reason the whole family rejects it:
+    ``True`` is an ``int`` of value 1, and a call dispatched to port 1
+    is not what anyone meant by ``port=True``.
+
+    None is returned unchanged and means "the caller named no port",
+    which :func:`destination_of` already answers by reading one out of
+    the URL or falling back to the family default. That is a documented
+    call, not an omission.
+
+    Args:
+        port: ``protocol_info['port']`` exactly as the caller supplied
+            it, of whatever type they actually passed, or None when they
+            supplied none.
+
+    Returns:
+        The port as an ``int``, or None when the caller named none.
+
+    Raises:
+        ConfigurationError: If the value is not None and is not an
+            integer in ``0..65535``. A port outside that range cannot
+            reach any socket -- ``aioftp`` and ``asyncssh`` both raise
+            an ``OverflowError`` from deep inside the transport for one
+            -- and :data:`~async_gateway.utils.constants.UNKNOWN_PORT`
+            is ``-1``, so accepting a negative port would let a caller
+            collide with the registry's own "no port known" sentinel.
+    """
+    if port is None:
+        return None
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise ConfigurationError(
+            f'protocol_info["port"] must be an integer port number in '
+            f'{PORT_RANGE_LOW}..{PORT_RANGE_HIGH}, got '
+            f'{type(port).__name__}')
+    if not PORT_RANGE_LOW <= port <= PORT_RANGE_HIGH:
+        raise ConfigurationError(
+            f'protocol_info["port"] must be an integer port number in '
+            f'{PORT_RANGE_LOW}..{PORT_RANGE_HIGH}, got {port}')
+    return port
 
 
 def credentials_of(auth: Any, *, protocol: str) -> Tuple[str, str]:

@@ -42,6 +42,7 @@ from async_gateway.async_gateway import (
 )
 from async_gateway.helpers.internal.base import (
     BaseRequestClass,
+    validated_port,
     validated_protocol_info,
 )
 from async_gateway.logic import protocol_mapping
@@ -397,6 +398,145 @@ def test_r11_ac3_validated_protocol_info_copies_rather_than_aliases() -> None:
     validated['request_type'] = 'DELETE'
 
     assert supplied == {'request_type': 'GET'}
+
+
+# --- NEW-2: the port that reaches the breaker registry's dict key ----------
+
+
+@pytest.mark.parametrize(
+    'port',
+    [
+        pytest.param(None, id='none-means-the-caller-named-no-port'),
+        pytest.param(0, id='zero-is-a-legal-port'),
+        pytest.param(21, id='the-ftp-default'),
+        pytest.param(8080, id='an-ordinary-high-port'),
+        pytest.param(65535, id='the-top-of-the-16-bit-range'),
+    ],
+)
+def test_validated_port_passes_every_usable_port(port: Any) -> None:
+    """A validator that rejects a legal port is its own defect.
+
+    ``0`` is on this list rather than the reject list on purpose, and
+    it is the one row worth arguing about: ``0`` is a legal port number,
+    which is precisely why
+    :data:`~async_gateway.utils.constants.UNKNOWN_PORT` is ``-1`` and
+    not ``0``. Rejecting it here would contradict that choice one module
+    away.
+
+    Args:
+        port: A port the library must accept unchanged.
+
+    Returns:
+        None.
+    """
+    assert validated_port(port) == port
+
+
+@pytest.mark.parametrize(
+    'port',
+    [
+        # The NEW-2 shapes: unhashable, so they reached
+        # `_BREAKERS.get(key)` and raised a bare `TypeError` from inside
+        # the registry rather than a `ConfigurationError` at the
+        # boundary. All three builtins, since it is the container-ness
+        # that does it.
+        pytest.param(['a', 'list'], id='an-unhashable-list'),
+        pytest.param({'a': 'dict'}, id='an-unhashable-dict'),
+        pytest.param({'a', 'set'}, id='an-unhashable-set'),
+        # Hashable and still wrong, which is why this validator checks
+        # the type and the range rather than stopping at hashability.
+        # `'21'` would have opened a *second* registry key for a
+        # destination that already had one -- `('ftp', 'h', '21')` and
+        # `('ftp', 'h', 21)` are distinct -- so each key accumulates
+        # half the failures and neither opens the circuit (H8, quietly
+        # restored for one caller).
+        pytest.param('21', id='a-numeric-string'),
+        pytest.param('not a port', id='a-non-numeric-string'),
+        pytest.param(21.0, id='a-float-however-round'),
+        # `True` is an `int` of value 1, and port 1 is not what anyone
+        # meant by `port=True` -- the same bargain the timeout, the
+        # response cap and the redirect bound all strike.
+        pytest.param(True, id='a-bool-which-is-an-int-of-value-one'),
+        pytest.param(False, id='the-other-bool'),
+        # `-1` is `UNKNOWN_PORT` itself: accepting it would let a caller
+        # collide with the registry's own "no port known" sentinel.
+        pytest.param(-1, id='the-unknown-port-sentinel'),
+        pytest.param(-8080, id='any-other-negative'),
+        pytest.param(65536, id='one-past-the-16-bit-ceiling'),
+        pytest.param(10 ** 12, id='far-past-it'),
+        pytest.param(object(), id='an-arbitrary-object'),
+    ],
+)
+def test_validated_port_refuses_everything_a_socket_cannot_use(
+    port: Any,
+) -> None:
+    """Every rejection is a ``ConfigurationError``, never a builtin.
+
+    The contract this library makes is that a non-``AsyncGatewayError``
+    reaching the caller means a bug in *here*. A caller's own bad
+    ``protocol_info['port']`` is not that, so it is reported as
+    configuration -- and reported at the boundary, before any protocol
+    object exists to crash inside.
+
+    Args:
+        port: A port no socket can be opened on.
+
+    Returns:
+        None.
+    """
+    with pytest.raises(ConfigurationError) as raised:
+        validated_port(port)
+
+    # The message names the key and the range, so a caller can fix it
+    # without reading this source.
+    assert 'protocol_info["port"]' in str(raised.value)
+    assert '0..65535' in str(raised.value)
+
+
+@pytest.mark.parametrize('protocol', ['HTTP', 'HTTPS', 'FTP', 'SFTP', 'SOAP'])
+async def test_an_unusable_port_is_refused_before_any_protocol_runs(
+    protocol: str,
+) -> None:
+    """The registry key is built in a constructor, so the guard is earlier.
+
+    Every protocol object's ``__init__`` calls
+    ``get_breaker(*destination_of(..., info.get('port')))`` before it
+    does anything else, and that tuple is a **dict key**. So an
+    unhashable port did not fail in the protocol the caller chose -- it
+    failed identically in all five, from inside the shared registry, as
+    a bare ``TypeError`` past the entry point's one conversion point
+    where nothing catches it.
+
+    Checking at the boundary is what makes the fix protocol-agnostic
+    rather than five fixes, and this row asserts that by running every
+    protocol through the same hostile value. It also pins the
+    *placement*: a ``ConfigurationError`` raised synchronously, per
+    AGW-35, rather than an ``ok=False`` envelope a retry loop would
+    re-attempt forever for a mistake no retry can fix.
+
+    Args:
+        protocol: The protocol under test.
+
+    Returns:
+        None.
+    """
+    with pytest.raises(ConfigurationError) as raised:
+        await request(
+            'http://host.invalid/p',
+            protocol=protocol,
+            protocol_info={
+                'request_type': 'GET',
+                'operation': 'Op',
+                'mode': 'download',
+                'server_path': '/f',
+                'local_path': '/tmp/unused',
+                'port': ['unhashable'],
+            },
+            auth=AUTH,
+        )
+
+    assert 'protocol_info["port"]' in str(raised.value)
+    assert raised.value.code == 'CONFIG'
 
 
 # --- R11-AC4 + FI-14: the scheme of the URL actually dispatched (H6) -------

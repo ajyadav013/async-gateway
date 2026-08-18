@@ -74,6 +74,21 @@ BREAKER_REGISTRY_MAX: Final[int] = 256
 #: library did not anticipate.
 UNKNOWN_PORT: Final[int] = -1
 
+#: The inclusive bounds a caller-supplied ``protocol_info['port']`` is
+#: held to. A TCP port is a 16-bit unsigned number, so anything outside
+#: this cannot reach a socket at all -- ``aioftp`` and ``asyncssh`` both
+#: surface one as an ``OverflowError`` from deep inside the transport,
+#: which is neither this library's contract nor a message a caller can
+#: act on.
+#:
+#: The low bound is ``0`` and not ``1`` deliberately, for the same reason
+#: :data:`UNKNOWN_PORT` is ``-1``: ``0`` is a legal port number, and a
+#: validator that rejected it would contradict the sentinel choice made
+#: directly above. Rejecting negatives is what keeps a caller from
+#: colliding with that sentinel.
+PORT_RANGE_LOW: Final[int] = 0
+PORT_RANGE_HIGH: Final[int] = 65535
+
 #: The port each protocol family answers on when the caller names none.
 DEFAULT_PORTS: Final[Mapping[str, int]] = MappingProxyType({
     'http': 80,

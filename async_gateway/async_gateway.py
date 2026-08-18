@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from async_gateway.helpers.internal.base import (
     BaseRequestClass,
+    validated_port,
     validated_protocol_info,
 )
 from async_gateway.logic import protocol_mapping
@@ -719,6 +720,23 @@ async def request(
     protocol_name, protocol_class = resolve_protocol(protocol)
     info: Dict[str, Any] = validated_protocol_info(
         protocol_info, required=protocol_class.REQUIRED_INFO_KEYS)
+
+    # `port` is checked here, at the boundary, with the rest of the
+    # `validated_*` family and *outside* the one conversion `try` -- the
+    # placement AGW-35 settled, because an unretryable configuration
+    # mistake should raise once and synchronously rather than become an
+    # `ok=False` envelope a retry loop re-attempts forever.
+    #
+    # It has to be this early. Every protocol object's constructor
+    # reaches `get_breaker(*destination_of(..., info.get('port')))`
+    # before it does anything else, and that tuple is a **dict key**, so
+    # an unhashable port raised a bare `TypeError` from inside the
+    # registry on all five protocols (NEW-2). The return value is
+    # discarded rather than written back: `destination_of` and the FTP
+    # and SFTP clients read `info['port']` themselves, and re-writing a
+    # validated copy into the caller's config is the mutation M12
+    # already ruled out.
+    validated_port(info.get('port'))
 
     # Both processor configs, checked here and *both before either runs*.
     # These are documented public parameters and were the last two read
