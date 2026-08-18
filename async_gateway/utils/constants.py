@@ -119,6 +119,31 @@ MAX_REDIRECTS: Final[int] = 10
 #: that no longer exists.
 MAX_MULTIPART_DEPTH: Final[int] = 64
 
+#: How deep a SOAP Fault's ``<detail>`` may nest before this library
+#: declines to re-serialise it. The same bound as the multipart cap above,
+#: for the same reason and against the same shape of input: 1000 levels of
+#: nesting is 7 KB on the wire -- nowhere near ``MAX_RESPONSE_BYTES`` --
+#: and ``ElementTree.tostring`` recurses one frame per level, so a remote
+#: server could exhaust the interpreter's stack and have its own Fault
+#: reported as ``STACK_EXHAUSTED``/502. That let the *server* choose which
+#: error code its caller saw for the server's own Fault (N5).
+#:
+#: The XML *parse* is already iterative and safe past 50k levels; only the
+#: serialisation of the detail subtree recurses, so this bounds that step
+#: alone. Crossing it does not discard the Fault: code, reason, subcodes
+#: and actor are all read without recursing, so the Fault is still
+#: reported as a Fault and only ``detail`` is withheld -- see
+#: ``fault_detail_text`` in ``logic/soap_client.py``.
+#:
+#: 64 is generous past anything real. A Fault detail carries an
+#: application error structure -- a code, a message, perhaps a list of
+#: field errors -- which is a handful of levels; SOAP itself imposes no
+#: nesting limit on it. Deliberately not derived from
+#: ``sys.getrecursionlimit()``: an application is free to raise or lower
+#: that, and a bound this library states is one it can hold to whatever
+#: the embedding process chose.
+MAX_FAULT_DETAIL_DEPTH: Final[int] = 64
+
 #: The URL schemes an HTTP-family call may be dispatched to, on the initial
 #: URL and on every redirect hop alike. R21 (a later story) reads it for
 #: the initial URL; the owned redirect loop in ``request_helper`` reads it

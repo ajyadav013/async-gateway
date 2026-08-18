@@ -86,6 +86,7 @@ from async_gateway.logic.http_client import (
 from async_gateway.utils.constants import (
     ALLOWED_SCHEMES,
     HTTP_ERROR_STATUS,
+    MAX_FAULT_DETAIL_DEPTH,
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
 )
@@ -183,6 +184,10 @@ class SoapFault(TypedDict):
             ``Element`` because a Fault detail routinely carries nested
             application XML whose schema this library knows nothing about,
             and a string preserves it exactly without pretending to.
+            Also None when the detail nests deeper than
+            :data:`~async_gateway.utils.constants.MAX_FAULT_DETAIL_DEPTH`,
+            which is refused rather than serialised -- the rest of the
+            Fault is still reported. See :func:`fault_detail_text`.
     """
 
     code: str
@@ -582,6 +587,95 @@ def first_element_child(parent: Element) -> Optional[Element]:
     return children[0]
 
 
+def exceeds_depth(root: Element, max_depth: int) -> bool:
+    """Say whether ``root``'s tree nests deeper than ``max_depth``.
+
+    **Iterative, over an explicit stack, and that is a security property
+    rather than a style preference** -- the same shape, for the same
+    reason, as the multipart walk in
+    ``helpers/internal/request_helper.drain_multipart``. A recursive
+    depth check would exhaust the interpreter's stack on precisely the
+    input it exists to refuse, which is not a check at all.
+
+    It stops at the first node past the limit rather than measuring the
+    true depth: the answer is a yes/no, the caller has nothing to do with
+    a depth of 4000 that it would not do with 65, and a hostile tree
+    should cost as little as possible to reject.
+
+    Args:
+        root: The subtree to measure, counted as level 1.
+        max_depth: The deepest level permitted.
+
+    Returns:
+        True when some node sits deeper than ``max_depth``.
+    """
+    # Each entry is one node and the depth it sits at, so the walk carries
+    # its own level rather than inferring one from the stack's length --
+    # this is a breadth-agnostic descent, not a single path.
+    stack: List[Tuple[Element, int]] = [(root, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > max_depth:
+            return True
+        stack.extend((child, depth + 1) for child in node)
+    return False
+
+
+def fault_detail_text(detail: Optional[Element]) -> Optional[str]:
+    """Re-serialise a Fault's ``<detail>``, refusing one that nests too far.
+
+    ``ElementTree.tostring`` recurses one frame per element, and the
+    element it is handed here came from a remote server. A ``<detail>``
+    of 1000 nesting levels is 7 KB on the wire -- far under
+    ``MAX_RESPONSE_BYTES``, so the byte cap cannot see it -- and raised
+    ``RecursionError``, which ``request()``'s backstop converts to
+    ``STACK_EXHAUSTED``/502. **A remote server therefore chose which
+    error code its caller saw for the server's own Fault** (N5): the same
+    Fault arrived as ``SOAP_FAULT``/real-status when its detail was flat
+    and as a stack exhaustion when it was deep.
+
+    **The Fault is preserved and only the detail is withheld.** That is
+    the deliberate choice, and R19 is what decides it: a Fault is "the
+    server's considered answer", the requirement is that it maps to
+    ``ok=False`` with ``error.code == 'SOAP_FAULT'`` and the real HTTP
+    status, and ``code``, ``reason``, ``subcodes`` and ``actor`` are all
+    read with ``findtext`` -- no recursion, so nothing about them is in
+    doubt. Refusing the whole Fault would discard the parts R19 requires
+    in order to protect a part it lists as optional (its edge cases
+    permit a detail that is "absent, empty, or contains nested
+    application XML"), and would hand the server the same power by
+    another route: a deep detail would still decide the caller's error
+    code. Withholding only the unserialisable part keeps the fault
+    contract stable under hostile input, which is the property N5 says is
+    missing.
+
+    So a too-deep detail reports as an absent one -- ``None``, the value
+    R19 already defines for a Fault with no detail -- and a warning names
+    the limit, because ``None`` alone would let real data vanish
+    silently.
+
+    Args:
+        detail: The ``detail``/``Detail`` element, or None when the Fault
+            carries none.
+
+    Returns:
+        The detail as XML text, or None when it is absent or nests deeper
+        than :data:`~async_gateway.utils.constants.MAX_FAULT_DETAIL_DEPTH`.
+    """
+    if detail is None:
+        return None
+    if exceeds_depth(detail, MAX_FAULT_DETAIL_DEPTH):
+        logger.warning(
+            'SOAP Fault <detail> nests deeper than '
+            'max_fault_detail_depth=%d; the fault is reported without it. '
+            'Re-serialising it would recurse once per level and exhaust '
+            'the interpreter stack, which would report this fault as a '
+            'stack exhaustion rather than as the fault it is',
+            MAX_FAULT_DETAIL_DEPTH)
+        return None
+    return tostring(detail, encoding='unicode')
+
+
 def fault_from_11(fault: Element) -> SoapFault:
     """Read a SOAP 1.1 ``<Fault>`` into the shared fault shape.
 
@@ -596,15 +690,13 @@ def fault_from_11(fault: Element) -> SoapFault:
         The fault, with an always-empty ``subcodes``: 1.1 has no subcode
         chain, and inventing one from the code string would be a guess.
     """
-    detail = fault.find('detail')
     actor = fault.findtext('faultactor')
     return SoapFault(
         code=(fault.findtext('faultcode') or '').strip(),
         subcodes=[],
         reason=(fault.findtext('faultstring') or '').strip(),
         actor=actor.strip() if actor is not None else None,
-        detail=None if detail is None else tostring(
-            detail, encoding='unicode'),
+        detail=fault_detail_text(fault.find('detail')),
     )
 
 
@@ -642,14 +734,12 @@ def fault_from_12(fault: Element, namespace: str) -> SoapFault:
         reason_text = (reason.findtext(f'{qualified}Text') or '').strip()
 
     role = fault.findtext(f'{qualified}Role')
-    detail = fault.find(f'{qualified}Detail')
     return SoapFault(
         code=value,
         subcodes=subcodes,
         reason=reason_text,
         actor=role.strip() if role is not None else None,
-        detail=None if detail is None else tostring(
-            detail, encoding='unicode'),
+        detail=fault_detail_text(fault.find(f'{qualified}Detail')),
     )
 
 
