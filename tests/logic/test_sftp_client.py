@@ -1510,6 +1510,45 @@ async def test_a_recursive_download_refuses_an_occupied_destination(
         'the refused mkdir must leave what was in the way untouched')
 
 
+async def test_a_preserving_download_cannot_widen_the_local_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``preserve=True`` may not hand the server the local file's mode.
+
+    The ``setstat`` tail of the real ``_copy``, reached here for the
+    first time. ``asyncssh``'s ``_setstat`` chmods to the attributes
+    it is given and ``_copy`` gives it the **remote** file's
+    permissions, so ``preserve=True`` undid the 0600 that
+    ``test_r22_an_ordinary_tree_still_downloads`` asserts one row
+    above. Measured against a real loopback SFTP server: a remote file
+    at 0777 left the local one at 0o777.
+
+    The remote file here is 0644 -- what
+    :func:`~tests.fixtures.sftp.remote_file` reports -- which is wider
+    than 0600 and is the ordinary case rather than a contrived one.
+    """
+    target = tmp_path / 'downloads'
+    trusting_double(
+        monkeypatch,
+        StubSFTPClient(attrs=DIRECTORY_ATTRS, remote_tree=hostile_tree()))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        mode='get',
+        remote_path=REMOTE_TREE_ROOT,
+        local_path=str(target),
+        additional_arguments={'preserve': True})
+
+    landed = target / 'harmless.txt'
+    assert envelope['ok'] is True, (
+        'preserve=True is a legitimate option and must keep working')
+    assert landed.read_bytes() == HARMLESS_CONTENT
+    assert landed.stat().st_mode & 0o777 == 0o600, (
+        'the remote server chose the mode of a local file: preserve '
+        "reverted the guarded open's 0600 (M18)")
+
+
 async def test_r22_a_server_supplied_symlink_is_not_recreated(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -819,8 +819,14 @@ async def test_the_local_fs_still_performs_the_operations(
             os.fsencode(str(base)))
     ] == [b'sub', b'f.bin'] or True
 
-    await filesystem.setstat(inside, asyncssh.SFTPAttrs(permissions=0o100640))
-    assert (base / 'f.bin').stat().st_mode & 0o777 == 0o640
+    # `setstat` applies the times and drops the mode -- see
+    # `test_setstat_preserves_the_times_and_never_the_mode` for why.
+    # Asserted here too, because this is the row that would otherwise
+    # let a wrapper which refuses *everything* pass.
+    await filesystem.setstat(inside, asyncssh.SFTPAttrs(
+        permissions=0o100640, atime=1000000000, mtime=1000000000))
+    assert (base / 'f.bin').stat().st_mode & 0o777 == 0o600
+    assert int((base / 'f.bin').stat().st_mtime) == 1000000000
 
     (base / 'link').symlink_to(base / 'f.bin')
     assert await filesystem.readlink(
@@ -905,6 +911,76 @@ async def test_mkdir_keeps_its_containment_answer_for_a_symlink(
 
     with pytest.raises(PathContainmentError):
         await path_io(base).mkdir(base / 'link', exist_ok=False)
+
+
+async def test_setstat_preserves_the_times_and_never_the_mode(
+    tmp_path: Path,
+) -> None:
+    """``preserve=True`` may not let a server widen a local file (M18).
+
+    Every local file this library creates is opened at 0600, which is a
+    security property of the release rather than whatever ``umask``
+    allowed. ``asyncssh``'s ``_setstat`` ends with an ``os.chmod`` to
+    the attributes it was handed, and ``_copy`` hands it the **remote**
+    file's permission bits -- so ``preserve=True`` silently reverted
+    it. Measured against a real loopback SFTP server with the remote
+    file at 0777: the local file was left at 0o777, on a single-file
+    and on a recursive ``get`` alike.
+
+    What ``preserve`` may keep is decided by what the field *grants*.
+    A timestamp grants nothing -- the worst a hostile server does with
+    it is date a file whose contents it already chose -- so the times
+    are applied. Permissions and ownership grant the remote side
+    authority over a local file, so they are dropped.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+    target = base / 'f.bin'
+    handle = await filesystem.open(os.fsencode(str(target)), 'wb')
+    await handle.write(b'body', 0)
+    await handle.close()
+    assert target.stat().st_mode & 0o777 == 0o600
+
+    await filesystem.setstat(
+        os.fsencode(str(target)),
+        asyncssh.SFTPAttrs(
+            permissions=0o100777, atime=1000000000, mtime=1000000000))
+
+    assert target.stat().st_mode & 0o777 == 0o600, (
+        'a remote server decided the mode of a local file: the guarded '
+        "open's 0600 was undone by the chmod inside asyncssh's _setstat"
+    )
+    assert int(target.stat().st_mtime) == 1000000000, (
+        'the timestamps are the half of preserve=True that is safe to '
+        'honour, and dropping them would make the option pointless'
+    )
+
+
+async def test_setstat_leaves_a_local_file_owned_by_this_process(
+    tmp_path: Path,
+) -> None:
+    """The ownership fields ride with the mode, for the same reason.
+
+    ``_setstat`` chowns to ``attrs.uid``/``gid`` before it chmods. A
+    download is not an invitation to reassign a local file's owner, so
+    those fields are dropped too -- and unprivileged, a ``chown`` to
+    another uid raises ``EPERM``, which would turn a legitimate
+    ``preserve=True`` download into a failure on top of being wrong.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    filesystem = ContainedLocalFS(base)
+    target = base / 'f.bin'
+    handle = await filesystem.open(os.fsencode(str(target)), 'wb')
+    await handle.close()
+
+    await filesystem.setstat(
+        os.fsencode(str(target)),
+        asyncssh.SFTPAttrs(uid=0, gid=0, permissions=0o100777))
+
+    assert target.stat().st_uid == os.getuid()
+    assert target.stat().st_mode & 0o777 == 0o600
 
 
 async def test_the_local_fs_delegates_its_pure_string_helpers(

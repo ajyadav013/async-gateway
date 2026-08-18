@@ -17,6 +17,7 @@ import inspect
 import itertools
 import json
 import logging
+import os
 import re
 import socket
 import urllib.parse
@@ -85,6 +86,8 @@ from tests.fixtures.protocol_transports import (
     OVER_CAP_CODE,
     OVER_CAP_LIMIT,
     PROTOCOL_FAULTS,
+    REMOTE_ENTRY,
+    REMOTE_PERMISSIONS,
     contract_call,
     install_failing_transport,
     install_transport,
@@ -981,6 +984,47 @@ async def test_a_mkdir_over_an_existing_file_is_one_code_on_both(
         'one local fault, two codes, hidden because no double took the '
         "real client's directory arm.")
     assert destination.read_bytes() == b'an ordinary file in the way'
+
+
+async def test_preserve_cannot_let_a_server_widen_a_local_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No protocol lets the remote side choose a local file's mode (M18).
+
+    SFTP is the only protocol with a ``preserve`` to reconcile --
+    ``aioftp`` and this library's HTTP write path apply no
+    server-supplied attribute to a local file, so 0600 already held
+    there unconditionally -- but the *property* is cross-protocol and
+    is asserted as one: every local file this library writes is
+    owner-only, whatever the server says about its own copy.
+
+    ``asyncssh``'s ``_setstat`` chmods to the attributes ``_copy``
+    hands it, and those are the remote file's, so ``preserve=True``
+    silently reverted the guarded open's 0600. No double reached
+    ``setstat`` at all, which is why nothing saw it.
+
+    Args:
+        monkeypatch: The pytest patcher.
+        tmp_path: The test's temporary directory.
+
+    Returns:
+        None.
+    """
+    destination = tmp_path / 'downloads'
+    call = local_io_call('SFTP', str(destination))
+    install_writing_transport(
+        monkeypatch, 'SFTP', recurse=True, preserve=True)
+
+    result = await request(**call)
+
+    landed = destination / os.fsdecode(REMOTE_ENTRY)
+    assert result['ok'] is True, (
+        'preserve=True is legitimate and must still complete')
+    assert landed.stat().st_mode & 0o777 == 0o600, (
+        f'the server asked for {oct(REMOTE_PERMISSIONS)} and got it: a '
+        'remote endpoint decided the permissions of a file on this '
+        'machine, undoing the 0600 every local write establishes.')
 
 
 @pytest.mark.parametrize('protocol', CONTRACT_ROWS)

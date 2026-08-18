@@ -1008,22 +1008,60 @@ class ContainedLocalFS:
         *,
         follow_symlinks: bool = True,
     ) -> None:
-        """Apply attributes to a contained local path.
+        """Apply the *safe* attributes to a contained local path.
 
         Reached only for ``preserve=True``, and it is a write: a
         ``chmod`` through an escaping path is the same escape as a
-        ``write`` through one.
+        ``write`` through one. Containment alone is not enough, though,
+        because the danger here is not *where* the call lands but
+        *what* it sets.
+
+        **The ownership and permission bits are dropped.** Every local
+        file this library creates is opened at
+        :data:`~async_gateway.utils.paths.FILE_MODE` -- 0600, owner-only
+        -- and that is a security property of this release rather than
+        an accident of ``umask`` (M18). ``asyncssh``'s ``_setstat``
+        ends with an ``os.chmod`` to whatever ``attrs.permissions``
+        carries, so a ``preserve=True`` download silently reverted it:
+        measured against a real loopback SFTP server with the remote
+        file at 0777, the **local** file was left at 0o777, on both a
+        single-file and a recursive ``get``. That hands a remote server
+        the power to decide the mode of a file on this machine, which
+        is precisely the authority the guarded open exists to deny it.
+
+        Intersecting with 0600 was considered and rejected: it is the
+        same answer as dropping the field for every mode a caller would
+        actually preserve, and it invites the reading that *some*
+        server-supplied bit is honoured. Refusing the whole call was
+        rejected too -- ``preserve=True`` is a legitimate option whose
+        timestamps this library has no reason to withhold, and turning
+        a working download into an error would cost a caller a feature
+        to fix a bit they never asked about.
+
+        **The timestamps are preserved, and are the point.** ``atime``
+        and ``mtime`` describe the remote file and grant nobody
+        anything: the worst a hostile server can do with them is date a
+        file it already chose the contents of. ``size`` is kept for the
+        same reason it exists here at all -- ``_setstat`` truncates to
+        it, which is asyncssh completing its own copy.
+
+        The other three protocols have no equivalent to reconcile:
+        neither ``aioftp`` nor this library's HTTP write path applies
+        any server-supplied attribute to a local file, so 0600 already
+        held there unconditionally. This is what makes all four agree.
 
         Args:
             path: The path to modify.
-            attrs: The attributes to apply.
+            attrs: The attributes asyncssh read off the remote file.
             follow_symlinks: Whether to follow a final symlink.
 
         Returns:
             None.
         """
         await local_fs.setstat(
-            self.contained(path), attrs, follow_symlinks=follow_symlinks)
+            self.contained(path),
+            _without_ownership(attrs),
+            follow_symlinks=follow_symlinks)
 
     async def exists(self, path: bytes) -> bool:
         """Report whether a contained local path exists.
@@ -1164,6 +1202,49 @@ class ContainedLocalFS:
         if _writes(mode):
             await asyncio.to_thread(_make_sparse, handle)
         return ClassifyingLocalFile(handle, target, self.budget)
+
+
+#: The ``SFTPAttrs`` fields a **remote server** must not get to set on a
+#: local file. ``permissions`` is the finding: ``_setstat`` chmods to it,
+#: undoing the 0600 every guarded open establishes. The four identity
+#: fields ride with it because ``_setstat`` chowns to them by the same
+#: logic and the same argument applies -- a download is not an
+#: invitation to reassign a local file's owner. Dropping a field means
+#: setting it to None, which is how ``SFTPAttrs`` spells "unset" and is
+#: what makes ``_setstat`` skip the call entirely.
+UNPRESERVED_ATTRS: Final[Tuple[str, ...]] = (
+    'permissions',
+    'uid',
+    'gid',
+    'owner',
+    'group',
+)
+
+
+def _without_ownership(attrs: asyncssh.SFTPAttrs) -> asyncssh.SFTPAttrs:
+    """Return ``attrs`` with every field in :data:`UNPRESERVED_ATTRS` unset.
+
+    A copy, never a mutation: the object belongs to ``asyncssh``'s
+    ``_copy``, which reads it again after the ``setstat`` to log what it
+    preserved, and editing it in place would make that log lie.
+
+    Built by reading ``SFTPAttrs.__slots__`` rather than by naming the
+    fields to keep, so a field a future ``asyncssh`` adds is carried
+    through instead of silently dropped -- the failure this direction
+    can produce is a preserved timestamp going missing, while the other
+    direction produces exactly the mode-widening being fixed.
+
+    Args:
+        attrs: What ``asyncssh`` read off the remote file.
+
+    Returns:
+        The same attributes with ownership and permissions unset.
+    """
+    fields = {
+        name: getattr(attrs, name) for name in type(attrs).__slots__
+    }
+    fields.update({name: None for name in UNPRESERVED_ATTRS})
+    return asyncssh.SFTPAttrs(**fields)
 
 
 def _make_sparse(handle: io.BytesIO) -> None:

@@ -1315,6 +1315,17 @@ that hardcodes a path now fails by design.
 **Files are created mode `0600`** — readable and writable by their owner and
 nobody else, rather than at whatever `umask` allows.
 
+**`preserve=True` preserves timestamps, never permissions or ownership.** SFTP
+is the only protocol with the option (pass it in `additional_arguments`), and
+asyncssh implements it by applying the *remote* file's attributes to the local
+copy — including a `chmod` to the server's mode, which silently undid the `0600`
+above: measured against a real server, a remote file at `0777` left the local
+one at `0777`. The permission and ownership fields are therefore dropped and the
+access/modification times are applied. A timestamp grants nobody anything; a
+mode bit lets a remote endpoint decide the permissions of a file on your disk.
+The other three protocols apply no server-supplied attribute to a local file, so
+`0600` already held there unconditionally — all four now agree.
+
 **A symbolic link at the destination is refused, never followed** — including
 with `overwrite=True`, which opts into replacing a *file* and not into following
 a link. The refusal is in the `os.open` flags (`O_EXCL`, `O_NOFOLLOW`), not in a

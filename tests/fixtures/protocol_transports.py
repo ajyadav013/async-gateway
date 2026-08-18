@@ -799,6 +799,18 @@ class WritingFTPClientBody:
     payload: bytes = JSON_BODY
 
 
+#: The mode a ``WritingSFTPClient`` reports the remote file carries, and
+#: therefore what a ``preserve=True`` copy would apply locally if
+#: nothing stopped it. World-everything, so that a double which reached
+#: ``setstat`` unguarded produces a visibly wrong local mode rather than
+#: one that happens to match 0600.
+REMOTE_PERMISSIONS: int = 0o100777
+
+#: The timestamp the same client reports, and the half of ``preserve``
+#: that a download legitimately keeps. A fixed epoch second, so a test
+#: can assert the value rather than merely that something was set.
+REMOTE_MTIME: int = 1000000000
+
 #: The entry name a directory copy writes inside the destination tree.
 REMOTE_ENTRY: bytes = b'f.bin'
 
@@ -889,10 +901,19 @@ class WritingSFTPClient(StubSFTPClient):
     directory download onto an occupied local path answered ``PATH`` on
     SFTP and ``CONFIG`` on FTP.
 
+    The second was ``setstat``. ``_copy`` ends with one for
+    ``preserve=True``, carrying the **server's** permission bits, and
+    no double reached it -- so nothing saw that ``asyncssh``'s
+    ``_setstat`` chmods the local file to whatever the remote said,
+    undoing the 0600 the guarded open had just established. Measured
+    the same way: a remote file at 0777 left the local one at 0o777.
+
     Attributes:
         recurse: True to take ``_copy``'s directory arm -- ``isdir``,
             ``mkdir``, then one file inside -- instead of copying a
             single file.
+        preserve: True to make the ``setstat`` tail run, as
+            ``preserve=True`` does on the real client.
         symlink: True to take ``_copy``'s symbolic-link arm, which
             calls ``dstfs.symlink`` with the server's own target.
     """
@@ -901,15 +922,18 @@ class WritingSFTPClient(StubSFTPClient):
         self,
         *,
         recurse: bool = False,
+        preserve: bool = False,
         symlink: bool = False,
     ) -> None:
         """Choose which of ``_copy``'s arms this client will exercise.
 
         Args:
             recurse: Take the directory arm.
+            preserve: Run the ``setstat`` tail.
             symlink: Take the symbolic-link arm.
         """
         self.recurse = recurse
+        self.preserve = preserve
         self.symlink = symlink
 
     async def _begin_copy(
@@ -959,6 +983,17 @@ class WritingSFTPClient(StubSFTPClient):
         await handle.write(WritingFTPClientBody.payload, 0)
         await handle.close()
 
+        if self.preserve:
+            # `_copy`'s tail, with the fields it actually sends: the
+            # remote's permission bits and times, and nothing else.
+            await dstfs.setstat(
+                target,
+                asyncssh.SFTPAttrs(
+                    permissions=REMOTE_PERMISSIONS,
+                    atime=REMOTE_MTIME,
+                    mtime=REMOTE_MTIME),
+                follow_symlinks=True)
+
 
 class WritingFTPContext:
     """``aioftp.Client.context`` yielding a client bound to the real layer.
@@ -1006,6 +1041,7 @@ def install_writing_transport(
     body: bytes = JSON_BODY,
     *,
     recurse: bool = False,
+    preserve: bool = False,
     symlink: bool = False,
 ) -> None:
     """Replace ``protocol``'s seam with one that reaches the local disk.
@@ -1028,6 +1064,8 @@ def install_writing_transport(
         recurse: SFTP only. Take ``_copy``'s directory arm, so
             ``isdir``/``mkdir`` on the destination filesystem are
             actually reached.
+        preserve: SFTP only. Run ``_copy``'s ``setstat`` tail with the
+            server's own permission bits.
         symlink: SFTP only. Take ``_copy``'s symbolic-link arm.
 
     Returns:
@@ -1043,7 +1081,8 @@ def install_writing_transport(
         monkeypatch.setattr(
             aioftp.Client, 'context', WritingFTPContext(recurse=recurse))
     elif protocol == 'SFTP':
-        client = WritingSFTPClient(recurse=recurse, symlink=symlink)
+        client = WritingSFTPClient(
+            recurse=recurse, preserve=preserve, symlink=symlink)
         monkeypatch.setattr(
             asyncssh, 'connect',
             lambda *a, **k: entered(StubSSHConnection(client)))
