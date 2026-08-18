@@ -1406,3 +1406,91 @@ def test_n7_a_status_code_error_still_outranks_the_config_arm() -> None:
 
     assert isinstance(error, FtpStatusError)
     assert error.code == 'FTP_STATUS'
+
+
+# --- NEW-R10-4: a cancelled call stays cancelled ---------------------------
+
+
+async def test_a_cancelled_transfer_is_not_reported_as_a_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation propagates; it does not become a CONNECT envelope.
+
+    FTP alone converted a cancelled call into ``ok=False``/``CONNECT``,
+    and the mechanism is in the dependency rather than in this module's
+    obvious surface. ``aioftp``'s session context manager runs ``await
+    client.quit()`` from a ``finally`` in its ``__aexit__``, which sends
+    QUIT on a socket the cancel has already torn down; the resulting
+    ``ConnectionResetError`` **replaces** the ``CancelledError`` in
+    flight and matches this client's transport clause as an ordinary
+    network failure.
+
+    The wrong code is the smaller half. Swallowing a cancel defeats
+    every structured-concurrency primitive built on it -- measured, an
+    ``asyncio.timeout()`` around an FTP call did not fire -- and the
+    caller was handed a fabricated transport verdict against a server
+    that was perfectly healthy, counted against its breaker.
+
+    Driven by cancelling the task rather than by raising
+    ``CancelledError`` inside the double, because the two are not the
+    same: only a real cancel sets the flag the fix reads, so a test
+    that raised the exception directly would pass against a fix that
+    could not work.
+    """
+    started = asyncio.Event()
+
+    class Hanging(RecordingFTPClient):
+        """A client whose download blocks until the task is cancelled."""
+
+        async def download(self, *args: Any, **kwargs: Any) -> None:
+            """Block forever, having announced that the transfer began.
+
+            Args:
+                args: The transfer operands, unused.
+                kwargs: Transfer options, unused.
+
+            Returns:
+                Never; this is cancelled where it waits.
+            """
+            started.set()
+            await asyncio.Event().wait()
+
+    # `quit_error` is what makes this row bite. `aioftp`'s real exit
+    # sends QUIT on the torn-down socket and earns a
+    # `ConnectionResetError`, which supersedes the cancellation; a
+    # double whose exit does nothing lets the `CancelledError` through
+    # untouched and would pass against the unfixed client.
+    install_ftp_double(
+        monkeypatch,
+        client=Hanging(),
+        quit_error=ConnectionResetError('QUIT on a torn-down socket'))
+    task = asyncio.create_task(ftp_call())
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_a_real_connection_reset_is_still_a_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: the cancellation fix must not swallow a real reset.
+
+    Without this row, "re-raise CancelledError" is satisfiable by a
+    client that treats *every* ``ConnectionResetError`` as a
+    cancellation -- which would turn a genuinely reset connection into
+    an exception where the contract promises an envelope. What separates
+    the two is whether this task is actually being cancelled, and only a
+    row that resets without cancelling can prove the distinction is
+    being made.
+    """
+    install_ftp_double(
+        monkeypatch,
+        client=RecordingFTPClient(
+            command_error=ConnectionResetError('the server reset it')))
+
+    result = await ftp_call()
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'CONNECT'

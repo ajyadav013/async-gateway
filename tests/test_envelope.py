@@ -673,8 +673,29 @@ SOAP_EXCEPTED_KEYS: frozenset[str] = frozenset({
 })
 
 
+#: How a client can name a ``protocol_info`` key: read it, or refuse it
+#: by name. Three spellings, because a key reached through a shared
+#: helper is named at the *call site* -- ``validated_serialization(
+#: self.info, ...)`` -- rather than subscripted in the constructor, and
+#: a pattern set that saw only ``self.info.get('key')`` was blind to
+#: exactly the keys that had drifted (NEW-R10-5).
+_KEY_PATTERNS: tuple[str, ...] = (
+    # The ordinary read.
+    r"self\.info\.get\(\s*'([a-z_]+)'",
+    # A membership test -- how a key whose *presence* is the conflict is
+    # detected, and how an explicit refusal is spelled.
+    r"'([a-z_]+)'\s+in\s+self\.info",
+    # The key a shared validator owns, named by the validator this
+    # client calls. `validated_serialization` is the whole of how
+    # `serialization` is reached, so calling it *is* honouring the key
+    # and not calling it is ignoring it -- which is the difference the
+    # first two patterns could not see.
+    r'validated_(serialization|trace_config)\(',
+)
+
+
 def _info_keys(client: Any) -> frozenset[str]:
-    """Return the ``protocol_info`` keys a client's constructor reads.
+    """Return the ``protocol_info`` keys ``client`` reads or refuses.
 
     Read off the source rather than a declared list, because a declared
     list is the thing that goes stale: the point is to catch a key the
@@ -684,10 +705,15 @@ def _info_keys(client: Any) -> frozenset[str]:
         client: The protocol class to inspect.
 
     Returns:
-        Every name passed to ``self.info.get(...)`` in its module.
+        Every ``protocol_info`` key its constructor names, whether by
+        reading it, by testing for it, or by calling the validator that
+        owns it.
     """
-    return frozenset(re.findall(
-        r"self\.info\.get\(\s*'([a-z_]+)'", inspect.getsource(client)))
+    source = inspect.getsource(client)
+    return frozenset(
+        name
+        for pattern in _KEY_PATTERNS
+        for name in re.findall(pattern, source))
 
 
 def test_soap_honours_every_http_key_it_does_not_document_an_exception_for(
@@ -707,6 +733,17 @@ def test_soap_honours_every_http_key_it_does_not_document_an_exception_for(
     an undocumented exception; a key in the exception list that SOAP now
     reads is a stale exception. Either way the table and the code have
     diverged, which is the only condition this row exists to catch.
+
+    A key SOAP **refuses** by name counts as named, and that is the
+    intended reading rather than a loophole. What the guard forbids is
+    *silence*: a caller passing a key that does nothing and is told
+    nothing. Honouring it and refusing it are both honest answers;
+    ignoring it is the defect, and `serialization` is the key that
+    proves the distinction matters -- it can never apply to a SOAP body,
+    so refusal is the only correct answer and silence was the shipped
+    one (NEW-R10-5). `SOAP_EXCEPTED_KEYS` is therefore for keys SOAP
+    does not mention at all, which is why a key it refuses must *not*
+    be listed there.
     """
     http_keys = _info_keys(http_client.HttpRequest)
     soap_keys = _info_keys(soap_client.SoapRequest)

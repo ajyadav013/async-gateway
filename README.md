@@ -540,11 +540,14 @@ that is empty — an empty directory and a single file stay distinguishable.
 
 ### `protocol_info` — SOAP
 
-SOAP reuses the HTTP transport, so every HTTP key above applies except
-`request_type` (always POST) and the two file-transfer configs — MTOM is out of
-scope, so a SOAP call writes no local file. That list of exceptions is asserted
-against the code rather than only stated here: a key `HttpRequest` reads and
-`SoapRequest` does not is a test failure, in both directions. In addition:
+SOAP reuses the HTTP transport, so every HTTP key above applies except four:
+`request_type` (always POST), the two file-transfer configs (MTOM is out of
+scope, so a SOAP call writes no local file), and `serialization` (the request
+body is an XML envelope sent byte for byte, never a JSON document, so there is
+nothing for a JSON encoder to encode). All four are **refused** if you pass
+them, never silently ignored. That list is asserted against the code rather
+than only stated here: a key `HttpRequest` reads and `SoapRequest` does not is
+a test failure, in both directions. In addition:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

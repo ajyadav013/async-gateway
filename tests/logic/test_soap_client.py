@@ -2041,3 +2041,47 @@ async def test_an_undeclared_header_still_stops_at_the_origin_on_soap(
             'rest turns an opt-in hatch into no allowlist at all.')
     finally:
         await elsewhere.close()
+
+
+# --- NEW-R10-5: a key that cannot apply is refused, not ignored ------------
+
+
+@pytest.mark.parametrize(
+    'serialization',
+    [
+        pytest.param(42, id='not-callable'),
+        pytest.param(str, id='callable-returning-str'),
+        pytest.param(
+            lambda obj: b'{}', id='callable-returning-bytes'),
+    ],
+)
+async def test_serialization_is_refused_on_soap_rather_than_ignored(
+    http_server: RecordingHTTPServer,
+    serialization: Any,
+) -> None:
+    """An inapplicable key earns a refusal, never silence (NEW-R10-5).
+
+    ``serialization`` names the JSON encoder, and a SOAP body is never
+    JSON: the Content-Type this client sets routes the envelope to the
+    raw-body filter byte for byte. So there is genuinely nothing here
+    for an encoder to encode, and building the session without
+    ``json_serialize=`` is correct.
+
+    What was wrong is that the key was then **accepted in silence**.
+    ``42`` and a bytes-returning callable each raised
+    ``ConfigurationError`` on HTTP and were accepted here, so the
+    README's parity claim had a fifth undocumented exception -- the same
+    shape as NEW-R10-3, one key over, found only because that finding
+    prompted a sweep of the rest.
+
+    The third row is the load-bearing one: a *valid* serialiser is
+    refused too. Refusing only the malformed values would leave the
+    silent no-op live for exactly the caller who did everything right
+    and still had their encoder ignored.
+    """
+    with pytest.raises(ConfigurationError) as caught:
+        await soap_call(http_server, serialization=serialization)
+
+    assert caught.value.code == 'CONFIG'
+    assert 'serialization' in str(caught.value)
+    assert http_server.requests == []

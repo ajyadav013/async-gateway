@@ -488,6 +488,7 @@ class FTPContextDouble:
         *,
         client: Optional[RecordingFTPClient] = None,
         connect_error: Optional[BaseException] = None,
+        quit_error: Optional[BaseException] = None,
     ) -> None:
         """Build a transport double.
 
@@ -496,9 +497,14 @@ class FTPContextDouble:
                 by default.
             connect_error: When given, the session refuses on entry with
                 this error instead of yielding a client.
+            quit_error: When given, the session's *exit* raises this --
+                modelling ``aioftp``'s ``finally: await client.quit()``,
+                which is what replaces a cancellation with a
+                ``ConnectionResetError`` (NEW-R10-4).
         """
         self.client = RecordingFTPClient() if client is None else client
         self.connect_error = connect_error
+        self.quit_error = quit_error
         self.calls: list[tuple[tuple[Any, ...], dict[Text, Any]]] = []
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -526,7 +532,7 @@ class FTPContextDouble:
         # red, exactly as they would in production.
         factory = kwargs.get('path_io_factory', aioftp.pathio.PathIO)
         self.client.path_io = factory(timeout=kwargs.get('path_timeout'))
-        return _entered(self.client)
+        return _entered(self.client, self.quit_error)
 
     @property
     def kwargs(self) -> dict[Text, Any]:
@@ -546,16 +552,41 @@ class FTPContextDouble:
 
 
 @asynccontextmanager
-async def _entered(client: Any) -> AsyncIterator[Any]:
-    """Yield ``client`` from an async context manager that does nothing.
+async def _entered(
+    client: Any,
+    quit_error: Optional[BaseException] = None,
+) -> AsyncIterator[Any]:
+    """Yield ``client``, optionally failing the way ``aioftp`` teardown does.
+
+    The no-op exit is right for almost every row and **wrong** for the
+    one that matters most, so the behaviour is a parameter.
+    ``aioftp.Client.context.__aexit__`` runs ``await client.quit()``
+    from a ``finally``, which sends QUIT on the control socket. When
+    the block is unwinding because the task was cancelled that socket
+    is already gone, so the QUIT raises ``ConnectionResetError`` -- and
+    an exception raised while unwinding **replaces** the one in flight.
+    That is the whole mechanism of NEW-R10-4, and a double whose exit
+    does nothing cannot reproduce it: the ``CancelledError`` reaches
+    the caller untouched and the row passes against the unfixed client.
 
     Args:
         client: The object the ``async with`` block should bind.
+        quit_error: Raised from the exit path, as a failing ``quit()``
+            would. None -- the default -- keeps every existing row's
+            silent teardown.
 
     Yields:
         ``client``, unchanged.
+
+    Raises:
+        BaseException: ``quit_error``, on the way out, whether the
+            block succeeded or is unwinding.
     """
-    yield client
+    try:
+        yield client
+    finally:
+        if quit_error is not None:
+            raise quit_error
 
 
 def install_ftp_double(
@@ -563,6 +594,7 @@ def install_ftp_double(
     *,
     client: Optional[RecordingFTPClient] = None,
     connect_error: Optional[BaseException] = None,
+    quit_error: Optional[BaseException] = None,
 ) -> FTPContextDouble:
     """Replace ``aioftp.Client.context`` for the duration of one test.
 
@@ -570,11 +602,14 @@ def install_ftp_double(
         monkeypatch: The pytest patcher, which undoes this on teardown.
         client: The client double the session yields.
         connect_error: When given, the session refuses on entry.
+        quit_error: When given, the session's exit raises this, the way
+            ``aioftp``'s own ``finally: await client.quit()`` does.
 
     Returns:
         The installed double, for the test to assert against.
     """
-    double = FTPContextDouble(client=client, connect_error=connect_error)
+    double = FTPContextDouble(
+        client=client, connect_error=connect_error, quit_error=quit_error)
     monkeypatch.setattr(aioftp.Client, 'context', double)
     return double
 

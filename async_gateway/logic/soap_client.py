@@ -947,6 +947,36 @@ class SoapRequest(BaseRequestClass):
                 self.info.get('cross_origin_headers')))
         self.session: Optional[aiohttp.ClientSession] = validated_session(
             self.info.get('session'), self.cross_origin_forward)
+        # Refused rather than honoured, and refused rather than ignored.
+        #
+        # `serialization` names the JSON encoder, and a SOAP request
+        # body is never JSON: the Content-Type this class sets routes
+        # the envelope to the raw-body filter, byte for byte. So there
+        # is nothing here for a JSON encoder to encode, and this module
+        # correctly builds its session without `json_serialize=`.
+        #
+        # What was wrong is that the key was then accepted in silence.
+        # `42`, and `orjson.dumps` -- which returns bytes where aiohttp
+        # requires str -- each raised `ConfigurationError` on HTTP and
+        # were accepted here, so the README's claim that every HTTP key
+        # applies to SOAP had a *fifth* undocumented exception
+        # (NEW-R10-5, the same shape as NEW-R10-3 one key over).
+        #
+        # An accepted no-op is the worst of the three options: the
+        # caller believes they chose an encoder and nothing tells them
+        # otherwise. `validated_serialization` already refuses the
+        # analogous no-op on HTTP -- a serialiser combined with a
+        # caller's session, which aiohttp gives this library nowhere to
+        # apply -- and this is that reasoning on a protocol where the
+        # key can never apply at all.
+        if 'serialization' in self.info:
+            raise ConfigurationError(
+                'protocol_info["serialization"] does not apply to SOAP: '
+                'the request body is an XML envelope sent byte for '
+                'byte, never a JSON document, so there is nothing for a '
+                'JSON encoder to encode. Remove the key -- it was '
+                'silently ignored before this release, so a call that '
+                'relied on it was never encoding what it appeared to')
         # `redact_params` is passed for the reason `logic/http_client.py`
         # passes it, and omitting it here was a latent leak rather than a
         # stylistic difference. The tracer this library builds records

@@ -517,6 +517,34 @@ class FTPRequest(BaseRequestClass):
                 f'{redact_url(self.url, extra_params=self.redact_params)}'
             ) from err
         except (FailsafeError,) + TRANSPORT_FAULTS as err:
+            # A cancellation that reaches here has already been
+            # *replaced*, and only on this protocol. `aioftp`'s session
+            # context manager runs `await client.quit()` from a
+            # `finally` in its `__aexit__`, which sends QUIT on a socket
+            # the cancel has already torn down; that raises
+            # `ConnectionResetError`, which supersedes the
+            # `CancelledError` in flight and matches the clause above as
+            # an ordinary transport failure.
+            #
+            # So FTP alone answered a cancelled call with
+            # `ok=False`/`CONNECT`/502 where HTTP and SFTP propagate.
+            # Measured with an explicit `task.cancel()` at five points
+            # in a 64 MiB download: HTTP and SFTP cancelled at all five,
+            # FTP swallowed four. That is worse than a wrong code -- it
+            # defeats every structured-concurrency primitive built on
+            # cancellation, so an `asyncio.timeout()` around an FTP call
+            # did not fire and the caller got a fabricated transport
+            # verdict against a healthy server, counted against that
+            # destination's breaker (NEW-R10-4).
+            #
+            # `cancelling()` is the question that actually separates the
+            # two cases: it is non-zero only while this task is really
+            # being cancelled, so a `ConnectionResetError` from a server
+            # that genuinely reset the connection is still classified,
+            # and re-raising restores what the cleanup discarded.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise asyncio.CancelledError from err
             raise transport_error_for(
                 err, redact_params=self.redact_params) from err
 
