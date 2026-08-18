@@ -764,6 +764,17 @@ class WritingFTPClient(StubFTPClient):
     ``ContainedPathIO`` the client under test installed, so the refusal
     is produced and classified by the code being tested.
 
+    **It must make every call the real client makes, in the real
+    order.** NEW-R11-1 is what happens when it does not: this double
+    opened the destination directly and never called ``mkdir``, while
+    the real ``aioftp.Client.download`` calls
+    ``path_io.mkdir(destination.parent, parents=True, exist_ok=True)``
+    *first*. The ``LOCAL_IO`` row therefore passed 6/6 against a
+    ``ContainedPathIO`` that was, on the real client, silently running
+    an unbounded ``mkdir -p`` and answering ``ok=True``/200 for the
+    missing destination directory this row exists to refuse. A double
+    that is easier than reality certifies an arm it never exercised.
+
     Attributes:
         path_io: Set by :class:`WritingFTPContext` from the
             ``path_io_factory`` the client passed, exactly as
@@ -775,6 +786,9 @@ class WritingFTPClient(StubFTPClient):
     async def download(self, *args: Any, **kwargs: Any) -> None:
         """Write the downloaded body to the local destination.
 
+        Mirrors ``aioftp.Client.download``'s single-file arm: the
+        parent ``mkdir`` first, then the open and the write.
+
         Args:
             args: ``(source, destination)`` -- remote first.
             kwargs: ``write_into`` and the block size, unused.
@@ -783,6 +797,8 @@ class WritingFTPClient(StubFTPClient):
             None, as ``aioftp`` does.
         """
         destination = pathlib.Path(str(args[1]))
+        await self.path_io.mkdir(
+            destination.parent, parents=True, exist_ok=True)
         async with self.path_io.open(destination, mode='wb') as handle:
             await handle.write(WritingFTPClientBody.payload)
 
