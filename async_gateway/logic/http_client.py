@@ -309,6 +309,64 @@ def validated_upload_config(
     return http_file_upload_config
 
 
+def validated_download_config(
+    http_file_download_config: object,
+) -> Optional[Dict[str, Any]]:
+    """Return the caller's download config once proven usable, or None.
+
+    The upload config next door has had a validator since R12; this one
+    had none at all, and the asymmetry was invisible until the hostile
+    ``protocol_info`` matrix grew a row for the key (NEW-R10-1). Two
+    shapes escaped ``request()`` un-enveloped as a result: a config that
+    is not a mapping earned an ``AttributeError`` on ``.get``, and a
+    ``download_filepath`` that is not a path-like earned ``TypeError:
+    expected str, bytes or os.PathLike object, not int`` from inside
+    ``os.fspath`` -- both from several frames below the caller's
+    mistake, in a library whose contract is that only its own bugs
+    escape.
+
+    Validated **here**, at construction, for the reason
+    :func:`validated_upload_config` gives: a configuration error raised
+    before the request goes out reaches the caller as an exception,
+    where one raised during it would become an ``ok=False`` envelope a
+    retry loop would re-attempt.
+
+    Only the shape is checked, not the destination. Whether the path is
+    writable, already taken, or a symlink is decided at the open, by
+    ``utils.paths.safe_writer``, against the filesystem as it is *then*
+    -- a check here would be a TOCTOU window, which is the defect R22
+    exists to close.
+
+    Args:
+        http_file_download_config: ``protocol_info``'s
+            ``'http_file_download_config'``, of whatever type the caller
+            passed, or None when they asked for no download.
+
+    Returns:
+        The same config, unmodified, or None. None and ``{}`` stay
+        distinguishable: absence means "no download", and an empty
+        mapping means "download on every documented default" (M10).
+
+    Raises:
+        ConfigurationError: If the config is not a mapping, or names a
+            ``download_filepath`` that is not a string.
+    """
+    if http_file_download_config is None:
+        return None
+    if not isinstance(http_file_download_config, Mapping):
+        raise ConfigurationError(
+            f'protocol_info["http_file_download_config"] must be a '
+            f'mapping of download settings or absent, got '
+            f'{type(http_file_download_config).__name__}')
+    filepath = http_file_download_config.get('download_filepath')
+    if filepath is not None and not isinstance(filepath, str):
+        raise ConfigurationError(
+            f'http_file_download_config["download_filepath"] must be a '
+            f'string naming the local destination, got '
+            f'{type(filepath).__name__}')
+    return dict(http_file_download_config)
+
+
 def validated_cross_origin_headers(
     cross_origin_headers: object,
 ) -> frozenset[str]:
@@ -1187,8 +1245,9 @@ class HttpRequest(BaseRequestClass):
         # No `{}` default: an empty config is a caller asking for a
         # download on every documented default, and absence is the only
         # way left to say "no download at all" (M10).
-        self.file_download_config: Optional[Dict] = self.info.get(
-            'http_file_download_config')
+        self.file_download_config: Optional[Dict] = (
+            validated_download_config(
+                self.info.get('http_file_download_config')))
         self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(
             total=validated_timeout(self.timeout))
         # Read before the session, which is validated *against* it: a

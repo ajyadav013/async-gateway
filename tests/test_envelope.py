@@ -13,6 +13,7 @@ acceptance criterion it proves.
 
 import asyncio
 import importlib
+import inspect
 import itertools
 import json
 import logging
@@ -40,8 +41,10 @@ from async_gateway.helpers.common.date_helper import (
     monotonic_now,
     utc_now_iso,
 )
-from async_gateway.logic import protocol_mapping
-from async_gateway.logic.http_client import HttpRequest, transport_error_for
+from async_gateway.logic import (
+    ftp_client, http_client, protocol_mapping, sftp_client, soap_client)
+from async_gateway.logic.http_client import (
+    HttpRequest, transport_error_for)
 from async_gateway.utils import redaction
 from async_gateway.utils.envelope import (
     GatewayResponse,
@@ -75,11 +78,19 @@ from tests.fixtures.protocol_transports import (
     CONTRACT_CALL,
     EXPECTED_CODE,
     FAULT_CATEGORIES,
+    LOCAL_IO_CATEGORIES,
+    LOCAL_IO_CODE,
+    LOCAL_IO_LEAF,
     PROTOCOL_FAULTS,
     contract_call,
     install_failing_transport,
     install_transport,
+    install_writing_transport,
+    local_io_call,
 )
+
+#: The loopback path a ``LOCAL_IO`` row's HTTP-family call dials.
+LOCAL_IO_PATH: str = '/local-io'
 
 # The envelope's public key set. Named here so that adding a key is a
 # deliberate edit to this list rather than something a test silently
@@ -637,6 +648,206 @@ async def test_every_protocol_answers_for_every_fault_category(
         f'{category} fault, which every protocol must classify as '
         f'{EXPECTED_CODE[category]}. A family missing from this '
         "client's table is the divergence AGW-R9-1 was.")
+
+
+#: The four dispatch sites, each with the classification table its
+#: ``except`` clause must be derived from. The round-9 fix claimed
+#: divergence was "no longer representable" because the clause was
+#: derived from the table -- but the derivation reached only the two
+#: HTTP-family modules, and ``logic.ftp_client`` and
+#: ``logic.sftp_client`` still kept hand-written tuples beside tables of
+#: their own. Two of four is how the same class of gap survives a fix
+#: that was supposed to end it, so the arity is asserted rather than
+#: described (NEW-R10-1).
+DISPATCH_SITES: tuple[tuple[str, Any, Any], ...] = (
+    ('http_client', http_client.TRANSPORT_ERRORS,
+     http_client.TRANSPORT_FAULTS),
+    ('soap_client', http_client.TRANSPORT_ERRORS,
+     soap_client.TRANSPORT_FAULTS),
+    ('ftp_client', ftp_client.TRANSPORT_ERRORS,
+     ftp_client.TRANSPORT_FAULTS),
+    ('sftp_client', sftp_client.TRANSPORT_ERRORS,
+     sftp_client.TRANSPORT_FAULTS),
+)
+
+
+@pytest.mark.parametrize(
+    'module, table, faults',
+    [pytest.param(*row, id=row[0]) for row in DISPATCH_SITES],
+)
+def test_every_dispatch_site_catches_exactly_what_it_classifies(
+    module: str,
+    table: Any,
+    faults: Any,
+) -> None:
+    """A client's catch clause is derived from its own table, at all four.
+
+    The property the round-9 fix named and delivered to half the code:
+    a family added to a classification table is caught by the client
+    that maps through it, in the same commit, with no second edit to
+    remember. Where the clause is hand-written instead, the two drift --
+    which is AGW-R9-1 (``ssl.SSLError`` classified and not caught) and
+    its FTP sibling (``AIOFTPException`` caught and not classified), the
+    same defect from opposite directions.
+
+    Asserted structurally rather than behaviourally, and that is the
+    point of this row. A behavioural test can only reach a family some
+    transport actually raises on some code path; the families most
+    likely to be dropped are exactly the ones no current path produces,
+    so they fall out of a derived tuple in silence. Comparing the tuple
+    to its table catches the drop whether or not anything raises it.
+
+    Args:
+        module: The dispatch site's module name, for the failure text.
+        table: Its ordered classification table.
+        faults: The tuple its ``except`` clause is built from.
+
+    Returns:
+        None.
+    """
+    classified = tuple(family for family, _ in table)
+    missing = [f.__name__ for f in classified if f not in faults]
+
+    assert not missing, (
+        f'logic.{module} classifies {missing} in its table and does not '
+        f'catch them, so each reaches the caller raw whenever it '
+        f'arrives unwrapped -- through abortable_exceptions, which is a '
+        f'documented public knob. Derive the clause with '
+        f'exceptions.faults_of(TRANSPORT_ERRORS) instead of restating '
+        f'it; that is what makes the pair impossible to desynchronise.')
+
+
+def test_the_derivation_reaches_every_dispatch_site() -> None:
+    """The count itself, so a fifth site cannot quietly opt out.
+
+    The row above holds each *listed* site to its table; nothing in it
+    notices a site that was never listed. That is precisely how the
+    round-9 fix came to cover two of four -- the two that were looked
+    at. The registry is the whole set of protocols, so the site list is
+    checked against it rather than against itself.
+    """
+    covered = {module for module, _, _ in DISPATCH_SITES}
+    expected = {
+        f'{protocol.lower()}_client' for protocol in protocol_mapping
+    } - {'https_client'}
+
+    assert expected <= covered, (
+        f'{sorted(expected - covered)} dispatch(es) over a transport '
+        'and are not held to the derivation, which is the two-of-four '
+        'gap NEW-R10-1 found one round after it was declared closed.')
+
+
+@pytest.mark.parametrize('protocol', CONTRACT_ROWS)
+@pytest.mark.parametrize('category', LOCAL_IO_CATEGORIES)
+async def test_every_protocol_answers_for_a_local_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+    protocol: str,
+    category: str,
+) -> None:
+    """A local disk failure is one code on every protocol (NEW-R10-1).
+
+    The second axis of the cross-protocol guard, and the one whose
+    absence let four protocols answer the same question four ways. The
+    rows above are all *wire* faults, raised at the transport seam;
+    nothing asked what happens when the transport succeeds and the
+    **local filesystem** refuses the download it produced. Measured
+    before the fix, against real loopback servers: HTTP handed the
+    caller a raw ``FileNotFoundError``, FTP said ``CONNECT``, SFTP said
+    ``CONNECT``, and a directory destination said ``CONFIG``.
+
+    The transport is made to **succeed** here, which is the whole
+    difference from the wire-fault row above -- a refusing transport
+    never reaches a disk at all. The HTTP family dials
+    the real loopback server rather than a double, because its write
+    lives several frames below the seam the doubles replace and a
+    doubled transport would skip the code the row is about.
+
+    Args:
+        monkeypatch: The pytest patcher.
+        http_server: The loopback server, for the HTTP-family rows.
+        tmp_path: The test's temporary directory.
+        protocol: The protocol under test, from the contract table.
+        category: The non-wire category under test.
+
+    Returns:
+        None.
+    """
+    exempt = CATEGORY_EXEMPT.get(category, {})
+    if protocol in exempt:
+        pytest.skip(f'{protocol}/{category}: {exempt[protocol]}')
+
+    destination = str(tmp_path / LOCAL_IO_LEAF)
+    call = local_io_call(protocol, destination)
+    if protocol == 'HTTPS':
+        # `HTTPS` shares `HttpRequest` with `HTTP` and differs only in
+        # refusing a plaintext URL (R11-AC4), so pointing it at the
+        # plaintext loopback server would fail this row at the scheme
+        # check -- before a byte was written -- and prove nothing. The
+        # `HTTP` row above exercises the identical write path.
+        pytest.skip(
+            'HTTPS requires an https:// URL and shares HttpRequest with '
+            'HTTP, whose live row covers the same local write path.')
+    if protocol == 'HTTP':
+        http_server.respond(LOCAL_IO_PATH, body=b'{"value": 1}')
+        call['url'] = http_server.url_for(LOCAL_IO_PATH)
+    else:
+        install_writing_transport(monkeypatch, protocol)
+
+    result = await request(**call)
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == LOCAL_IO_CODE, (
+        f'{protocol} reported {result["error"]["code"]} for a local '
+        f'write failure, which every protocol must classify as '
+        f'{LOCAL_IO_CODE}. A local disk is not evidence the remote is '
+        'unhealthy, and the four protocols answering this four '
+        'different ways is what NEW-R10-1 was.')
+    assert not Path(destination).exists(), (
+        'a refused write must leave no file behind')
+
+
+@pytest.mark.parametrize('protocol', CONTRACT_ROWS)
+def test_every_protocol_declares_a_local_destination_or_is_exempt(
+    protocol: str,
+) -> None:
+    """The ``LOCAL_IO`` axis cannot silently lose a protocol.
+
+    The data-driven guard's own failure mode, and the reason the wire
+    axis carries the identical row: a protocol quietly dropped from the
+    table above would reduce coverage while every remaining row stayed
+    green. An omission must be **argued** in
+    :data:`CATEGORY_EXEMPT`, not merely absent.
+
+    SOAP's exemption is checked rather than believed. It claims to write
+    no local file, and this asserts the claim against the code -- the
+    protocol accepts no local-destination key -- so the day SOAP grows
+    a download the exemption fails instead of hiding it.
+
+    Args:
+        protocol: The protocol under test, from the contract table.
+
+    Returns:
+        None.
+    """
+    exempt = CATEGORY_EXEMPT.get('LOCAL_IO', {})
+    if protocol not in exempt:
+        assert local_io_call(protocol, '/tmp/x')['protocol_info'], (
+            f'{protocol} claims no LOCAL_IO exemption and names no '
+            'local destination, so its row proves nothing.')
+        return
+
+    source = inspect.getsource(soap_client.SoapRequest)
+    assert 'http_file_download_config=None' in source, (
+        'SOAP is exempt from LOCAL_IO because it hands the transport a '
+        'literal None for the download config, so no local file is '
+        'ever opened. That line is the exemption; it is gone.')
+    assert "info.get('http_file_download_config')" not in source, (
+        'SOAP now reads a caller-supplied download config, so it can '
+        'write a local file and the LOCAL_IO exemption is stale: give '
+        'it a row instead of an argument.')
 
 
 @pytest.mark.parametrize('protocol', CONTRACT_ROWS)

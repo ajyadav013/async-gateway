@@ -32,11 +32,13 @@ correct them rather than to find them already right.
 """
 
 import asyncio
+import os
+import pathlib
 import socket
 import ssl
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 import aioftp
 
@@ -244,6 +246,16 @@ class StubSFTPClient:
 class StubSSHConnection:
     """The slice of an ``asyncssh`` connection an SFTP transfer uses."""
 
+    def __init__(self, sftp: Optional[StubSFTPClient] = None) -> None:
+        """Record which SFTP client this connection will yield.
+
+        Args:
+            sftp: The client the channel yields, or None for the
+                recording default. Parametrised so a ``LOCAL_IO`` row
+                can substitute one that actually writes.
+        """
+        self.sftp = sftp or StubSFTPClient()
+
     def start_sftp_client(
         self,
     ) -> AbstractAsyncContextManager[StubSFTPClient]:
@@ -252,7 +264,7 @@ class StubSSHConnection:
         Returns:
             An async context manager yielding the SFTP client.
         """
-        return entered(StubSFTPClient())
+        return entered(self.sftp)
 
 
 def _http_transport(
@@ -441,6 +453,15 @@ def install_transport(
 
 #: The five families of wire failure a caller can distinguish from the
 #: envelope. Each maps to the ``error['code']`` the contract promises.
+#:
+#: **Wire** faults only, and that word is the sixth gap rather than a
+#: description: a category vocabulary built entirely from what the
+#: *network* can do has no place to put a fault the **local disk**
+#: produces, so the four protocols were free to answer a full disk four
+#: different ways and nothing in 2981 tests could see it (NEW-R10-1).
+#: :data:`LOCAL_IO_CATEGORIES` below is the second axis, kept separate
+#: because its rows are driven the opposite way round -- the transport
+#: must *succeed* for the disk to be reached at all.
 FAULT_CATEGORIES: tuple[str, ...] = (
     'TLS',
     'TIMEOUT',
@@ -449,11 +470,29 @@ FAULT_CATEGORIES: tuple[str, ...] = (
     'PROTOCOL',
 )
 
+#: The non-wire fault categories, and the protocols each applies to.
+#: One entry today; a tuple rather than a bare string because the axis
+#: is the point -- the next non-wire fault (a caller-side resource
+#: limit, a clock) gets a row here instead of a bespoke test per
+#: protocol, which is how the wire axis came to have five gaps.
+LOCAL_IO_CATEGORIES: tuple[str, ...] = ('LOCAL_IO',)
+
 #: Protocols that cannot produce a given category, with the reason. An
 #: entry here is an exemption that had to be argued for, not a silent gap:
 #: the guard reads this mapping, and a protocol absent from it is held to
 #: every category.
 CATEGORY_EXEMPT: dict[str, dict[str, str]] = {
+    'LOCAL_IO': {
+        'SOAP': (
+            'SOAP passes http_file_download_config=None to the '
+            'transport unconditionally -- MTOM is out of scope (R18) '
+            'and a multipart body is refused before a byte of it is '
+            'written -- so a SOAP call writes no local file and has no '
+            'local destination for a disk to refuse. Verified by the '
+            'row below, which asserts the key is absent from the '
+            'protocol rather than trusting this note.'
+        ),
+    },
     'TLS': {
         'SFTP': (
             'asyncssh runs SFTP over SSH, which has no TLS layer, so no '
@@ -640,3 +679,209 @@ class FaultingTransport:
             False, so any exception propagates.
         """
         return False
+
+
+# --- LOCAL_IO: the category that is not a wire fault -----------------------
+#
+# NEW-R10-1, and the reason it was invisible to 2981 tests. Every
+# category above is a failure raised at the *transport seam* -- the
+# exception a protocol's own library hands the client when the network
+# refuses. The cross-protocol guard was built from exactly that
+# vocabulary, so a fault raised on the **local filesystem**, on a
+# transport that succeeded, had no row to occupy and no exemption to
+# argue: it was not covered and its absence was not visible.
+#
+# It is the same class of divergence the guard exists to end, reached
+# through a surface the guard could not see. FTP answered `CONNECT`,
+# SFTP answered `CONNECT`, a directory target answered `CONFIG`, and
+# HTTP handed the caller a raw `FileNotFoundError`. Four protocols, four
+# answers, to one question: "the local destination will not take this
+# file."
+#
+# The doubles below therefore fake the **wire only**, exactly as the
+# fault doubles above do, and let each protocol's real local-write layer
+# run: `utils.paths.safe_writer` for the HTTP family,
+# `utils.contained_io.ContainedPathIO` for FTP,
+# `utils.contained_io.ContainedLocalFS` for SFTP. What decides the
+# answer is the code under test, not the double.
+
+#: What a ``LOCAL_IO`` row asks each protocol to write to: a path whose
+#: parent directory does not exist. ENOENT rather than a full disk
+#: because it needs no privileges and no ``RLIMIT`` games, and it takes
+#: the identical arm -- the end-to-end ``RLIMIT_FSIZE`` runs confirm
+#: ENOSPC and EFBIG classify the same way.
+LOCAL_IO_LEAF: str = 'no-such-dir/out.bin'
+
+#: The ``error['code']`` a local write failure must produce, on every
+#: protocol that writes locally.
+LOCAL_IO_CODE: str = 'PATH'
+
+
+class WritingFTPClient(StubFTPClient):
+    """An FTP client whose download writes through the real path layer.
+
+    ``StubFTPClient.download`` returns without touching a disk, which is
+    right for the rows that assert the envelope's *shape*. A
+    ``LOCAL_IO`` row asserts what happens when the disk refuses, so this
+    one performs the write -- through ``self.path_io``, the
+    ``ContainedPathIO`` the client under test installed, so the refusal
+    is produced and classified by the code being tested.
+
+    Attributes:
+        path_io: Set by :class:`WritingFTPContext` from the
+            ``path_io_factory`` the client passed, exactly as
+            ``aioftp.Client`` would.
+    """
+
+    path_io: Any = None
+
+    async def download(self, *args: Any, **kwargs: Any) -> None:
+        """Write the downloaded body to the local destination.
+
+        Args:
+            args: ``(source, destination)`` -- remote first.
+            kwargs: ``write_into`` and the block size, unused.
+
+        Returns:
+            None, as ``aioftp`` does.
+        """
+        destination = pathlib.Path(str(args[1]))
+        async with self.path_io.open(destination, mode='wb') as handle:
+            await handle.write(JSON_BODY)
+
+
+class WritingSFTPClient(StubSFTPClient):
+    """An SFTP client whose download writes through the real local FS.
+
+    The sibling of :class:`WritingFTPClient`. ``contained_download``
+    reaches ``_begin_copy`` with the ``ContainedLocalFS`` the client
+    built, so writing through that object is writing through the code
+    under test.
+    """
+
+    async def _begin_copy(
+        self,
+        srcfs: Any,
+        dstfs: Any,
+        srcpaths: Any,
+        dstpath: Any,
+        copy_type: str,
+        expand_glob: bool,
+        *options: Any,
+    ) -> None:
+        """Write the downloaded body to the local destination.
+
+        Args:
+            srcfs: The source filesystem, unused.
+            dstfs: The contained destination filesystem under test.
+            srcpaths: The remote source operand, unused.
+            dstpath: The local destination operand.
+            copy_type: ``'get'`` or ``'mget'``, unused.
+            expand_glob: Whether the source is a glob, unused.
+            options: ``_begin_copy``'s remaining options, unused.
+
+        Returns:
+            None, as ``asyncssh`` does.
+        """
+        handle = await dstfs.open(os.fsencode(str(dstpath)), 'wb')
+        await handle.write(JSON_BODY, 0)
+        await handle.close()
+
+
+class WritingFTPContext:
+    """``aioftp.Client.context`` yielding a client bound to the real layer.
+
+    ``aioftp.Client.__init__`` calls ``path_io_factory(timeout=...)``
+    and keeps the result as ``self.path_io``; the doubles here replace
+    the whole client, so that binding has to be reproduced or the write
+    would go through no containment layer at all -- and the row would
+    pass while testing nothing.
+    """
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Open a session whose client writes through the caller's layer.
+
+        Args:
+            args: Host, port and credentials, unused.
+            kwargs: ``aioftp`` options, of which ``path_io_factory`` is
+                read.
+
+        Returns:
+            An async context manager yielding the bound client.
+        """
+        client = WritingFTPClient()
+        factory = kwargs['path_io_factory']
+        client.path_io = factory(timeout=None)
+        return entered(client)
+
+
+def install_writing_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+) -> None:
+    """Replace ``protocol``'s seam with one that reaches the local disk.
+
+    The ``LOCAL_IO`` counterpart of :func:`install_failing_transport`.
+    That one makes the *wire* fail; this one makes the wire **succeed**
+    so the local write actually happens and the destination is what
+    refuses.
+
+    ``HTTP``/``HTTPS`` are not doubled at all: their write is
+    ``read_response``'s, several frames below the seam these doubles
+    replace, so a doubled transport would skip the very code the row is
+    about. They dial the loopback server instead.
+
+    Args:
+        monkeypatch: The pytest patcher, which undoes this on teardown.
+        protocol: A normalised protocol name that writes locally.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If ``protocol`` writes to no local destination, for
+            the same fail-closed reason its siblings give: installing
+            nothing would let the row pass having proven nothing.
+    """
+    if protocol == 'FTP':
+        monkeypatch.setattr(aioftp.Client, 'context', WritingFTPContext())
+    elif protocol == 'SFTP':
+        monkeypatch.setattr(
+            asyncssh, 'connect',
+            lambda *a, **k: entered(StubSSHConnection(WritingSFTPClient())))
+    else:
+        raise ValueError(
+            f'{protocol!r} has no doubled local-write seam. HTTP and '
+            'HTTPS write below the seam this doubles and must dial the '
+            'loopback server instead; a protocol that writes no local '
+            'file belongs in CATEGORY_EXEMPT, argued.')
+
+
+def local_io_call(protocol: str, destination: str) -> dict[str, Any]:
+    """Return a contract call that downloads ``protocol`` to ``destination``.
+
+    Each protocol names its local destination under a different key --
+    ``http_file_download_config`` for the HTTP family, ``client_path``
+    for FTP, ``local_path`` for SFTP -- which is precisely the reason
+    one hand-written test per protocol drifted and a table did not.
+
+    Args:
+        protocol: A protocol name from the contract table.
+        destination: The local path the download should write to.
+
+    Returns:
+        ``request()`` keyword arguments for the download.
+
+    Raises:
+        KeyError: If ``protocol`` names no local-write configuration.
+    """
+    call = contract_call(protocol)
+    call['protocol_info'].update({
+        'HTTP': {'http_file_download_config': {
+            'download_filepath': destination}},
+        'HTTPS': {'http_file_download_config': {
+            'download_filepath': destination}},
+        'FTP': {'client_path': destination},
+        'SFTP': {'local_path': destination},
+    }[protocol])
+    return call

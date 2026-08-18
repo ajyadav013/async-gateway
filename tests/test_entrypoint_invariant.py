@@ -324,6 +324,28 @@ HOSTILE_PROTOCOL_INFO: Final[tuple[Any, ...]] = (
     {'local_path': 42},
     {'overwrite': 'yes'},
     {'verify_ssl': 'yes'},
+    # NEW-R10-1's blind spot, and the reason the escape was invisible to
+    # 2981 tests: this file drives every `protocol_info` *value* it can
+    # think of, and it had never named the key that makes a call write
+    # to the local disk at all. So the whole download path -- the one
+    # surface where a caller's configuration reaches a filesystem rather
+    # than a socket -- was outside the one guard whose entire job is
+    # "no shape escapes the entry point".
+    #
+    # Four shapes, because the key's failure modes are not one. The
+    # first is the wrong type for the config itself. The next two are a
+    # destination the filesystem will refuse -- a parent that does not
+    # exist, and one under a path component that is a *file* -- which
+    # are the shapes that actually escaped as raw `FileNotFoundError`
+    # and `NotADirectoryError`. The last is the wrong type for the path
+    # inside a well-formed config, which is the shape most likely to
+    # slip past a check on the config and crash on the `open`.
+    {'http_file_download_config': 'not a mapping'},
+    {'http_file_download_config': {
+        'download_filepath': '/nonexistent-dir-for-agw/out.bin'}},
+    {'http_file_download_config': {
+        'download_filepath': '/etc/hosts/out.bin'}},
+    {'http_file_download_config': {'download_filepath': 42}},
 )
 
 #: Request payloads. ``data`` is forwarded to a JSON encoder for most
