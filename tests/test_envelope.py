@@ -1742,6 +1742,189 @@ def test_redact_url_leaves_a_url_with_nothing_to_mask_alone() -> None:
     assert redact_url(clean) == clean
 
 
+# --- N1: the two query rules, held to one another --------------------------
+
+#: The secret every generated query spelling carries, and the string the
+#: rows below assert the absence of. Distinct from :data:`FUZZ_SECRET` so
+#: a failure names which differential caught it.
+QUERY_SECRET = 'QUERYSECRETPW'
+
+#: The separator spellings a query can use between two pairs. ``&`` is the
+#: modern one, ``;`` the legacy one HTML 4.01 recommended and PHP, servlet
+#: containers and CGI code still parse -- so a server reading
+#: ``?x=1;api_key=S`` sees two parameters and the second is secret.
+QUERY_SEPARATOR_SPELLINGS = ('&', ';')
+
+#: Insensitive names, to sit *before* the secret. The position is the
+#: point: N1 survived a round of fixing because ``parse_qsl`` folds
+#: ``;api_key=S`` into the preceding value and masks it there **when the
+#: preceding name is itself sensitive** -- so a corpus whose leading name
+#: was always ``token`` would have passed while the leak shipped.
+QUERY_INNOCENT_NAMES = ('x', 'page', 'tenant')
+
+#: Sensitive names, as written and percent-encoded, because the lookup
+#: normalises both and a differential using one spelling would not see
+#: the two maskers disagreeing about the other.
+QUERY_SECRET_NAMES = ('api_key', 'token', 'api%5Fkey', 'PASSWORD')
+
+#: Spellings of the secret value itself. The value is what a rebuild
+#: re-encodes, so this is the dimension on which a masker that rewrites
+#: the query -- ``urlencode`` turning ``a b`` into ``a+b`` -- diverges
+#: from one that substitutes in place, while both still hide the secret.
+QUERY_SECRET_VALUES = (
+    QUERY_SECRET,
+    f'{QUERY_SECRET}%20tail',
+    f'{QUERY_SECRET}+tail',
+    f'{QUERY_SECRET}=padded',
+)
+
+
+def query_spellings() -> Iterator[str]:
+    """Generate query strings carrying a secret, spelled every way.
+
+    A product rather than a list of remembered inputs, for the reason
+    :func:`fuzz_spellings` is one: a list grows by one after each
+    incident, and every finding this module has produced was a spelling
+    nobody had listed yet. What is generated is the *disagreement
+    surface* the two query rules share -- separator, the secret's
+    position, the name before it, the value's encoding, the scheme, and
+    what follows.
+
+    Yields:
+        A URL or scheme-less URL whose query carries
+        :data:`QUERY_SECRET` under a sensitive name.
+    """
+    prefixes = ('https://host/p', 'host/p', 'https://user@host/p')
+    tails = ('', 'page=2', 'x=a%20b', 'flag')
+    for prefix, separator, innocent, name, value in itertools.product(
+            prefixes, QUERY_SEPARATOR_SPELLINGS, QUERY_INNOCENT_NAMES,
+            QUERY_SECRET_NAMES, QUERY_SECRET_VALUES):
+        pair = f'{name}={value}'
+        # The secret *second*, after an insensitive name -- the shape the
+        # `parse_qsl` folding argument does not cover, and the one N1 was
+        # reported as.
+        yield f'{prefix}?{innocent}=1{separator}{pair}'
+        # And the secret first, which that argument does cover, so a
+        # regression reinstating it still fails on the row above.
+        for tail in tails:
+            yield f'{prefix}?{pair}{separator}{tail}' if tail else (
+                f'{prefix}?{pair}')
+
+
+def test_the_two_maskers_agree_on_every_query_spelling() -> None:
+    """The property N1 was an instance of, asserted as a differential.
+
+    This module has two string maskers with two query rules.
+    :func:`redact_url` serves the envelope ``url`` -- on the ``ok=True``
+    and ``ok=False`` paths alike -- and ``validated_url``'s
+    ``ConfigurationError``, both of which call it *alone*.
+    :func:`redact_text` serves ``error['message']``, ``error['cause']``
+    and the logged traceback. They must agree about what a query
+    separator is, and twice now they have not.
+
+    The first round taught ``;`` to :func:`redact_text`'s rule only, on
+    the reasoning that ``parse_qsl`` folds the legacy pair into the
+    preceding value -- true only where that preceding name is itself
+    sensitive, and then written into :func:`redact_url`'s docstring as a
+    claim of coverage that was false for exactly the surfaces which never
+    reach the other masker. ``?x=1;api_key=SECRETPW`` was published in
+    the clear.
+
+    A row per reported spelling cannot catch the *next* divergence, which
+    is the only kind that has ever shipped here. This asserts the
+    invariant instead: over the generated corpus neither masker leaks,
+    **and the two return the same string**. Equality is the stronger
+    claim and the right one -- a difference in rendering is how a
+    divergence first shows itself, one release before it becomes a
+    difference in what is masked.
+    """
+    leaked: list[tuple[str, list[str]]] = []
+    disagreed: list[tuple[str, str, str]] = []
+    checked = 0
+    for spelling in sorted(set(query_spellings())):
+        checked += 1
+        from_url = redact_url(spelling)
+        from_text = redact_text(spelling)
+        published = sorted(
+            name for name, text in (
+                ('envelope url (redact_url)', from_url),
+                ('message (redact_text)', from_text),
+                ("extra['url'] (redact_value)", redact_value(spelling)),
+            ) if QUERY_SECRET in text)
+        if published:
+            leaked.append((spelling, published))
+        if from_url != from_text:
+            disagreed.append((spelling, from_url, from_text))
+
+    assert checked > 500, (
+        f'only {checked} spellings were generated, so this row is close '
+        f'to vacuous -- the generator has stopped producing queries')
+    assert leaked == [], (
+        f'{len(leaked)} query spellings publish a secret; first five: '
+        f'{leaked[:5]}')
+    assert disagreed == [], (
+        f'{len(disagreed)} spellings are masked differently by the two '
+        f'maskers, which is how the last two leaks began; first five: '
+        f'{disagreed[:5]}')
+
+
+def test_the_two_query_rules_are_generated_from_one_separator_set() -> None:
+    """The agreement is by construction, and this is what proves it.
+
+    The differential above says the two maskers agree *today*, over the
+    shapes generated today. This says they cannot be made to disagree by
+    the edit that has now produced three findings -- teaching one rule a
+    separator and not the other -- because there is one place to teach.
+
+    The query-separator counterpart of
+    :func:`test_the_deleted_character_set_is_taken_from_the_parser`: a
+    structural check that the shared definition is still shared, which
+    fails when someone re-hardcodes a class rather than one release later
+    from a leak. It asserts *behaviour* per separator rather than pattern
+    source, so a rewrite keeping the property passes.
+    """
+    separators = redaction._QUERY_SEPARATORS
+
+    for separator in separators:
+        assert redaction._QUERY_SEPARATOR_SPLIT.split(
+            f'a=1{separator}b=2') == ['a=1', separator, 'b=2']
+        assert redact_url(
+            f'https://h/p?x=1{separator}api_key={QUERY_SECRET}') == (
+                f'https://h/p?x=1{separator}api_key={REDACTED}')
+        assert redact_text(
+            f'host/p?x=1{separator}api_key={QUERY_SECRET}') == (
+                f'host/p?x=1{separator}api_key={REDACTED}')
+
+    assert redaction._QUERY_DELIMITERS == (
+        redaction._QUERY_START + separators)
+
+
+def test_redact_url_masking_stays_linear_on_a_hostile_query() -> None:
+    """``redact_url`` runs inside ``log_failure`` too, on the event loop.
+
+    The rule this fix rewrote no longer goes through ``parse_qsl`` and
+    ``urlencode``; it splits on a character class and substitutes. The
+    linearity that matters is therefore this function's, not only
+    :func:`redact_text`'s -- the envelope ``url`` is built on the same
+    path as the log record, and a masker taking 35s on 200KB is an outage
+    on either.
+
+    A split on a one-character class has nothing to backtrack, so these
+    rows are about volume rather than a catastrophic shape: 200KB of
+    separators carrying no pairs at all, then 200KB of real pairs under
+    each separator spelling.
+    """
+    started = monotonic_now()
+
+    redact_url('https://h/p?' + ';' * 200000)
+    redact_url('https://h/p?' + '&'.join(
+        f'k{index}=v{index}' for index in range(20000)))
+    redact_url('https://h/p?' + ';'.join(
+        f'api_key=v{index}' for index in range(20000)))
+
+    assert elapsed_since(started) < 2.0
+
+
 def test_redact_headers_keeps_names_and_masks_only_the_values() -> None:
     """A caller can still see *that* a credential header was sent."""
     redacted = redact_headers({
