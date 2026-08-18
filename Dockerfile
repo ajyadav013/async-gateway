@@ -28,9 +28,18 @@
 # This is a library. The image is a test and reproducibility harness, not a
 # deployable service -- there is no entry point to start and no port to
 # serve. `docker run` runs the suite and exits.
+#
+# `PYTHON_VERSION` selects the interpreter, defaulting to the 3.12 the
+# image has always used. `requires-python` is `>=3.10` and CI claims the
+# whole 3.10-3.14 range, so the claim is only worth what has actually been
+# run: building with `--build-arg PYTHON_VERSION=3.10` reproduces one leg
+# of that matrix locally. Both stages take it, so the wheel is built and
+# installed by the same interpreter.
+
+ARG PYTHON_VERSION=3.12
 
 # ---------------------------------------------------------------- build --
-FROM python:3.12-slim AS build
+FROM python:${PYTHON_VERSION}-slim AS build
 
 WORKDIR /src
 
@@ -48,7 +57,7 @@ COPY async_gateway/ ./async_gateway/
 RUN python -m build --wheel --sdist --outdir /dist
 
 # -------------------------------------------------------------- runtime --
-FROM python:3.12-slim AS runtime
+FROM python:${PYTHON_VERSION}-slim AS runtime
 
 # No cached wheel may satisfy the install below: a cache hit would hide
 # exactly the packaging defect this stage exists to catch.

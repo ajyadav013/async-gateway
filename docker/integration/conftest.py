@@ -57,6 +57,15 @@ BASE_SOAP = f'http://{SOAP_HOST}:{SOAP_PORT}'
 KNOWN_HOSTS = '/hostkeys/known_hosts'
 CA_BUNDLE = '/pki/ca.pem'
 
+# A writable path on a real volume rather than the image's own overlayfs.
+# The filesystem tests that assert mode, ownership and link counts run
+# there as well as under `tmp_path`, because those are exactly the
+# properties a volume driver may answer differently from the container's
+# writable layer -- and differently again from APFS, which is all the
+# host suite has ever seen. Empty when no volume is mounted, which those
+# tests read as a reason to skip rather than to pass.
+SCRATCH_DIR = env('SCRATCH_DIR', '')
+
 # The fixture both file servers seed at start. Asserted byte for byte, so
 # it is stated once here and read from the servers' entrypoints.
 REMOTE_FIXTURE = b'pair,rate\nEURUSD,1.0842\nGBPUSD,1.2671\n'

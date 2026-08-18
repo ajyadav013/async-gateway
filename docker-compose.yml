@@ -147,7 +147,15 @@ services:
     volumes:
       - pki:/pki:ro
       - hostkeys:/hostkeys:ro
+      # A writable volume, so the local-filesystem tests land somewhere
+      # that is NOT the container's own overlayfs. File mode, ownership
+      # and link counting are exactly where macOS/APFS and Linux
+      # diverge, and a download into the image's writable layer would
+      # only ever exercise overlayfs. Mounted, the same assertions run
+      # against the volume driver the host actually provides.
+      - scratch:/scratch
     environment:
+      SCRATCH_DIR: /scratch
       HTTP_HOST: http-server
       HTTP_PORT: '8080'
       HTTPS_PORT: '8443'
@@ -178,3 +186,4 @@ services:
 volumes:
   pki:
   hostkeys:
+  scratch:

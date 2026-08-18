@@ -45,8 +45,35 @@ RUN chmod +x /usr/local/bin/generate-pki
 ENV SSL_CERT_FILE=/pki/ca.pem \
     REQUESTS_CA_BUNDLE=/pki/ca.pem
 
-# `openssh-client` for the wrong-key test, which mints a second host key
-# to pin so that "any known_hosts satisfies the check" is ruled out.
+# Non-root, matching the wheel image -- and here it is load-bearing
+# rather than only hygiene. The local-filesystem tests assert that the
+# 0600 open, the `O_NOFOLLOW` descent and the `st_nlink` check hold in a
+# directory this process does not own, and "does not own" is not a
+# statement uid 0 can make: root owns everything by default, so the
+# foreign-ownership premise would be vacuous and the test would pass
+# without testing anything. The suite writes only to `tmp_path` and to
+# the mounted scratch volume, so it needs no ownership of the image.
+RUN useradd --create-home --uid 10001 gateway
+
+# The mount point for the scratch volume, pre-created so that Docker
+# seeds the fresh volume with these two directories and their ownership.
+#
+# `/scratch` belongs to the test user, which is what lets the ordinary
+# filesystem cases create their own working directories on a real volume
+# rather than on the image's overlayfs.
+#
+# `/scratch/foreign` deliberately does NOT: it is left to root, mode
+# 0777, so the guard tests have a directory they can write into but do
+# not own. That is the arrangement `tmp_path` structurally cannot
+# provide -- the test user creates and owns everything under it -- and
+# ownership is what decides whether the kernel's `O_NOFOLLOW` and link
+# checks are being asked a real question.
+RUN mkdir -p /scratch/foreign \
+ && chown gateway:gateway /scratch \
+ && chmod 0777 /scratch/foreign
+
+USER gateway
+
 WORKDIR /app/integration
 ENTRYPOINT ["pytest", "-p", "no:cacheprovider"]
 CMD ["test_integration.py"]

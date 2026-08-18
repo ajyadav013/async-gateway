@@ -45,6 +45,8 @@ from typing import Any, Dict
 # is classified third-party whichever way it is imported -- and it
 # sorts before `pytest`. Reading the constants off it also makes it
 # obvious where each one is configured.
+import asyncssh
+
 import conftest as cfg
 
 import pytest
@@ -61,6 +63,7 @@ from async_gateway.utils.exceptions import (
     PathContainmentError,
     ProcessorError,
 )
+from async_gateway.utils.paths import FILE_MODE
 
 BASE_HTTP = cfg.BASE_HTTP
 BASE_HTTPS = cfg.BASE_HTTPS
@@ -72,6 +75,7 @@ FTP_PORT = cfg.FTP_PORT
 FTP_USER = cfg.FTP_USER
 KNOWN_HOSTS = cfg.KNOWN_HOSTS
 REMOTE_FIXTURE = cfg.REMOTE_FIXTURE
+SCRATCH_DIR = cfg.SCRATCH_DIR
 SFTP_HOST = cfg.SFTP_HOST
 SFTP_PORT = cfg.SFTP_PORT
 
@@ -1963,3 +1967,429 @@ async def test_a_traversing_entry_name_cannot_escape_the_named_directory(
             path_io.contained(pathlib.Path(hostile))
 
     assert list(outside.iterdir()) == [], 'the traversal escaped'
+
+
+# ------------- the local filesystem, on Linux rather than on APFS --------
+#
+# Everything below asserts a property of the LOCAL disk the transfer
+# writes to, and every one of them has only ever been proven on macOS.
+# That is the gap this section closes. File mode, ownership and link
+# counting are the classic points of divergence between APFS and a Linux
+# filesystem, and a container adds two more layers entitled to disagree:
+# the image's own overlayfs, and whatever driver backs a mounted volume.
+#
+# So each test that can runs TWICE -- once under `tmp_path` (overlayfs)
+# and once under the mounted `scratch` volume -- parametrised on the
+# directory rather than duplicated, because two hand-written copies are
+# what drift. `scratch_dir` skips rather than passes when no volume is
+# mounted: a silently-halved matrix is the failure this whole section
+# exists to avoid.
+
+
+def volume_available() -> bool:
+    """Report whether the writable scratch volume is mounted.
+
+    Returns:
+        True when compose provided one and it is writable.
+    """
+    return bool(SCRATCH_DIR) and os.access(SCRATCH_DIR, os.W_OK)
+
+
+requires_volume = pytest.mark.skipif(
+    not volume_available(),
+    reason='no writable scratch volume is mounted')
+
+
+@pytest.fixture()
+def scratch(
+    request: pytest.FixtureRequest, tmp_path: pathlib.Path,
+) -> pathlib.Path:
+    """Return an empty directory on the filesystem the test asked for.
+
+    Args:
+        request: Carries the ``'overlay'`` or ``'volume'`` parameter.
+        tmp_path: The overlayfs-backed default.
+
+    Returns:
+        A fresh empty directory on the requested filesystem.
+    """
+    if request.param == 'overlay':
+        return tmp_path
+    if not volume_available():
+        pytest.skip('no writable scratch volume is mounted')
+    made = pathlib.Path(SCRATCH_DIR) / unique('case')
+    made.mkdir(parents=True)
+    return made
+
+
+#: Applied to every test that must hold on both filesystems.
+both_filesystems = pytest.mark.parametrize(
+    'scratch', ['overlay', 'volume'], indirect=True)
+
+#: An mtime far enough in the past that no filesystem could produce it
+#: by accident, so a preserved timestamp cannot be confused with the one
+#: the download itself would have written.
+WIDE_MTIME = 1000000000
+
+
+async def seed_remote_file(mode: int, mtime: int) -> str:
+    """Put a copy of the fixture on the server at a chosen mode and time.
+
+    Through ``asyncssh`` directly rather than through the library, for
+    the reason the FTPS posture test shells out to ``lftp``: when the
+    assertion is "the server's attributes did not reach the local
+    file", establishing what the server's attributes *are* with the
+    code under test would be circular. The sshd here also runs
+    ``ForceCommand internal-sftp``, so there is no shell to run
+    ``chmod`` in -- these are SFTP attribute operations, which is what
+    a real peer would use.
+
+    Args:
+        mode: The permission bits to set on the remote copy.
+        mtime: The modification time to set, in epoch seconds.
+
+    Returns:
+        The remote path of the seeded file.
+    """
+    remote = f'pub/{unique("wide")}.csv'
+    async with asyncssh.connect(
+            SFTP_HOST, port=SFTP_PORT, username=cfg.SFTP_USER,
+            password=cfg.SFTP_PASSWORD, known_hosts=KNOWN_HOSTS) as conn:
+        async with conn.start_sftp_client() as sftp:
+            async with sftp.open(remote, 'wb') as handle:
+                await handle.write(REMOTE_FIXTURE)
+            await sftp.chmod(remote, mode)
+            await sftp.utime(remote, (mtime, mtime))
+    return remote
+
+
+async def download_to(
+    client_path: pathlib.Path,
+    ftp_auth: Any,
+    server_path: str = 'pub/report.csv',
+) -> Dict[str, Any]:
+    """Run one FTP download, without opting in to overwrite.
+
+    Distinct from :func:`download_into`, which passes ``overwrite=True``
+    so that the guarded open is reached. Nothing here exists yet, so the
+    default is what the caller would use.
+
+    Args:
+        client_path: The local destination.
+        ftp_auth: The FTP credential fixture.
+        server_path: The remote source.
+
+    Returns:
+        The envelope ``request()`` returned.
+    """
+    return await request(
+        FTP_HOST,
+        protocol='FTP',
+        auth=ftp_auth,
+        protocol_info={
+            'port': FTP_PORT,
+            'command': 'download',
+            'server_path': server_path,
+            'client_path': str(client_path),
+            'timeout': 30,
+        },
+    )
+
+
+async def sftp_get_to(
+    local_path: pathlib.Path,
+    sftp_auth: Any,
+    remote_path: str = 'pub/report.csv',
+    **extra: Any,
+) -> Dict[str, Any]:
+    """Run one SFTP ``get``, with the host key pinned.
+
+    Args:
+        local_path: The local destination.
+        sftp_auth: The SFTP credential fixture.
+        remote_path: The remote source.
+        **extra: Extra ``protocol_info`` keys, e.g. a preserve option.
+
+    Returns:
+        The envelope ``request()`` returned.
+    """
+    info: Dict[str, Any] = {
+        'port': SFTP_PORT,
+        'mode': 'get',
+        'remote_path': remote_path,
+        'local_path': str(local_path),
+        'known_hosts': KNOWN_HOSTS,
+        'timeout': 30,
+    }
+    info.update(extra)
+    return await request(
+        SFTP_HOST, protocol='SFTP', auth=sftp_auth, protocol_info=info)
+
+
+@both_filesystems
+async def test_ftp_refuses_a_missing_destination_parent(
+    ftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """NEW-R11-1 against a live server, on a container filesystem.
+
+    ``aioftp.Client.download`` calls ``mkdir(parent, parents=True,
+    exist_ok=True)`` before it writes, so forwarding that flag ran an
+    unbounded ``mkdir -p`` on a caller-named path: FTP answered a
+    missing destination directory with ``ok=True``/200 having created
+    the tree, where HTTP and SFTP both refused. Dropping the flag is the
+    fix, and this is it holding over a real FTPS session.
+
+    The gap is three levels deep on purpose. One level would be
+    satisfied by a ``mkdir`` that merely lacks ``parents``; three can
+    only be satisfied by not creating anything.
+    """
+    missing = scratch / 'a' / 'b' / 'c'
+
+    result = await download_to(missing / 'out.bin', ftp_auth)
+
+    assert_envelope(result, 'FTP')
+    assert result['ok'] is False, (
+        'FTP created the missing destination tree the caller named, '
+        'instead of refusing it -- NEW-R11-1, which HTTP and SFTP '
+        'both refuse')
+    assert result['error']['code'] == 'PATH', result['error']
+    assert result['status_code'] == 400, result['status_code']
+    assert not (scratch / 'a').exists(), (
+        f'the refusal still created {scratch / "a"} -- nothing the '
+        'caller did not name may be created')
+
+
+@requires_hostkey
+@both_filesystems
+async def test_sftp_refuses_a_missing_destination_parent(
+    sftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """The same question to the other transfer protocol, live.
+
+    This is the half NEW-R11-1 made FTP agree WITH, so it is the
+    control: if the container filesystem changed this answer, the
+    parity the fix established would be broken from the other side and
+    the FTP assertion above would be measuring the wrong baseline.
+    """
+    missing = scratch / 'a' / 'b' / 'c'
+
+    result = await sftp_get_to(missing / 'out.bin', sftp_auth)
+
+    assert_envelope(result, 'SFTP')
+    assert result['ok'] is False, 'SFTP created the missing tree'
+    assert result['error']['code'] == 'PATH', result['error']
+    assert result['status_code'] == 400, result['status_code']
+    assert not (scratch / 'a').exists(), (
+        f'the refusal still created {scratch / "a"}')
+
+
+@both_filesystems
+async def test_ftp_mkdir_over_an_existing_file_is_path(
+    ftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """A directory download onto a path a regular file occupies.
+
+    The eleventh-round divergence: one local fault, two codes. FTP said
+    ``CONFIG``/400 -- advising ``overwrite=True``, which cannot make a
+    ``mkdir`` succeed over a file -- where SFTP said ``PATH``/400.
+    ``PATH`` is the settled answer on both.
+
+    A *directory* server path is what makes this reachable: a
+    single-file download opens the destination and never calls
+    ``mkdir`` on it at all.
+    """
+    occupied = scratch / 'tree'
+    occupied.write_bytes(b'an ordinary file in the way')
+
+    result = await download_to(occupied, ftp_auth, server_path='pub')
+
+    assert_envelope(result, 'FTP')
+    assert result['ok'] is False, 'the file in the way was replaced'
+    assert result['error']['code'] == 'PATH', (
+        f'FTP reported {result["error"]["code"]} for a mkdir over an '
+        f'existing file, where SFTP reports PATH')
+    assert result['status_code'] == 400, result['status_code']
+    assert occupied.read_bytes() == b'an ordinary file in the way'
+
+
+@requires_hostkey
+@both_filesystems
+async def test_sftp_mkdir_over_an_existing_file_is_path(
+    sftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """The other half of the parity row above, live.
+
+    Asserted as its own test rather than folded into the FTP one
+    because the two clients reach ``mkdir`` by different routes --
+    ``aioftp``'s recursion versus ``asyncssh``'s ``_copy`` -- and the
+    claim is that they agree, which needs both measured.
+    """
+    occupied = scratch / 'tree'
+    occupied.write_bytes(b'an ordinary file in the way')
+
+    result = await sftp_get_to(occupied, sftp_auth, remote_path='pub')
+
+    assert_envelope(result, 'SFTP')
+    assert result['ok'] is False, 'the file in the way was replaced'
+    assert result['error']['code'] == 'PATH', result['error']
+    assert result['status_code'] == 400, result['status_code']
+    assert occupied.read_bytes() == b'an ordinary file in the way'
+
+
+@requires_hostkey
+@both_filesystems
+async def test_preserve_does_not_let_a_0777_server_file_widen_the_local_one(
+    sftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """M18 over a real SFTP session: the server does not pick the mode.
+
+    ``asyncssh``'s ``_setstat`` ends in an ``os.chmod`` to whatever
+    ``attrs.permissions`` carries, so ``preserve=True`` silently
+    reverted the guarded open's 0600 to the REMOTE file's mode. The fix
+    drops the permission and ownership fields and keeps the timestamps.
+
+    Both halves are asserted, because dropping the whole call would
+    also pass a mode-only test while quietly costing the caller the
+    feature they asked for. The remote file is chmod'ed 0777 through
+    the same SSH connection the test then downloads over -- the widest
+    mode there is, so a preserved bit cannot be mistaken for the
+    default.
+
+    On a container filesystem for a specific reason: a volume driver is
+    free to answer ``chmod`` and ``stat`` differently from APFS, and
+    0600 is a security property of this release rather than an
+    accident of ``umask``.
+    """
+    remote = await seed_remote_file(0o777, WIDE_MTIME)
+
+    local = scratch / 'preserved.csv'
+    result = await sftp_get_to(
+        local, sftp_auth, remote_path=remote,
+        additional_arguments={'preserve': True})
+
+    assert_envelope(result, 'SFTP')
+    assert result['ok'] is True, result['error']
+    assert local.read_bytes() == REMOTE_FIXTURE
+
+    mode = local.stat().st_mode & 0o777
+    assert mode == FILE_MODE, (
+        f'the local file is {mode:#o}, not {FILE_MODE:#o}: a remote '
+        f'server chose the mode of a file on this machine, which is '
+        f'the authority the guarded open exists to deny it (M18)')
+    assert local.stat().st_mtime == WIDE_MTIME, (
+        'the timestamp was not preserved -- preserve=True must still '
+        'do the thing it is for, or the fix cost the caller a feature')
+
+
+@requires_hostkey
+@both_filesystems
+async def test_a_recursive_preserve_download_keeps_every_file_at_0600(
+    sftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """The same, on the recursive arm, into an EXISTING tree.
+
+    Two things at once, deliberately. The mode assertion covers every
+    file the walk writes rather than one -- ``_setstat`` is called per
+    entry, so a per-file leak is what a single-file test would miss.
+    And the destination already exists, which is the legitimate case
+    the NEW-R11-1 ``mkdir`` change is most likely to have broken: the
+    base is ``mkdir``'ed with ``exist_ok``, and a fix that refused here
+    would have traded a real capability for the defect it fixed.
+    """
+    destination = scratch / 'tree'
+    destination.mkdir()
+
+    result = await sftp_get_to(
+        destination, sftp_auth, remote_path='pub',
+        additional_arguments={'preserve': True})
+
+    assert_envelope(result, 'SFTP')
+    assert result['ok'] is True, result['error']
+
+    landed = sorted(p for p in destination.rglob('*') if p.is_file())
+    assert landed, f'nothing landed under {destination}'
+    assert any(p.name == 'report.csv' for p in landed), landed
+
+    wide = {
+        str(p): oct(p.stat().st_mode & 0o777)
+        for p in landed
+        if p.stat().st_mode & 0o777 != FILE_MODE
+    }
+    assert wide == {}, (
+        f'a recursive preserve=True download left these files at a '
+        f'mode the server chose, not {FILE_MODE:#o}: {wide}')
+
+
+@requires_volume
+async def test_the_guards_hold_on_a_volume_owned_by_another_uid(
+    ftp_auth: Any,
+) -> None:
+    """0600, ``O_NOFOLLOW`` and ``st_nlink`` under foreign ownership.
+
+    The three guards are asserted where the host suite structurally
+    cannot reach: a world-writable directory on a mounted volume that
+    this process does **not** own. Under `tmp_path` the test user
+    creates and owns every component, so a guard that quietly depended
+    on that would pass there and fail in the deployment this library is
+    actually used in.
+
+    None of the three is a permission check -- `O_NOFOLLOW` and the
+    `st_nlink` count are refusals the kernel makes regardless of uid,
+    and 0600 is the mode the open requests -- so the expected answer is
+    that ownership changes nothing. That is the claim, and an
+    unsurprising result measured is worth more than an assumed one:
+    this is the axis on which a container filesystem is most entitled
+    to differ from APFS.
+
+    Both premises are asserted rather than assumed, because either one
+    failing would make the test pass while proving nothing. Where the
+    directory comes back owned by this process -- which a rootless or
+    userns-remapped daemon may do -- it says so instead.
+    """
+    # The foreign directory itself, not a subdirectory of it: anything
+    # this process creates there it would then own, which is the very
+    # property being removed. Unique leaf names keep the cases apart
+    # instead.
+    workdir = pathlib.Path(SCRATCH_DIR) / 'foreign'
+    stem = unique('case')
+    assert workdir.is_dir(), (
+        f'{workdir} is missing: the image pre-creates it so that Docker '
+        f'seeds the volume with a directory the test user does not own')
+    assert workdir.stat().st_uid != os.getuid(), (
+        f'{workdir} is owned by this process (uid {os.getuid()}), so '
+        f'there is no foreign ownership here to test')
+
+    # 0600 survives a download into a directory we do not own.
+    landed = workdir / f'{stem}-report.csv'
+    result = await download_to(landed, ftp_auth)
+    assert_envelope(result, 'FTP')
+    assert result['ok'] is True, result['error']
+    assert landed.stat().st_mode & 0o777 == FILE_MODE, (
+        f'{landed} is {landed.stat().st_mode & 0o777:#o}, not '
+        f'{FILE_MODE:#o}, under foreign ownership')
+
+    # O_NOFOLLOW: a link the caller did not name, planted at a path
+    # INSIDE the directory they did. Not the caller's own `client_path`
+    # -- that is followed by design, and
+    # `test_a_symlinked_client_path_is_followed_by_the_transfer`
+    # records it. Asserted at the guarded open, which is the seam that
+    # refuses it, and where the recursion's writes go through.
+    victim = workdir / f'{stem}-victim.txt'
+    victim.write_bytes(b'do not follow me\n')
+    base = workdir / f'{stem}-tree'
+    base.mkdir()
+    (base / 'planted.csv').symlink_to(victim)
+
+    path_io = contained_path_io_factory(local_base(base), overwrite=True)()
+    with pytest.raises(PathContainmentError):
+        _open_guarded(path_io.contained(base / 'planted.csv'), 'wb', True)
+    assert victim.read_bytes() == b'do not follow me\n', (
+        'the planted symlink was followed and the victim rewritten')
+
+    # st_nlink: a hard link is refused, and the other name survives.
+    linked = workdir / f'{stem}-hardlink.csv'
+    os.link(victim, linked)
+    result = await download_into(linked, ftp_auth)
+    assert_path_refusal(result, linked)
+    assert 'hard link' in str(result['error']), result['error']
+    assert victim.read_bytes() == b'do not follow me\n'
