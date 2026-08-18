@@ -26,6 +26,8 @@ import asyncio
 import time
 from typing import Any, Optional
 
+import aioftp
+
 from failsafe import CircuitOpen, RetriesExhausted
 
 import pytest
@@ -1336,6 +1338,45 @@ def test_the_default_abortable_set_is_this_library_s_own_refusals() -> None:
     """
     assert ConfigurationError in DEFAULT_ABORTABLE_EXCEPTIONS
     assert ResponseTooLargeError in DEFAULT_ABORTABLE_EXCEPTIONS
+    assert aioftp.errors.InvalidCommand in DEFAULT_ABORTABLE_EXCEPTIONS
+
+
+async def test_n7_a_callers_crlf_never_opens_the_destinations_circuit(
+) -> None:
+    """N7's second half: the refusal must not be *counted*, either.
+
+    ``aioftp`` refuses a CR or an LF in a command line, and mapping that
+    refusal to a ``ConfigurationError`` envelope
+    (``logic.ftp_client.transport_error_for``) fixes only what the
+    caller *sees*. That classification happens **outside** this loop, so
+    with ``InvalidCommand`` absent from the abortable set the loop still
+    treated it as a retriable transport failure first: it burned the
+    retry budget re-sending a value that can never succeed, and it
+    counted every attempt against the destination.
+
+    The consequence is the one the abortable set exists to prevent, and
+    it is worth stating concretely: one caller repeating a single
+    CR-bearing ``server_path`` drove the shared breaker to OPEN, so
+    every *other* caller's request to that host was then refused with
+    ``CIRCUIT_OPEN`` -- a typo taking a healthy destination offline
+    process-wide.
+
+    Driven through ``run`` rather than asserted against the tuple,
+    because membership is not the property that matters; what matters is
+    that the loop does not count. Repeated to four times the breaker's
+    own threshold, so a regression cannot hide behind a small budget.
+    """
+    breaker = CircuitBreakerHelper(maximum_failures=2)
+
+    async def refuse() -> None:
+        raise aioftp.errors.InvalidCommand('Command must not contain CR/LF')
+
+    for _ in range(8):
+        with pytest.raises(aioftp.errors.InvalidCommand):
+            await breaker.run(refuse)
+
+    assert breaker.failures == 0
+    assert breaker.state is BreakerState.CLOSED
 
 
 # --- R28: the last two uncovered lines of the facade -----------------------

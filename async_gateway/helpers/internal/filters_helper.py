@@ -427,6 +427,13 @@ async def application_json_filters(
         ``{'data': ...}`` for an already-serialised ``str``/``bytes`` body
         or a serialised scalar. A GET whose payload is not a mapping has
         nothing that can become a query string, so it contributes nothing.
+
+    Raises:
+        ConfigurationError: If a payload that is neither a mapping nor
+            already-serialised text cannot be JSON-encoded. It is the
+            caller's own ``data``, so it is reported as their
+            configuration rather than as the bare ``TypeError``
+            ``orjson`` raises, which escaped ``request()`` un-enveloped.
     """
     if is_get(request_type):
         if isinstance(data, dict):
@@ -439,7 +446,11 @@ async def application_json_filters(
         return {'data': data}
     # Decoded because `filters['data']` must stay a `str`, as it was under
     # the previous serialiser.
-    return {'data': orjson.dumps(data).decode()}
+    try:
+        return {'data': orjson.dumps(data).decode()}
+    except TypeError as err:
+        raise ConfigurationError(
+            f'data is not JSON-serialisable: {err}') from err
 
 
 async def raw_body_filters(

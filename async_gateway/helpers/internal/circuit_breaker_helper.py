@@ -103,9 +103,23 @@ RETRIABLE_FAILURES: Final[tuple[type[BaseException], ...]] = (
 #: They also propagate as *themselves*. Wrapped in a ``RetriesExhausted``
 #: -- whose own ``str()`` is ``''`` -- a refusal reaches the caller as a
 #: blank message where a named reason belongs.
+#:
+#: ``aioftp.errors.InvalidCommand`` is the one entry raised by a
+#: dependency rather than by this library, and it is here for the same
+#: reason the other two are: it is ``aioftp`` refusing a CR or an LF in a
+#: value *the caller supplied*, so no retry of it can ever succeed. It
+#: reaches this set rather than being classified only at
+#: ``logic.ftp_client.transport_error_for`` because that function runs
+#: **outside** the loop -- by the time it maps the exception to a
+#: ``ConfigurationError`` the retries have already been spent and the
+#: failure already counted. Measured, not assumed: without this entry a
+#: caller repeating one CR-bearing ``server_path`` five times drove the
+#: destination's circuit to OPEN, so the sixth call -- and every other
+#: caller's call to that host -- got ``CIRCUIT_OPEN`` for a typo (N7).
 DEFAULT_ABORTABLE_EXCEPTIONS: Final[tuple[type[BaseException], ...]] = (
     ConfigurationError,
     ResponseTooLargeError,
+    aioftp.errors.InvalidCommand,
 )
 
 #: Backoff shapes a caller may name. Replaces the magic

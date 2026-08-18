@@ -27,6 +27,7 @@ from async_gateway.utils.constants import (DEFAULT_PORTS, HTTP_TIMEOUT,
 from async_gateway.utils.envelope import GatewayResponse
 from async_gateway.utils.exceptions import ConfigurationError
 from async_gateway.utils.http_file_config import resolve_verb
+from async_gateway.utils.redaction import redact_url
 
 
 def validated_protocol_info(
@@ -161,8 +162,25 @@ def destination_of(
         so using it as "unknown" would collapse every unknown-scheme
         destination onto a single key and re-create M16 for exactly the
         callers whose scheme this library did not anticipate.
+
+    Raises:
+        ConfigurationError: If the URL cannot be parsed at all.
+            ``urlsplit`` itself raises ``ValueError('Invalid IPv6 URL')``
+            on an unclosed bracket, and this is the *first* thing every
+            protocol does with a URL. ``dispatch_url_for`` already
+            converts that same failure, but only for the HTTP family --
+            so ``http://[::1`` reached FTP, SFTP and SOAP here as a bare
+            ``ValueError`` escaping ``request()`` un-enveloped. Found by
+            the entry-point invariant matrix in
+            ``tests/test_entrypoint_invariant.py``, which is what that
+            file is for.
     """
-    parsed = urlsplit(url if '://' in url else f'//{url}')
+    try:
+        parsed = urlsplit(url if '://' in url else f'//{url}')
+    except ValueError as err:
+        raise ConfigurationError(
+            f'url is not parseable: '
+            f'{redact_url(url)}') from err
     family = (parsed.scheme or protocol).lower()
     host = (parsed.hostname or '').lower()
 

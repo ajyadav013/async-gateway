@@ -77,6 +77,9 @@ from async_gateway.logic.http_client import (
     transport_error_for,
     validated_allow_redirects,
     validated_allowed_schemes,
+    validated_cookies,
+    validated_headers,
+    validated_http_auth,
     validated_max_redirects,
     validated_max_response_bytes,
     validated_session,
@@ -784,8 +787,9 @@ class SoapRequest(BaseRequestClass):
                 text nor an ``Element``; or any of the HTTP-layer keys
                 (``session``, ``timeout``, ``max_response_bytes``,
                 ``allow_redirects``, ``max_redirects``,
-                ``allowed_schemes``, ``trace_config``) failing the same
-                checks they fail on an HTTP call.
+                ``allowed_schemes``, ``trace_config``, ``headers``,
+                ``cookies``) failing the same checks they fail on an HTTP
+                call.
         """
         super().__init__(*args, **kwargs)
 
@@ -809,12 +813,20 @@ class SoapRequest(BaseRequestClass):
         # contradict -- and a contradicted Content-Type would also route
         # the envelope away from the raw-body filter and into the JSON
         # encoder, which is the routing hole this class exists inside.
+        #
+        # The caller's half is validated *before* the merge, not after:
+        # the library's own two headers are built from values this
+        # constructor has already checked, so re-checking them would
+        # report a library bug as the caller's `protocol_info["headers"]`
+        # -- naming the wrong key in the one message the caller acts on.
         self.headers: Dict[str, str] = {
-            **self.info.get('headers', {}),
+            **validated_headers(self.info.get('headers')),
             **soap_transport_headers(
                 version=self.soap_version, action=self.soap_action),
         }
-        self.cookies: Any = self.info.get('cookies')
+        self.auth = validated_http_auth(self.auth, self.url)
+        self.cookies: Optional[Dict[str, str]] = validated_cookies(
+            self.info.get('cookies'))
         self.verify_ssl: bool = self.info.get('verify_ssl', True)
         self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(
             total=validated_timeout(self.timeout))

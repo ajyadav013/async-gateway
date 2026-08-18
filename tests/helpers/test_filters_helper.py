@@ -214,6 +214,25 @@ def test_the_default_serializer_returns_text_not_bytes() -> None:
     assert _http_request().serialization is default_json_serialize
 
 
+def test_the_default_serializer_reports_an_unencodable_value() -> None:
+    """``aiohttp`` calls this too deep for a bare ``TypeError`` to be one.
+
+    ``json_serialize`` is invoked from inside ``aiohttp``'s payload
+    construction, several frames below anything this library wraps, so
+    ``orjson``'s own ``TypeError`` escaped ``request()`` un-enveloped:
+    ``data={'k': object()}`` reached the caller as
+    ``TypeError: Type is not JSON serializable: object``. It is the
+    caller's ``data`` that cannot be encoded, so it is reported as their
+    configuration -- ``CONFIG``/400 -- rather than as a library bug.
+    """
+    with pytest.raises(ConfigurationError) as raised:
+        default_json_serialize({'key': object()})
+
+    assert 'not JSON-serialisable' in str(raised.value)
+    assert raised.value.code == 'CONFIG'
+    assert raised.value.status_code == 400
+
+
 async def test_the_default_serializer_puts_the_expected_json_on_the_wire(
     http_server: RecordingHTTPServer,
 ) -> None:
@@ -2137,3 +2156,26 @@ async def test_raw_body_filters_passes_a_payload_through_verbatim() -> None:
         envelope, request_type='POST') == {'data': envelope}
     assert await raw_body_filters(
         b'\x00\x01', request_type='PUT') == {'data': b'\x00\x01'}
+
+
+async def test_an_unserialisable_scalar_payload_is_configuration() -> None:
+    """A payload ``orjson`` cannot encode is the caller's, not a bug.
+
+    The scalar arm of the JSON filter is the one place this library
+    hands a caller's ``data`` straight to ``orjson`` itself, and
+    ``orjson`` refuses what it cannot encode with a bare ``TypeError``.
+    Raised from inside a filter, that ``TypeError`` belonged to no
+    family and escaped ``request()`` un-enveloped -- the caller's own
+    unserialisable object reported as a library bug.
+
+    A mapping payload takes the ``{'json': ...}`` branch instead and is
+    encoded later, by ``aiohttp``, through ``default_json_serialize``;
+    that path has its own test beside that function. This row covers the
+    scalar branch, which encodes here and now.
+    """
+    with pytest.raises(ConfigurationError) as raised:
+        await application_json_filters(object(), request_type='POST')
+
+    assert 'not JSON-serialisable' in str(raised.value)
+    assert raised.value.code == 'CONFIG'
+    assert raised.value.status_code == 400
