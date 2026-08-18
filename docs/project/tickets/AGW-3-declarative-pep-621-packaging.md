@@ -39,8 +39,11 @@ Closes findings: M22, M23, H26, L16, L17.
   `License-Expression: MIT` + `License-File: LICENSE` (metadata 2.4). **Consequence routed to AGW-28:**
   R34's criterion "the `license` field, classifier and file agree" is now *unsatisfiable as worded* —
   it needs a spec amendment, NOT a re-added classifier.
-- **`Development Status :: 4 - Beta`** (was `5 - Production/Stable`, which was L17's false claim). The
-  package has never been published. R4-AC6's justification belongs in the CHANGELOG at AGW-31.
+- **`Development Status :: 4 - Beta`** (was `5 - Production/Stable`, which was L17's false claim). ~~The
+  package has never been published.~~ **CORRECTED 2026-08-18:** the code is published as
+  `asyncio-requests 2.7.3`; only the new name is unpublished. Beta still holds — the inherited tree did
+  not import from a clean install, and this rewrite has no field experience under this name.
+  R4-AC6's justification belongs in the CHANGELOG at AGW-31.
 - **`download_url` not carried forward.** PEP 621 has no such field, and the old value pointed at *a
   different project's* release tarball (H25). AGW-28/R5-AC5 is therefore already satisfied.
 - **`requires-python = ">=3.10"`** — OQ3 defaults to the spec's recommendation; the orchestrator ruled

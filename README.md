@@ -27,6 +27,7 @@ and call it.
 ## Contents
 
 - [Install](#install)
+- [Migrating from `asyncio-requests`](#migrating-from-asyncio-requests)
 - [Quickstart per protocol](#quickstart-per-protocol)
 - [Public API reference](#public-api-reference)
 - [The response envelope](#the-response-envelope)
@@ -70,6 +71,46 @@ project, and the decision to keep, replace or vendor it is recorded under
 JSON is encoded with **orjson**. Note that `orjson.dumps` returns `bytes`; the
 library wraps it so aiohttp's `str`-returning contract holds. If you supply your
 own `serialization` callable it must return `str`.
+
+---
+
+## Migrating from `asyncio-requests`
+
+**This package is the continuation of
+[`asyncio-requests`](https://pypi.org/project/asyncio-requests/), under a new
+name.** That distribution is retired at `2.7.3` and will receive no further
+releases; development continues here. If you install `asyncio-requests` today,
+this is where it went.
+
+The rename is why the version resets from `2.7.3` to `1.0.0`: `async-gateway`
+is a new distribution name with no release history, so the reset cannot move
+any installed package backwards or invalidate any pin. It also means `pip
+install --upgrade asyncio-requests` will **not** find this release — migrating
+is a deliberate step, not something a resolver does to you.
+
+To migrate:
+
+1. Replace `asyncio-requests` with `async-gateway` in your dependencies.
+2. Change the import path — `asyncio_requests` becomes `async_gateway`. The
+   entry point keeps its name:
+
+```text
+# before
+from asyncio_requests.asyncio_request import request
+# after
+from async_gateway.async_gateway import request
+```
+
+3. Work through the breaking changes in [CHANGELOG.md](CHANGELOG.md): the
+   single response envelope, the removal of `api_response`, `tat` renamed to
+   `latency`, the FTP `verify_ssl` default flip, SFTP host-key verification on
+   by default, and the `logic/*` module renames.
+
+**Before you defer this:** `asyncio-requests <= 2.7.3` ships with SSH host-key
+verification disabled on SFTP, an FTP path that raises on every call, and a
+SOAP module that is an empty file. All three are fixed here. The details, the
+impact of each, and what to do if you cannot migrate yet are in the
+[security advisory](CHANGELOG.md#security-advisory--asyncio-requests--273).
 
 ---
 
@@ -1469,7 +1510,11 @@ asyncio throughout — there is no synchronous entry point and none is planned.
 
 ## Versioning policy
 
-[Semantic versioning](https://semver.org/). Given `MAJOR.MINOR.PATCH`:
+[Semantic versioning](https://semver.org/). `1.0.0` is the first release under
+the name `async-gateway`; it follows `asyncio-requests 2.7.3` under the old
+name, and the reset is explained in
+[Migrating from `asyncio-requests`](#migrating-from-asyncio-requests). Given
+`MAJOR.MINOR.PATCH`:
 
 - **MAJOR** — a breaking change to the public surface: `request()`'s signature,
   the envelope's key set, an `error['code']` value, or a documented default that
@@ -1598,3 +1643,10 @@ Copyright (c) 2026 Arjunsingh Yadav, and Copyright (c) 2022 Fynd and
 contributors to this fork. Both notices are reproduced here because `LICENSE`
 carries both: this project began as a fork of Fynd's `aio-requests`, and MIT
 requires the original notice to travel with the code.
+
+That fork was published as
+[`asyncio-requests`](https://pypi.org/project/asyncio-requests/) (12 releases,
+2022-02-24 to 2023-01-02, last at `2.7.3`), authored by Arjunsingh Yadav,
+Manish Magnani and Devesh Ratthour at Fynd. `async-gateway` is its
+continuation under a new name — see
+[Migrating from `asyncio-requests`](#migrating-from-asyncio-requests).

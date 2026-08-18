@@ -35,8 +35,9 @@ authors = [
     { name = "Arjunsingh Yadav", email = "arjun.yadav013@gmail.com" },
 ]
 classifiers = [
-    # Deliberate downgrade from `5 - Production/Stable` (L17): the package has
-    # never been published and does not yet import from a clean install.
+    # Deliberate downgrade from `5 - Production/Stable` (L17): the inherited
+    # tree did not import from a clean install, and this rewrite has no field
+    # experience under this name yet.
     # Re-examined and justified in the CHANGELOG at the release step.
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

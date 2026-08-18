@@ -11,38 +11,101 @@ Nothing yet.
 
 ## [1.0.0] — unreleased
 
-The first release of this package, and a near-total rewrite of the code it
-inherited. Read the two notes below before the change list: they are what make
-a release numbered *lower* than its predecessor safe.
+The first release **under this name**, and a near-total rewrite of the code it
+inherited. Read the three notes below before the change list: they are what
+make a release numbered *lower* than its predecessor safe, and what its
+existing users need to do about it.
 
-### About the version going down, from 2.7.3 to 1.0.0
+### About the rename, and the version going down from 2.7.3 to 1.0.0
 
-**This package has never been published.** `pip install async-gateway` returns
-404 from PyPI: there is no `2.x` on any index, no release history, and
-therefore **zero installed users**. The `2.7.3` in the packaging metadata was
-inherited from the fork this repository was squashed from; the `2.x` lineage
-itself is not in this repository's history at all.
+**This code is published — under a different name.** It ships today as
+[`asyncio-requests`](https://pypi.org/project/asyncio-requests/), currently at
+`2.7.3` (uploaded 2023-01-02), with 12 releases going back to 2022-02-24 and
+roughly 110 downloads a month. That distribution is the direct predecessor of
+this one: same `request()` entry point, same `logic/{http,ftp,sftp,soap}.py`
+layout, and `2.7.3` is the exact version this repository inherited in its
+packaging metadata.
 
-That is the whole of why the reset is safe, and the safety is conditional on
-it. Nobody can be broken by a version moving backwards when nobody could ever
-have installed the version it moved back from. There is no resolver to
-confuse, no pin to invalidate, no `>=2.0` constraint in anyone's requirements
-file. Had a single `2.x` been uploaded, this release would have had to go
-*forward* instead, and the breaking changes below would have needed a
-deprecation path rather than a clean statement.
+So this release is **a rename with a discontinued predecessor**, not a first
+release of new code. `asyncio-requests` is retired at `2.7.3`; development
+continues here as `async-gateway`.
 
-`1.0.0` is therefore an honest first release: it says "this is version one of
-a library you have not used before," which is true, where `2.7.4` would have
-implied a lineage of published releases that does not exist.
+The version reset is safe, but not for the reason a first release would be
+safe. It is safe because **the new distribution name has no history**:
+`async-gateway` has never been uploaded to PyPI, so no resolver can be
+confused, no pin can be invalidated, and no `>=2.0` constraint can exist —
+nobody can hold a requirement on a name that has never existed. Publishing
+`async-gateway 1.0.0` cannot move any installed package backwards, because no
+installed package answers to that name.
+
+What is *not* true is that this code has no users. It has them, on the old
+name, and they are the subject of the next two notes.
+
+### For existing `asyncio-requests` users
+
+You are not carried along by a resolver. `pip install --upgrade
+asyncio-requests` will not find this release, by design — a rename means the
+migration is deliberate, which is the honest trade for not silently swapping a
+package's import path and behaviour underneath a working program.
+
+To migrate:
+
+1. Replace the dependency: drop `asyncio-requests`, add `async-gateway`.
+2. Change the import path: `asyncio_requests` becomes `async_gateway`. The
+   entry point keeps its name — `async_gateway.async_gateway.request()`.
+3. Work through the breaking changes listed below. They are real, and against
+   `2.7.3` they are the changes you will actually feel: the single response
+   envelope, the removal of `api_response`, `tat` becoming `latency`, the FTP
+   `verify_ssl` default flip, SFTP host-key verification now on by default,
+   and the `logic/*` module renames.
+
+Staying on `asyncio-requests 2.7.3` is a choice to stay on the defects in the
+advisory below. It will receive no further releases.
+
+### Security advisory — `asyncio-requests <= 2.7.3`
+
+The published predecessor carries three defects that this release fixes. They
+are stated here because that distribution has current users who cannot see
+this repository's history. No CVE has been requested or assigned for any of
+them; the severities below are our own plain description of the impact, not a
+scored rating.
+
+- **SFTP host-key verification is disabled**
+  (`asyncio_requests/logic/sftp.py:42`, `known_hosts=None`). Every SFTP
+  connection accepts any host key without checking it, so a machine-in-the-
+  middle on the network path can impersonate the server and read or alter the
+  transferred file and the credentials used to fetch it. This is the one to
+  act on first. In this release, host-key verification is **on** by default.
+- **FTP raises on every call** (`asyncio_requests/logic/ftp.py:50-52`):
+  `verify_ssl` is bound only inside an `if`, so any code path reaching the
+  connect call hits `UnboundLocalError`. The FTP protocol has therefore never
+  worked in a published release; the impact is a hard failure, not silent
+  corruption.
+- **SOAP is advertised but absent**
+  (`asyncio_requests/logic/soap.py` is a zero-byte file). Requesting `'SOAP'`
+  raises `TypeError: 'NoneType' object is not callable` rather than making a
+  call. SOAP is implemented for real in this release.
+
+Separately, `2.7.3` pins its dependencies at `aiohttp>=3.7.3`,
+`ujson>=4.0.1`, `zeep[async]==4.0.0` and `aioboto3==8.0.5`. The two exact pins
+in particular hold those packages at 2020–2021 releases, so an install
+inherits whatever vulnerabilities have been reported against them since. This
+release ships current, patched versions.
+
+**Remedy:** migrate to `async-gateway 1.0.0` as described above. If you cannot
+migrate yet, treat SFTP through `asyncio-requests` as unauthenticated at the
+host level and do not use it over an untrusted network; the FTP and SOAP paths
+are non-functional and nothing depends on them.
 
 ### About the breaking changes
 
 They are listed as breaking, plainly and in full, because that is what they
-are — measured against the previous *code*, not against a previous *release*.
-With no consumers, none of them breaks anyone today. They are recorded so that
-someone comparing this code against the old README, an internal fork, or a
-vendored copy can see exactly what moved, rather than discovering it at
-runtime.
+are — measured against `asyncio-requests 2.7.3`, the code and the release
+both. Under the new name none of them can break an existing install, because
+no existing install resolves to it; they are recorded so that anyone migrating
+from `asyncio-requests` — or comparing this code against the old README, an
+internal fork, or a vendored copy — can see exactly what moved, rather than
+discovering it at runtime.
 
 ### Added
 
@@ -296,12 +359,13 @@ runtime.
   retained. The `release = '2.1'` version claim in `conf.py` — a third,
   independent version number — goes with them.
 - **`Development Status :: 4 - Beta`, not `5 - Production/Stable`.** The
-  inherited metadata claimed Production/Stable for a package that had never
-  been published and could not be imported from a clean install. Beta is the
-  honest claim for a first release: the API is settled and the test suite is
-  thorough, but no version of this library has yet run in anyone's production
-  system, and that is precisely what the classifier is asked to report. It is
-  worth revisiting once there is field experience to point at.
+  inherited metadata claimed Production/Stable for a package that could not be
+  imported from a clean install. Beta is the honest claim for a first release
+  under this name: the API is settled and the test suite is thorough, but this
+  rewrite has not yet run in anyone's production system — whatever field
+  experience `asyncio-requests` accumulated was against code this release
+  largely replaces — and that is precisely what the classifier is asked to
+  report. It is worth revisiting once there is field experience to point at.
 
 ### Versioning policy
 

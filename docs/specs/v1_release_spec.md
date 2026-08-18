@@ -18,15 +18,30 @@ critique (stage 1e.5); `em-approved` is not final until it returns CONFIRMED.
 
 `async-gateway` is a ~1,133-LOC pure-Python async client library (22 `.py` files) that other projects
 import to make HTTP / FTP / SFTP / SOAP calls behind one config-driven entry point,
-`async_gateway.async_gateway.request()`. It is a fork, currently versioned `2.7.3`, and it has **never
+`async_gateway.async_gateway.request()`. It is a fork, currently versioned `2.7.3`. ~~It has **never
 been published**: `pypi.org/pypi/async-gateway/json` returns 404, `pypi.org/simple/async-gateway/`
 returns 404, and `pip download async-gateway` reports no matching distribution. There are zero users,
-zero consumers and zero production deployments.
+zero consumers and zero production deployments.~~
 
-That framing governs this entire document. **This is a pre-release checklist, not an incident report.**
-Every defect below is real and every one bites on first publish — none of them has hurt anyone yet.
-It is also what makes the plan cheap: with no consumers, breaking changes (a single response envelope,
-a version reset, a renamed module) cost nothing today and cost a great deal the day after first upload.
+> **CORRECTED 2026-08-18 — the 404 was verified against the wrong name.** `async-gateway` is
+> indeed free on PyPI, but that is the *new* name. **This code is published**, as
+> [`asyncio-requests`](https://pypi.org/project/asyncio-requests/) — 12 releases from 2022-02-24,
+> currently `2.7.3` (2023-01-02, the exact version this repository inherited), ~110 downloads/month.
+> Same `request()` entry point, same `logic/{http,ftp,sftp,soap}.py` layout. So there are **real
+> current users**, on the old name. What remains true is the narrower claim the plan actually needs:
+> the **name** `async-gateway` has no release history, so no resolver, pin or `>=2.0` constraint can
+> be broken by publishing `1.0.0` under it. The release is therefore **a rename with a discontinued
+> predecessor**, not a first release; existing `asyncio-requests` users migrate deliberately rather
+> than being carried by a resolver. The published `2.7.3` still carries the SFTP `known_hosts=None`,
+> FTP `UnboundLocalError` and zero-byte SOAP defects, which is why `CHANGELOG.md` gains a
+> **Security advisory** disclosing them.
+
+That framing governs this entire document. **This is a pre-release checklist, not an incident report**
+— for the new name. Every defect below is real; each one bites any new user on first publish, and
+~~none of them has hurt anyone yet~~ **the three named in the advisory are live today for
+`asyncio-requests` users**. It is also what makes the plan cheap: with no consumers *of the new name*,
+breaking changes (a single response envelope, a version reset, a renamed module) cost nothing today
+and cost a great deal the day after first upload.
 
 The delivered state does not match the intent. From a clean install the documented entry point raises
 `ModuleNotFoundError` (`ujson` imported by three runtime modules, declared nowhere). FTP raises
@@ -2133,8 +2148,15 @@ contains and what the versioning policy is, so that I can judge whether to depen
 
 **Acceptance Criteria**:
 - [ ] `CHANGELOG.md` exists, follows Keep-a-Changelog structure, and has a `1.0.0` entry.
-- [ ] The `1.0.0` entry states plainly that the package was never published before, that the version
-      moved **down** from the fork-inherited `2.7.3`, and why that is safe.
+- [ ] ~~The `1.0.0` entry states plainly that the package was never published before, that the version
+      moved **down** from the fork-inherited `2.7.3`, and why that is safe.~~ **CORRECTED 2026-08-18
+      (see the Overview):** the entry states that this is a **rename** of the published
+      `asyncio-requests` (retired at `2.7.3`), that the version moved **down** because the *new
+      distribution name* has no release history, and how existing `asyncio-requests` users migrate.
+- [ ] **Added 2026-08-18:** the `1.0.0` entry carries a **Security advisory** naming
+      `asyncio-requests <= 2.7.3` and its three live defects — SFTP `known_hosts=None`
+      (`logic/sftp.py:42`), FTP `UnboundLocalError` (`logic/ftp.py:50-52`), zero-byte
+      `logic/soap.py` — with the impact of each and the remedy. `README.md` links to it.
 - [ ] It lists the breaking changes as breaking: the single response envelope, the removal of
       `api_response`, `tat` → `latency`, the FTP `verify_ssl` default flip, SFTP host-key verification
       on by default, and the `logic/*` module renames.
@@ -2155,7 +2177,7 @@ none. Accept only with the CI step above.
 `author='Arjunsingh Yadav'`; the initial commit contains only `.gitignore` + `LICENSE` with the whole
 codebase squashed in afterwards, so the 2.x lineage is not in this repository. The MIT notice **is**
 preserved verbatim, so there is no licence violation — this is provenance hygiene to settle before a
-first release, not a defect that harms anyone.
+first release under the new name, not a defect that harms anyone.
 
 **User Story**: As a developer whose company's legal review reads the LICENSE of every dependency, I
 want the copyright holder and the licence text to be correct and internally consistent with the
@@ -2265,9 +2287,16 @@ while the dependency set is un-upgraded**, and R6's advisory scan ("zero Critica
 set") is the gate.
 
 What the withdrawn disclosure got right, and is worth keeping on the record: nothing is published
-during the delivery window (locked decision 4; A1/OQ4 confirm PyPI 404s) and there are zero consumers,
-so C7's advisories were never *reachable* by anyone. The deferral's flaw was never its security
-exposure — it was the schedule bomb hidden underneath it.
+*under this name* during the delivery window (locked decision 4; A1/OQ4 confirm PyPI 404s **for the
+name `async-gateway`**), so C7's advisories were never reachable through *this* distribution. The
+deferral's flaw was never its security exposure — it was the schedule bomb hidden underneath it.
+
+> **Narrowed 2026-08-18 (A1's correction).** "There are zero consumers, so C7's advisories were never
+> *reachable by anyone*" is too strong. `asyncio-requests 2.7.3` is published and installed, and its
+> pinned `aiohttp>=3.7.3` / `zeep[async]==4.0.0` / `aioboto3==8.0.5` are reachable by its users right
+> now. What holds is the narrower claim above: nothing reaches them *through `async-gateway`*, which
+> has never been installable. The exposure that does exist is disclosed in the CHANGELOG's
+> **Security advisory**, and the remedy is the migration this release exists to offer.
 
 ---
 
@@ -2595,10 +2624,10 @@ written in. Any of them being false changes the plan.
 
 | # | Assumption | If it is false |
 |---|---|---|
-| A1 | **The package is still unpublished at implementation time.** Every "breaking change is free" argument in this spec rests on it. | R5's version reset becomes impossible (you cannot go down from a published version) and R8's envelope change becomes a genuine breaking change requiring a major-version story and a migration note. Re-verify `pypi.org/pypi/async-gateway/json` immediately before starting. |
+| A1 | ~~**The package is still unpublished at implementation time.** Every "breaking change is free" argument in this spec rests on it.~~ **PARTIALLY FALSE — resolved 2026-08-18.** The 404 was verified against the *new* name. The code **is** published as `asyncio-requests 2.7.3` (~110 downloads/month), so "zero users" was wrong; but the **name** `async-gateway` genuinely has no history, which is the part the plan needs. The assumption is restated as: **the distribution name `async-gateway` is unpublished** — re-verify `pypi.org/pypi/async-gateway/json` immediately before uploading. | *(Was: "R5's version reset becomes impossible and R8's envelope change becomes a genuine breaking change requiring a major-version story and a migration note.")* In the event: the reset **survives** — a new name cannot break a pin — and the plan changes only in framing and disclosure, not in engineering. R33 gains the rename narrative, a migration path for `asyncio-requests` users, and a **Security advisory** for the three defects live in the published `2.7.3`. |
 | A2 | **The seven pre-approved dependency versions still exist and still resolve together** on the target Python. They were live-verified 2026-08-15. | R6's story re-verifies and, if a version has been yanked, escalates rather than silently picking a neighbour. |
 | A3 | **The audit's `file:line` citations still match `31542aa`.** This spec re-read every source file and confirmed the load-bearing ones; a few line numbers drift by 1-2 (e.g. H14's `request_helper.py:216` is the `content_type` assignment; the failing call is at `:217-218`). | Citations are navigational, not contractual; the acceptance criteria name behaviour, not lines. |
-| A4 | **There is no consumer of `async_gateway.logic.http` (or any other internal module path).** | R27's rename to `*_client.py` would need a deprecation shim. Verified as far as possible: the package is unpublished and the README only documents `async_gateway.async_gateway.request`. |
+| A4 | **There is no consumer of `async_gateway.logic.http` (or any other internal module path).** **Still holds after A1's correction (2026-08-18)**, and for a stronger reason: the published consumers import `asyncio_requests.*`, never `async_gateway.*`, so no import of this package's paths exists anywhere. | R27's rename to `*_client.py` would need a deprecation shim. ~~Verified as far as possible: the package is unpublished and~~ the README only documents `async_gateway.async_gateway.request` — and a shim under this name would have nothing to catch, since migrating users change the top-level package name regardless. |
 | A5 | ~~**`aioresponses` (or an equivalent) can mock the aiohttp version R6 selects.**~~ **No longer an assumption — executed, and FALSE.** See the decided-fact box below the table. | *(Was: "R2's tooling story escalates; the fallback is a local `aiohttp.web` test server.")* The fallback is now the plan: Ruling A makes the `aiohttp.web` test server the primary HTTP/SOAP fixture and removes `aioresponses` from R2, Step 1 and the dev dependency set. |
 | A6 | **`asyncssh` and `aioftp` can be driven entirely through mocks to 100% branch coverage** without a live server. | R28's coverage target would need a containerised server fixture in CI — a materially larger testing story. **With A5 resolved, this is again the single biggest *open* schedule risk in the plan** (the plan critique correctly noted that while A5 stood, A5 was). Note that A5's resolution does not help here: the `aiohttp.web` fixture is an aiohttp-specific answer and gives `asyncssh`/`aioftp` nothing. |
 | A7 | **The repository's git history is authoritative for provenance.** The initial commit contains only `.gitignore` + `LICENSE`, with the whole codebase squashed in afterwards, so the 2.x lineage is *not* in this repository. | R34's copyright decision needs information from outside the repository — which is why it is a human decision (OQ7). |
@@ -4057,6 +4086,18 @@ argument here rests on it: the version reset (R5), the envelope replacement (R8)
 `api_response`, the module renames (R27). If anything is uploaded before this lands, three requirements
 change shape at once and the version can only go forward. *Resolved:* OQ4 makes re-verifying the PyPI
 404 a gating step immediately before R5, recorded in the ticket work log.
+
+> **And it broke — 2026-08-18, in the way the resolution could not catch.** Nominating A1 as the
+> riskiest assumption was correct. The *resolution* was not: re-verifying the 404 checks the name
+> being published, and the name being published is not the name the code ships under today. The 404
+> was real and meaningless. `asyncio-requests 2.7.3` had been on PyPI since 2023 with ~110
+> downloads/month the whole time, and no number of re-verifications of
+> `pypi.org/pypi/async-gateway/json` would ever have revealed it. **The lesson is that a
+> "verify before starting" step inherits the blind spot of whatever identifier it is given** — the
+> check must be "is this *code* published, under any name" (search PyPI for the author, the
+> homepage, the module layout), not "is this *string* free". The plan survived on the merits: a new
+> name cannot break a pin, so R5, R8 and R27 stand unchanged. What it cost was the disclosure the
+> real users were owed, which the release nearly shipped without.
 
 **And the assumption this self-critique got wrong — recorded rather than quietly corrected.** Two
 revisions of this document nominated A1 as the riskiest assumption and A6 as the biggest schedule

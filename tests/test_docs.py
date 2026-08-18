@@ -1129,6 +1129,103 @@ def test_the_traceback_logging_tradeoff_is_documented() -> None:
     assert 'group' in section, (
         'the README does not state the APM grouping this costs')
 
+
+# --------------------------------------------------------------------------
+# The predecessor disclosure. This release was written on the premise that
+# the package had never been published -- verified against the *new* name,
+# which 404s because it is new. The code ships as `asyncio-requests 2.7.3`
+# with real current users, and that distribution still carries the defects
+# fixed here. These tests pin the corrected claim so the docs cannot drift
+# back to the comfortable one.
+# --------------------------------------------------------------------------
+
+#: The published predecessor's distribution name.
+PREDECESSOR = 'asyncio-requests'
+
+#: The defects live in the published predecessor, as `file:line` anchors the
+#: advisory must name. Keyed by the shorthand used in the failure message.
+ADVISORY_ANCHORS = {
+    'SFTP host-key verification': 'logic/sftp.py:42',
+    'the FTP UnboundLocalError': 'logic/ftp.py:50-52',
+    'the zero-byte SOAP module': 'logic/soap.py',
+}
+
+
+def test_no_document_claims_the_package_was_never_published() -> None:
+    """Check the false premise is not asserted in the README or CHANGELOG.
+
+    The claim is false: this code is published as ``asyncio-requests``. A
+    struck-through or quoted historical record is fine and expected in the
+    specs, which keep their corrections visible -- but the two documents a
+    consumer actually reads must not assert it in their own voice.
+    """
+    claim = re.compile(
+        r'never (?:been )?published|zero (?:installed |published )?users',
+        re.IGNORECASE)
+    offenders = [
+        f'{path.name}:{number}'
+        for path in (README, REPO_ROOT / 'CHANGELOG.md')
+        for number, line in enumerate(
+            path.read_text(encoding='utf-8').splitlines(), start=1)
+        if claim.search(line) and '~~' not in line
+    ]
+    assert not offenders, (
+        f'the "never published" claim is asserted at {offenders}; this code '
+        f'ships as {PREDECESSOR} and the claim was verified against the new '
+        'name, which 404s only because it is new'
+    )
+
+
+def test_the_readme_tells_predecessor_users_how_to_migrate() -> None:
+    """Check the README names the predecessor and the import-path change.
+
+    The rename means no resolver carries an ``asyncio-requests`` user across;
+    the migration is deliberate, so the instructions have to be present and
+    have to name both package names.
+    """
+    section = prose_after('## Migrating from `asyncio-requests`')
+    assert PREDECESSOR in section
+    assert 'asyncio_requests' in section and 'async_gateway' in section, (
+        'the README does not state the import-path change')
+    assert '2.7.3' in section, (
+        'the README does not name the version the predecessor is retired at')
+
+
+def test_the_changelog_advisory_names_every_defect_and_its_anchor() -> None:
+    """Check the security advisory is present and names all three defects.
+
+    The advisory exists so the predecessor's current users can act. An
+    advisory that omits one of the three, or names it without the
+    ``file:line`` that lets a reader confirm it, is not doing that job.
+    """
+    changelog = (REPO_ROOT / 'CHANGELOG.md').read_text(encoding='utf-8')
+    heading = '### Security advisory'
+    assert heading in changelog, 'the CHANGELOG carries no security advisory'
+    advisory = changelog.partition(heading)[2].partition('\n### ')[0]
+    advisory = ' '.join(advisory.split())
+
+    assert f'{PREDECESSOR} <= 2.7.3' in advisory, (
+        'the advisory does not name the affected package and version bound')
+    missing = [
+        f'{name} ({anchor})'
+        for name, anchor in ADVISORY_ANCHORS.items()
+        if anchor.replace(' ', '') not in advisory.replace(' ', '')
+    ]
+    assert not missing, f'the advisory does not anchor: {missing}'
+    assert 'migrate' in advisory.lower(), (
+        'the advisory states no remedy')
+
+
+def test_the_readme_links_the_changelog_advisory() -> None:
+    """Check the README points at the advisory rather than restating it.
+
+    One statement of the disclosure, linked from the other document, is the
+    same anti-drift rule the versioning policy follows.
+    """
+    assert 'CHANGELOG.md#security-advisory' in README_TEXT, (
+        'the README does not link the CHANGELOG security advisory')
+
+
 # ==========================================================================
 # Part B (R30) -- the source-tree documentation and annotation
 # standard. Everything below polices ``async_gateway/`` itself and is

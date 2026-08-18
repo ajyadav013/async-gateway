@@ -19,7 +19,8 @@ too. The CI gate is what stops the changelog rotting after this release.
 
 ## Definition of Done
 
-- Keep-a-Changelog with a `1.0.0` entry stating plainly that the package was **never published**, that the version moved **down** from the fork-inherited 2.7.3, and why that is safe
+- Keep-a-Changelog with a `1.0.0` entry stating plainly ~~that the package was **never published**~~ **(CORRECTED 2026-08-18 — see the work log)** that this is a **rename with a discontinued predecessor**, that the version moved **down** from the fork-inherited 2.7.3, and why that is safe
+- a **migration path** for existing `asyncio-requests` users, and a **Security advisory** for the three defects live in the published 2.7.3
 - breaking changes listed **as breaking**: the single envelope, removal of `api_response`, `tat`→`latency`, the FTP `verify_ssl` default flip, SFTP host-key verification on by default, the `logic/*` renames
 - records the **R7 decision** (AGW-23's ADR) and the **R31 docs decision** (AGW-28)
 - the `Development Status` classifier choice justified here (R4-AC6's discharge point)
@@ -116,3 +117,25 @@ too. The CI gate is what stops the changelog rotting after this release.
   (AGW-29); the Sphinx file deletions themselves (AGW-28) — this CHANGELOG records the R31-AC4
   decision and its reason, which is this story's criterion, not the deletion.
 - **Commits:** `e2b94fe` (examples + their tests), `5974cde` (CHANGELOG + CI).
+
+### 2026-08-18 — corrected premise + security advisory (post-`v1.0rc-1`)
+
+- **The false premise.** The whole release was written on "this package has never been published,
+  therefore zero installed users". That was verified against the **wrong name**:
+  `pypi.org/pypi/async-gateway/json` does 404, but `async-gateway` is the *new* name. This code ships
+  today as [`asyncio-requests`](https://pypi.org/project/asyncio-requests/) — 12 releases from
+  2022-02-24, currently `2.7.3` (2023-01-02, the exact inherited version), ~110 downloads/month, same
+  `request()` entry point and same `logic/{http,ftp,sftp,soap}.py` layout.
+- **What survives.** The `1.0.0` reset stands, for a corrected reason: the *distribution name*
+  `async-gateway` has no history, so no resolver, pin or `>=2.0` constraint can be broken. The release
+  is **a rename with a discontinued predecessor**, not a first release. No engineering changed.
+- **What was added.** `CHANGELOG.md`: the rename narrative, a "For existing `asyncio-requests` users"
+  migration section, and a **Security advisory** for `asyncio-requests <= 2.7.3` naming
+  `logic/sftp.py:42` (`known_hosts=None` — MITM on SFTP), `logic/ftp.py:50-52` (`UnboundLocalError` on
+  every call), and the zero-byte `logic/soap.py`, plus the unpatched dependency pins. `README.md`:
+  a "Migrating from `asyncio-requests`" section linking the advisory, plus versioning-policy and
+  attribution corrections.
+- **Pinned by tests** so the docs cannot drift back: `tests/test_docs.py` (migration section, advisory
+  link, no revived false claim) and `tests/test_packaging.py` (the reset's stated reason).
+- **Remaining publish-time step, human-owned:** a final `asyncio-requests 2.7.4` pointing at the new
+  name. Not done here.
