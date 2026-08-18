@@ -167,6 +167,20 @@ SYMLINK_ERRNOS: Final[frozenset[int]] = frozenset(
     ) if code is not None
 )
 
+#: The errnos an ``O_NONBLOCK`` open answers with when the target is not
+#: something a regular write can land on. ``ENXIO`` is the POSIX answer
+#: for a FIFO opened for writing with no reader attached, and is also
+#: what Linux answers for a bound unix socket; macOS answers
+#: ``EOPNOTSUPP`` for the socket instead. Both mean the same thing here,
+#: and a set spanning them is what keeps the refusal identical on both
+#: platforms rather than letting one of them escape as a bare ``OSError``.
+NOT_A_REGULAR_FILE_ERRNOS: Final[frozenset[int]] = frozenset(
+    code for code in (
+        getattr(errno, 'ENXIO', None),
+        getattr(errno, 'EOPNOTSUPP', None),
+    ) if code is not None
+)
+
 #: ``O_DIRECTORY`` where the platform has it, else 0. Used on every
 #: intermediate step of the descriptor walk so that a component which
 #: has become a *file* between two steps is refused by the kernel rather
@@ -326,6 +340,32 @@ def _describe(mode: int) -> str:
         if predicate(mode):
             return name
     return 'special file'
+
+
+def _describe_at(parent_fd: int, leaf: str) -> str:
+    """Name what sits at ``leaf``, asked relative to an open directory.
+
+    The counterpart to :func:`_describe` for the one refusal that has no
+    descriptor to ``fstat``: when the open itself fails there is nothing
+    to inspect but the name. That makes this an ``lstat`` on a path, and
+    so in principle raceable -- but only in the direction of a *wrong
+    noun in an error message*, because the open has already been refused
+    and no write can follow. Naming the kind is worth that, and getting
+    it wrong is what a hardcoded "named pipe" did on Linux, where a
+    bound unix socket earns the same ``ENXIO`` a reader-less FIFO does.
+
+    Args:
+        parent_fd: The open descriptor for the containing directory.
+        leaf: The final component to describe.
+
+    Returns:
+        A short human-readable name for the object kind, falling back to
+        the generic phrase when the entry cannot be stat'ed at all.
+    """
+    try:
+        return _describe(os.lstat(leaf, dir_fd=parent_fd).st_mode)
+    except OSError:
+        return 'named pipe or unconnected device'
 
 
 def _names_a_directory(relative: PurePath) -> bool:
@@ -673,19 +713,21 @@ def open_within(path: str, flags: int, *, nofollow: int = O_NOFOLLOW) -> int:
                 dir_fd=parent_fd,
             )
         except OSError as err:
-            # ``ENXIO`` is what ``O_NONBLOCK`` converts N3's hang into: a
-            # FIFO opened for writing with no reader attached. Without
-            # the flag this call would block forever in a threadpool
-            # worker; with it the kernel answers immediately, and the
-            # answer means "not a regular file" just as surely as the
-            # ``fstat`` below would have. Typed here rather than left to
+            # ``O_NONBLOCK`` converts N3's hang into an errno, and which
+            # errno depends on the platform: Linux answers ``ENXIO`` for
+            # both a reader-less FIFO and a bound unix socket, while
+            # macOS answers ``ENXIO`` for the FIFO and ``EOPNOTSUPP``
+            # for the socket. Both are refusals of the same kind --
+            # "this is not a regular file" -- so both are typed, and the
+            # message asks the filesystem what is actually there rather
+            # than assuming the FIFO. Typed here rather than left to
             # `classify_refusal`, because this is the one site that
             # knows the errno came from *this* library's own open flag.
-            if err.errno != errno.ENXIO:
+            if err.errno not in NOT_A_REGULAR_FILE_ERRNOS:
                 raise
             raise PathContainmentError(
-                f'refusing to write to {str(path)!r}, which is a named '
-                f'pipe or unconnected device rather than a regular '
+                f'refusing to write to {str(path)!r}, which is a '
+                f'{_describe_at(parent_fd, leaf)} rather than a regular '
                 f'file') from err
     finally:
         os.close(parent_fd)

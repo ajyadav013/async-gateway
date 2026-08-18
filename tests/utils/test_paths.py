@@ -35,6 +35,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Optional, Text
+from unittest import mock
 
 import pytest
 
@@ -1228,6 +1229,76 @@ def test_n3_a_fifo_with_a_reader_is_still_refused(tmp_path: Path) -> None:
         os.close(reader)
 
     assert 'named pipe' in str(caught.value)
+
+
+def test_a_socket_is_refused_and_named_a_socket(tmp_path: Path) -> None:
+    """The refused-open message names what is there, on every platform.
+
+    A container run caught this and the host suite could not: Linux
+    answers ``ENXIO`` for a bound unix socket, exactly as it does for a
+    reader-less FIFO, so a branch that hardcoded "named pipe" told a
+    Linux operator their socket was a pipe. macOS answers
+    ``EOPNOTSUPP`` for the same open, took the untyped path, and left
+    the assertion satisfied by its ``OSError`` alternative -- which is
+    why only the container saw it.
+
+    Both errnos are now refusals of the same kind, and the noun is read
+    off the filesystem rather than assumed. Asserted here on the
+    refusal *type* as well as the wording, because the macOS half of the
+    defect was a bare ``OSError`` escaping where a containment refusal
+    was owed.
+    """
+    # Bound from inside a short-named directory: `AF_UNIX` paths are
+    # capped near 104 bytes on macOS and pytest's `tmp_path` alone
+    # already exceeds it, so binding by absolute path fails before the
+    # code under test is reached. The *parent* is then canonicalised for
+    # the open, because `/tmp` is itself a symlink on macOS and the
+    # descriptor walk refuses a symlinked component by design -- which
+    # would fail this test for the wrong reason.
+    endpoint = Path(tempfile.mkdtemp(dir='/tmp')) / 's'
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(endpoint))
+        target = endpoint.parent.resolve() / endpoint.name
+        with pytest.raises(PathContainmentError) as caught:
+            guarded_opener(overwrite=True)(
+                str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    finally:
+        server.close()
+        shutil.rmtree(endpoint.parent, ignore_errors=True)
+
+    assert 'socket' in str(caught.value)
+
+
+def test_the_refusal_still_names_something_when_the_entry_vanishes(
+    tmp_path: Path,
+) -> None:
+    """The describing ``lstat`` is best-effort, and says so when it fails.
+
+    Naming the kind means asking the filesystem a second time, after the
+    open has already been refused -- so the entry can be gone by then.
+    That is harmless (nothing can be written; the open failed) but it
+    must not turn a clean containment refusal into an unrelated
+    ``FileNotFoundError`` from the error path itself. Forced here by
+    removing the FIFO between the two syscalls, which is the race the
+    fallback exists for.
+    """
+    target = tmp_path / 'pipe'
+    os.mkfifo(target)
+
+    real_lstat = os.lstat
+
+    def vanishing_lstat(*args: Any, **kwargs: Any) -> os.stat_result:
+        """Delete the FIFO, then answer as the real ``lstat`` would."""
+        target.unlink(missing_ok=True)
+        return real_lstat(*args, **kwargs)
+
+    with mock.patch.object(os, 'lstat', vanishing_lstat):
+        with pytest.raises(PathContainmentError) as caught:
+            guarded_opener(overwrite=True)(
+                str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+    assert 'unconnected device' in str(caught.value)
 
 
 def test_n3_a_character_device_target_is_refused(tmp_path: Path) -> None:
