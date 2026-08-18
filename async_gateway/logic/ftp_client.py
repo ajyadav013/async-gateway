@@ -45,7 +45,10 @@ from async_gateway.helpers.internal.base import (
     credentials_of,
 )
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
+from async_gateway.logic.http_client import validated_max_response_bytes
+from async_gateway.utils.constants import MAX_RESPONSE_BYTES
 from async_gateway.utils.contained_io import (
+    TransferBudget,
     contained_path_io_factory,
     local_base,
 )
@@ -403,6 +406,16 @@ class FTPRequest(BaseRequestClass):
         # local side of a download is a caller-supplied path, so the
         # same decision that governs an HTTP download governs this one.
         self.overwrite: bool = self.info.get('overwrite') is True
+        # R14's ceiling, stated globally in the spec and implemented on
+        # the HTTP family alone until NEW-R10-2. The same call with a
+        # 1 KiB cap and a 256 KiB payload had HTTP refuse with
+        # RESPONSE_TOO_LARGE and write nothing, while this protocol
+        # returned ok=True having written all 262144 bytes -- so the
+        # bound a caller sets to stop a hostile endpoint filling their
+        # disk did not exist here. Validated with the HTTP family's own
+        # validator, so one bad value is one message on every protocol.
+        self.max_response_bytes: int = validated_max_response_bytes(
+            self.info.get('max_response_bytes', MAX_RESPONSE_BYTES))
         # `True`, matching the HTTP client. A default that puts the
         # caller's password on the wire is not a default anyone asked
         # for by name (H1).
@@ -557,7 +570,12 @@ class FTPRequest(BaseRequestClass):
         if not self.client_path:
             return aioftp.pathio.PathIO
         return contained_path_io_factory(
-            local_base(self.client_path), overwrite=self.overwrite)
+            local_base(self.client_path),
+            overwrite=self.overwrite,
+            # One budget per call, built here rather than per file: a
+            # recursive download's file count is the *server's* choice,
+            # so a per-file allowance is no ceiling at all (R14).
+            budget=TransferBudget(self.max_response_bytes))
 
     async def _tls_value(self) -> Union[ssl.SSLContext, bool]:
         """Return what this session hands ``aioftp`` as its ``ssl``.

@@ -470,18 +470,41 @@ FAULT_CATEGORIES: tuple[str, ...] = (
     'PROTOCOL',
 )
 
+#: A body large enough to cross a small cap, for the ``OVER_CAP`` rows.
+#: 256 KiB against a 1 KiB ceiling, the pair the finding was measured
+#: with -- large enough that no buffer absorbs it and the write layer is
+#: genuinely reached.
+OVER_CAP_BODY: bytes = b'B' * 262144
+
+#: The ceiling an ``OVER_CAP`` row sets.
+OVER_CAP_LIMIT: int = 1024
+
+#: The ``error['code']`` a body over the ceiling must produce, on every
+#: protocol that writes locally.
+OVER_CAP_CODE: str = 'RESPONSE_TOO_LARGE'
+
 #: The non-wire fault categories, and the protocols each applies to.
 #: One entry today; a tuple rather than a bare string because the axis
 #: is the point -- the next non-wire fault (a caller-side resource
 #: limit, a clock) gets a row here instead of a bespoke test per
 #: protocol, which is how the wire axis came to have five gaps.
-LOCAL_IO_CATEGORIES: tuple[str, ...] = ('LOCAL_IO',)
+LOCAL_IO_CATEGORIES: tuple[str, ...] = ('LOCAL_IO', 'OVER_CAP')
 
 #: Protocols that cannot produce a given category, with the reason. An
 #: entry here is an exemption that had to be argued for, not a silent gap:
 #: the guard reads this mapping, and a protocol absent from it is held to
 #: every category.
 CATEGORY_EXEMPT: dict[str, dict[str, str]] = {
+    'OVER_CAP': {
+        'SOAP': (
+            'SOAP enforces max_response_bytes on the response body it '
+            'reads -- it shares the HTTP transport, and its own row in '
+            'tests/logic/test_soap_client.py covers that. What it has '
+            'no row for here is a *local write* over the cap, because '
+            'it writes no local file at all: the same reason it is '
+            'exempt from LOCAL_IO, asserted by the same row.'
+        ),
+    },
     'LOCAL_IO': {
         'SOAP': (
             'SOAP passes http_file_download_config=None to the '
@@ -717,6 +740,20 @@ LOCAL_IO_LEAF: str = 'no-such-dir/out.bin'
 LOCAL_IO_CODE: str = 'PATH'
 
 
+#: What a writing double sends. Overridden per row so an ``OVER_CAP``
+#: row can hand down a body larger than the ceiling while a ``LOCAL_IO``
+#: row keeps the small one.
+class WritingFTPClientBody:
+    """Namespace for the body the writing doubles send.
+
+    A module-level mutable would leak between rows; an attribute on a
+    tiny holder is rebound per row by :func:`install_writing_transport`
+    and read at write time.
+    """
+
+    payload: bytes = JSON_BODY
+
+
 class WritingFTPClient(StubFTPClient):
     """An FTP client whose download writes through the real path layer.
 
@@ -747,7 +784,7 @@ class WritingFTPClient(StubFTPClient):
         """
         destination = pathlib.Path(str(args[1]))
         async with self.path_io.open(destination, mode='wb') as handle:
-            await handle.write(JSON_BODY)
+            await handle.write(WritingFTPClientBody.payload)
 
 
 class WritingSFTPClient(StubSFTPClient):
@@ -784,7 +821,7 @@ class WritingSFTPClient(StubSFTPClient):
             None, as ``asyncssh`` does.
         """
         handle = await dstfs.open(os.fsencode(str(dstpath)), 'wb')
-        await handle.write(JSON_BODY, 0)
+        await handle.write(WritingFTPClientBody.payload, 0)
         await handle.close()
 
 
@@ -818,6 +855,7 @@ class WritingFTPContext:
 def install_writing_transport(
     monkeypatch: pytest.MonkeyPatch,
     protocol: str,
+    body: bytes = JSON_BODY,
 ) -> None:
     """Replace ``protocol``'s seam with one that reaches the local disk.
 
@@ -834,6 +872,8 @@ def install_writing_transport(
     Args:
         monkeypatch: The pytest patcher, which undoes this on teardown.
         protocol: A normalised protocol name that writes locally.
+        body: What the transport sends, so an over-cap row can hand
+            down more bytes than the ceiling allows.
 
     Returns:
         None.
@@ -843,6 +883,7 @@ def install_writing_transport(
             the same fail-closed reason its siblings give: installing
             nothing would let the row pass having proven nothing.
     """
+    monkeypatch.setattr(WritingFTPClientBody, 'payload', body)
     if protocol == 'FTP':
         monkeypatch.setattr(aioftp.Client, 'context', WritingFTPContext())
     elif protocol == 'SFTP':

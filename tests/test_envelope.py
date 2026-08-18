@@ -81,6 +81,9 @@ from tests.fixtures.protocol_transports import (
     LOCAL_IO_CATEGORIES,
     LOCAL_IO_CODE,
     LOCAL_IO_LEAF,
+    OVER_CAP_BODY,
+    OVER_CAP_CODE,
+    OVER_CAP_LIMIT,
     PROTOCOL_FAULTS,
     contract_call,
     install_failing_transport,
@@ -746,7 +749,7 @@ async def test_every_protocol_answers_for_a_local_write_failure(
     protocol: str,
     category: str,
 ) -> None:
-    """A local disk failure is one code on every protocol (NEW-R10-1).
+    """A non-wire failure is one code on every protocol (R10-1, R10-2).
 
     The second axis of the cross-protocol guard, and the one whose
     absence let four protocols answer the same question four ways. The
@@ -778,8 +781,15 @@ async def test_every_protocol_answers_for_a_local_write_failure(
     if protocol in exempt:
         pytest.skip(f'{protocol}/{category}: {exempt[protocol]}')
 
-    destination = str(tmp_path / LOCAL_IO_LEAF)
+    over_cap = category == 'OVER_CAP'
+    # An OVER_CAP row's destination must be perfectly writable: the
+    # refusal it asserts is the *ceiling*, and a path the filesystem
+    # would reject anyway would satisfy the row for the wrong reason.
+    destination = str(
+        tmp_path / 'out.bin' if over_cap else tmp_path / LOCAL_IO_LEAF)
     call = local_io_call(protocol, destination)
+    if over_cap:
+        call['protocol_info']['max_response_bytes'] = OVER_CAP_LIMIT
     if protocol == 'HTTPS':
         # `HTTPS` shares `HttpRequest` with `HTTP` and differs only in
         # refusing a plaintext URL (R11-AC4), so pointing it at the
@@ -789,24 +799,29 @@ async def test_every_protocol_answers_for_a_local_write_failure(
         pytest.skip(
             'HTTPS requires an https:// URL and shares HttpRequest with '
             'HTTP, whose live row covers the same local write path.')
+    body = OVER_CAP_BODY if over_cap else b'{"value": 1}'
     if protocol == 'HTTP':
-        http_server.respond(LOCAL_IO_PATH, body=b'{"value": 1}')
+        http_server.respond(LOCAL_IO_PATH, body=body)
         call['url'] = http_server.url_for(LOCAL_IO_PATH)
     else:
-        install_writing_transport(monkeypatch, protocol)
+        install_writing_transport(monkeypatch, protocol, body)
 
     result = await request(**call)
 
+    expected = OVER_CAP_CODE if over_cap else LOCAL_IO_CODE
     assert result['ok'] is False
     assert result['error'] is not None
-    assert result['error']['code'] == LOCAL_IO_CODE, (
-        f'{protocol} reported {result["error"]["code"]} for a local '
-        f'write failure, which every protocol must classify as '
-        f'{LOCAL_IO_CODE}. A local disk is not evidence the remote is '
-        'unhealthy, and the four protocols answering this four '
-        'different ways is what NEW-R10-1 was.')
+    assert result['error']['code'] == expected, (
+        f'{protocol} reported {result["error"]["code"]} for a '
+        f'{category} failure, which every protocol that writes locally '
+        f'must classify as {expected}. LOCAL_IO: a local disk is not '
+        'evidence the remote is unhealthy, and four protocols answered '
+        'four ways (NEW-R10-1). OVER_CAP: R14 states the ceiling '
+        'globally and two protocols ignored it, returning ok=True '
+        'having written the whole 256 KiB body (NEW-R10-2).')
     assert not Path(destination).exists(), (
-        'a refused write must leave no file behind')
+        'a refused write must leave no file behind -- not even the '
+        'empty or truncated one a cap crossed mid-transfer produces')
 
 
 @pytest.mark.parametrize('protocol', CONTRACT_ROWS)

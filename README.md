@@ -481,6 +481,7 @@ encoding as the bare media type.
 | `overwrite` | `bool` | `False` | Whether a download may replace an existing local file. |
 | `timeout` | number | `15` | Bounds the connect, and bounds **each** socket read and write. |
 | `circuit_breaker_config` | `dict` | `{}` | Retry and breaker settings. |
+| `max_response_bytes` | positive `int` | `67108864` (64 MiB) | Ceiling on the total bytes a download may write locally, across **all** files of a recursive transfer. No sentinel disables it. |
 | `redact_query_params` | list of `str` | `()` | Extra sensitive parameter names. |
 
 **FTP commands** — `command` must name one of these five:
@@ -517,6 +518,7 @@ removes is the hang — a socket that goes silent forever.
 | `overwrite` | `bool` | `False` | Whether a download may replace an existing local file. |
 | `timeout` | number | `15` | Bounds the connect and the login. |
 | `circuit_breaker_config` | `dict` | `{}` | Retry and breaker settings. |
+| `max_response_bytes` | positive `int` | `67108864` (64 MiB) | Ceiling on the total bytes a download may write locally, across **all** files of a recursive transfer. No sentinel disables it. |
 | `redact_query_params` | list of `str` | `()` | Extra sensitive parameter names. |
 
 **SFTP modes** — `mode` must name one of these three:
@@ -1126,6 +1128,13 @@ A password and `client_keys` supplied together are both offered, in asyncssh's
 own order — public key first, password as the fallback.
 
 ### Response size
+
+`max_response_bytes` applies to **every** protocol, not only the HTTP family.
+On HTTP and SOAP it caps the response body read; on FTP and SFTP it caps the
+bytes a download writes to the local disk, counted across all files of a
+recursive transfer rather than per file — the server chooses how many files it
+sends, so a per-file allowance would bound nothing. A transfer that crosses the
+ceiling is refused with `RESPONSE_TOO_LARGE` and leaves no file behind.
 
 Every response read is capped at `max_response_bytes`, 64 MiB by default. A
 declared `Content-Length` over the cap is refused before a byte is read; a body

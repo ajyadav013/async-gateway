@@ -34,6 +34,7 @@ from async_gateway.utils.contained_io import (
     ClassifyingLocalFile,
     ContainedLocalFS,
     ContainedPathIO,
+    TransferBudget,
     contained_download,
     contained_path_io_factory,
     local_base,
@@ -42,6 +43,7 @@ from async_gateway.utils.exceptions import (
     ConfigurationError,
     LocalWriteError,
     PathContainmentError,
+    ResponseTooLargeError,
 )
 
 
@@ -98,6 +100,88 @@ class _FullDisk:
             Never; this always raises.
         """
         self._refuse()
+
+
+class _RecordingFile:
+    """A file object that records the size of every block written.
+
+    The ordering claim -- charged *before* the write -- is invisible
+    from the envelope, because both orderings report the same code and
+    both leave no file once the partial is removed. What distinguishes
+    them is whether the over-cap block ever reached a ``write`` at all,
+    so the sizes that arrive are what the test asserts on.
+    """
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.landed: list[int] = []
+
+    def write(self, data: bytes) -> int:
+        """Record a block instead of putting it anywhere.
+
+        Args:
+            data: The bytes the layer handed down.
+
+        Returns:
+            How many bytes were written, as a real file does.
+        """
+        self.landed.append(len(data))
+        return len(data)
+
+
+async def test_the_budget_refuses_before_the_bytes_reach_the_disk(
+    tmp_path: Path,
+) -> None:
+    """The cap is charged *before* the write, not after (R14, NEW-R10-2).
+
+    A ceiling enforced after the fact has already put the bytes on the
+    disk it exists to protect. The two orderings look identical from
+    the envelope -- both report ``RESPONSE_TOO_LARGE``, and both leave
+    no file once the partial is removed -- so only the write itself can
+    tell them apart, and it is the difference between refusing a
+    10 GB block and writing it first.
+
+    Asserted by counting what reached the underlying file object.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base, budget=TransferBudget(16))
+    recorder = _RecordingFile()
+
+    await layer.write(recorder, b'under the cap')
+    with pytest.raises(ResponseTooLargeError):
+        await layer.write(recorder, b'x' * 4096)
+
+    assert recorder.landed == [13], (
+        'the over-cap block reached the disk before it was refused; '
+        'charge the budget before the write, not after')
+
+
+async def test_one_budget_spans_every_file_of_a_recursive_transfer(
+    tmp_path: Path,
+) -> None:
+    """The ceiling bounds the transfer, not each file (R14, NEW-R10-2).
+
+    The vector R22 is about is a **recursive** download, where the
+    *server* chooses both the file count and the file sizes. A per-file
+    allowance is therefore no ceiling at all: a thousand files just
+    under it pass a cap meant to bound the lot. One budget object,
+    shared by every file the layer opens, is what makes the bound hold.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base, budget=TransferBudget(20))
+
+    async with layer.open(base / 'a.bin', mode='wb') as first:
+        await first.write(b'0123456789')
+
+    async with layer.open(base / 'b.bin', mode='wb') as second:
+        with pytest.raises(ResponseTooLargeError):
+            await second.write(b'0123456789ab')
+
+    assert (base / 'a.bin').read_bytes() == b'0123456789'
+    assert not (base / 'b.bin').exists(), (
+        'the file that crossed the shared ceiling must leave nothing')
 
 
 def escaping(base: Path, name: Text = 'OWNED') -> Text:
@@ -395,6 +479,42 @@ async def test_a_local_write_failure_mid_transfer_is_typed_on_ftp(
     with pytest.raises(LocalWriteError) as on_close:
         await layer.close(full_disk)
     assert on_close.value.code == 'PATH'
+
+
+async def test_a_close_that_fails_flushing_removes_the_partial_on_ftp(
+    tmp_path: Path,
+) -> None:
+    """A failed flush orphans nothing (M19), on the transfer protocols.
+
+    The close seam's cleanup half. ``aiofiles`` and ``aioftp`` both
+    buffer, so a body small enough to fit never fails at ``write`` --
+    the first and only syscall is the flush inside ``close``, and what
+    it leaves behind on failure is a truncated file. ``safe_writer``
+    removes it on the HTTP path; this asserts the FTP layer does the
+    same, so a refused download leaves no file on any protocol.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base)
+    target = base / 'flushed.bin'
+
+    handle = await layer.open(target, mode='wb')
+    # Substitute the file object the layer will flush, leaving the entry
+    # the layer recorded at open time intact -- which is exactly the
+    # state a real ENOSPC produces: a created file whose flush fails.
+    layer._targets[id(handle.file)] = target
+    doomed = _FullDisk()
+    layer._targets[id(doomed)] = target
+
+    with pytest.raises(LocalWriteError):
+        await layer.close(doomed)
+
+    assert not target.exists(), (
+        'a failed flush must not orphan the truncated file it left')
+
+    async with layer.open(target, mode='wb') as reopened:
+        await reopened.write(b'proving the layer still works')
+    assert target.read_bytes() == b'proving the layer still works'
 
 
 async def test_a_non_oserror_ftp_path_failure_is_left_to_aioftp(

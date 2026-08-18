@@ -41,6 +41,7 @@ import asyncio
 import inspect
 import io
 import os
+from contextlib import suppress
 from pathlib import Path
 from types import MappingProxyType
 from typing import (
@@ -58,6 +59,7 @@ import asyncssh
 from asyncssh.sftp import LocalFile, local_fs
 
 from async_gateway.utils.exceptions import PathContainmentError
+from async_gateway.utils.http_file_config import response_too_large
 from async_gateway.utils.paths import (
     BytesOrPathLike,
     PathLike,
@@ -71,6 +73,86 @@ from async_gateway.utils.paths import (
 #: source, and applying ``O_EXCL`` to that would refuse every file that
 #: exists, which is all of them.
 WRITING_MODES: Final[frozenset[str]] = frozenset({'w', 'x', 'a'})
+
+
+class TransferBudget:
+    """The bytes one transfer may write locally, counted down as it goes.
+
+    R14 states the response-size ceiling *globally* -- "every response
+    read is capped at ``max_response_bytes``" -- and it was implemented
+    on the HTTP family alone. Measured with a 1 KiB cap and a 256 KiB
+    payload: HTTP refused with ``RESPONSE_TOO_LARGE`` and wrote nothing,
+    while FTP and SFTP both returned ``ok=True`` having written all
+    262144 bytes (NEW-R10-2). The bound a caller sets to keep a hostile
+    or misconfigured endpoint from filling their disk simply did not
+    exist on two of the four protocols.
+
+    Neither transport library offers a transfer-size limit, so the
+    budget is enforced where this package already owns the write: the
+    containment wrappers every download's bytes pass through. Counting
+    there rather than at each call site is what makes the bound hold
+    across a **recursive** transfer -- the vector R22 is about -- where
+    the server chooses both the file count and the file sizes, and a
+    per-file check would let a thousand small files past a cap meant to
+    bound the lot.
+
+    One budget object is shared by every file of one transfer, so it is
+    a ceiling on the transfer and not a per-file allowance.
+
+    Attributes:
+        limit: The ceiling in bytes, as the caller set it.
+        written: How much has been written so far.
+    """
+
+    def __init__(self, limit: int) -> None:
+        """Start a budget of ``limit`` bytes.
+
+        Args:
+            limit: The ceiling, already validated positive by
+                ``logic.http_client.validated_max_response_bytes``.
+        """
+        self.limit = limit
+        self.written = 0
+
+    def spend(self, count: int) -> None:
+        """Account for ``count`` bytes, or refuse the transfer.
+
+        Called **before** the write, not after: a cap enforced after the
+        fact has already put the bytes on the disk it exists to
+        protect.
+
+        Args:
+            count: The size of the block about to be written.
+
+        Returns:
+            None.
+
+        Raises:
+            ResponseTooLargeError: If the block would cross the
+                ceiling. The same error the HTTP path raises, so a
+                caller reads one code for one condition on all four
+                protocols.
+        """
+        self.written += count
+        if self.written > self.limit:
+            raise response_too_large(self.written, self.limit)
+
+
+async def _unlink(path: Path) -> None:
+    """Remove ``path``, succeeding when it is already gone.
+
+    The transfer wrappers' equivalent of
+    :func:`~async_gateway.utils.paths.safe_unlink`, in a thread because
+    R20 bans a blocking filesystem call on the event loop and these
+    wrappers -- unlike ``safe_writer`` -- are not already inside one.
+
+    Args:
+        path: The partial file to remove.
+
+    Returns:
+        None, whether or not there was anything to remove.
+    """
+    await asyncio.to_thread(path.unlink, missing_ok=True)
 
 
 def _writes(mode: str) -> bool:
@@ -189,6 +271,7 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
         *args: Any,
         base: PathLike,
         overwrite: bool = False,
+        budget: Optional[TransferBudget] = None,
         **kwargs: Any,
     ) -> None:
         """Bind this path layer to one directory.
@@ -197,12 +280,24 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
             args: Positional arguments for ``AsyncPathIO``.
             base: The local directory writes are confined to.
             overwrite: Whether an existing file may be replaced.
+            budget: The bytes this whole transfer may write, or None
+                for an unbounded one. One object per transfer, shared
+                across every file of a recursive download, so the
+                ceiling bounds the transfer rather than each file.
             kwargs: Keyword arguments for ``AsyncPathIO``; ``aioftp``
                 passes ``timeout``.
         """
         super().__init__(*args, **kwargs)
         self.base = Path(base)
         self.overwrite = overwrite
+        self.budget = budget
+        #: Where each open handle was opened, so a write that fails can
+        #: remove what it left. ``aioftp`` hands the *file object* back
+        #: to ``write``/``close`` and never the path, and a partial file
+        #: is exactly what M19 says this library must not orphan --
+        #: without this a refused transfer left a truncated download on
+        #: disk where the HTTP path leaves nothing.
+        self._targets: dict[int, Path] = {}
 
     def contained(self, path: BytesOrPathLike) -> Path:
         """Return ``path`` proven to be inside :attr:`base`.
@@ -403,9 +498,11 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
                 target, mode, **kwargs)  # type: ignore[arg-type]
         opened = asyncio.get_running_loop().run_in_executor(
             self.executor, _open_guarded, target, mode, self.overwrite)
-        if self.timeout is None:
-            return await opened
-        return await asyncio.wait_for(opened, self.timeout)
+        handle = (
+            await opened if self.timeout is None
+            else await asyncio.wait_for(opened, self.timeout))
+        self._targets[id(handle)] = target
+        return handle
 
     async def write(self, file: io.BytesIO, data: Any) -> int:
         """Write a block, classifying a local filesystem refusal.
@@ -425,8 +522,24 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
 
         Raises:
             LocalWriteError: If the local filesystem refused the write.
+            ResponseTooLargeError: If the block would cross the
+                transfer's byte ceiling (R14, NEW-R10-2). Charged
+                *before* the write, so the bytes over the cap never
+                reach the disk.
         """
-        return int(await self._classifying(super().write(file, data)))
+        try:
+            if self.budget is not None:
+                self.budget.spend(len(data))
+            return int(await self._classifying(super().write(file, data)))
+        except BaseException:
+            # M19, on the transfer protocols: what a failed write leaves
+            # is a truncated file, not the caller's data, so it is
+            # removed rather than orphaned. `safe_writer` gives the HTTP
+            # path the same guarantee from its `except` arm; doing it
+            # here is what keeps a refused download leaving *no* file on
+            # all four protocols instead of a 0-byte one on two of them.
+            await self._discard(file)
+            raise
 
     async def close(self, file: io.BytesIO) -> None:
         """Close a local file, classifying a refusal from its flush.
@@ -444,7 +557,30 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
         Raises:
             LocalWriteError: If the local filesystem refused the flush.
         """
-        await self._classifying(super().close(file))
+        target = self._targets.pop(id(file), None)
+        try:
+            await self._classifying(super().close(file))
+        except BaseException:
+            if target is not None:
+                await _unlink(target)
+            raise
+
+    async def _discard(self, file: io.BytesIO) -> None:
+        """Close and remove the partial file behind ``file``.
+
+        Args:
+            file: The open handle whose write failed.
+
+        Returns:
+            None. A close that also fails is suppressed: the write's own
+            failure is the one the caller must see, and the file is
+            removed either way.
+        """
+        target = self._targets.pop(id(file), None)
+        with suppress(Exception):
+            await super().close(file)
+        if target is not None:
+            await _unlink(target)
 
     async def _classifying(self, awaited: Any) -> Any:
         """Await ``awaited``, typing a local filesystem refusal.
@@ -480,6 +616,7 @@ def contained_path_io_factory(
     base: PathLike,
     *,
     overwrite: bool = False,
+    budget: Optional[TransferBudget] = None,
 ) -> Any:
     """Return the ``path_io_factory`` an FTP client is built with.
 
@@ -490,6 +627,10 @@ def contained_path_io_factory(
     Args:
         base: The local directory the transfer is confined to.
         overwrite: Whether an existing local file may be replaced.
+        budget: The bytes this transfer may write, or None for
+            unbounded. Bound here rather than passed per call for the
+            same reason ``base`` is, and it is what makes one ceiling
+            span every file of a recursive download.
 
     Returns:
         A callable ``aioftp`` can use where it expects a path-IO class.
@@ -505,7 +646,8 @@ def contained_path_io_factory(
             The bound path layer.
         """
         return ContainedPathIO(
-            *args, base=base, overwrite=overwrite, **kwargs)
+            *args, base=base, overwrite=overwrite, budget=budget,
+            **kwargs)
 
     return factory
 
@@ -533,15 +675,22 @@ class ClassifyingLocalFile(LocalFile):
             actionable.
     """
 
-    def __init__(self, file: Any, path: Path) -> None:
+    def __init__(
+        self,
+        file: Any,
+        path: Path,
+        budget: Optional[TransferBudget] = None,
+    ) -> None:
         """Wrap an open local file with its own path.
 
         Args:
             file: The open file object, as ``LocalFile`` takes.
             path: The path it was opened at.
+            budget: The transfer's shared byte budget, or None.
         """
         super().__init__(file)
         self.path = path
+        self.budget = budget
 
     async def write(self, data: bytes, offset: int) -> int:
         """Write ``data``, classifying a local filesystem refusal.
@@ -555,11 +704,23 @@ class ClassifyingLocalFile(LocalFile):
 
         Raises:
             LocalWriteError: If the local filesystem refused the write.
+            ResponseTooLargeError: If the block would cross the
+                transfer's byte ceiling (R14, NEW-R10-2). Charged
+                before the write, so the excess never reaches the disk.
         """
         try:
+            if self.budget is not None:
+                self.budget.spend(len(data))
             return await super().write(data, offset)
         except OSError as err:
+            await self._discard()
             raise classify_refusal(self.path, err) from err
+        except BaseException:
+            # M19 on this protocol too: a refused transfer leaves no
+            # truncated file, matching what `safe_writer` guarantees the
+            # HTTP path and what the FTP wrapper now guarantees its own.
+            await self._discard()
+            raise
 
     async def close(self) -> None:
         """Close the file, classifying a refusal from its flush.
@@ -573,7 +734,20 @@ class ClassifyingLocalFile(LocalFile):
         try:
             await super().close()
         except OSError as err:
+            await _unlink(self.path)
             raise classify_refusal(self.path, err) from err
+
+    async def _discard(self) -> None:
+        """Close and remove the partial file this handle wrote.
+
+        Returns:
+            None. A close that also fails is suppressed: the write's own
+            failure is the one the caller must see, and the file goes
+            either way.
+        """
+        with suppress(Exception):
+            await super().close()
+        await _unlink(self.path)
 
 
 class ContainedLocalFS:
@@ -603,15 +777,25 @@ class ContainedLocalFS:
     #: and writes. Delegated to the real one verbatim.
     limits = local_fs.limits
 
-    def __init__(self, base: PathLike, *, overwrite: bool = False) -> None:
+    def __init__(
+        self,
+        base: PathLike,
+        *,
+        overwrite: bool = False,
+        budget: Optional[TransferBudget] = None,
+    ) -> None:
         """Bind a local filesystem view to one directory.
 
         Args:
             base: The local directory writes are confined to.
             overwrite: Whether an existing file may be replaced.
+            budget: The bytes this whole transfer may write, or None
+                for an unbounded one -- shared across every file of a
+                recursive download.
         """
         self.base = Path(base)
         self.overwrite = overwrite
+        self.budget = budget
 
     def contained(self, path: BytesOrPathLike) -> bytes:
         """Return ``path`` proven inside :attr:`base`, byte-encoded.
@@ -833,7 +1017,7 @@ class ContainedLocalFS:
             _open_guarded, target, mode, self.overwrite)
         if _writes(mode):
             await asyncio.to_thread(_make_sparse, handle)
-        return ClassifyingLocalFile(handle, target)
+        return ClassifyingLocalFile(handle, target, self.budget)
 
 
 def _make_sparse(handle: io.BytesIO) -> None:
@@ -887,6 +1071,7 @@ async def contained_download(
     *,
     base: PathLike,
     overwrite: bool = False,
+    budget: Optional[TransferBudget] = None,
     **options: Any,
 ) -> None:
     """Run an SFTP download whose local destination cannot be escaped.
@@ -916,6 +1101,8 @@ async def contained_download(
         local_path: The local destination operand.
         base: The local directory the transfer is confined to.
         overwrite: Whether an existing local file may be replaced.
+        budget: The bytes this transfer may write locally, or None for
+            an unbounded one (R14, NEW-R10-2).
         options: The caller's ``additional_arguments``.
 
     Returns:
@@ -937,7 +1124,7 @@ async def contained_download(
 
     await _require_begin_copy(sftp)(
         sftp,
-        ContainedLocalFS(base, overwrite=overwrite),
+        ContainedLocalFS(base, overwrite=overwrite, budget=budget),
         remote_paths,
         local_path,
         mode,

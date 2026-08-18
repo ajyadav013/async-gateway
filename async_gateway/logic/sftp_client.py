@@ -131,7 +131,10 @@ from async_gateway.helpers.internal.base import (
     BaseRequestClass,
     credentials_of,
 )
-from async_gateway.utils.contained_io import contained_download, local_base
+from async_gateway.logic.http_client import validated_max_response_bytes
+from async_gateway.utils.constants import MAX_RESPONSE_BYTES
+from async_gateway.utils.contained_io import (
+    TransferBudget, contained_download, local_base)
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
@@ -437,6 +440,16 @@ class SFTPRequest(BaseRequestClass):
         self.local_path: Optional[str] = self.info.get('local_path')
         # R22-AC3: refuse to overwrite by default, opt in by name.
         self.overwrite: bool = self.info.get('overwrite') is True
+        # R14's ceiling, stated globally in the spec and implemented on
+        # the HTTP family alone until NEW-R10-2. The same call with a
+        # 1 KiB cap and a 256 KiB payload had HTTP refuse with
+        # RESPONSE_TOO_LARGE and write nothing, while this protocol
+        # returned ok=True having written all 262144 bytes -- so the
+        # bound a caller sets to stop a hostile endpoint filling their
+        # disk did not exist here. Validated with the HTTP family's own
+        # validator, so one bad value is one message on every protocol.
+        self.max_response_bytes: int = validated_max_response_bytes(
+            self.info.get('max_response_bytes', MAX_RESPONSE_BYTES))
         # Read, never written: `recurse` is added to a copy at the one
         # place it is needed, because this is the caller's own dict and
         # writing into it is M28.
@@ -897,6 +910,10 @@ class SFTPRequest(BaseRequestClass):
                 self.local_path,
                 base=local_base(self.local_path),
                 overwrite=self.overwrite,
+                # One budget per call, not per file: the server chooses
+                # how many files a recursive `get` writes, so a
+                # per-file allowance bounds nothing (R14).
+                budget=TransferBudget(self.max_response_bytes),
                 **options)
             return
 
