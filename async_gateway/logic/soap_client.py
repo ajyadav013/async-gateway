@@ -73,6 +73,7 @@ from async_gateway.helpers.internal.request_helper import (
     handle_http_request,
 )
 from async_gateway.logic.http_client import (
+    TRANSPORT_FAULTS,
     trace_collectors_for,
     transport_error_for,
     validated_allow_redirects,
@@ -1083,7 +1084,7 @@ class SoapRequest(BaseRequestClass):
         except RetriesExhausted as err:
             raise transport_error_for(
                 err, redact_params=self.redact_params) from err
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+        except TRANSPORT_FAULTS as err:
             raise transport_error_for(
                 err, redact_params=self.redact_params) from err
 

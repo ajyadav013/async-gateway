@@ -79,7 +79,16 @@ JsonSerializer = Callable[[Any], str]
 # `ClientConnectionError`, and `ClientConnectorCertificateError` is also a
 # `ClientConnectorError`. First match wins, so the most specific
 # classification is listed first.
-TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
+#
+# The left column is typed `type[BaseException]` rather than a bare
+# `type`, and that is load-bearing rather than tidiness: `TRANSPORT_FAULTS`
+# below derives the dispatch's `except` clause from this column, and only
+# the narrower annotation lets the type checker prove the derived tuple is
+# catchable. A bare `type` admits a non-exception here and says nothing
+# until the clause raises `TypeError` at runtime -- on the failure path,
+# which is the one place this library must not itself fail.
+TRANSPORT_ERRORS: Sequence[
+    Tuple[type[BaseException], type[AsyncGatewayError]]] = (
     (asyncio.TimeoutError, GatewayTimeoutError),
     (aiohttp.ClientSSLError, TlsError),
     (ssl.SSLError, TlsError),
@@ -87,6 +96,28 @@ TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
     (aiohttp.ClientConnectionError, ConnectError),
     (aiohttp.ClientError, TransportError),
 )
+
+#: The families the HTTP-family dispatch catches, derived from the table
+#: above rather than restated beside it.
+#:
+#: It is derived because restating it is the defect this replaces. The
+#: catch clause used to be a hand-written tuple in each of the two modules
+#: that dispatch over ``aiohttp`` -- ``(aiohttp.ClientError,
+#: asyncio.TimeoutError, ssl.SSLError)`` here and the same tuple *minus*
+#: ``ssl.SSLError`` in ``logic.soap_client``. The omission was invisible
+#: for as long as every failure arrived wrapped in a ``RetriesExhausted``,
+#: which the clause above this one catches; a caller who named
+#: ``ssl.SSLError`` in ``abortable_exceptions`` -- a documented public
+#: knob -- got it back **unwrapped**, matched no clause, and received a
+#: raw ``ssl.SSLError`` where the library's whole contract is an envelope
+#: (AGW-R9-1).
+#:
+#: One name, imported by both modules, is what makes that divergence
+#: unrepresentable: a family added to the classification table is caught
+#: by every client that maps through it, in the same commit, with no
+#: second edit to remember.
+TRANSPORT_FAULTS: Tuple[type[BaseException], ...] = tuple(
+    family for family, _ in TRANSPORT_ERRORS)
 
 
 def default_json_serialize(obj: Any) -> str:
@@ -1302,8 +1333,7 @@ class HttpRequest(BaseRequestClass):
         except RetriesExhausted as err:
             raise transport_error_for(
                 err, redact_params=self.redact_params) from err
-        except (aiohttp.ClientError, asyncio.TimeoutError,
-                ssl.SSLError) as err:
+        except TRANSPORT_FAULTS as err:
             raise transport_error_for(
                 err, redact_params=self.redact_params) from err
 
