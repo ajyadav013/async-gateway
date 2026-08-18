@@ -266,7 +266,8 @@ def transport_error_for(
         ``aioftp.InvalidCommand`` -- a CR or an LF in a value the caller
         supplied -- maps to ``ConfigurationError`` rather than to a
         transport class, because it is the caller's configuration and no
-        retry of it can succeed.
+        retry of it can succeed. Any other ``aioftp.AIOFTPException`` is
+        a protocol-level failure and maps to ``TransportError``.
 
     Raises:
         BaseException: The original cause, unchanged, when it belongs to
@@ -294,7 +295,21 @@ def transport_error_for(
     for family, error_class in TRANSPORT_ERRORS:
         if isinstance(cause, family):
             return error_class(message)
-    if cause is None:
+    # `AIOFTPException` last, as the family's catch-all, exactly as
+    # `logic.sftp_client` treats `asyncssh.Error`: it is `aioftp`'s own
+    # base class, so a protocol-level failure that is neither a status
+    # reply nor an `OSError` -- a malformed reply line, an unusable
+    # response to `PASV` -- is a transport failure and reports as one.
+    #
+    # It was missing, and the omission is the same cross-client
+    # divergence as AGW-R9-1: the FTP dispatch already *catches*
+    # `aioftp.AIOFTPException`, so the class was named as a failure this
+    # protocol answers for, and then classified by nothing. Everything
+    # under it that is not a `StatusCodeError`, an `InvalidCommand` or an
+    # `OSError` fell past this table and `raise cause from None` handed
+    # the caller a bare `aioftp` exception -- the same broken contract,
+    # on the protocol nobody re-checked.
+    if isinstance(cause, aioftp.AIOFTPException) or cause is None:
         return TransportError(message)
     # `from None`: the wrapper is already this exception's `__context__`,
     # and suppressing it keeps the traceback pointing at the bug.
