@@ -746,7 +746,7 @@ class FaultingTransport:
 #
 #   aioftp -> ContainedPathIO      reached by a client-driven test?
 #     mkdir, open(_open/write/close) ........................ yes
-#     is_file, is_dir, list ................................. no (3)
+#     is_file, is_dir, list ................................. yes (3)
 #
 # (1) `encode` and `limits` are read by the real `_begin_copy`, which
 #     both SFTP doubles *replace* -- that is the seam containment is
@@ -760,18 +760,35 @@ class FaultingTransport:
 #     by an upload -- which asyncssh routes through `srcfs`, not this
 #     object. Covered directly in `test_contained_io`, including their
 #     containment.
-# (3) aioftp asks these of the *source* too: `download` branches on
-#     `is_file(source)`/`is_dir(source)` and lists the remote tree, all
-#     of which are the client's own remote calls rather than `path_io`
-#     ones during a download. `path_io.is_file`/`is_dir`/`list` are
-#     reached by an **upload** of a local directory, which this library
-#     does not dispatch recursively. Covered directly in
-#     `test_contained_io`, containment included.
+# (3) On a *download* these are the client's own remote calls, not
+#     `path_io` ones: `download` branches on the remote
+#     `is_file(source)`/`is_dir(source)` and lists the remote tree. They
+#     become `path_io` calls on an **upload**, where the local side is
+#     the source -- and this row's argument for leaving them unreached
+#     was that "this library does not dispatch recursively", which was
+#     simply **false**. `command='upload'` with a directory
+#     `client_path` is dispatched exactly like any other, reaches
+#     `aioftp.Client.upload`'s directory arm, and calls all three.
+#
+#     The false premise cost a High defect (AGW-38).
+#     `ContainedPathIO.list` returned *canonicalised* entries while
+#     `upload` computed `entry.relative_to(source)` against the
+#     uncanonicalised `source` it still held; on any `client_path` with
+#     a symlinked component -- macOS `/tmp`, the README's own documented
+#     example -- the two disagreed and `ValueError` escaped `request()`
+#     un-enveloped, part-way through the upload. Nothing saw it because
+#     no test uploaded a directory, and the reasoning above is why
+#     nobody wrote one.
+#
+#     :attr:`WritingFTPClient.upload_tree` now takes the real arm, so
+#     the three are reached client-driven the way every other row's
+#     methods are. `test_contained_io` keeps its direct containment
+#     rows, which remain the narrow proof that each one refuses.
 #
 # No unreached method is left unclassified, and none is both
-# containment-bearing and unexercised. The two that were -- `mkdir` on
-# the SFTP side and `setstat` on both -- are the findings this file's
-# doubles were corrected to reach.
+# containment-bearing and unexercised. The three that were -- `mkdir` on
+# the SFTP side, `setstat` on both, and this `list`/`is_file`/`is_dir`
+# row -- are the findings this file's doubles were corrected to reach.
 
 #: What a ``LOCAL_IO`` row asks each protocol to write to: a path whose
 #: parent directory does not exist. ENOENT rather than a full disk
@@ -844,15 +861,104 @@ class WritingFTPClient(StubFTPClient):
     :attr:`recurse` so the existing rows keep exercising the single-file
     arm they were written for.
 
+    The **upload** verb is the third instance of the same lesson, and
+    the one the audit table above talked itself out of (AGW-38). Only
+    ``upload`` asks ``path_io`` about the *local* side, so
+    ``is_file``/``is_dir``/``list`` were reached by nothing -- and
+    ``list``'s canonicalised return value crashed the real client's
+    ``relative_to`` arithmetic on any symlinked ``client_path``. So
+    :attr:`upload_tree` runs ``aioftp.Client.upload``'s **own code**
+    bound to this object, exactly as :class:`~tests.fixtures.ftp.
+    HostileFTPServer` runs the real ``download``: the recursion, the
+    ``relative_to(source)`` arithmetic and every ``path_io`` call stay
+    the library's, and only the two wire coroutines below are faked.
+    It needs no flag of its own: ``download`` and ``upload`` are
+    different verbs, so a row asking for one never reaches the other.
+
     Attributes:
         path_io: Set by :class:`WritingFTPContext` from the
             ``path_io_factory`` the client passed, exactly as
             ``aioftp.Client`` would.
         recurse: True to take ``download``'s directory arm.
+        uploaded: What each remote path received, so a test can assert
+            the whole tree arrived rather than merely that nothing
+            raised.
     """
 
     path_io: Any = None
     recurse: bool = False
+
+    def __init__(self) -> None:
+        """Start with an empty record of what reached the server."""
+        self.uploaded: dict[str, bytes] = {}
+
+    async def make_directory(self, *args: Any, **kwargs: Any) -> None:
+        """Accept a remote ``mkdir``, as a real server would.
+
+        Args:
+            args: The remote path, unused -- the local side is what
+                this double is about.
+            kwargs: ``aioftp``'s options, unused.
+
+        Returns:
+            None.
+        """
+
+    @asynccontextmanager
+    async def upload_stream(
+        self,
+        destination: Any,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        """Record the bytes the real ``upload`` sends for one file.
+
+        Args:
+            destination: The remote path being written.
+            kwargs: ``aioftp``'s stream options, unused.
+
+        Yields:
+            A stream with the ``write`` ``aioftp.Client.upload`` calls.
+        """
+        received = bytearray()
+
+        class Stream:
+            """The write half of ``aioftp``'s upload stream."""
+
+            async def write(self, block: bytes) -> None:
+                """Accept one block.
+
+                Args:
+                    block: The bytes read off the local file.
+
+                Returns:
+                    None.
+                """
+                received.extend(block)
+
+        yield Stream()
+        self.uploaded[str(destination)] = bytes(received)
+
+    async def upload(self, *args: Any, **kwargs: Any) -> None:
+        """Run ``aioftp``'s **real** upload over the local tree.
+
+        The one method that must not be a stub, for the reason
+        :class:`~tests.fixtures.ftp.HostileFTPServer.download` gives
+        about its own: everything AGW-38 is about happens inside
+        ``aioftp.Client.upload`` -- the ``is_dir`` branch, the ``list``
+        of each local directory, the ``path.relative_to(source)``
+        arithmetic against the operand the caller passed, and the
+        recursion. A double that recorded the call and returned would
+        assert nothing about any of it.
+
+        Args:
+            args: ``(source, destination)`` -- for an upload, source is
+                **local**.
+            kwargs: ``write_into`` and the block size.
+
+        Returns:
+            None, as ``aioftp`` does.
+        """
+        await aioftp.Client.upload(self, *args, **kwargs)
 
     async def download(self, *args: Any, **kwargs: Any) -> None:
         """Write the downloaded body to the local destination.
@@ -1007,6 +1113,8 @@ class WritingFTPContext:
     Attributes:
         recurse: Passed to the client it builds, selecting
             ``download``'s directory arm.
+        client: The most recent client this yielded, so an upload row
+            can read back what reached the server.
     """
 
     def __init__(self, *, recurse: bool = False) -> None:
@@ -1016,6 +1124,7 @@ class WritingFTPContext:
             recurse: True for ``download``'s directory arm.
         """
         self.recurse = recurse
+        self.client: Any = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Open a session whose client writes through the caller's layer.
@@ -1032,6 +1141,7 @@ class WritingFTPContext:
         client.recurse = self.recurse
         factory = kwargs['path_io_factory']
         client.path_io = factory(timeout=None)
+        self.client = client
         return entered(client)
 
 
@@ -1043,7 +1153,7 @@ def install_writing_transport(
     recurse: bool = False,
     preserve: bool = False,
     symlink: bool = False,
-) -> None:
+) -> Any:
     """Replace ``protocol``'s seam with one that reaches the local disk.
 
     The ``LOCAL_IO`` counterpart of :func:`install_failing_transport`.
@@ -1069,7 +1179,9 @@ def install_writing_transport(
         symlink: SFTP only. Take ``_copy``'s symbolic-link arm.
 
     Returns:
-        None.
+        The installed seam. FTP's is the :class:`WritingFTPContext`,
+        whose ``client`` carries what an upload actually delivered;
+        SFTP's is the client itself.
 
     Raises:
         ValueError: If ``protocol`` writes to no local destination, for
@@ -1078,20 +1190,21 @@ def install_writing_transport(
     """
     monkeypatch.setattr(WritingFTPClientBody, 'payload', body)
     if protocol == 'FTP':
-        monkeypatch.setattr(
-            aioftp.Client, 'context', WritingFTPContext(recurse=recurse))
-    elif protocol == 'SFTP':
+        context = WritingFTPContext(recurse=recurse)
+        monkeypatch.setattr(aioftp.Client, 'context', context)
+        return context
+    if protocol == 'SFTP':
         client = WritingSFTPClient(
             recurse=recurse, preserve=preserve, symlink=symlink)
         monkeypatch.setattr(
             asyncssh, 'connect',
             lambda *a, **k: entered(StubSSHConnection(client)))
-    else:
-        raise ValueError(
-            f'{protocol!r} has no doubled local-write seam. HTTP and '
-            'HTTPS write below the seam this doubles and must dial the '
-            'loopback server instead; a protocol that writes no local '
-            'file belongs in CATEGORY_EXEMPT, argued.')
+        return client
+    raise ValueError(
+        f'{protocol!r} has no doubled local-write seam. HTTP and '
+        'HTTPS write below the seam this doubles and must dial the '
+        'loopback server instead; a protocol that writes no local '
+        'file belongs in CATEGORY_EXEMPT, argued.')
 
 
 def local_io_call(protocol: str, destination: str) -> dict[str, Any]:

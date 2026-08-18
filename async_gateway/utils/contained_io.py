@@ -193,6 +193,97 @@ def _shown(path: BytesOrPathLike) -> str:
     return os.fsdecode(path)
 
 
+def _as_given(given: Path, checked: Path, produced: Path) -> Path:
+    """Re-express a checked path in the form the caller handed down.
+
+    The half of containment that is *not* a security property, and
+    whose absence was a High defect (AGW-38). Every check in this
+    module canonicalises -- that is how the guard works, because a
+    ``..`` or a symlinked component only becomes visible once the path
+    is resolved. But a canonical path is the wrong thing to hand *back*
+    to a caller that is going to do arithmetic against the
+    uncanonicalised operand it still holds.
+
+    ``aioftp.Client.upload`` is exactly that caller: its directory arm
+    computes ``path.relative_to(source)`` for every entry
+    :meth:`ContainedPathIO.list` yields, against the ``source`` it was
+    given. Wherever any component of that source is a symbolic link the
+    two disagree -- ``/private/tmp/x`` is not under ``/tmp/x`` as a
+    *string* -- and ``relative_to`` raises ``ValueError``, which is in
+    no FTP transport family and so escaped ``request()`` un-enveloped,
+    part-way through a directory upload. Reproduced on the README's own
+    documented ``/tmp`` path.
+
+    So the check stays canonical and only the *answer* is translated:
+    ``produced`` is known to sit at or under ``checked`` (it was
+    composed from it), and is re-rooted onto ``given`` so the caller's
+    own arithmetic works. Containment is untouched -- nothing here
+    decides whether a path is allowed, and every path handed back is
+    checked again by whichever method acts on it next.
+
+    Args:
+        given: The path as the caller passed it in, uncanonicalised.
+        checked: What :meth:`ContainedPathIO.contained` made of it.
+        produced: A path at or under ``checked``.
+
+    Returns:
+        ``produced`` re-rooted onto ``given``.
+    """
+    return Path(given) / produced.relative_to(checked)
+
+
+class _AsGivenLister(aioftp.AsyncListerMixin[Path]):
+    """``aioftp``'s directory lister, yielding caller-form paths.
+
+    The listing half of :func:`_as_given`. ``aioftp``'s own lister is
+    built over the *checked* directory and therefore yields entries
+    under it; this re-roots each one onto the path the caller named, so
+    ``aioftp.Client.upload``'s ``relative_to(source)`` succeeds.
+
+    A wrapper rather than a reimplementation: the iteration, the
+    executor hop, the timeout and ``aioftp``'s ``PathIOError`` wrapping
+    all stay the library's own. ``AsyncListerMixin`` is subclassed for
+    the ``await lister`` form, which ``aioftp`` supports alongside
+    ``async for`` and which a bare async iterator would not answer.
+
+    Attributes:
+        inner: ``aioftp``'s lister over the checked directory.
+        given: The directory as the caller named it.
+        checked: What containment made of it.
+    """
+
+    def __init__(self, inner: Any, given: Path, checked: Path) -> None:
+        """Wrap one lister.
+
+        Args:
+            inner: ``aioftp``'s lister over ``checked``.
+            given: The directory as the caller named it.
+            checked: The contained form of ``given``.
+        """
+        super().__init__()
+        self.inner = inner
+        self.given = given
+        self.checked = checked
+
+    def __aiter__(self) -> '_AsGivenLister':
+        """Start iterating the wrapped lister.
+
+        Returns:
+            This object, which is its own iterator.
+        """
+        self.iterator = self.inner.__aiter__()
+        return self
+
+    async def __anext__(self) -> Path:
+        """Return the next entry, in the caller's own form.
+
+        Returns:
+            The next entry re-rooted onto :attr:`given`.
+        """
+        return _as_given(
+            self.given, self.checked, await self.iterator.__anext__())
+
+
 def classify_mkdir_refusal(path: Path, err: OSError) -> AsyncGatewayError:
     """Return the typed error a refused ``mkdir`` should raise.
 
@@ -514,15 +605,35 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
         await super().unlink(self.contained(path))
 
     def list(self, path: Path) -> Any:
-        """List a directory, inside the base or not at all.
+        """List a directory, inside the base, in the caller's own form.
+
+        The one method whose **return value** a caller does arithmetic
+        on, and therefore the one that cannot hand back the canonical
+        path the check produced (AGW-38). ``aioftp.Client.upload``'s
+        directory arm computes ``entry.relative_to(source)`` against
+        the uncanonicalised ``source`` it still holds, so a canonical
+        entry raised ``ValueError`` -- not an FTP transport family,
+        so it escaped ``request()`` un-enveloped part-way through the
+        upload -- whenever any component of ``client_path`` was a
+        symbolic link. That is the README's own ``/tmp`` example on
+        macOS, and any symlinked mount or home directory.
+
+        Every *other* method here returns None, a bool, an
+        ``os.stat_result`` or a file handle, none of which carries a
+        path for a caller to compose against; :meth:`rename` returns
+        the destination it was given, which ``aioftp.Client`` discards.
+        So the translation belongs here and only here -- see
+        :func:`_as_given` for why the check itself stays canonical.
 
         Args:
             path: The directory to list.
 
         Returns:
-            ``aioftp``'s async lister over the contained path.
+            ``aioftp``'s async lister, each entry re-rooted onto
+            ``path`` exactly as the caller wrote it.
         """
-        return super().list(self.contained(path))
+        target = self.contained(path)
+        return _AsGivenLister(super().list(target), Path(path), target)
 
     async def stat(self, path: Path) -> os.stat_result:
         """Stat a contained path.

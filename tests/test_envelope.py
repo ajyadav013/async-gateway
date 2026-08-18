@@ -47,6 +47,7 @@ from async_gateway.logic import (
 from async_gateway.logic.http_client import (
     HttpRequest, transport_error_for)
 from async_gateway.utils import redaction
+from async_gateway.utils.contained_io import contained_path_io_factory
 from async_gateway.utils.envelope import (
     GatewayResponse,
     finalise_error,
@@ -59,6 +60,7 @@ from async_gateway.utils.exceptions import (
     ConnectError,
     GatewayTimeoutError,
     HttpStatusError,
+    PathContainmentError,
     SerializationError,
 )
 from async_gateway.utils.redaction import (
@@ -1086,6 +1088,128 @@ async def test_preserve_cannot_let_a_server_widen_a_local_file(
         f'the server asked for {oct(REMOTE_PERMISSIONS)} and got it: a '
         'remote endpoint decided the permissions of a file on this '
         'machine, undoing the 0600 every local write establishes.')
+
+
+def _symlinked_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a small local tree reached through a symbolic link.
+
+    The shape AGW-38 fires on, made explicit rather than borrowed from
+    the platform: macOS ``/tmp`` is a link to ``/private/tmp``, which is
+    why the README's own documented path reproduced it, but relying on
+    that would make the row silently vacuous on Linux. A link created
+    here reproduces on every platform.
+
+    Args:
+        tmp_path: The test's temporary directory.
+
+    Returns:
+        The tree's path *as a caller would name it* -- through the link
+        -- and the real directory it resolves to.
+
+    """
+    real = tmp_path / 'real'
+    (real / 'tree' / 'sub').mkdir(parents=True)
+    (real / 'tree' / 'a.txt').write_bytes(b'AAAA')
+    (real / 'tree' / 'sub' / 'b.txt').write_bytes(b'BBBB')
+    link = tmp_path / 'link'
+    link.symlink_to(real, target_is_directory=True)
+    return link / 'tree', real / 'tree'
+
+
+async def test_a_directory_upload_survives_a_symlinked_client_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A recursive upload works when the local path goes via a link.
+
+    AGW-38, and the one call in the library whose *return value* a
+    transport client does arithmetic on. ``ContainedPathIO.list``
+    answered with canonicalised entries because that is how containment
+    checks a path; ``aioftp.Client.upload`` then computed
+    ``entry.relative_to(source)`` against the uncanonicalised ``source``
+    it still held. Wherever any component of ``client_path`` was a
+    symbolic link the two disagreed and ``ValueError`` escaped -- and
+    ``ValueError`` is in no FTP transport family, so it left
+    ``request()`` **un-enveloped**, part-way through the upload, with a
+    half-written remote tree behind it.
+
+    Measured against a real ``aioftp.Server`` on loopback with
+    ``client_path`` under macOS ``/tmp``: ``ValueError: '/private/tmp/
+    .../tree/sub' is not in the subpath of '/tmp/.../tree'``, with
+    ``dest/`` created and nothing in it.
+
+    The assertion is on the **whole tree arriving**, not on the absence
+    of an exception: a wrapper that quietly listed nothing would raise
+    nothing either, and would be just as broken.
+
+    Args:
+        monkeypatch: The pytest patcher.
+        tmp_path: The test's temporary directory.
+
+    Returns:
+        None.
+    """
+    through_link, _ = _symlinked_tree(tmp_path)
+    context = install_writing_transport(monkeypatch, 'FTP')
+
+    result = await request(
+        'host', protocol='FTP', auth=BasicAuth('u', 'p'),
+        protocol_info={
+            'command': 'upload',
+            'client_path': str(through_link),
+            'server_path': '/dest',
+        })
+
+    assert result['ok'] is True, (
+        f'a directory upload through a symlinked path failed with '
+        f'{result["error"]}; before the fix the ValueError did not even '
+        'reach the envelope.')
+    assert context.client.uploaded == {
+        'dest/a.txt': b'AAAA',
+        'dest/sub/b.txt': b'BBBB',
+    }, (
+        'the whole tree must arrive: a list that yielded nothing would '
+        'also raise nothing, and half a tree is what the defect left.')
+
+
+async def test_a_directory_upload_still_refuses_to_leave_the_base(
+    tmp_path: Path,
+) -> None:
+    """Returning caller-form paths must not weaken containment.
+
+    The other half of AGW-38's fix, and the risk in it: the escape the
+    whole module exists to refuse is decided by canonicalising, so a
+    change that hands *uncanonicalised* paths back must be shown not to
+    have moved the check as well as the answer. The base here is
+    reached through a symbolic link -- the very shape that broke the
+    arithmetic -- so the row proves the two properties hold at once.
+
+    Args:
+        tmp_path: The test's temporary directory.
+
+    Returns:
+        None.
+    """
+    through_link, real = _symlinked_tree(tmp_path)
+    victim = real.parent / 'victimdir'
+    victim.mkdir()
+    sentinel = victim / 'SENTINEL'
+    sentinel.write_bytes(b'must not be reachable from the base')
+    layer = contained_path_io_factory(through_link)(timeout=None)
+    escaping = Path(str(through_link / '..' / 'victimdir'))
+
+    with pytest.raises(PathContainmentError):
+        layer.list(escaping)
+    with pytest.raises(PathContainmentError):
+        await layer.is_dir(escaping)
+    with pytest.raises(PathContainmentError):
+        await layer.is_file(escaping / 'SENTINEL')
+
+    assert sentinel.read_bytes() == b'must not be reachable from the base'
+    assert [p async for p in layer.list(through_link / 'sub')] == [
+        through_link / 'sub' / 'b.txt'], (
+        'a contained entry must come back in the form the caller named, '
+        'not the canonical one aioftp cannot do arithmetic against')
 
 
 @pytest.mark.parametrize('protocol', CONTRACT_ROWS)
