@@ -26,7 +26,12 @@ kernel decides atomically and there is no window to race into.
 """
 
 import asyncio
+import fcntl
 import os
+import shutil
+import socket
+import stat
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Optional, Text
@@ -39,9 +44,12 @@ from async_gateway.utils.exceptions import (
 )
 from async_gateway.utils.paths import (
     FILE_MODE,
+    _describe,
+    _refuse_symlink_at,
+    _restore_blocking,
     caller_path,
     guarded_opener,
-    refuse_symlink,
+    open_within,
     resolve_caller_path,
     resolve_within,
     resolve_within_async,
@@ -433,67 +441,64 @@ def test_r22_ac3_the_refusal_is_in_the_open_flags(tmp_path: Path) -> None:
     window: both refusals are bits in the flags the kernel evaluates as
     part of the same operation that creates the file.
 
-    ``O_TRUNC`` is asserted **absent** for the same reason: it is what
-    ``'wb'`` asks for, and leaving it beside ``O_EXCL`` would be a
-    contradiction the kernel resolves in nobody's favour.
+    ``O_TRUNC`` is asserted **absent** for two reasons now. It is what
+    ``'wb'`` asks for and would contradict ``O_EXCL``; and since N3/N4 it
+    must not reach *any* open, because truncation that happens during the
+    open destroys a hardlinked victim before the ``fstat`` that refuses
+    it can run. Truncation is an ``ftruncate`` on the validated
+    descriptor instead -- asserted directly by
+    :func:`test_n4_overwrite_truncates_only_after_the_target_is_judged`.
     """
-    seen: list[int] = []
-
-    def record(path: Text, flags: int) -> int:
-        """Capture the flags instead of opening anything.
-
-        Args:
-            path: The path, unused.
-            flags: What the opener was given.
-
-        Returns:
-            A file descriptor for ``/dev/null``, so the caller has
-            something real to close.
-        """
-        seen.append(flags)
-        return os.open(os.devnull, os.O_WRONLY)
-
-    opener = guarded_opener(overwrite=False)
-    fd = opener(str(tmp_path / 'f'), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    os.close(fd)
-    flags = seen[0] if seen else _flags_from(opener, tmp_path)
+    flags = _leaf_flags_from(guarded_opener(overwrite=False), tmp_path)
 
     assert flags & os.O_NOFOLLOW, 'a symlink at the target can be followed'
     assert flags & os.O_EXCL, 'an existing file can be replaced'
     assert not flags & os.O_TRUNC, 'O_TRUNC contradicts O_EXCL'
 
 
-def _flags_from(opener: Any, tmp_path: Path) -> int:
-    """Return the flags ``opener`` computes, by intercepting ``os.open``.
+def _leaf_flags_from(opener: Any, tmp_path: Path) -> int:
+    """Return the flags ``opener`` uses for the **leaf** open.
+
+    Since the N2 fix the opener issues several ``os.open`` calls: one per
+    directory component of the walk, then the leaf. Only the last carries
+    the write flags, and it is the one identifiable by ``dir_fd`` being
+    passed with a bare component rather than a path -- so that is what is
+    recorded, rather than "the first call", which is now the anchor
+    directory and would report the walk's read-only flags.
+
+    Every call is delegated to the real ``os.open``: substituting a
+    ``/dev/null`` descriptor the way this helper used to would now be
+    rejected by the ``S_ISREG`` guard, and rightly so.
 
     Args:
         opener: The opener under test.
         tmp_path: A directory to name a throwaway path in.
 
     Returns:
-        The flags the opener passed on.
+        The flags the opener passed for the final component.
     """
     captured: list[int] = []
     real_open = os.open
 
     def spy(path: Any, flags: int, mode: int = 0o777, **kwargs: Any) -> int:
-        """Record the flags and open ``/dev/null`` instead.
+        """Record the leaf's flags, then open for real.
 
         Args:
-            path: The path, unused.
+            path: The path or component being opened.
             flags: What was computed.
-            mode: The mode, unused.
-            kwargs: The rest, unused.
+            mode: The creation mode.
+            kwargs: The rest, including ``dir_fd``.
 
         Returns:
-            An open descriptor.
+            The real descriptor.
         """
-        captured.append(flags)
-        return real_open(os.devnull, os.O_WRONLY)
+        if kwargs.get('dir_fd') is not None and not flags & os.O_DIRECTORY:
+            captured.append(flags)
+        return real_open(path, flags, mode, **kwargs)
 
     # `type: ignore[assignment]` -- `os.open` is replaced for the
-    # duration of this test to observe which thread the real open runs
-    # on. mypy rightly refuses an assignment to a stdlib function; the
+    # duration of this test to observe the flags the real open receives.
+    # mypy rightly refuses an assignment to a stdlib function; the
     # substitution is the experiment, and it is undone in the `finally`
     # below.
     os.open = spy  # type: ignore[assignment]
@@ -502,6 +507,7 @@ def _flags_from(opener: Any, tmp_path: Path) -> int:
             str(tmp_path / 'f'), os.O_WRONLY | os.O_CREAT | os.O_TRUNC))
     finally:
         os.open = real_open  # type: ignore[assignment]
+    assert captured, 'no leaf open was observed, so nothing was proven'
     return captured[0]
 
 
@@ -513,28 +519,34 @@ def test_r22_ac3_the_mode_reaches_the_kernel(tmp_path: Path) -> None:
     case M18 describes is the whole exposure. Asserted on the argument
     because the resulting mode is also filtered by ``umask``, and a
     machine with a permissive umask would let a wrong constant pass.
+
+    Only the **leaf** open is inspected. Since the N2 fix the walk also
+    opens each directory component, and those are read-only opens that
+    create nothing -- a mode argument on them is meaningless, so folding
+    them into this assertion would test the wrong call.
     """
     captured: list[int] = []
     real_open = os.open
 
     def spy(path: Any, flags: int, mode: int = 0o777, **kwargs: Any) -> int:
-        """Record the mode and delegate.
+        """Record the leaf's mode and delegate.
 
         Args:
             path: The path to open.
             flags: The flags.
             mode: The creation mode under test.
-            kwargs: The rest.
+            kwargs: The rest, including ``dir_fd``.
 
         Returns:
             The real descriptor.
         """
-        captured.append(mode)
+        if kwargs.get('dir_fd') is not None and not flags & os.O_DIRECTORY:
+            captured.append(mode)
         return real_open(path, flags, mode, **kwargs)
 
     # `type: ignore[assignment]` -- `os.open` is replaced for the
-    # duration of this test to observe which thread the real open runs
-    # on. mypy rightly refuses an assignment to a stdlib function; the
+    # duration of this test to observe the mode the real open receives.
+    # mypy rightly refuses an assignment to a stdlib function; the
     # substitution is the experiment, and it is undone in the `finally`
     # below.
     os.open = spy  # type: ignore[assignment]
@@ -593,12 +605,22 @@ def test_r22_ac6_the_degraded_check_allows_an_ordinary_path(
 def test_the_degraded_symlink_check_passes_an_absent_path(
     tmp_path: Path,
 ) -> None:
-    """:func:`refuse_symlink` says nothing about a path that is not there.
+    """:func:`_refuse_symlink_at` says nothing about an absent path.
 
     A download names a file it is about to create, so the ordinary case
     for this check is a path with nothing at it at all.
+
+    Now asked relative to an open directory descriptor: the standalone
+    ``refuse_symlink`` this used to call was superseded by the
+    descriptor-relative form when the walk landed, because a check made
+    against a bare path can be answered about a *different* directory
+    than the one the open will use.
     """
-    refuse_symlink(str(tmp_path / 'nothing-here'))
+    parent_fd = os.open(str(tmp_path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _refuse_symlink_at(parent_fd, 'nothing-here', str(tmp_path))
+    finally:
+        os.close(parent_fd)
 
 
 # --- R22-AC5 / M19: partial files and the idempotent unlink ----------------
@@ -1057,3 +1079,531 @@ async def test_concurrent_writers_to_one_path_do_not_both_succeed(
 
     assert sorted(str(outcome) for outcome in outcomes) == ['CONFIG', 'None']
     assert target.read_bytes() in (b'first', b'second')
+
+
+# --- N2/N3/N4: the descriptor walk -----------------------------------------
+#
+# One construction answers all three, so the tests are grouped rather than
+# split by finding: they exercise the same `open_within` from three angles.
+# Each was written against the pre-fix code first and observed to FAIL.
+
+
+def test_n2_a_directory_component_swapped_after_the_check_cannot_redirect(
+    tmp_path: Path,
+) -> None:
+    """N2, asserted deterministically rather than by winning a race.
+
+    The defect: ``resolve_within`` canonicalises the parent and answers a
+    *string*; handing that string to ``os.open`` makes the kernel walk
+    every component again, so a directory component swapped in between is
+    followed. Measured on the pre-fix code at 6 escaped payloads per 3000
+    writes under a flipping component.
+
+    A scheduling race would be flaky and would prove nothing on the run
+    that lost, so the swap is performed **at a guaranteed moment**: the
+    hook fires when the leaf component is opened, and replaces the
+    already-traversed directory ``hop`` with a symbolic link pointing
+    outside the base.
+
+    That instant is chosen because it is the one both implementations
+    share, which is what makes this a discriminator rather than a
+    tautology. The old code opened the leaf by its **full path**, so the
+    kernel re-walked ``hop`` after the swap and the payload landed
+    outside. The new code opens the leaf by **name against ``hop``'s
+    descriptor**, so the swap changes a name nobody consults again and
+    the payload lands where it was checked to land.
+    """
+    base, outside = base_and_outside(tmp_path)
+    hop = base / 'hop'
+    hop.mkdir()
+    target = base.resolve() / 'hop' / 'payload.bin'
+
+    real_open = os.open
+    swapped: list[bool] = []
+
+    def swap_at_the_leaf(
+        path: Any, flags: int, mode: int = 0o777, **kwargs: Any,
+    ) -> int:
+        """Replace ``hop`` with a link outside, as the leaf is opened.
+
+        Args:
+            path: The component or path being opened.
+            flags: The open flags.
+            mode: The creation mode.
+            kwargs: The rest, including ``dir_fd``.
+
+        Returns:
+            The real descriptor.
+        """
+        if str(path).endswith('payload.bin') and not swapped:
+            swapped.append(True)
+            hop.rename(base / 'hop-moved-away')
+            (base / 'hop').symlink_to(outside)
+        return real_open(path, flags, mode, **kwargs)
+
+    # `type: ignore[assignment]` -- `os.open` is replaced to force the
+    # swap at the one instant that matters. Undone in the `finally`.
+    os.open = swap_at_the_leaf  # type: ignore[assignment]
+    try:
+        descriptor = guarded_opener(overwrite=False)(
+            str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    finally:
+        os.open = real_open  # type: ignore[assignment]
+    try:
+        os.write(descriptor, b'PAYLOAD')
+    finally:
+        os.close(descriptor)
+
+    assert swapped, 'the swap never fired, so the window was never tested'
+    assert entries(outside) == [], (
+        'the write followed a directory component swapped after it was '
+        'checked -- the N2 TOCTOU is open')
+    assert (base / 'hop-moved-away' / 'payload.bin').read_bytes() == b'PAYLOAD'
+
+
+def test_n2_a_symlinked_directory_component_is_refused_at_the_walk(
+    tmp_path: Path,
+) -> None:
+    """The walk refuses a symlinked component even reached directly.
+
+    ``resolve_within`` would normally have canonicalised this away, so
+    this asserts the *opener's own* guarantee rather than the resolver's
+    -- the two are separate halves and the opener must not depend on
+    having been called correctly.
+    """
+    base, outside = base_and_outside(tmp_path)
+    (base / 'link').symlink_to(outside)
+
+    with pytest.raises(OSError):
+        guarded_opener(overwrite=False)(
+            str(base / 'link' / 'f.bin'), os.O_WRONLY | os.O_CREAT)
+
+    assert entries(outside) == []
+
+
+def test_n3_a_fifo_target_is_refused_instead_of_hanging_forever(
+    tmp_path: Path,
+) -> None:
+    """N3: the defect was an unbounded hang, not merely a wrong answer.
+
+    Opening a FIFO for writing blocks until a reader attaches. That open
+    runs in a threadpool worker, where the caller's ``timeout`` cannot
+    reach it -- so ``request(timeout=3)`` measured no return after 6s.
+    ``O_NONBLOCK`` turns the block into ``ENXIO``, which is typed as a
+    containment refusal.
+
+    The test itself would hang rather than fail if this regressed, which
+    is the honest shape: a bounded assertion cannot be written for
+    "returns at all" without a watchdog, and pytest's own timeout would
+    report it.
+    """
+    target = tmp_path / 'pipe'
+    os.mkfifo(target)
+
+    with pytest.raises(PathContainmentError) as caught:
+        guarded_opener(overwrite=True)(
+            str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+    assert 'named pipe' in str(caught.value)
+
+
+def test_n3_a_fifo_with_a_reader_is_still_refused(tmp_path: Path) -> None:
+    """``O_NONBLOCK`` alone is not the fix, and this is why.
+
+    A FIFO that already has a reader attached opens *immediately* and
+    without error, so the ``ENXIO`` path never runs and an implementation
+    relying on the flag alone would accept it -- streaming the download
+    into a pipe some other process is reading. Only the ``fstat`` on the
+    returned descriptor catches this one, which is the reason both
+    mechanisms are present rather than either alone.
+    """
+    target = tmp_path / 'pipe'
+    os.mkfifo(target)
+    reader = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        with pytest.raises(PathContainmentError) as caught:
+            guarded_opener(overwrite=True)(
+                str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    finally:
+        os.close(reader)
+
+    assert 'named pipe' in str(caught.value)
+
+
+def test_n3_a_character_device_target_is_refused(tmp_path: Path) -> None:
+    """``/dev/null`` reported ``ok=True`` and discarded the whole body.
+
+    The worst shape of this defect: no error, no file, and a caller told
+    the download succeeded. Refused by ``S_ISREG`` on the descriptor.
+    """
+    with pytest.raises(PathContainmentError) as caught:
+        guarded_opener(overwrite=True)(
+            os.devnull, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+    assert 'character device' in str(caught.value)
+
+
+async def test_n3_a_devnull_download_no_longer_reports_success(
+    tmp_path: Path,
+) -> None:
+    """The same finding at the seam a caller actually uses.
+
+    Asserted through ``safe_writer`` rather than the opener, because the
+    envelope a consumer sees is built from what this context manager
+    raises -- and the defect was precisely that it raised nothing.
+    """
+    with pytest.raises(PathContainmentError):
+        async with safe_writer(Path(os.devnull), overwrite=True) as handle:
+            await handle.write(b'this body would be silently discarded')
+
+
+def test_n4_a_hardlinked_target_is_refused(tmp_path: Path) -> None:
+    """N4: ``is_symlink()`` is False for a hard link, so it was written.
+
+    The reviewer overwrote a victim file holding ``'secret-original'``
+    and got ``ok=True``. A hard link is the same inode under a second
+    name, so writing the download writes the victim.
+    """
+    victim = tmp_path / 'victim'
+    victim.write_bytes(b'secret-original')
+    target = tmp_path / 'download.bin'
+    os.link(victim, target)
+
+    with pytest.raises(PathContainmentError) as caught:
+        guarded_opener(overwrite=True)(
+            str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+    assert 'hard link' in str(caught.value)
+    assert victim.read_bytes() == b'secret-original'
+
+
+def test_n4_overwrite_truncates_only_after_the_target_is_judged(
+    tmp_path: Path,
+) -> None:
+    """The subtle half of N4, and a defect this fix had in its first draft.
+
+    Passing ``O_TRUNC`` to the open makes the kernel truncate *as part of
+    opening*, before any ``fstat`` can refuse the file. The refusal then
+    fires correctly -- and the victim has already been emptied, which is
+    a worse outcome than the write-through the check exists to prevent.
+
+    Asserted on the victim's **contents**, not on the exception: the
+    exception was already correct in the broken draft. That is what makes
+    this row worth its own test rather than an extra assertion above.
+    """
+    victim = tmp_path / 'victim'
+    victim.write_bytes(b'secret-original')
+    target = tmp_path / 'download.bin'
+    os.link(victim, target)
+
+    with pytest.raises(PathContainmentError):
+        guarded_opener(overwrite=True)(
+            str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+    assert victim.read_bytes() == b'secret-original', (
+        'the victim was truncated by the open before the guard refused it')
+
+
+def test_n4_overwrite_still_truncates_an_ordinary_file(
+    tmp_path: Path,
+) -> None:
+    """The control: moving truncation off the open must not lose it.
+
+    Without this row, an implementation that simply dropped ``O_TRUNC``
+    would pass every assertion above while leaving the tail of a longer
+    previous download appended to every shorter new one -- silent data
+    corruption that no test here would otherwise notice.
+    """
+    target = tmp_path / 'existing.bin'
+    target.write_bytes(b'the original contents, which are much longer')
+
+    descriptor = guarded_opener(overwrite=True)(
+        str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    try:
+        os.write(descriptor, b'short')
+    finally:
+        os.close(descriptor)
+
+    assert target.read_bytes() == b'short'
+
+
+def test_a_hardlink_is_refused_by_default_too(tmp_path: Path) -> None:
+    """The default path refuses the hard link as well, by ``O_EXCL``.
+
+    ``overwrite=False`` never reaches the ``fstat``: ``O_EXCL`` fails the
+    open with ``EEXIST`` first, and :func:`safe_writer` classifies that
+    as configuration. The raw opener therefore raises ``FileExistsError``
+    here rather than a typed error -- the translation happens one layer
+    up, which is exactly where the existing suite already pins it.
+
+    Worth its own row because the security outcome is what matters and
+    it is identical on both paths: the victim is untouched either way.
+    """
+    victim = tmp_path / 'victim'
+    victim.write_bytes(b'secret-original')
+    target = tmp_path / 'download.bin'
+    os.link(victim, target)
+
+    with pytest.raises(FileExistsError):
+        guarded_opener(overwrite=False)(
+            str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+    assert victim.read_bytes() == b'secret-original'
+
+
+def test_a_directory_target_is_refused_by_the_walk(tmp_path: Path) -> None:
+    """A path that is itself a directory cannot be opened for writing.
+
+    R22 already covered this through ``O_EXCL``'s ``EEXIST``; the walk
+    reaches it first now, so the behaviour is re-pinned at the new site.
+    """
+    directory = tmp_path / 'a-directory'
+    directory.mkdir()
+
+    with pytest.raises((OSError, ConfigurationError, PathContainmentError)):
+        guarded_opener(overwrite=True)(
+            str(directory), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+
+def test_the_walk_refuses_a_path_with_no_components(tmp_path: Path) -> None:
+    """The root itself names no file to write.
+
+    Unreachable through ``resolve_within``, which refuses a directory
+    candidate earlier, but :func:`open_within` is a separate primitive
+    and must answer for its own inputs rather than trusting its caller.
+    """
+    with pytest.raises(PathContainmentError) as caught:
+        open_within(os.sep, os.O_WRONLY | os.O_CREAT)
+
+    assert 'names a directory' in str(caught.value)
+
+
+def test_the_walk_anchors_a_relative_path_at_the_working_directory(
+    tmp_path: Path,
+) -> None:
+    """A relative path is anchored at ``.``, matching ``resolve_within``.
+
+    Not a shape this library produces -- both entry points canonicalise
+    to absolute first -- but the branch exists and an untested branch is
+    an unverified claim.
+    """
+    previous = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        descriptor = open_within('relative.bin', os.O_WRONLY | os.O_CREAT)
+        os.close(descriptor)
+    finally:
+        os.chdir(previous)
+
+    assert (tmp_path / 'relative.bin').exists()
+
+
+def test_the_degraded_walk_refuses_a_symlinked_leaf(tmp_path: Path) -> None:
+    """The no-``O_NOFOLLOW`` fallback, now asked against the parent's fd.
+
+    R22-AC6 requires the degraded branch to carry real coverage, so the
+    flag is passed as 0 explicitly. The check is a separate syscall and
+    keeps its documented window; what changed is that it asks about the
+    leaf relative to the directory descriptor the open will use, rather
+    than about a path that may name a different directory by then.
+    """
+    victim = tmp_path / 'victim'
+    link = tmp_path / 'link'
+    link.symlink_to(victim)
+
+    with pytest.raises(PathContainmentError):
+        open_within(str(link), os.O_WRONLY | os.O_CREAT, nofollow=0)
+
+    assert not victim.exists()
+
+
+def test_the_degraded_walk_allows_an_ordinary_absent_path(
+    tmp_path: Path,
+) -> None:
+    """And the fallback still creates a file when there is no link.
+
+    The control for the row above: a degraded branch that refused
+    everything would satisfy it and break every download on the platform
+    the branch exists for. Also covers the ``FileNotFoundError`` arm of
+    the check, which is the ordinary case -- a download names a file that
+    is not there yet.
+    """
+    target = tmp_path / 'ordinary.bin'
+
+    descriptor = open_within(
+        str(target), os.O_WRONLY | os.O_CREAT, nofollow=0)
+    os.close(descriptor)
+
+    assert target.exists()
+
+
+def test_the_degraded_walk_allows_an_existing_ordinary_file(
+    tmp_path: Path,
+) -> None:
+    """The degraded check tolerates a file that is present and not a link.
+
+    Distinct from the row above: that one exercises the ``lstat`` raising
+    ``FileNotFoundError``, this one exercises it *succeeding* on a
+    non-symlink. Two different arms of the same branch.
+    """
+    target = tmp_path / 'already-here.bin'
+    target.write_bytes(b'previous')
+
+    descriptor = open_within(
+        str(target), os.O_WRONLY, nofollow=0)
+    os.close(descriptor)
+
+    assert target.read_bytes() == b'previous'
+
+
+def test_a_socket_target_is_named_in_the_refusal(tmp_path: Path) -> None:
+    """The refusal names what it found, for every kind a write can hit.
+
+    A message that says only "not a regular file" leaves the operator to
+    go and look; naming the kind is the difference between a diagnosable
+    error and a puzzle. Sockets are the one remaining kind reachable
+    without root, so the enumeration is exercised rather than asserted
+    from the source.
+    """
+    # Bound from inside a short-named directory: `AF_UNIX` paths are
+    # capped near 104 bytes on macOS and pytest's `tmp_path` alone
+    # already exceeds it, so binding by absolute path fails before the
+    # code under test is reached.
+    endpoint = Path(tempfile.mkdtemp(dir='/tmp')) / 's'
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(endpoint))
+        with pytest.raises((PathContainmentError, OSError)) as caught:
+            guarded_opener(overwrite=True)(
+                str(endpoint.resolve()),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    finally:
+        server.close()
+        shutil.rmtree(endpoint.parent, ignore_errors=True)
+
+    assert isinstance(caught.value, OSError) or 'socket' in str(caught.value)
+
+
+def test_describe_names_every_kind_it_enumerates() -> None:
+    """:func:`_describe` answers for each mode, and falls back safely.
+
+    A table test rather than one filesystem object per kind: block
+    devices cannot be created without root, so exercising the branch
+    through a real file is impossible on CI. The fallback arm matters
+    most -- an unknown mode must still produce a usable message rather
+    than an index error.
+    """
+    assert _describe(stat.S_IFIFO) == 'named pipe'
+    assert _describe(stat.S_IFCHR) == 'character device'
+    assert _describe(stat.S_IFBLK) == 'block device'
+    assert _describe(stat.S_IFSOCK) == 'socket'
+    assert _describe(stat.S_IFDIR) == 'directory'
+    assert _describe(stat.S_IFLNK) == 'symbolic link'
+    assert _describe(stat.S_IFREG) == 'special file'
+
+
+def test_the_walk_closes_every_descriptor_it_opens(tmp_path: Path) -> None:
+    """No descriptor leak, on the success path or on a refusal.
+
+    The walk holds one directory descriptor per component, and a leak
+    would be invisible until a long-running consumer exhausted its file
+    limit -- a failure that surfaces far from its cause. Measured by
+    counting open descriptors around a batch of both outcomes.
+    """
+    deep = tmp_path / 'a' / 'b' / 'c'
+    deep.mkdir(parents=True)
+    victim = tmp_path / 'victim'
+    victim.write_bytes(b'x')
+    linked = tmp_path / 'linked'
+    os.link(victim, linked)
+
+    def open_descriptor_count() -> int:
+        """Count this process's open descriptors.
+
+        Returns:
+            How many of the first 512 descriptors are open.
+        """
+        total = 0
+        for candidate in range(512):
+            try:
+                os.fstat(candidate)
+            except OSError:
+                continue
+            total += 1
+        return total
+
+    before = open_descriptor_count()
+    for index in range(20):
+        descriptor = guarded_opener(overwrite=False)(
+            str(deep / f'f{index}.bin'), os.O_WRONLY | os.O_CREAT)
+        os.close(descriptor)
+        with pytest.raises(PathContainmentError):
+            guarded_opener(overwrite=True)(
+                str(linked), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+    assert open_descriptor_count() == before
+
+
+def test_the_walk_propagates_an_unrelated_open_failure(
+    tmp_path: Path,
+) -> None:
+    """Only ``ENXIO`` is translated; every other errno arrives as itself.
+
+    Translating more would report a full disk or a permission failure as
+    a containment finding, which is both wrong and alarming -- the same
+    principle ``classify_refusal`` already applies at the other seam.
+    """
+    with pytest.raises(FileNotFoundError):
+        guarded_opener(overwrite=False)(
+            str(tmp_path / 'no-such-dir' / 'f.bin'),
+            os.O_WRONLY | os.O_CREAT)
+
+
+def test_the_write_descriptor_is_left_in_blocking_mode(
+    tmp_path: Path,
+) -> None:
+    """``O_NONBLOCK`` is a means to the N3 check, not a lasting change.
+
+    A descriptor left non-blocking can accept a short write -- fewer
+    bytes than it was handed, with no error -- and every caller here
+    streams a body chunk by chunk through ``aiofiles``. That would be a
+    silently truncated download, so the flag is cleared once the ``fstat``
+    it enabled has run.
+    """
+    target = tmp_path / 'out.bin'
+
+    descriptor = guarded_opener(overwrite=False)(
+        str(target), os.O_WRONLY | os.O_CREAT)
+    try:
+        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    finally:
+        os.close(descriptor)
+
+    assert not flags & os.O_NONBLOCK, (
+        'the write descriptor is still non-blocking, so a short write '
+        'can silently truncate a download')
+
+
+def test_restoring_blocking_is_a_no_op_where_the_flag_does_not_exist(
+    tmp_path: Path,
+) -> None:
+    """The platform branch, exercised on a platform that has the flag.
+
+    Where ``O_NONBLOCK`` is absent the constant is 0, there is nothing to
+    clear, and the function must return without touching the descriptor.
+    Passing 0 explicitly reaches that branch here -- the same technique
+    ``guarded_opener``'s ``nofollow`` parameter uses, and for the same
+    reason: a branch guarded by ``sys.platform`` can never run on CI and
+    so carries no coverage at all.
+    """
+    target = tmp_path / 'out.bin'
+    descriptor = os.open(
+        str(target), os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK, FILE_MODE)
+    try:
+        _restore_blocking(descriptor, nonblock=0)
+        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    finally:
+        os.close(descriptor)
+
+    assert flags & os.O_NONBLOCK, (
+        'the no-op branch cleared the flag anyway, so it is not a no-op')
