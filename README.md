@@ -357,8 +357,40 @@ async def request(
 | `auth` | **Required for FTP and SFTP** — any object carrying `.login` and `.password`, e.g. `SimpleNamespace(login=..., password=...)`; omitted there, the call raises `ConfigurationError`, because those two protocols cannot connect without credentials. **Optional for HTTP/HTTPS/SOAP**, where `None` sends no credentials; put credentials in an `Authorization` header instead (see [HTTP credentials](#http-basic-auth)). `auth` is still forwarded to aiohttp untouched, but `aiohttp.BasicAuth` is deprecated in aiohttp 3.14. |
 | `protocol` | One of `'HTTP'`, `'HTTPS'`, `'FTP'`, `'SFTP'`, `'SOAP'`. Matched with surrounding whitespace stripped and without regard to case, so `'http'`, `' HTTP '` and `'Http'` are one protocol. |
 | `protocol_info` | Per-protocol configuration; see the tables below. `None` is a valid call for every protocol that requires no key. |
-| `pre_processor_config` | `{'function': async_callable, 'params': {...}}`. Awaited before dispatch with `response=<envelope>` plus `params`; its return value lands in `pre_processor_response`. |
+| `pre_processor_config` | `{'function': async_callable, 'params': {...}}`. Awaited before dispatch with `response=<envelope>` plus `params`; its return value lands in `pre_processor_response`. See [Processor hooks](#processor-hooks). |
 | `post_processor_config` | The same shape, awaited after the call; its return value lands in `post_processor_response`. |
+
+### Processor hooks
+
+Both configs are validated **before either runs** — so a typo in your
+post-processor config refuses the call up front, rather than after the request
+has already gone out and cannot be un-sent.
+
+A malformed *configuration* raises `ConfigurationError` (`CONFIG`/400): a
+config that is not a mapping, a missing or non-callable `'function'`, a
+`'params'` that is not a mapping of `str` keys, or a `'params'` naming
+`'response'` — which this library passes itself, so supplying it too would give
+your callable two values for one argument.
+
+A *valid* config whose callable then fails raises `ProcessorError`
+(`PROCESSOR`/500), with the original chained as `__cause__`. That covers your
+function raising, refusing the `response` keyword, returning something that
+cannot be awaited, or removing a key from the envelope it was handed. The two
+errors are deliberately distinct: the first says the hook was configured
+wrongly, the second says the hook that was configured is itself broken.
+
+Your callable is handed the **live** envelope and may change what it holds —
+rewriting `response['url']` from a pre-processor is a supported use — but it
+may not *remove* a key, because the protocol clients read them and
+`result['ok']` is the documented success predicate.
+
+A post-processor that raises therefore forfeits the envelope, response body
+included. That is the cost of the guarantee that nothing but an
+`AsyncGatewayError` escapes `request()`: an `ok=False` envelope would dress a
+bug in your cleanup function up as a failed request and overwrite the
+successful result you were about to read. A callback that must not cost you the
+response handles its own failures. A callback that raises an
+`AsyncGatewayError` itself is passed through untouched.
 
 ### `protocol_info` — HTTP and HTTPS
 
@@ -709,6 +741,7 @@ explicitly rather than inventing a sentinel.
 | XML refused before parse (DOCTYPE) | `502` | `XML_UNSAFE` | `False` |
 | Path containment violation | `400` | `PATH` | `False` |
 | Caller configuration error | `400` | `CONFIG` | `False` |
+| Your own processor callback failed | `500` | `PROCESSOR` | `False` |
 
 `495` is library-assigned and documented: no registered status describes an SSH
 host-key mismatch, and 495 — a client-certificate rejection — is the nearest
@@ -809,6 +842,7 @@ AsyncGatewayError                 GATEWAY              502
 │   ├── GatewayTimeoutError       TIMEOUT              504
 │   ├── ResponseTooLargeError     RESPONSE_TOO_LARGE   502
 │   └── ResponseTooDeepError      RESPONSE_TOO_DEEP    502
+├── ProcessorError                PROCESSOR            500
 ├── CircuitOpenError              CIRCUIT_OPEN         503
 ├── StackExhaustedError           STACK_EXHAUSTED      502
 └── ProtocolError                 PROTOCOL             502
@@ -830,6 +864,7 @@ message text.
 | `code` | Raised when | Retryable? |
 |---|---|---|
 | `CONFIG` | Your configuration cannot form a valid call | No |
+| `PROCESSOR` | Your own pre/post-processor callback failed | No |
 | `SERIALIZATION` | A body will not parse, or will not serialise | No |
 | `XML_UNSAFE` | An XML prolog declares a DOCTYPE | No |
 | `PATH` | A local path escapes its target directory, or is a symlink | No |
