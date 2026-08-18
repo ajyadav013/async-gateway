@@ -194,6 +194,192 @@ def test_ci_matrix_matches_the_pyproject_version_classifiers() -> None:
     )
 
 
+# --- The floor is a syntax claim too ----------------------------------------
+#
+# The tests above assert the matrix *names* 3.10. They cannot assert the
+# repository still *parses* on it, and that is a different failure: PEP 701
+# relaxed the f-string grammar in 3.12, so an f-string written naturally on
+# a modern interpreter is a hard `SyntaxError` on the oldest leg the matrix
+# claims. It is a collection-time error, not a test failure -- the module
+# never imports, so every test in it silently stops running.
+#
+# This was not hypothetical. `test_packaging.py` itself carried a
+# line-spanning f-string that made this very module unparseable on 3.10 and
+# 3.11: the two legs whose *existence* it asserts. Every check above was
+# dead on both, and the suite was green on 3.12+ regardless.
+#
+# `ast.parse(..., feature_version=(3, 10))` does not help -- it gates
+# semantics, not the tokenizer, and accepts all three forms below. Nothing
+# short of the older interpreter, or this scan, can see them.
+#
+# The scan itself needs 3.12 to run, which sounds circular and is not.
+# Before 3.12 every `FormattedValue` reports the position of the WHOLE
+# enclosing f-string rather than of its own replacement field, so the two
+# tests below -- "does the field span lines", "does it contain the
+# enclosing quote" -- are both trivially true of every f-string ever
+# written, and the scan reports the entire repository as offending.
+#
+# So the scan is skipped below 3.12, and skipping loses nothing: an older
+# interpreter does not need to be *told* the file will not parse, it
+# fails to parse it. The 3.12+ run is where the answer is not already
+# obvious, and it is the run that reports for the older legs.
+
+#: The opening quote of an f-string, after any prefix letters. Needed to
+#: tell a *reused* quote inside a replacement field -- legal only from 3.12
+#: -- from a different one, which has always been legal.
+_FSTRING_QUOTE = re.compile(r'^[A-Za-z]*(?P<quote>\'\'\'|"""|\'|")')
+
+#: The replacement-field forms PEP 701 introduced, each verified to raise
+#: `SyntaxError` on a real 3.10 and 3.11 interpreter and to parse on 3.12+.
+#:
+#: Two entries, not three. PEP 701 also allows a `#` comment inside a
+#: field, but that form cannot be detected separately and does not need
+#: to be: a comment runs to end of line, so the closing brace is always
+#: on a later one and the field is already caught as spanning lines.
+#: Testing the source text for `#` as its own arm would be worse than
+#: redundant -- it would flag `f'{"#"}'`, which 3.10 accepts.
+#:
+#: A nested quote that *differs* from the enclosing one is absent for the
+#: same reason: it predates PEP 701 and is legal on every version here.
+PEP_701_FORMS = ('spans more than one line', 'reuses the enclosing quote')
+
+#: Applied to the scan and to its own two self-tests together, so that
+#: the thing under test and the tests of it can never disagree about
+#: which interpreters they run on.
+needs_field_positions = pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason='before 3.12 a FormattedValue reports the position of the '
+           'whole f-string rather than its own, so the scan cannot tell '
+           'a field from its container; the older legs prove the same '
+           'property by failing to parse instead')
+
+
+def pep_701_fstrings_in(source: str, module: str) -> List[str]:
+    """Report replacement fields that need Python 3.12 or newer.
+
+    Walks the f-strings rather than pattern-matching the text: a regex
+    over source cannot tell an f-string's braces from a dict literal's,
+    and would flag the prose in this very docstring.
+
+    Args:
+        source: The module's source text.
+        module: A display name for the offence messages.
+
+    Returns:
+        One ``module:line: reason`` string per offending field, empty
+        when the module parses on the ``requires-python`` floor.
+    """
+    offenders: List[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        opener = _FSTRING_QUOTE.match(
+            ast.get_source_segment(source, node) or '')
+        quote = opener['quote'] if opener else ''
+        for value in node.values:
+            if not isinstance(value, ast.FormattedValue):
+                continue
+            field = ast.get_source_segment(source, value) or ''
+            if (value.end_lineno or value.lineno) > value.lineno:
+                reason = PEP_701_FORMS[0]
+            elif quote and quote in field:
+                reason = PEP_701_FORMS[1]
+            else:
+                continue
+            offenders.append(f'{module}:{value.lineno}: {reason}')
+    return offenders
+
+
+@needs_field_positions
+def test_every_committed_module_parses_on_the_requires_python_floor(
+) -> None:
+    """No source file needs an interpreter newer than the floor.
+
+    Scoped to the package, the suite and the examples -- everything the
+    3.10 CI leg imports. The file list is materialised and asserted
+    first: an empty ``offenders`` is the pass condition and is also what
+    scanning nothing produces, so a mistyped root would otherwise report
+    the tree clean.
+    """
+    roots = (PACKAGE_ROOT, REPO_ROOT / 'tests', EXAMPLES)
+    scanned = sorted(
+        path for root in roots for path in root.rglob('*.py'))
+
+    offenders = [
+        offence
+        for path in scanned
+        for offence in pep_701_fstrings_in(
+            path.read_text(encoding='utf-8'),
+            path.relative_to(REPO_ROOT).as_posix())
+    ]
+
+    floor = _read_requires_python_floor()
+    assert scanned, f'no modules scanned under {roots}'
+    assert offenders == [], (
+        f'these f-strings need Python 3.12 or newer, and '
+        f'requires-python is >={floor[0]}.{floor[1]}. On the older legs '
+        f'the module fails to PARSE, so its tests do not run at all -- '
+        f'a green suite on a newer interpreter says nothing about them: '
+        f'{offenders}'
+    )
+
+
+@needs_field_positions
+@pytest.mark.parametrize('source, expected', [
+    ("x = [1]\ny = f'a{\n    x}b'\n", PEP_701_FORMS[0]),
+    ("a = {'k': 1}\nb = f'{a['k']}'\n", PEP_701_FORMS[1]),
+    # The comment form, which has no arm of its own: it is reported as
+    # spanning lines, because a comment always pushes the closing brace
+    # onto the next one. Asserted so the reasoning stays checked.
+    ("x = 1\ny = f'{x  # note\n}'\n", PEP_701_FORMS[0]),
+])
+def test_the_floor_scan_reports_every_form_it_claims_to(
+    source: str, expected: str,
+) -> None:
+    """Each PEP 701 form the scan names is one the scan finds.
+
+    A scan that reported nothing would pass the test above for the
+    wrong reason, so each form is fed to it and must come back.
+
+    Args:
+        source: A module body using one 3.12-only f-string form.
+        expected: The reason the scan must give for it.
+    """
+    offenders = pep_701_fstrings_in(source, 'probe.py')
+
+    assert len(offenders) == 1, offenders
+    assert offenders[0].endswith(expected), offenders
+
+
+@needs_field_positions
+@pytest.mark.parametrize('source', [
+    # A nested quote that differs from the enclosing one: legal since 3.6.
+    'a = {"k": 1}\nb = f"{a[\'k\']}"\n',
+    # An ordinary field, and a format spec, on one line.
+    "x = 1.5\ny = f'{x} and {x:.2f}'\n",
+    # Adjacent implicit concatenation, each part its own f-string.
+    "x = 1\ny = (f'a{x}'\n     f'b{x}')\n",
+    # A `#` in the literal text rather than in a replacement field.
+    "x = 1\ny = f'# {x}'\n",
+    # And a `#` inside a nested string: 3.10 takes it, so a text search
+    # for `#` -- the arm PEP_701_FORMS deliberately omits -- would be a
+    # false positive here.
+    'y = f\'{"#"}\'\n',
+])
+def test_the_floor_scan_permits_what_3_10_already_accepts(
+    source: str,
+) -> None:
+    """The scan flags nothing the floor interpreter would have taken.
+
+    The counterpart to the test above: a scan that flagged every
+    f-string would also catch the three forms, and be useless.
+
+    Args:
+        source: A module body legal on every supported interpreter.
+    """
+    assert pep_701_fstrings_in(source, 'probe.py') == []
+
+
 # --- Version: one source of truth (R5) --------------------------------------
 #
 # Four mutually contradictory version claims (H22) are collapsed to one:
@@ -408,8 +594,8 @@ def test_no_independent_version_claim_survives_in_docs() -> None:
         if path.is_file() and path.suffix in {'.py', '.cfg', '.bat'}
         and claim.search(path.read_text(encoding='utf-8', errors='replace'))
     ]
-    assert not offenders, f'an independent version claim survives in {
-        offenders}'
+    assert not offenders, (
+        f'an independent version claim survives in {offenders}')
 
 
 # --- LICENSE (R34) ----------------------------------------------------------
