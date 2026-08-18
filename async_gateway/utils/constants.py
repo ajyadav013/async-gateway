@@ -12,6 +12,7 @@ is, because a bare number invites the next reader to change it back.
 """
 
 from collections.abc import Mapping
+from string import ascii_letters, digits
 from types import MappingProxyType
 from typing import Final, FrozenSet
 
@@ -143,6 +144,43 @@ MAX_MULTIPART_DEPTH: Final[int] = 64
 #: that, and a bound this library states is one it can hold to whatever
 #: the embedding process chose.
 MAX_FAULT_DETAIL_DEPTH: Final[int] = 64
+
+#: The characters no HTTP header name or value may carry: NUL through
+#: US except HT, plus DEL. Exactly the class
+#: ``aiohttp.http_writer._safe_header`` refuses, restated here because
+#: this library refuses them *earlier* -- at construction, before a
+#: socket -- and the two must agree or the earlier check either rejects
+#: what would have worked or admits what will not (N6).
+#:
+#: HT is absent deliberately: it is legal inside a header value as
+#: obsolete line folding, ``aiohttp`` permits it, and refusing it here
+#: would make this library stricter than the transport for no security
+#: gain. CR and LF are the two that matter -- they end the header line
+#: and let whatever follows be read as headers of its own -- and the
+#: rest of C0 comes with them because a serialiser that refuses them is
+#: not a boundary this library should be discovering at write time.
+FORBIDDEN_HEADER_CHARS: Final[FrozenSet[str]] = frozenset(
+    {chr(n) for n in range(0x20)} - {'\t'} | {'\x7f'})
+
+#: The characters no cookie value may carry. ``http.cookies`` quotes and
+#: escapes everything else it is given -- a space, a comma, a semicolon
+#: all survive as an escaped octal -- so the control characters are the
+#: whole of what cannot be expressed, and CR and LF are again the two
+#: that would end the ``Cookie`` header early.
+FORBIDDEN_COOKIE_VALUE_CHARS: Final[FrozenSet[str]] = frozenset(
+    {chr(n) for n in range(0x20)} | {'\x7f'})
+
+#: The characters a cookie *name* may carry, which is a much shorter list
+#: than a value's: a name is an RFC 6265 token and cannot be quoted, so
+#: anything outside this set has no representation at all rather than an
+#: escaped one. It is the same set as ``http.cookies._LegalChars``,
+#: written out rather than imported because that name is private and a
+#: stdlib internal is not a dependency this library should take --
+#: ``tests/logic/test_http_client.py`` pins the two as equal, so a
+#: divergence in a future Python is a failing test rather than a
+#: surprise.
+LEGAL_COOKIE_NAME_CHARS: Final[FrozenSet[str]] = frozenset(
+    ascii_letters + digits + "!#$%&'*+-.^_`|~:")
 
 #: The URL schemes an HTTP-family call may be dispatched to, on the initial
 #: URL and on every redirect hop alike. R21 (a later story) reads it for

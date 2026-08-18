@@ -139,6 +139,17 @@ TLS_CONFIG_KEYS: Final[Tuple[str, ...]] = ('ssl_context', 'ssl')
 # from Python 3.11, and `ssl.SSLError` and `socket.gaierror` are both
 # `OSError` subclasses. First match wins, so the most specific
 # classification is listed first.
+#
+# `aioftp.InvalidCommand` is deliberately *not* here, and the omission is
+# load-bearing rather than an oversight -- see `transport_error_for`,
+# which classifies it above this table as configuration. It is a
+# `ValueError` subclass, so the tempting one-line fix for N7 was to add
+# `(ValueError, ConnectError)` to this table. That would have been wrong
+# twice over: it declares a caller's own CR/LF a *transport* failure,
+# carrying the retry recommendation a transport verdict carries, and it
+# would swallow every other `ValueError` this library's own code can
+# raise -- a genuine bug -- as a failed network call, which is the exact
+# blindness the one-conversion-point rule exists to prevent.
 TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
     (asyncio.TimeoutError, GatewayTimeoutError),
     (ssl.SSLError, TlsError),
@@ -251,7 +262,11 @@ def transport_error_for(
 
     Returns:
         The ``AsyncGatewayError`` subclass matching the failure's family,
-        carrying a message that is never empty and always redacted.
+        carrying a message that is never empty and always redacted. An
+        ``aioftp.InvalidCommand`` -- a CR or an LF in a value the caller
+        supplied -- maps to ``ConfigurationError`` rather than to a
+        transport class, because it is the caller's configuration and no
+        retry of it can succeed.
 
     Raises:
         BaseException: The original cause, unchanged, when it belongs to
@@ -263,6 +278,19 @@ def transport_error_for(
     message, _ = unwrap_cause(err, redact_params=redact_params)
     if isinstance(cause, aioftp.StatusCodeError):
         return FtpStatusError(message, reply_status(cause))
+    # Above the table, and matched on the concrete class rather than on
+    # its `ValueError` base: `aioftp` refuses a CR or an LF in a command
+    # line itself (`aioftp.Client.command`), correctly, but it refuses
+    # with an `InvalidCommand` -- an `AIOFTPException` *and* a
+    # `ValueError` -- which belonged to no family here and so escaped
+    # `request()` bare (N7). What reached that refusal is a `command`,
+    # a `server_path` or a credential the caller supplied, so the honest
+    # classification is `CONFIG`/400: the caller's own configuration
+    # cannot form a valid call. Not a transport failure, which would
+    # invite a retry of a value that can never succeed and would count
+    # a spelling mistake against the destination's circuit breaker.
+    if isinstance(cause, aioftp.errors.InvalidCommand):
+        return ConfigurationError(message)
     for family, error_class in TRANSPORT_ERRORS:
         if isinstance(cause, family):
             return error_class(message)
@@ -591,7 +619,14 @@ class FTPRequest(BaseRequestClass):
 
         Raises:
             ConfigurationError: If ``server_path`` is absent or is not a
-                non-empty string.
+                non-empty string, or if ``client_path`` is present and is
+                not a non-empty string. ``client_path`` is checked for
+                the same reason and against the same shape: absent is the
+                documented "no local operand" call, but a present
+                non-string reached ``Path()`` inside
+                :func:`~async_gateway.utils.contained_io.local_base` and
+                raised a ``TypeError`` belonging to no transport family,
+                which escaped ``request()`` un-enveloped.
             UnsupportedVerbError: If ``command`` names nothing in
                 :data:`FTP_COMMANDS` (R15-AC8). A
                 ``ConfigurationError``, so it reaches the caller as a
@@ -602,6 +637,15 @@ class FTPRequest(BaseRequestClass):
             raise ConfigurationError(
                 "protocol_info['server_path'] must be a non-empty string "
                 f'naming the path on the server, got {self.server_path!r}')
+        # `is not None` rather than a truth test: absent is the
+        # documented no-local-operand call, which `_run_command` reads
+        # for None, and `''` is a caller who meant a path and supplied
+        # none -- `Path('')` is the current directory, not an error.
+        if self.client_path is not None and (
+                not isinstance(self.client_path, str) or not self.client_path):
+            raise ConfigurationError(
+                "protocol_info['client_path'] must be a non-empty string "
+                f'naming the local path, got {self.client_path!r}')
         validated_verb(
             self.command_, allowed=FTP_COMMANDS, setting='command')
 

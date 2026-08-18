@@ -475,7 +475,9 @@ class SFTPRequest(BaseRequestClass):
                 could never have run. Checked before the connect, the
                 caller's own error is what they are told about; the
                 lookup keeps its own check so no ordering resolves an
-                unadmitted name against a live client.
+                unadmitted name against a live client. Also raised when
+                ``remote_path`` is absent or is not a non-empty string,
+                or when ``local_path`` is present and is not one.
         """
         if not isinstance(self.mode_, str) or not self.mode_:
             raise ConfigurationError(
@@ -498,6 +500,18 @@ class SFTPRequest(BaseRequestClass):
             raise ConfigurationError(
                 "protocol_info['remote_path'] must be a non-empty string "
                 f'naming the path on the server, got {self.remote_path!r}')
+        # And the local operand, for the same reason one step further
+        # out: absent is the documented no-local-path call, which the
+        # transfer reads for None, but a *present* non-string reached
+        # `Path()` inside `local_base` and raised a `TypeError` that
+        # belonged to no family and escaped un-enveloped. `is not None`
+        # rather than a truth test, because `''` is a caller who meant a
+        # path and gave none -- `Path('')` is the current directory.
+        if self.local_path is not None and (
+                not isinstance(self.local_path, str) or not self.local_path):
+            raise ConfigurationError(
+                "protocol_info['local_path'] must be a non-empty string "
+                f'naming the local path, got {self.local_path!r}')
 
     def _connect_options(self) -> Dict[str, Any]:
         """Return the keyword arguments ``asyncssh.connect`` is called with.

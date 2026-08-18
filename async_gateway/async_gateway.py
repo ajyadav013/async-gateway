@@ -120,7 +120,10 @@ def dispatch_url_for(
 
     Raises:
         ConfigurationError: If the URL's scheme is one this protocol will
-            not dispatch on, or if the URL cannot be parsed at all.
+            not dispatch on, or if the URL cannot be parsed at all. The
+            URL's *type* is checked earlier, in ``request()``, because
+            the envelope is built from it before this function is
+            reached.
     """
     allowed = HTTP_FAMILY_SCHEMES.get(protocol)
     if allowed is None:
@@ -309,9 +312,12 @@ async def request(
         form a valid call. That is: a protocol that is not a string, is
         empty, or names nothing registered; a ``protocol_info`` that is
         neither None nor a mapping, or that omits a key the chosen
-        protocol requires, such as HTTP's "request_type"; a URL whose
-        scheme the chosen protocol will not dispatch on, which for
-        ``protocol='HTTPS'`` includes a plain ``http://`` URL; a
+        protocol requires, such as HTTP's "request_type"; a URL that is
+        not a string; a URL whose scheme the chosen protocol will not
+        dispatch on, which for ``protocol='HTTPS'`` includes a plain
+        ``http://`` URL; "headers" or "cookies" that are not mappings of
+        str to str, or that carry a control character a header line
+        cannot express; a
         "serialization" value that is not callable or does not return
         str; an HTTP "request_type" naming no verb in the R21 allowlist
         (``UnsupportedVerbError``, a subclass); an
@@ -368,7 +374,18 @@ async def request(
     # do not check it again.
     #
     # The URL's *scheme* is the one exception and is deliberately not
-    # checked here; see FI-14 below.
+    # checked here; see FI-14 below. Its *type* is checked here, and has
+    # to be: `new_envelope` redacts the URL a few lines down, so a
+    # non-str reached `redact_url` -- and `yarl.URL` after it -- as a
+    # bare `TypeError` ("a bytes-like object is required, not 'str'") or
+    # an `AttributeError`, escaping `request()` un-enveloped on every
+    # protocol. The annotation says `str`; an annotation is not
+    # enforcement, and passing None is a caller's configuration mistake
+    # rather than a library bug, so it is reported as one.
+    if not isinstance(url, str):
+        raise ConfigurationError(
+            f'url must be a str, got {type(url).__name__}')
+
     protocol_name, protocol_class = resolve_protocol(protocol)
     info: Dict[str, Any] = validated_protocol_info(
         protocol_info, required=protocol_class.REQUIRED_INFO_KEYS)

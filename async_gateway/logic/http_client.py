@@ -9,7 +9,7 @@ the caller the body (invariant E11).
 
 import asyncio
 import ssl
-from collections.abc import Collection, MutableMapping
+from collections.abc import Collection, Mapping, MutableMapping
 from typing import (
     Any,
     Callable,
@@ -21,6 +21,7 @@ from typing import (
     Sequence,
     Tuple,
 )
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -39,7 +40,10 @@ from async_gateway.utils.constants import (
     ALLOWED_SCHEMES,
     CREDENTIAL_HEADERS,
     CROSS_ORIGIN_SAFE_HEADERS,
+    FORBIDDEN_COOKIE_VALUE_CHARS,
+    FORBIDDEN_HEADER_CHARS,
     HTTP_ERROR_STATUS,
+    LEGAL_COOKIE_NAME_CHARS,
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
 )
@@ -99,9 +103,19 @@ def default_json_serialize(obj: Any) -> str:
         The JSON encoding of ``obj`` as text.
 
     Raises:
-        TypeError: If ``orjson`` cannot serialise ``obj``.
+        ConfigurationError: If ``orjson`` cannot serialise ``obj``.
+            ``aiohttp`` invokes this deep inside payload construction, so
+            the ``TypeError`` it raises natively escaped ``request()``
+            bare -- ``data={'k': object()}`` reached the caller as
+            ``TypeError: Type is not JSON serializable: object`` rather
+            than as an envelope. It is the caller's own ``data`` that
+            cannot be encoded, so it is reported as their configuration.
     """
-    return orjson.dumps(obj).decode()
+    try:
+        return orjson.dumps(obj).decode()
+    except TypeError as err:
+        raise ConfigurationError(
+            f'data is not JSON-serialisable: {err}') from err
 
 
 def validated_json_serializer(serialization: JsonSerializer) -> JsonSerializer:
@@ -397,6 +411,217 @@ def validated_session(
             'argument of request() instead, which this library strips '
             'when a hop crosses an origin')
     return session
+
+
+def _checked_header_text(
+    value: object,
+    *,
+    setting: str,
+    part: str,
+) -> str:
+    """Return one header name or value once proven safe to serialise.
+
+    The shared half of :func:`validated_headers`, applied to a name and
+    to a value alike, because ``aiohttp``'s serialiser applies the same
+    rule to both: :data:`FORBIDDEN_HEADER_CHARS` is the exact character
+    class ``aiohttp.http_writer._safe_header`` refuses, so what this
+    admits is what reaches the wire and nothing more.
+
+    Args:
+        value: The name or the value, of whatever type the caller passed.
+        setting: The ``protocol_info`` key it came from, named in the
+            failure so the caller is told which of their own keys to fix.
+        part: ``'name'`` or ``'value'``, to say which half is at fault.
+
+    Returns:
+        The text unchanged. Not normalised: a header name is echoed back
+        in the envelope, and case is the caller's to choose.
+
+    Raises:
+        ConfigurationError: If it is not a ``str``, or carries a
+            character no header may. The offending character is named by
+            ordinal rather than quoted raw, so a CR in a message cannot
+            split a log line the way it would have split the request.
+    """
+    if not isinstance(value, str):
+        raise ConfigurationError(
+            f'protocol_info[{setting!r}] must map str to str, got a '
+            f'{part} of type {type(value).__name__}')
+    for char in value:
+        if char in FORBIDDEN_HEADER_CHARS:
+            raise ConfigurationError(
+                f'protocol_info[{setting!r}] {part} may not contain the '
+                f'control character U+{ord(char):04X}: it would end the '
+                f'header line early and let the rest be read as headers '
+                f'of its own')
+    return value
+
+
+def validated_headers(
+    headers: object,
+    *,
+    setting: str = 'headers',
+) -> Dict[str, str]:
+    """Return the caller's request headers once proven safe to send.
+
+    The caller-configuration half of a defect that had nothing to do
+    with injection succeeding. A CR or an LF in a header *is* refused --
+    by ``aiohttp``, correctly, in
+    ``aiohttp.http_writer._safe_header`` -- but it is refused with a
+    bare ``ValueError``, and that refusal happens at *serialisation*,
+    which is after the connection is open. So the exception a caller saw
+    for one and the same mistake depended on whether the host answered:
+    an unreachable host produced a ``CONNECT`` envelope, because the
+    connect failed first and the headers were never serialised, while a
+    reachable one produced a ``ValueError`` escaping ``request()``
+    un-enveloped. Remote reachability deciding which of those a caller
+    gets is precisely the nondeterminism the one-conversion-point
+    contract exists to remove (N6).
+
+    Checked here, at construction, and therefore before any socket is
+    opened -- the placement every other caller-configuration check in
+    this module uses, and the reason the answer no longer depends on the
+    network. The non-``str`` shapes are refused in the same pass and for
+    the same reason: ``{'X': 1}`` reached ``aiohttp`` as a ``TypeError``
+    and ``{1: 'v'}`` as an ``AttributeError``, both bare, both from the
+    same key, and a caller cannot be asked to catch three exception
+    types for three spellings of one configuration mistake.
+
+    Args:
+        headers: ``protocol_info['headers']``, of whatever type the
+            caller passed, or absent.
+        setting: The key name to quote in a failure. SOAP passes its own,
+            because it merges the caller's mapping with headers of its
+            own and needs the message to name the caller's key.
+
+    Returns:
+        A new dict of the caller's headers, unmodified. Empty when they
+        supplied none, which is the documented default call.
+
+    Raises:
+        ConfigurationError: If the value is not a mapping, or names a
+            header whose name or value is not a ``str`` or carries a
+            character no header may.
+    """
+    if headers is None:
+        return {}
+    if not isinstance(headers, Mapping):
+        raise ConfigurationError(
+            f'protocol_info[{setting!r}] must be a mapping of header '
+            f'names to values, got {type(headers).__name__}')
+    return {
+        _checked_header_text(name, setting=setting, part='name'):
+        _checked_header_text(value, setting=setting, part='value')
+        for name, value in headers.items()
+    }
+
+
+def validated_cookies(cookies: object) -> Optional[Dict[str, str]]:
+    """Return the caller's cookies once proven safe to send.
+
+    The same defect as :func:`validated_headers`, one key over, and
+    reached through a different library: a cookie is serialised by
+    ``http.cookies``, which refuses a control character with a
+    ``CookieError`` and an illegal name with the same, and refuses both
+    only once the request is being built. ``{1: 'v'}`` did not even get
+    that far -- it raised a bare ``AttributeError`` on ``.lower()``, and
+    a bare ``'nope'`` raised ``ValueError: not enough values to unpack``,
+    which tells a caller nothing about the key they got wrong.
+
+    ``None`` is preserved rather than normalised to ``{}``: ``aiohttp``
+    distinguishes them -- ``cookies=None`` leaves the session's own cookie
+    jar to answer, ``cookies={}`` overrides it with nothing -- and this
+    library has no business collapsing that difference.
+
+    Args:
+        cookies: ``protocol_info['cookies']``, of whatever type the
+            caller passed, or absent.
+
+    Returns:
+        A new dict of the caller's cookies, or None when they supplied
+        none.
+
+    Raises:
+        ConfigurationError: If the value is not a mapping, or names a
+            cookie whose name or value is not a ``str``, or whose name is
+            not a legal cookie name, or whose value carries a control
+            character.
+    """
+    if cookies is None:
+        return None
+    if not isinstance(cookies, Mapping):
+        raise ConfigurationError(
+            f'protocol_info["cookies"] must be a mapping of cookie names '
+            f'to values, got {type(cookies).__name__}')
+    checked: Dict[str, str] = {}
+    for name, value in cookies.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise ConfigurationError(
+                f'protocol_info["cookies"] must map str to str, got '
+                f'{type(name).__name__} -> {type(value).__name__}')
+        if not name or not set(name) <= LEGAL_COOKIE_NAME_CHARS:
+            raise ConfigurationError(
+                f'protocol_info["cookies"] name {name!r} is not a legal '
+                f'cookie name: a name is a token, so a space, a comma, a '
+                f'semicolon or a control character cannot appear in one')
+        for char in value:
+            if char in FORBIDDEN_COOKIE_VALUE_CHARS:
+                raise ConfigurationError(
+                    f'protocol_info["cookies"] value for {name!r} may not '
+                    f'contain the control character U+{ord(char):04X}: it '
+                    f'would end the Cookie header early and let the rest '
+                    f'be read as headers of its own')
+        checked[name] = value
+    return checked
+
+
+def validated_http_auth(auth: object, url: str) -> object:
+    """Return the caller's ``auth`` once proven usable on this call.
+
+    The HTTP family's counterpart to
+    :func:`~async_gateway.helpers.internal.base.credentials_of`, which
+    FTP and SFTP already run for the same reason: ``auth`` is documented
+    optional and typed ``object``, so whatever the caller passed reaches
+    ``aiohttp`` unexamined. Two shapes crashed there, both bare, and
+    both found by the entry-point invariant matrix:
+
+    * anything that is not a ``BasicAuth`` raised
+      ``TypeError: BasicAuth() tuple is required instead``, from inside
+      ``ClientSession._request``;
+    * a ``BasicAuth`` combined with a URL that already carries
+      ``user:password@`` raised ``ValueError: Cannot combine AUTH
+      argument with credentials encoded in URL`` -- a genuine ambiguity
+      about *which* credential the caller meant, which is worth
+      refusing, but not as an untyped exception.
+
+    ``None`` is admitted: unlike FTP and SFTP, an HTTP call without
+    credentials is the ordinary case rather than an impossible one.
+
+    Args:
+        auth: The caller's ``auth`` argument, of whatever type.
+        url: The URL this call dispatches to, checked for embedded
+            credentials so the conflict is named before dispatch.
+
+    Returns:
+        The same object, unmodified.
+
+    Raises:
+        ConfigurationError: If ``auth`` is neither None nor an
+            ``aiohttp.BasicAuth``, or if it is combined with a URL that
+            already carries credentials.
+    """
+    if auth is None:
+        return None
+    if not isinstance(auth, aiohttp.BasicAuth):
+        raise ConfigurationError(
+            f'auth must be an aiohttp.BasicAuth or None, got '
+            f'{type(auth).__name__}')
+    if '@' in urlsplit(url).netloc:
+        raise ConfigurationError(
+            'auth cannot be combined with credentials already encoded in '
+            'the url: aiohttp refuses the pair rather than choosing '
+            'between them. Pass one or the other')
+    return auth
 
 
 def validated_max_response_bytes(max_response_bytes: object) -> int:
@@ -863,9 +1088,13 @@ class HttpRequest(BaseRequestClass):
                 "max_redirects" that is not a non-negative int; a
                 "timeout" that is not a positive number of seconds; an
                 "allowed_schemes" that is not a non-empty collection of
-                scheme names; or a "cross_origin_headers" that is not a
+                scheme names; a "cross_origin_headers" that is not a
                 collection of header names, or that names a known
-                credential header. ``UnsupportedVerbError`` -- a
+                credential header; a "headers" that is not a mapping of
+                str to str or that carries a control character; or a
+                "cookies" that is not a mapping of str to str, names an
+                illegal cookie name, or carries a control character in a
+                value. ``UnsupportedVerbError`` -- a
                 ``ConfigurationError`` -- for a "request_type" naming no
                 verb in the R21 allowlist. All are raised here, in the
                 constructor, because
@@ -879,8 +1108,11 @@ class HttpRequest(BaseRequestClass):
 
         self.request_type: str = validated_request_type(
             self.info['request_type'])
-        self.cookies: Any = self.info.get('cookies')
-        self.headers: Dict = self.info.get('headers', {})
+        self.auth = validated_http_auth(self.auth, self.url)
+        self.cookies: Optional[Dict[str, str]] = validated_cookies(
+            self.info.get('cookies'))
+        self.headers: Dict[str, str] = validated_headers(
+            self.info.get('headers'))
         self.verify_ssl: bool = self.info.get('verify_ssl', True)
         self.http_file_upload_config: Dict = validated_upload_config(
             self.info.get('http_file_upload_config', {}), self.request_type)

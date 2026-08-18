@@ -1334,3 +1334,48 @@ async def test_an_admitted_command_is_matched_case_insensitively(
 
     assert result['ok'] is True
     assert [name for name, _ in client.calls] == ['download', 'stat']
+
+
+def test_n7_an_invalid_command_is_configuration_not_transport() -> None:
+    """N7: ``aioftp.InvalidCommand`` is the caller's config, not the wire.
+
+    ``aioftp`` refuses a CR or an LF in a command line itself, which is
+    correct and is not the defect. The defect was the *shape* of the
+    refusal: ``InvalidCommand`` is an ``AIOFTPException`` **and** a
+    ``ValueError``, it matched no entry in ``TRANSPORT_ERRORS``, and so
+    it escaped ``request()`` as a bare third-party exception -- where
+    the library's contract is that only an ``AsyncGatewayError`` may.
+
+    Asserted as ``CONFIG``/400 rather than merely as "some typed error",
+    because the classification is the whole decision. Adding
+    ``ValueError`` to ``TRANSPORT_ERRORS`` would also have made this
+    typed, and would have been wrong twice: it declares a caller's own
+    CR/LF a transport failure -- carrying a retry recommendation, on a
+    value no retry can fix -- and it swallows every genuine
+    ``ValueError`` from this library's own code as a failed network
+    call, which is the blindness the one-conversion-point rule exists to
+    prevent.
+    """
+    error = transport_error_for(
+        aioftp.errors.InvalidCommand('Command must not contain CR/LF'))
+
+    assert isinstance(error, ConfigurationError)
+    assert error.code == 'CONFIG'
+    assert error.status_code == 400
+    assert 'CR/LF' in str(error)
+
+
+def test_n7_a_status_code_error_still_outranks_the_config_arm() -> None:
+    """The ordering the N7 arm was inserted above must still hold.
+
+    ``StatusCodeError`` is checked first and stays first: a real reply
+    code from the server is a protocol outcome, and misreporting one as
+    the caller's configuration would tell them to fix a value that is
+    fine. This pins the arm's *position*, which a reader moving it for
+    tidiness would otherwise silently change.
+    """
+    error = transport_error_for(
+        aioftp.StatusCodeError('550', '550 Not found', 'info'))
+
+    assert isinstance(error, FtpStatusError)
+    assert error.code == 'FTP_STATUS'
