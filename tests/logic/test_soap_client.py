@@ -37,6 +37,7 @@ one are the recording server and nothing else.
 
 import asyncio
 import logging
+import sys
 from typing import Any, Final
 from xml.etree.ElementTree import Element, fromstring, tostring
 
@@ -51,12 +52,16 @@ from async_gateway.logic.soap_client import (
     SOAP_11,
     SOAP_12,
     build_envelope,
+    exceeds_depth,
     parse_soap_response,
     soap_transport_headers,
     validated_soap_action,
     validated_soap_headers,
 )
-from async_gateway.utils.constants import HTTP_TIMEOUT
+from async_gateway.utils.constants import (
+    HTTP_TIMEOUT,
+    MAX_FAULT_DETAIL_DEPTH,
+)
 from async_gateway.utils.envelope import GatewayResponse
 from async_gateway.utils.exceptions import ConfigurationError
 from async_gateway.utils.request_tracer import request_tracer
@@ -1011,6 +1016,179 @@ async def test_r19_a_fault_detail_may_be_absent_or_nested(
         assert '<code>7</code>' in fault['detail']
     else:
         assert fault['detail'] is None
+
+
+# --- N5: a Fault detail cannot choose the caller's error code -------------
+
+
+def nested_detail(levels: int) -> str:
+    """Return ``levels`` of nested elements for a Fault ``<detail>``.
+
+    Args:
+        levels: How many ``<a>`` elements to nest inside one another. The
+            ``<detail>`` wrapping them is level 1, so the tree this
+            produces is ``levels + 1`` deep.
+
+    Returns:
+        The nested XML as text.
+    """
+    return '<a>' * levels + 'x' + '</a>' * levels
+
+
+@pytest.mark.parametrize(
+    ('levels', 'kept'),
+    [
+        pytest.param(1, True, id='one-level'),
+        pytest.param(MAX_FAULT_DETAIL_DEPTH - 1, True, id='at-the-limit'),
+        pytest.param(MAX_FAULT_DETAIL_DEPTH, False, id='one-past-the-limit'),
+        pytest.param(1000, False, id='the-reported-depth'),
+    ],
+)
+async def test_n5_a_deep_fault_detail_is_still_reported_as_a_fault(
+    http_server: RecordingHTTPServer,
+    levels: int,
+    kept: bool,
+) -> None:
+    """A remote server must not get to pick its caller's error code.
+
+    ``tostring`` recurses one frame per element, so re-serialising a
+    ``<detail>`` of 1000 levels -- **7 KB on the wire**, far under
+    ``max_response_bytes``, which is why the byte cap could not see it --
+    raised ``RecursionError``. ``request()``'s backstop converts that to
+    ``STACK_EXHAUSTED``/502, so the identical Fault arrived as
+    ``SOAP_FAULT`` with its real status when its detail was flat and as a
+    stack exhaustion when it was deep. **The server chose**, which is the
+    defect (N5).
+
+    The assertions are therefore about *what survives*, not merely that
+    nothing crashed. R19 requires a Fault to map to ``ok=False``,
+    ``error.code == 'SOAP_FAULT'`` and the real HTTP status, and none of
+    ``code``, ``reason`` or ``actor`` needs recursion to read -- so every
+    one is asserted at every depth and only ``detail`` changes. A fix that
+    refused the whole Fault would pass a "no ``RecursionError``" test and
+    fail this one, which is why the fields are spelled out.
+
+    The boundary rows sit either side of the limit because an off-by-one
+    is invisible in behaviour here: both neighbours produce a valid
+    envelope, and only ``detail``'s presence separates them.
+    """
+    result = await soap_call(
+        http_server, body=fault_11(nested_detail(levels)), status=500)
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'SOAP_FAULT'
+    assert result['status_code'] == 500
+
+    fault = result['protocol_details']['soap_fault']
+    assert fault['code'] == 'soap:Client'
+    assert fault['reason'] == 'Invalid account number'
+    assert fault['actor'] == 'urn:billing'
+    if kept:
+        assert fault['detail'] is not None
+        assert '<a>' in fault['detail']
+    else:
+        # Reported as an *absent* detail -- the value R19 already defines
+        # for a Fault carrying none -- rather than as a truncated string,
+        # which would be XML no consumer could parse.
+        assert fault['detail'] is None
+
+
+async def test_n5_a_refused_fault_detail_says_so_in_the_log(
+    http_server: RecordingHTTPServer,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``None`` alone would let a real detail vanish silently.
+
+    A withheld detail is deliberately indistinguishable from an absent
+    one in the envelope -- that indistinguishability is what keeps the
+    fault contract stable under hostile input. So the operator-facing
+    signal has to be the log, and it has to name the limit crossed, or
+    the first person debugging a missing detail has nothing to search
+    for.
+    """
+    caplog.set_level(logging.WARNING, logger='async_gateway')
+
+    result = await soap_call(
+        http_server, body=fault_11(nested_detail(1000)), status=500)
+
+    assert result['protocol_details']['soap_fault']['detail'] is None
+    warnings = [
+        record.getMessage() for record in caplog.records
+        if record.levelno == logging.WARNING
+        and 'max_fault_detail_depth' in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert str(MAX_FAULT_DETAIL_DEPTH) in warnings[0]
+
+
+def test_n5_the_depth_check_answers_a_tree_the_parser_can_hold() -> None:
+    """The guard must survive the input it exists to refuse.
+
+    50,000 levels is far past any interpreter's default frame budget and
+    is what the XML *parser* already tolerates, so this pins the asymmetry
+    the whole fix rests on: parsing was never the recursive step, and the
+    guard must be able to answer for anything the parse can produce.
+    """
+    deep = fromstring(f'<detail>{nested_detail(50000)}</detail>')
+
+    assert exceeds_depth(deep, MAX_FAULT_DETAIL_DEPTH) is True
+    assert exceeds_depth(fromstring('<detail><a>x</a></detail>'), 64) is False
+
+
+def test_n5_the_depth_check_needs_no_frames_of_its_own() -> None:
+    """Iterative is a security property here, not a style preference.
+
+    The row above does not on its own distinguish an iterative walk from
+    a *recursive* one, and that is worth stating because the difference
+    looks academic and is not. A recursive check bounded by ``max_depth``
+    self-limits at 65 frames, so it passes every test that merely feeds
+    it a deep tree -- which is precisely how a guard that still depends
+    on the frame budget would ship.
+
+    What it cannot do is answer without frames. ``sys.setrecursionlimit``
+    belongs to the *application* embedding this library, not to this
+    library, so a bound stated here has to hold whatever the process
+    chose -- the same argument
+    ``MAX_MULTIPART_DEPTH`` makes for declining to derive itself from the
+    limit. With the headroom squeezed to under the depth cap, a recursive
+    walk raises ``RecursionError`` on the exact input it exists to
+    refuse, converting a clean refusal back into the crash N5 reported;
+    an iterative one answers.
+
+    The limit is restored in a ``finally`` because leaving it lowered
+    would fail unrelated tests in whatever order they happen to run.
+    """
+    deep = fromstring(f'<detail>{nested_detail(5000)}</detail>')
+
+    frames = 0
+    frame: Any = sys._getframe()
+    while frame is not None:
+        frames += 1
+        frame = frame.f_back
+
+    original = sys.getrecursionlimit()
+    # Less headroom than the depth cap, so a recursive walk cannot
+    # complete even though it self-bounds at `MAX_FAULT_DETAIL_DEPTH`.
+    sys.setrecursionlimit(frames + 10)
+    try:
+        assert exceeds_depth(deep, MAX_FAULT_DETAIL_DEPTH) is True
+    finally:
+        sys.setrecursionlimit(original)
+
+
+def test_n5_a_wide_fault_detail_is_not_mistaken_for_a_deep_one() -> None:
+    """Breadth is not depth, and the walk must not confuse them.
+
+    The stack this check keeps holds siblings as well as descendants, so
+    an implementation inferring depth from ``len(stack)`` -- which the
+    multipart walk legitimately does, because *its* stack is a single
+    nesting path -- would read 5000 siblings as 5000 levels and refuse an
+    ordinary detail listing field errors. Carrying the depth per node is
+    what avoids that, and this row is what fails if it is dropped.
+    """
+    wide = fromstring('<detail>' + '<a>x</a>' * 5000 + '</detail>')
+
+    assert exceeds_depth(wide, MAX_FAULT_DETAIL_DEPTH) is False
 
 
 async def test_the_response_body_is_still_on_the_envelope_after_a_fault(

@@ -315,6 +315,16 @@ assert fault['actor'] is None
 None — a fault detail routinely carries application XML whose schema this
 library knows nothing about, and a string preserves it exactly.
 
+It is also None when the detail **nests deeper than 64 levels**, which is
+refused rather than serialised. Re-serialising recurses once per level, and a
+1000-level detail is only 7 KB on the wire — far under `max_response_bytes`, so
+the byte cap cannot see it — which would exhaust the interpreter stack and get
+the server's Fault reported as a `STACK_EXHAUSTED` 502 rather than the
+`SOAP_FAULT` it is. The rest of the fault is unaffected: `code`, `reason`,
+`subcodes` and `actor` are read without recursing, so a too-deep detail costs
+you the detail and never the fault. A warning naming the limit is logged when
+it happens.
+
 An XML response whose **prolog declares a `DOCTYPE`** is refused before parsing
 with `error['code'] == 'XML_UNSAFE'`: a DOCTYPE is the entry condition for
 entity-expansion attacks and a SOAP envelope never legitimately carries one. The
