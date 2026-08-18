@@ -207,7 +207,15 @@ FILE_STAT_FIELDS: Final[Tuple[str, ...]] = (
 # from Python 3.11, and `socket.gaierror` is one too. First match wins, so
 # the most specific classification is listed first.
 TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
+    # Both timeout classes -- see the identical row in
+    # `logic.ftp_client`'s table for the measurement. On 3.10
+    # `asyncio.TimeoutError is TimeoutError` is False, so a socket
+    # timeout raised as the builtin fell through to the residual
+    # `OSError` row and this protocol reported `PATH`/400 for a slow
+    # server, blaming the caller's disk and keeping the destination out
+    # of its own breaker.
     (asyncio.TimeoutError, GatewayTimeoutError),
+    (TimeoutError, GatewayTimeoutError),
     (socket.gaierror, DnsError),
     (ConnectionError, ConnectError),
     # The residual `OSError`, reporting `PATH` rather than the `CONNECT`

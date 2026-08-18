@@ -38,7 +38,8 @@ from async_gateway.async_gateway import request
 from async_gateway.helpers.internal.filters_helper import get_ssl_config
 from async_gateway.logic import ftp_client
 from async_gateway.logic.ftp_client import (
-    FTPRequest, reply_status, tls_context_for, transport_error_for)
+    FTPRequest, _being_cancelled, reply_status, tls_context_for,
+    transport_error_for)
 from async_gateway.utils.envelope import GatewayResponse, new_envelope
 from async_gateway.utils.exceptions import (
     ConfigurationError, FtpStatusError, TlsError, TransportError)
@@ -1495,6 +1496,52 @@ async def test_a_real_connection_reset_is_still_a_transport_failure(
 
     assert result['ok'] is False
     assert result['error']['code'] == 'CONNECT'
+
+
+@pytest.mark.parametrize('cancelled, expected', [(True, True), (False, False)])
+async def test_the_cancellation_probe_works_without_task_cancelling(
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool, expected: bool,
+) -> None:
+    """The 3.10 arm of the probe, forced on whatever runs the suite.
+
+    ``Task.cancelling()`` arrived in 3.11 and ``requires-python`` is
+    ``>=3.10``, so ``_being_cancelled`` falls back to reading the
+    exception chain. That fallback is unreachable on a modern
+    interpreter, which is exactly how it would ship untested -- and it
+    is on the failure path, where an untested branch is worst. The
+    attribute is therefore removed for the length of the test so the
+    branch the floor takes is the branch measured here.
+
+    Both directions, because a fallback that answered ``True``
+    unconditionally would satisfy the cancellation row alone while
+    turning every genuine reset into an exception where the contract
+    promises an envelope.
+
+    Args:
+        monkeypatch: The pytest patcher.
+        cancelled: Whether to chain a ``CancelledError`` as the context,
+            which is what a cancelled call leaves behind.
+        expected: What the probe must answer.
+    """
+    # `_asyncio.Task` is immutable, so the attribute cannot be deleted
+    # off the real task. `current_task` is redirected instead, to an
+    # object shaped like the 3.10 one: a task with no `cancelling`.
+    class FloorTask:
+        """A task as 3.10 exposes it -- without ``cancelling()``."""
+
+    monkeypatch.setattr(
+        ftp_client.asyncio, 'current_task', lambda: FloorTask())
+    assert not hasattr(ftp_client.asyncio.current_task(), 'cancelling'), (
+        'the 3.11+ attribute survived, so this measured the wrong arm')
+
+    err = ConnectionResetError('QUIT on a torn-down socket')
+    if cancelled:
+        try:
+            raise asyncio.CancelledError
+        except asyncio.CancelledError as cancel:
+            err.__context__ = cancel
+
+    assert _being_cancelled(err) is expected
 
 
 async def test_a_residual_oserror_reports_path_not_connect(

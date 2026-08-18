@@ -156,7 +156,22 @@ TLS_CONFIG_KEYS: Final[Tuple[str, ...]] = ('ssl_context', 'ssl')
 # raise -- a genuine bug -- as a failed network call, which is the exact
 # blindness the one-conversion-point rule exists to prevent.
 TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
+    # BOTH timeout classes, and naming both is load-bearing on the
+    # interpreter floor. `asyncio.TimeoutError is TimeoutError` only from
+    # 3.11; on 3.10 they are unrelated classes, so a socket timeout --
+    # which `aioftp` raises as the *builtin* `TimeoutError` -- matched
+    # nothing here and fell all the way to the residual `OSError` row,
+    # reporting `PATH`/400 for a slow server. That is the worst possible
+    # direction for this particular mistake: `PATH` tells the caller
+    # their local disk is at fault, and it keeps the timing-out
+    # destination out of its own circuit breaker.
+    #
+    # Measured, not reasoned: green on 3.12-3.14 and failing on a real
+    # 3.10 interpreter, which is why nothing on the development machine
+    # ever saw it. `circuit_breaker_helper.RETRIABLE_FAILURES` already
+    # spells both out for exactly this reason; these two tables did not.
     (asyncio.TimeoutError, GatewayTimeoutError),
+    (TimeoutError, GatewayTimeoutError),
     (ssl.SSLError, TlsError),
     (socket.gaierror, DnsError),
     (ConnectionError, ConnectError),
@@ -276,6 +291,45 @@ def reply_status(error: aioftp.StatusCodeError) -> Optional[int]:
         if text.isdigit():
             return int(text)
     return None
+
+
+def _being_cancelled(err: BaseException) -> bool:
+    """Report whether ``err`` is a cancellation wearing another class.
+
+    The question NEW-R11-2 turns on. ``aioftp``'s session ``__aexit__``
+    sends QUIT on a socket the cancel has already torn down, so the
+    resulting ``ConnectionResetError`` *replaces* the ``CancelledError``
+    in flight and reaches the dispatch looking like an ordinary network
+    fault. Answering it wrongly either way is a real defect: say yes to
+    a genuine reset and the caller gets an exception where the contract
+    promises an envelope; say no to a cancellation and every
+    structured-concurrency primitive built on it stops working.
+
+    Two signals, because neither alone spans the supported range.
+    ``Task.cancelling()`` is the precise one -- non-zero only while this
+    task is really being cancelled -- and it arrived in **3.11**, where
+    ``requires-python`` is ``>=3.10``. Calling it unguarded raised
+    ``AttributeError`` on the floor, from the failure path.
+
+    The fallback reads the exception chain instead of the task, and is
+    not a weaker approximation: Python sets ``__context__`` to whatever
+    was in flight when the replacing exception was raised, so a
+    cancelled call carries the ``CancelledError`` there and a server
+    that genuinely reset does not. Verified on real 3.10, 3.12 and 3.14
+    interpreters, in both directions.
+
+    Args:
+        err: The transport failure the dispatch caught.
+
+    Returns:
+        True when this task is being cancelled and ``err`` is the
+        cleanup's replacement for that cancellation.
+    """
+    task = asyncio.current_task()
+    cancelling = getattr(task, 'cancelling', None)
+    if cancelling is not None:
+        return bool(cancelling())
+    return isinstance(err.__context__, asyncio.CancelledError)
 
 
 def transport_error_for(
@@ -542,8 +596,14 @@ class FTPRequest(BaseRequestClass):
             # being cancelled, so a `ConnectionResetError` from a server
             # that genuinely reset the connection is still classified,
             # and re-raising restores what the cleanup discarded.
-            task = asyncio.current_task()
-            if task is not None and task.cancelling():
+            #
+            # It arrived in 3.11, and `requires-python` is `>=3.10`, so
+            # on the floor this line raised `AttributeError` -- from the
+            # failure path, replacing the envelope this library's whole
+            # contract promises with a crash, on the one interpreter CI
+            # claims and nothing had run. `_being_cancelled` is where
+            # both interpreters are reconciled.
+            if _being_cancelled(err):
                 raise asyncio.CancelledError from err
             raise transport_error_for(
                 err, redact_params=self.redact_params) from err

@@ -831,6 +831,67 @@ def test_every_dispatch_site_catches_exactly_what_it_classifies(
         f'it; that is what makes the pair impossible to desynchronise.')
 
 
+#: The dispatch sites whose classification table ends in a residual
+#: ``OSError`` row. Only these two can mis-file a timeout as a local
+#: disk fault, because only these two have a row for it to fall into --
+#: the HTTP family's table ends at ``aiohttp.ClientError`` and an
+#: unmatched timeout there is simply not classified.
+OSERROR_TAILED_SITES: Final[tuple[str, ...]] = ('ftp_client', 'sftp_client')
+
+
+@pytest.mark.parametrize('module', OSERROR_TAILED_SITES)
+def test_both_timeout_classes_are_named_where_oserror_is_the_tail(
+    module: str,
+) -> None:
+    """``asyncio.TimeoutError`` and ``TimeoutError``, spelled out.
+
+    They are the same object from **3.11**. On 3.10 -- which
+    ``requires-python`` admits and the CI matrix claims -- they are
+    unrelated classes, so a table naming only the ``asyncio`` one does
+    not match the *builtin* raised by a socket read. And because the
+    builtin is an ``OSError``, on these two sites it did not merely go
+    unclassified: it fell through to the residual ``OSError`` row and a
+    slow server was reported ``PATH``/400 -- telling the caller their
+    own disk was at fault, and keeping the timing-out destination out
+    of its own circuit breaker.
+
+    **Asserted against the source text, which is the only thing that
+    can be.** Every runtime form of this question -- ``is``,
+    ``issubclass``, raising one and catching the other -- is answered by
+    the interpreter running the suite, and on 3.11+ every one of them
+    says the table is fine whatever it names. That is precisely how
+    this shipped: green on 3.12, 3.13 and 3.14, broken on the one leg
+    nobody had run. Reading the table as text asks the same question on
+    every interpreter.
+
+    ``circuit_breaker_helper.RETRIABLE_FAILURES`` already named both,
+    with a comment explaining why, so the knowledge was in the codebase
+    and had not been applied where it also mattered.
+
+    Args:
+        module: The dispatch site's module name.
+
+    Returns:
+        None.
+    """
+    source = (PACKAGE_ROOT / 'logic' / f'{module}.py').read_text(
+        encoding='utf-8')
+    table = source.split('TRANSPORT_ERRORS')[1].split(')\n\n')[0]
+
+    assert '(OSError, LocalWriteError)' in table, (
+        f'logic.{module} no longer ends its table with a residual '
+        f'OSError row, so this test is guarding a shape that has '
+        f'changed; re-read it rather than deleting it')
+    for spelling in ('(asyncio.TimeoutError, GatewayTimeoutError)',
+                     '(TimeoutError, GatewayTimeoutError)'):
+        assert spelling in table, (
+            f'the TRANSPORT_ERRORS table in logic.{module} does not name '
+            f'{spelling}. On Python 3.10 the two timeout classes are '
+            f'unrelated, so the one that is missing falls through to '
+            f'the (OSError, LocalWriteError) row and a socket timeout '
+            f'is reported PATH/400 instead of TIMEOUT/504.')
+
+
 def test_the_derivation_reaches_every_dispatch_site() -> None:
     """The count itself, so a fifth site cannot quietly opt out.
 
