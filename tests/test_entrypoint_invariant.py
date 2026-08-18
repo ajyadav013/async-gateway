@@ -238,6 +238,26 @@ HOSTILE_URLS: Final[tuple[Any, ...]] = (
     'file:///etc/passwd',
     'gopher://host/p',
     'http://user:pw@host/p',
+    # Protocol-relative references: no scheme, but a real authority.
+    #
+    # **This axis was already varied and still missed a bare escape**,
+    # which is the part worth recording. The family had schemeless rows
+    # (`''`, `'   '`, `'///'`) and authority-bearing rows
+    # (`'http://user:pw@host/p'`), but never one that was *both*: every
+    # schemeless row here parsed to an empty netloc, and an empty netloc
+    # is what made them safe. `//host/p` parses to a netloc of `host`
+    # with no scheme, `dispatch_url_for` returned it unchanged under
+    # `'HTTP'`, and `aiohttp` then failed an internal
+    # `assert port is not None` -- a bare `AssertionError` out of
+    # `request()` (F3).
+    #
+    # So the gap was not a missing dimension but an uncovered
+    # *combination* of two that were each present, which is the same
+    # shape as the ninth escape this file's docstring records: a
+    # one-dimensional reading of a matrix that needs a corner.
+    '//host/p',
+    '//user:pw@host/p',
+    '//host:8080/p?api_key=SECRET',
 )
 
 #: ``protocol_info`` values that are not the mapping the entry point

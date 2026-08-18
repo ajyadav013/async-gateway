@@ -1241,6 +1241,18 @@ Note the shape: `allowed_schemes` takes a **collection**, and a bare string is
 rejected — `frozenset('https')` is `{'h', 't', 'p', 's'}`, an allowlist that
 admits no real scheme at all.
 
+**A protocol-relative URL is refused.** `//host/p` names an authority but no
+scheme, and this library will not guess one for you — the call raises
+`ConfigurationError` (`code='CONFIG'`) before anything is dispatched, with a
+message reading *"url is a protocol-relative reference, which names an authority
+but no scheme to reach it over"*.
+
+Prepending `https://` would be a guess about how to reach a host you named, and
+a wrong guess is a plaintext request you did not ask for. Under `protocol='HTTPS'`
+a URL with **no authority** is still upgraded — `host/p` becomes
+`https://host/p`, because there is exactly one scheme that can satisfy `HTTPS`
+and nothing about the destination is being guessed.
+
 ---
 
 ## Local files: downloads, uploads and overwrite

@@ -52,6 +52,20 @@ HTTP_FAMILY_SCHEMES: Final[dict[str, frozenset[str]]] = {
     'HTTPS': frozenset({'https'}),
 }
 
+# Every protocol whose `url` is dispatched as a URL, rather than read as
+# a bare host name the way FTP's and SFTP's are.
+#
+# This is a *superset* of `HTTP_FAMILY_SCHEMES`' keys and is deliberately
+# a second table rather than another column of the first: the question
+# "which schemes may this protocol dispatch on?" and the question "is
+# this `url` a URL at all?" have different answers for `'SOAP'`, which
+# constrains no scheme and still goes out over `aiohttp`. Scoping the
+# protocol-relative check to the allowlist would have refused `//host/p`
+# under three protocols and let the fourth reach the same
+# `assert port is not None` (F3).
+URL_DISPATCHED_PROTOCOLS: Final[frozenset[str]] = (
+    frozenset(HTTP_FAMILY_SCHEMES) | frozenset({'SOAP'}))
+
 
 def resolve_protocol(
     protocol: object,
@@ -358,6 +372,18 @@ def dispatch_url_for(
     the URL is malformed for every protocol here, and rejecting it says so
     where guessing at an intended scheme would not.
 
+    And so is a **protocol-relative** ``//host/p``, which is the one
+    schemeless shape "leave it alone" could not survive. It has no
+    scheme *and* a real authority, so under ``'HTTP'`` it was passed
+    through untouched, and ``aiohttp`` then failed an internal
+    ``assert port is not None`` -- a bare ``AssertionError`` escaping
+    ``request()`` un-enveloped, which is the same one-conversion-point
+    break as the earlier escapes (F3). It cannot be upgraded the way a
+    bare ``host/p`` is, either: ``https://` + `//host/p`` is a different
+    URL, and RFC 3986 says the scheme is exactly what this reference is
+    waiting for. Refusing names what is missing where guessing would
+    dispatch somewhere the caller did not ask for.
+
     Args:
         protocol: The normalised protocol name from :func:`resolve_protocol`.
         url: The URL the call is about to be dispatched to.
@@ -372,21 +398,37 @@ def dispatch_url_for(
 
     Raises:
         ConfigurationError: If the URL's scheme is one this protocol will
-            not dispatch on, or if the URL cannot be parsed at all. The
-            URL's *type* is checked earlier, in ``request()``, because
-            the envelope is built from it before this function is
-            reached.
+            not dispatch on, if it is a protocol-relative reference
+            carrying an authority but no scheme, or if the URL cannot be
+            parsed at all. The URL's *type* is checked earlier, in
+            ``request()``, because the envelope is built from it before
+            this function is reached.
     """
     allowed = HTTP_FAMILY_SCHEMES.get(protocol)
-    if allowed is None:
+    if allowed is None and protocol not in URL_DISPATCHED_PROTOCOLS:
         return url
 
     try:
-        scheme = urlsplit(url).scheme.lower()
+        parts = urlsplit(url)
     except ValueError as err:
         raise ConfigurationError(
             f'url is not parseable: '
             f'{redact_url(url, extra_params=redact_params)}') from err
+    scheme = parts.scheme.lower()
+
+    # Checked ahead of the scheme allowlist, and for every protocol that
+    # dispatches on a URL rather than only the two with an allowlist.
+    # `'SOAP'` has no allowlist -- it accepts whatever scheme the caller
+    # gives -- but it reaches the same `aiohttp` call, so it failed the
+    # same internal assertion, and scoping this to `HTTP_FAMILY_SCHEMES`
+    # would have fixed three of the four protocols that could hit it.
+    if not scheme and parts.netloc:
+        raise ConfigurationError(
+            f'url is a protocol-relative reference, which names an '
+            f'authority but no scheme to reach it over; give it one: '
+            f'{redact_url(url, extra_params=redact_params)}')
+    if allowed is None:
+        return url
 
     if not scheme:
         return f'https://{url}' if protocol == 'HTTPS' else url

@@ -34,6 +34,8 @@ from aiohttp import BasicAuth
 import pytest
 
 from async_gateway.async_gateway import (
+    HTTP_FAMILY_SCHEMES,
+    URL_DISPATCHED_PROTOCOLS,
     dispatch_url_for,
     request,
     resolve_protocol,
@@ -515,6 +517,102 @@ def test_fi14_the_checked_url_is_the_value_handed_to_the_protocol() -> None:
     """``dispatch_url_for`` returns what it checked, so they cannot differ."""
     assert dispatch_url_for('HTTPS', 'host/p') == 'https://host/p'
     assert dispatch_url_for('FTP', 'anything at all') == 'anything at all'
+
+
+@pytest.mark.parametrize(
+    'protocol', sorted(URL_DISPATCHED_PROTOCOLS))
+@pytest.mark.parametrize(
+    'url',
+    [
+        pytest.param('//host/p', id='a-bare-authority'),
+        pytest.param('//host:8080/p', id='with-a-port'),
+        pytest.param('//user:pw@host/p', id='with-userinfo'),
+        pytest.param('//host', id='authority-only'),
+    ],
+)
+def test_a_protocol_relative_url_is_refused_at_validation(
+    protocol: str,
+    url: str,
+) -> None:
+    """A URL with an authority and no scheme is config, not transport.
+
+    ``//host/p`` is the one schemeless shape the "leave it alone" branch
+    could not survive. A bare ``host/p`` has no authority, so
+    ``aiohttp`` reads the whole thing as a path and fails in a way the
+    transport layer already maps; ``//host/p`` has a real authority and
+    no scheme, so ``aiohttp`` got far enough to assert
+    ``port is not None`` internally and a bare ``AssertionError`` left
+    ``request()`` un-enveloped -- the same one-conversion-point break as
+    the earlier escapes (F3).
+
+    Refused rather than upgraded, because upgrading would guess:
+    ``'https://' + '//host/p'`` is a different URL, and RFC 3986 says
+    the scheme is exactly the part this reference is waiting for. A
+    ``ConfigurationError`` names what is missing, which is what the
+    neighbouring ``validated_*`` family does with every other unusable
+    configuration.
+
+    Parametrised over every protocol that dispatches a *URL* rather than
+    a bare host name -- which is a wider set than the two with a scheme
+    allowlist. ``'SOAP'`` constrains no scheme and still reaches the
+    same ``aiohttp`` call, so a check scoped to ``HTTP_FAMILY_SCHEMES``
+    would have left it escaping.
+
+    Args:
+        protocol: The URL-dispatched protocol under test.
+        url: One protocol-relative spelling.
+
+    Returns:
+        None.
+    """
+    with pytest.raises(ConfigurationError) as raised:
+        dispatch_url_for(protocol, url)
+
+    assert 'protocol-relative' in str(raised.value)
+    assert raised.value.code == 'CONFIG'
+
+
+def test_a_protocol_relative_url_is_named_without_its_credential() -> None:
+    """The refusal message is a caller-visible surface like any other.
+
+    ``dispatch_url_for``'s own "url is not parseable" message published
+    a password once (M1/AGW-34); a new message naming a rejected URL is
+    the same surface and gets the same treatment.
+    """
+    with pytest.raises(ConfigurationError) as raised:
+        dispatch_url_for('HTTP', '//user:REFUSEDPW@host/p')
+
+    assert 'REFUSEDPW' not in str(raised.value)
+
+
+def test_a_schemeless_url_with_no_authority_is_still_not_refused() -> None:
+    """The bound: only an *authority* without a scheme is a refusal.
+
+    ``host/p`` under ``'HTTP'`` is left alone and under ``'HTTPS'`` is
+    upgraded, and both predate this check. A guard that refused every
+    schemeless URL would break the documented upgrade and every caller
+    passing a bare host.
+    """
+    assert dispatch_url_for('HTTP', 'host/p') == 'host/p'
+    assert dispatch_url_for('HTTPS', 'host/p') == 'https://host/p'
+    # `///` and `''` parse to an *empty* netloc, which is why they were
+    # already safe -- and why their presence in the invariant matrix did
+    # not cover `//host/p`.
+    assert dispatch_url_for('HTTP', '///') == '///'
+    assert dispatch_url_for('HTTP', '') == ''
+
+
+def test_every_url_dispatched_protocol_is_a_registered_one() -> None:
+    """The second table cannot drift from the registry it names.
+
+    :data:`URL_DISPATCHED_PROTOCOLS` is a hand-maintained superset of
+    ``HTTP_FAMILY_SCHEMES``' keys, and a hand-maintained list of
+    protocol names is exactly the thing that goes stale when a protocol
+    is renamed or added. This fails at the rename rather than at the
+    next bare ``AssertionError``.
+    """
+    assert URL_DISPATCHED_PROTOCOLS <= set(protocol_mapping)
+    assert set(HTTP_FAMILY_SCHEMES) <= URL_DISPATCHED_PROTOCOLS
 
 
 async def test_the_envelope_reports_the_url_that_was_dispatched(
