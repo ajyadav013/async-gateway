@@ -31,6 +31,9 @@ and S10 is the first story that will actually execute them; expect to
 correct them rather than to find them already right.
 """
 
+import asyncio
+import socket
+import ssl
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
@@ -39,6 +42,7 @@ import aioftp
 
 import aiohttp
 from aiohttp import BasicAuth
+from aiohttp.client_reqrep import ConnectionKey
 
 import asyncssh
 
@@ -400,3 +404,239 @@ def install_transport(
             f'{protocol!r} owns no transport seam. Returning quietly here'
             ' would install nothing and let the row open a real'
             ' connection.')
+
+
+# --- The transport-fault categories every protocol must answer for -------
+#
+# The four rounds of divergence this table exists to end all had one
+# shape: a property was fixed in one protocol client and its siblings were
+# left behind, because nothing in the suite asserted the property *across*
+# protocols. M20 (the tracer on the failure path), H17 (per-call collector
+# binding) and `redact_params` on the SOAP tracer were the first three,
+# and `CONTRACT_ROWS` in `tests/test_envelope.py` grew rows for them.
+#
+# AGW-R9-1 is the fourth and got past those rows, because they assert
+# tracing behaviour and this is exception coverage: `logic/soap_client.py`
+# caught `(aiohttp.ClientError, asyncio.TimeoutError)` where
+# `logic/http_client.py` caught the same pair *plus* `ssl.SSLError`, so a
+# corrupt system CA bundle reached a SOAP caller as a raw `ssl.SSLError`
+# instead of an envelope. The fifth, found by comparing the four tables
+# rather than waiting for a report, was `aioftp.AIOFTPException`: FTP's
+# dispatch caught it and its `transport_error_for` classified it under
+# nothing, so it re-raised bare.
+#
+# What makes those two the *same* defect is not the exception -- it is
+# that each protocol's coverage was written by hand, once, and then only
+# ever checked against itself. So the table below is by **fault
+# category**, not by exception class: every protocol is asked the same
+# five questions in the vocabulary of what went wrong on the wire, and
+# each answers in the exception class its own transport library raises.
+#
+# Where a protocol legitimately differs, the row records *why* rather
+# than being dropped. SFTP is the one exemption and it is a real one:
+# `asyncssh` runs SFTP over SSH, which has no TLS layer, so `ssl.SSLError`
+# is not a fault its transport can produce -- see `TLS_EXEMPT` below,
+# which names the protocol, the reason, and is itself asserted rather
+# than merely commented.
+
+#: The five families of wire failure a caller can distinguish from the
+#: envelope. Each maps to the ``error['code']`` the contract promises.
+FAULT_CATEGORIES: tuple[str, ...] = (
+    'TLS',
+    'TIMEOUT',
+    'CONNECT',
+    'DNS',
+    'PROTOCOL',
+)
+
+#: Protocols that cannot produce a given category, with the reason. An
+#: entry here is an exemption that had to be argued for, not a silent gap:
+#: the guard reads this mapping, and a protocol absent from it is held to
+#: every category.
+CATEGORY_EXEMPT: dict[str, dict[str, str]] = {
+    'TLS': {
+        'SFTP': (
+            'asyncssh runs SFTP over SSH, which has no TLS layer, so no '
+            'ssl.SSLError can arise from its transport. Its table maps '
+            'the OSError family instead, which subsumes ssl.SSLError '
+            'anyway -- an SSLError reaching it reports CONNECT, not TLS.'
+        ),
+    },
+}
+
+
+def _dns_error() -> aiohttp.ClientConnectorDNSError:
+    """Return the resolution failure ``aiohttp`` itself raises.
+
+    Built with a real ``ConnectionKey`` rather than a stand-in, because
+    ``ClientConnectorDNSError.__str__`` reads ``connection_key.ssl`` and
+    raises ``AttributeError`` on a ``None`` -- a fault double that cannot
+    be stringified would fail the guard for a reason that is the double's
+    and not the client's.
+
+    Returns:
+        A ``ClientConnectorDNSError`` for ``host:443``.
+    """
+    key = ConnectionKey(
+        host='host',
+        port=443,
+        is_ssl=True,
+        ssl=None,
+        proxy=None,
+        proxy_auth=None,
+        proxy_headers_hash=None,
+        server_hostname=None,
+    )
+    return aiohttp.ClientConnectorDNSError(
+        connection_key=key, os_error=socket.gaierror('name not resolved'))
+
+
+#: One fault per (protocol, category): the exception that protocol's own
+#: transport library raises for that failure. The HTTP family, SOAP
+#: included, dispatches over ``aiohttp``; FTP over ``aioftp``; SFTP over
+#: ``asyncssh``. Each is the library's real class, so a client is held to
+#: what it will actually be handed rather than to a stand-in.
+_AIOHTTP_FAULTS: dict[str, Callable[[], BaseException]] = {
+    'TLS': lambda: ssl.SSLError('handshake failed'),
+    'TIMEOUT': lambda: asyncio.TimeoutError(),
+    'CONNECT': lambda: aiohttp.ClientConnectionError('connection refused'),
+    'DNS': _dns_error,
+    'PROTOCOL': lambda: aiohttp.ClientPayloadError('malformed chunk'),
+}
+
+PROTOCOL_FAULTS: dict[str, dict[str, Callable[[], BaseException]]] = {
+    'HTTP': _AIOHTTP_FAULTS,
+    'HTTPS': _AIOHTTP_FAULTS,
+    'SOAP': _AIOHTTP_FAULTS,
+    'FTP': {
+        'TLS': lambda: ssl.SSLError('handshake failed'),
+        'TIMEOUT': lambda: asyncio.TimeoutError(),
+        'CONNECT': lambda: ConnectionRefusedError('connection refused'),
+        'DNS': lambda: socket.gaierror('name not resolved'),
+        'PROTOCOL': lambda: aioftp.AIOFTPException('malformed reply'),
+    },
+    'SFTP': {
+        'TIMEOUT': lambda: asyncio.TimeoutError(),
+        'CONNECT': lambda: ConnectionRefusedError('connection refused'),
+        'DNS': lambda: socket.gaierror('name not resolved'),
+        'PROTOCOL': lambda: asyncssh.ProtocolError('bad packet'),
+    },
+}
+
+#: The ``error['code']`` each category must produce. ``PROTOCOL`` is the
+#: family's catch-all -- a wire-level failure that is neither a timeout,
+#: a refusal, a resolution failure nor a TLS problem -- and reports as
+#: ``TRANSPORT``.
+EXPECTED_CODE: dict[str, str] = {
+    'TLS': 'TLS',
+    'TIMEOUT': 'TIMEOUT',
+    'CONNECT': 'CONNECT',
+    'DNS': 'DNS',
+    'PROTOCOL': 'TRANSPORT',
+}
+
+
+def install_failing_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+    fault: Callable[[], BaseException],
+) -> None:
+    """Replace ``protocol``'s seam with one that raises ``fault()``.
+
+    The sibling of :func:`install_transport`, which only offers a
+    connection refusal. The fault-category guard needs each protocol's
+    seam to raise an *arbitrary* exception so every category can be put
+    to every client, and it patches the same seams for the same reason:
+    everything between the seam and the caller stays real code.
+
+    Args:
+        monkeypatch: The pytest patcher, which undoes this on teardown.
+        protocol: A normalised protocol name.
+        fault: A zero-argument callable returning the exception to raise.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If ``protocol`` names no seam, for the same
+            fail-closed reason :func:`install_transport` gives.
+    """
+    async def failing(*args: Any, **kwargs: Any) -> HttpResult:
+        """Raise the configured fault instead of answering.
+
+        Args:
+            args: The transport's positional arguments, unused.
+            kwargs: The transport's keyword arguments, unused.
+
+        Returns:
+            Never; this always raises.
+
+        Raises:
+            BaseException: Whatever ``fault()`` returns.
+        """
+        raise fault()
+
+    def opening(*args: Any, **kwargs: Any) -> Any:
+        """Return a context manager that raises the fault on entry.
+
+        Args:
+            args: Connection arguments, unused.
+            kwargs: Connection options, unused.
+
+        Returns:
+            An async context manager whose ``__aenter__`` raises.
+        """
+        return FaultingTransport(fault)
+
+    if protocol in {'HTTP', 'HTTPS'}:
+        monkeypatch.setattr(http_client, 'handle_http_request', failing)
+    elif protocol == 'SOAP':
+        monkeypatch.setattr(soap_client, 'handle_http_request', failing)
+    elif protocol == 'FTP':
+        monkeypatch.setattr(aioftp.Client, 'context', opening)
+    elif protocol == 'SFTP':
+        monkeypatch.setattr(asyncssh, 'connect', opening)
+    else:
+        raise ValueError(
+            f'{protocol!r} owns no transport seam. Returning quietly here'
+            ' would install nothing and let the row open a real'
+            ' connection.')
+
+
+class FaultingTransport:
+    """An async context manager whose entry raises a supplied fault.
+
+    :class:`RefusingTransport` with the exception made a parameter, so the
+    fault-category guard can put every category to the two protocols whose
+    seam is a context manager rather than a coroutine.
+    """
+
+    def __init__(self, fault: Callable[[], BaseException]) -> None:
+        """Record the fault this transport will raise on entry.
+
+        Args:
+            fault: A zero-argument callable returning the exception.
+        """
+        self.fault = fault
+
+    async def __aenter__(self) -> Any:
+        """Fail the connection with the configured fault.
+
+        Returns:
+            Never; this always raises.
+
+        Raises:
+            BaseException: Whatever ``fault()`` returns.
+        """
+        raise self.fault()
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        """Leave the context, suppressing nothing.
+
+        Args:
+            exc_info: The exception triple, unused.
+
+        Returns:
+            False, so any exception propagates.
+        """
+        return False

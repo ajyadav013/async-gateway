@@ -71,8 +71,13 @@ from async_gateway.utils.redaction import (
 
 from tests.fixtures.http_server import RecordingHTTPServer
 from tests.fixtures.protocol_transports import (
+    CATEGORY_EXEMPT,
     CONTRACT_CALL,
+    EXPECTED_CODE,
+    FAULT_CATEGORIES,
+    PROTOCOL_FAULTS,
     contract_call,
+    install_failing_transport,
     install_transport,
 )
 
@@ -530,6 +535,151 @@ def test_h17_no_protocol_binds_trace_state_at_construction(
             f'{protocol} bound {attribute} in __init__. Per-request trace '
             'state on a shared object is the mapping concurrent calls '
             'collide in (H17); bind it inside handle_request.')
+
+
+# --- The exception half of the same contract, on the same five rows --------
+#
+# The trace rows above closed the *tracing* class of cross-protocol
+# divergence. They did not close the class itself: AGW-R9-1 was a fourth
+# instance of the same shape -- a fix applied to one client and not its
+# siblings -- and it sailed past them, because what diverged was the
+# **transport-exception table** and those rows assert tracer counts.
+#
+# The reviewer's sharpest evidence was not the SOAP bug. It was that
+# deleting `ssl.SSLError` from the *HTTP* client left all 2952 tests
+# green: the working side was as unpinned as the broken one, and only the
+# specific value happened to be right. So a row that asserted "SOAP also
+# catches ssl.SSLError" would fix one cell of a table nothing holds. The
+# rows below assert the **property** -- every protocol answers for every
+# fault category -- driven from `PROTOCOL_FAULTS`, so a category dropped
+# from any client fails here in both directions.
+#
+# The category vocabulary, the per-protocol faults and the one argued
+# exemption live in `tests/fixtures/protocol_transports.py`, next to the
+# transport doubles they use.
+
+
+def _abortable_call(protocol: str, fault: BaseException) -> dict[str, Any]:
+    """Return a contract call that aborts on ``fault``'s own class.
+
+    ``abortable_exceptions`` is what makes these rows bite, and it is a
+    documented public knob rather than a test-only lever (README's retry
+    table). A fault named there propagates out of
+    ``CircuitBreakerHelper.run`` **unwrapped**, so it must be matched by
+    the client's own catch clause; every other failure arrives inside a
+    ``RetriesExhausted``, which every client catches by name and which
+    therefore masks a missing family entirely. That masking is exactly
+    why AGW-R9-1 survived four review rounds, and driving the rows
+    through the same knob is what stops the next one surviving.
+
+    Args:
+        protocol: A protocol name from the contract table.
+        fault: The exception the transport will raise.
+
+    Returns:
+        ``request()`` keyword arguments whose retry policy aborts
+        immediately on ``type(fault)``.
+    """
+    call = contract_call(protocol)
+    call['protocol_info']['circuit_breaker_config'] = {
+        'retry_config': {
+            'name': 'fault-category-guard',
+            'allowed_retries': 0,
+            'abortable_exceptions': [type(fault)],
+        },
+    }
+    return call
+
+
+@pytest.mark.parametrize('protocol', CONTRACT_ROWS)
+@pytest.mark.parametrize('category', FAULT_CATEGORIES)
+async def test_every_protocol_answers_for_every_fault_category(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+    category: str,
+) -> None:
+    """Each protocol maps each wire fault to an envelope (AGW-R9-1).
+
+    The library's central promise is that every failure becomes an
+    envelope and only a library bug propagates. A client whose catch
+    clause omits a family breaks that promise for one fault on one
+    protocol -- and does so invisibly, because the ``RetriesExhausted``
+    clause beside it catches the same failure on every path that does
+    not abort.
+
+    Asserting the *code* and not merely "some envelope" is what makes
+    the row a classification test rather than a smoke test: a client
+    that caught every fault and reported all of them as ``TRANSPORT``
+    would satisfy "an envelope came back" while destroying the
+    distinction a caller retries on.
+
+    Args:
+        monkeypatch: The pytest patcher.
+        protocol: The protocol under test, from the contract table.
+        category: The fault category under test.
+
+    Returns:
+        None.
+    """
+    exempt = CATEGORY_EXEMPT.get(category, {})
+    if protocol in exempt:
+        pytest.skip(f'{protocol}/{category}: {exempt[protocol]}')
+
+    build = PROTOCOL_FAULTS[protocol][category]
+    install_failing_transport(monkeypatch, protocol, build)
+
+    result = await request(**_abortable_call(protocol, build()))
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == EXPECTED_CODE[category], (
+        f'{protocol} reported {result["error"]["code"]} for a '
+        f'{category} fault, which every protocol must classify as '
+        f'{EXPECTED_CODE[category]}. A family missing from this '
+        "client's table is the divergence AGW-R9-1 was.")
+
+
+@pytest.mark.parametrize('protocol', CONTRACT_ROWS)
+def test_every_protocol_declares_a_fault_for_every_category(
+    protocol: str,
+) -> None:
+    """The fault table itself covers every protocol × category (AGW-R9-1).
+
+    The row above can only test what the table declares, so a protocol
+    quietly dropped from :data:`PROTOCOL_FAULTS` -- or a category left
+    out of one protocol's entry -- would silently reduce the guard's
+    coverage while every remaining row stayed green. That is the failure
+    mode of a data-driven guard, and it is the one that would let the
+    *sixth* instance of this class through.
+
+    An omission must therefore be either present or **argued**: a
+    category a protocol genuinely cannot produce is recorded in
+    :data:`CATEGORY_EXEMPT` with the reason, which this row requires and
+    which the row above prints when it skips. Silence is not an option
+    in either direction.
+
+    Args:
+        protocol: The protocol under test, from the contract table.
+
+    Returns:
+        None.
+    """
+    declared = PROTOCOL_FAULTS.get(protocol)
+    assert declared is not None, (
+        f'{protocol} is a contract row with no entry in PROTOCOL_FAULTS, '
+        'so the fault-category guard skips it entirely.')
+
+    for category in FAULT_CATEGORIES:
+        exempt = CATEGORY_EXEMPT.get(category, {})
+        assert category in declared or protocol in exempt, (
+            f'{protocol} declares no {category} fault and claims no '
+            'exemption for it. Add the exception its transport library '
+            'raises, or record in CATEGORY_EXEMPT why the category '
+            'cannot arise -- an undocumented gap is how this class of '
+            'divergence survived four review rounds.')
+        assert not (category in declared and protocol in exempt), (
+            f'{protocol} both declares a {category} fault and claims an '
+            'exemption from it. One of the two is stale.')
 
 
 # --- E2: ok is False exactly when error is set -----------------------------
