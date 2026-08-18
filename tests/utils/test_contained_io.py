@@ -537,31 +537,91 @@ async def test_a_non_oserror_ftp_path_failure_is_left_to_aioftp(
             await layer.write(handle, b'bytes')
 
 
-async def test_the_ftp_layer_permits_the_bases_own_parent_exactly(
+async def test_the_ftp_layer_tolerates_the_bases_own_parent_exactly(
     tmp_path: Path,
 ) -> None:
-    """One directory outside the base is allowed, by exact match only.
+    """One directory outside the base is tolerated, by exact match only.
 
-    ``aioftp.Client.download`` creates the destination's parent before
+    ``aioftp.Client.download`` asks for the destination's parent before
     writing any file, and for a single-file download the destination
-    *is* the base -- so refusing its parent would break every
-    single-file download. The exception is safe because it is not a
-    prefix rule: it admits exactly the one directory the caller already
-    named the inside of, and ``base/../victimdir`` is a different path.
+    *is* the base -- so raising on its parent would refuse every
+    single-file download. It is tolerated as a **no-op** rather than
+    created (NEW-R11-1): a missing directory the caller named the
+    inside of is the open's refusal to report, exactly as it is on the
+    HTTP path. The tolerance is safe because it is an exact match and
+    not a prefix rule, and ``base/../victimdir`` is a different path.
 
-    Both are asserted together, because the allowance is only defensible
-    if the sibling beside it is still refused.
+    Both are asserted together, because the tolerance is only
+    defensible if the sibling beside it is still refused.
     """
     base = tmp_path / 'downloads' / 'file.bin'
     layer = path_io(base)
 
     await layer.mkdir(base.parent, parents=True, exist_ok=True)
-    assert base.parent.is_dir()
+    assert not base.parent.exists(), (
+        "the base's own parent is tolerated as a no-op, never created: "
+        'creating it is the unrequested filesystem mutation NEW-R11-1 '
+        'is about, and it is what let FTP answer ok=True/200 for a '
+        'destination directory HTTP and SFTP both refuse'
+    )
 
     with pytest.raises(PathContainmentError):
         await layer.mkdir(Path(escaping(base)))
     assert not (tmp_path / 'downloads' / 'victimdir').exists()
     assert not (tmp_path / 'victimdir').exists()
+
+
+async def test_the_ftp_layer_never_creates_a_tree_of_parents(
+    tmp_path: Path,
+) -> None:
+    """NEW-R11-1: ``parents`` is dropped, so no unbounded ``mkdir -p``.
+
+    ``aioftp.Client.download`` calls
+    ``mkdir(parent, parents=True, exist_ok=True)`` before it writes,
+    and forwarding that flag ran an unbounded ``mkdir -p`` on a
+    caller-named path -- three levels created for
+    ``client_path=<tmp>/a/b/c/out.bin``, eight entries for a recursive
+    download, all reported ``ok=True``/200 where HTTP and SFTP refuse
+    with ``PATH``/400.
+
+    The refusal is typed, not raw: ``aioftp`` wraps the ``OSError`` in a
+    ``PathIOError``, and letting that escape had the FTP dispatch report
+    ``TRANSPORT``/502 -- a network verdict for a local directory.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base)
+
+    with pytest.raises(LocalWriteError):
+        await layer.mkdir(base / 'a' / 'b' / 'c', parents=True, exist_ok=True)
+    assert not (base / 'a').exists(), (
+        'a missing ancestor must be refused, not created: the caller '
+        'asked for one directory and an unbounded mkdir -p is not it'
+    )
+
+
+async def test_the_ftp_layer_still_creates_one_directory_inside_the_base(
+    tmp_path: Path,
+) -> None:
+    """Dropping ``parents`` must not break a legitimate recursion.
+
+    The positive control for the row above. ``aioftp``'s recursion
+    descends one level at a time and creates every parent before its
+    child, so a single directory whose parent exists is the only shape
+    it ever needs -- which is why dropping ``parents`` costs a
+    legitimate recursive download nothing.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base)
+
+    await layer.mkdir(base / 'tree', parents=True, exist_ok=True)
+    assert (base / 'tree').is_dir()
+
+    # `exist_ok` still holds on the second pass, which is what a
+    # recursive download re-entering an existing tree relies on.
+    await layer.mkdir(base / 'tree', parents=True, exist_ok=True)
+    assert (base / 'tree').is_dir()
 
 
 async def test_the_ftp_layer_runs_its_opens_off_the_event_loop(

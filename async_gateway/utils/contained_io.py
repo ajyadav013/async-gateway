@@ -353,37 +353,74 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
-        """Create a directory, inside the base or not at all.
+        """Create one directory, inside the base, never a whole tree.
 
         The directory half of the escape, and it lands *before* the
         file half: a hostile entry name that is a directory is
         ``mkdir``'d first and written second, so refusing here stops
         the tree being created at all rather than only its leaves.
 
-        One path outside the base is permitted, by **exact match**: the
-        base's own parent. ``aioftp.Client.download`` creates the
-        destination's parent before writing a single file, and for a
-        file download the destination *is* the base -- so refusing its
-        parent would refuse every single-file download. The exception is
-        safe because it is not a prefix rule: a server-derived name can
-        satisfy it only by naming exactly the one directory the caller
-        already named the inside of, where ``exist_ok`` makes it a
-        no-op. ``base/../victimdir`` is a different path and is refused.
+        ``parents`` is **dropped rather than forwarded**, which is
+        NEW-R11-1. ``aioftp.Client.download`` calls
+        ``mkdir(parent, parents=True, exist_ok=True)`` before it writes
+        anything, so forwarding the flag ran an unbounded ``mkdir -p``
+        on a caller-named path -- and FTP alone answered a missing
+        destination directory with ``ok=True``/200, having silently
+        created the tree, where HTTP and SFTP both refuse with
+        ``PATH``/400. Measured against real loopback servers with
+        ``client_path=<tmp>/a/b/c/out.bin``: three levels created on
+        FTP, nothing created and ``PATH`` on the other two; a recursive
+        download created eight caller- and server-named entries.
+
+        Containment itself was never breached -- the tree landed inside
+        the caller's own literal path -- so this is a *contract*
+        divergence, not an escape: creating directories nobody asked
+        for is the surprising behaviour, and the two siblings already
+        refuse. Dropping the flag makes all three agree, and agree the
+        way the majority already did.
+
+        What survives is the one level ``asyncssh`` also creates: the
+        base itself for a directory download, since ``exist_ok`` makes
+        it a no-op when it is already there and its own parent must
+        exist either way. Nothing legitimate is lost -- ``aioftp``'s
+        recursion descends one level at a time and creates every parent
+        before its child, so a ``parents`` it never needs is a
+        capability only a gap in the caller's path can consume.
+
+        One path outside the base is tolerated, by **exact match**: the
+        base's own parent. For a single-file download the destination
+        *is* the base, so ``aioftp`` asks for its parent -- the
+        directory the caller named the inside of. That is neither
+        created nor refused here; it is left to the open, which fails
+        with ``PATH`` if it is missing, exactly as the HTTP path does.
+        The tolerance is safe because it is an exact match and not a
+        prefix rule: ``base/../victimdir`` is a different path and is
+        refused.
 
         Args:
             path: The directory to create.
-            parents: Create missing parents.
+            parents: Accepted and deliberately ignored -- see above.
             exist_ok: Do not fail when it is already there.
 
         Returns:
             None.
+
+        Raises:
+            PathContainmentError: If the directory escapes the base.
+            LocalWriteError: If the local filesystem refused it -- a
+                missing ancestor above all. Classified here for the
+                same reason :meth:`write` and :meth:`close` classify:
+                ``aioftp`` wraps the ``OSError`` in a ``PathIOError``,
+                which reached the FTP dispatch as an
+                ``AIOFTPException`` and was reported ``TRANSPORT``/502
+                -- a network verdict for a local directory, on the very
+                call this method now refuses.
         """
+        del parents
         if Path(_shown(path)).absolute() == self.base.parent:
-            await aioftp.pathio.AsyncPathIO.mkdir(
-                self, self.base.parent, parents=parents, exist_ok=True)
             return
-        await super().mkdir(
-            self.contained(path), parents=parents, exist_ok=exist_ok)
+        await self._classifying(super().mkdir(
+            self.contained(path), parents=False, exist_ok=exist_ok))
 
     async def rmdir(self, path: Path) -> None:
         """Remove a directory, inside the base or not at all.
