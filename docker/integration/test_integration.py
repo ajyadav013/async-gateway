@@ -51,7 +51,15 @@ import pytest
 
 from async_gateway.async_gateway import request
 from async_gateway.utils.constants import MAX_MULTIPART_DEPTH
-from async_gateway.utils.exceptions import ConfigurationError
+from async_gateway.utils.contained_io import (
+    _open_guarded,
+    contained_path_io_factory,
+    local_base,
+)
+from async_gateway.utils.exceptions import (
+    ConfigurationError,
+    PathContainmentError,
+)
 
 BASE_HTTP = cfg.BASE_HTTP
 BASE_HTTPS = cfg.BASE_HTTPS
@@ -1160,3 +1168,434 @@ async def test_the_four_protocols_run_concurrently_on_one_loop(
 
     assert all(r['ok'] for r in results), [
         (r['protocol'], r['error']) for r in results if not r['ok']]
+
+
+# ------------------------------- security: the local-write guards, live --
+#
+# The guards below were rewritten around an fd-based `open_within()`:
+# the containment base is opened as a descriptor and each component is
+# descended with `O_NOFOLLOW|O_DIRECTORY` against the fd already held,
+# the leaf created with `dir_fd`, and the result judged by `fstat`
+# before a single byte is written.
+#
+# Every assertion about that construction so far was made in-process,
+# against a `tmp_path` on the developer's own filesystem. That is the
+# weakest place to make it. A container writes into a mounted volume on
+# overlayfs, owned by a different uid, and `O_NOFOLLOW`, `dir_fd` and
+# `st_nlink` are exactly the primitives whose behaviour a filesystem is
+# free to differ on. So each guard is re-asserted here through a REAL
+# download from a REAL server -- the transfer runs, the server has the
+# bytes, and the only thing standing between them and the disk is the
+# guard.
+#
+# Each one asserts three things, and the third is the one a unit test
+# cannot: an `ok=False` envelope (not an exception escaping), the `PATH`
+# code, and *that the call returned at all*. A FIFO with no reader was
+# N3's original symptom precisely because it did not return -- the open
+# blocked forever in a threadpool worker where the caller's own timeout
+# could not reach it. A hang is therefore a FAILURE here, not a slow
+# pass, and the `asyncio.timeout` below is what makes it one.
+
+
+#: Long enough that a working guard is never mistaken for a hang, short
+#: enough that a real hang fails the run in seconds rather than wedging
+#: it. The guarded open answers immediately -- it is one `openat` -- so
+#: anything near this bound is the defect, not slowness.
+GUARD_TIMEOUT = 20
+
+
+async def download_into(local: pathlib.Path, ftp_auth: Any) -> Dict[str, Any]:
+    """Download the FTP fixture to ``local``, refusing to hang.
+
+    ``overwrite=True`` on purpose. Every target below already exists --
+    a FIFO, a hard link, a path under a symlinked directory -- so with
+    the default the ``O_EXCL`` in the flags refuses first, with a
+    ``CONFIG`` "already exists" envelope, and the guard under test is
+    never reached. That refusal is correct, and it is a second line of
+    defence rather than the one being asserted: opting in to overwrite
+    is what puts the question to ``open_within`` itself.
+
+    Args:
+        local: The local path to write to -- the thing under test.
+        ftp_auth: The FTP credential fixture.
+
+    Returns:
+        The envelope ``request()`` returned.
+
+    Raises:
+        AssertionError: If the call does not return within
+            :data:`GUARD_TIMEOUT`, which is N3's symptom rather than an
+            ordinary failure.
+    """
+    try:
+        async with asyncio.timeout(GUARD_TIMEOUT):
+            return await request(
+                FTP_HOST,
+                protocol='FTP',
+                auth=ftp_auth,
+                protocol_info={
+                    'port': FTP_PORT,
+                    'command': 'download',
+                    'server_path': 'pub/report.csv',
+                    'client_path': str(local),
+                    'overwrite': True,
+                    'timeout': 30,
+                },
+            )
+    except TimeoutError:
+        raise AssertionError(
+            f'the download never returned for {local} -- the guard hung '
+            f'instead of refusing, which is N3 (a blocking open in a '
+            f'threadpool worker the caller timeout cannot reach)')
+
+
+def assert_path_refusal(result: Dict[str, Any], target: pathlib.Path) -> None:
+    """Assert a refusal arrived as an envelope and wrote nothing.
+
+    Args:
+        result: The envelope the download returned.
+        target: The local path that should not have been written.
+    """
+    assert_envelope(result, 'FTP')
+    assert result['ok'] is False, (
+        f'the guard admitted a write to {target}')
+    assert result['error']['code'] == 'PATH', (
+        f"expected a PATH refusal, got {result['error']}")
+
+
+async def test_a_fifo_download_target_is_refused_not_hung(
+    ftp_auth: Any, tmp_path: pathlib.Path,
+) -> None:
+    """N3 over a real transfer: a FIFO is refused, and it returns.
+
+    The original defect's symptom was a hang, so the timeout inside
+    :func:`download_into` is the substance of this test and the envelope
+    assertions are the confirmation. Asserted against a container
+    filesystem because `O_NONBLOCK`-on-a-FIFO is a kernel behaviour the
+    host suite only ever saw on APFS.
+    """
+    target = tmp_path / 'fifo-target.csv'
+    os.mkfifo(target)
+
+    result = await download_into(target, ftp_auth)
+
+    assert_path_refusal(result, target)
+    assert 'named pipe' in str(result['error']), result['error']
+
+
+async def test_a_hardlinked_download_target_is_refused(
+    ftp_auth: Any, tmp_path: pathlib.Path,
+) -> None:
+    """N4 over a real transfer: writing one name would rewrite another.
+
+    ``st_nlink`` is read off the descriptor the open returned, and link
+    counting is a filesystem property -- overlayfs and a bind-mounted
+    volume are entitled to answer differently from APFS, which is why
+    this is worth asserting here at all.
+
+    The victim's bytes are checked afterwards: a refusal that had
+    already truncated the file would be the worse outcome, and it is a
+    defect this construction actually had in its first draft.
+    """
+    victim = tmp_path / 'victim.txt'
+    victim.write_bytes(b'do not overwrite me\n')
+    target = tmp_path / 'hardlink.csv'
+    os.link(victim, target)
+
+    result = await download_into(target, ftp_auth)
+
+    assert_path_refusal(result, target)
+    assert 'hard link' in str(result['error']), result['error']
+    assert victim.read_bytes() == b'do not overwrite me\n', (
+        'the victim was truncated before the refusal')
+
+
+async def test_a_symlink_planted_in_the_destination_is_refused(
+    ftp_auth: Any, tmp_path: pathlib.Path,
+) -> None:
+    """M18/N2 over a real transfer: the pre-planted link is refused.
+
+    The threat is a symlink an attacker plants at a **predictable path
+    inside the directory the download will write into** -- M18's actual
+    shape, where the README's fixed ``/tmp/test.pdf`` was followed. The
+    descent refuses it: every component below the base is opened
+    ``O_NOFOLLOW|O_DIRECTORY`` against the descriptor already held, and
+    the leaf carries ``O_NOFOLLOW`` too.
+
+    A *symlinked parent the caller named themselves* is deliberately
+    NOT this test. Confirmed against this stack: the caller's own
+    ``client_path`` is canonicalised by ``caller_path`` before it
+    becomes the containment base, so naming a symlinked directory as
+    your own destination succeeds -- correctly. The caller chose it;
+    there is no escape from a boundary they drew there themselves, and
+    refusing it would break the ordinary case of downloading into a
+    symlinked mount point.
+
+    What must never be followed is a link the caller did *not* name,
+    which is what this asserts: the tree root is real, the link sits
+    inside it, and the write goes through the containment layer the
+    recursion uses -- both for a link *to* a directory outside, and for
+    a plain-file link planted at a name the transfer is about to create.
+
+    See ``test_a_symlinked_client_path_is_followed_TODO`` below for the
+    case this does NOT cover, and why it is filed rather than asserted.
+    """
+    destination = tmp_path / 'tree'
+    destination.mkdir()
+    outside = tmp_path / 'victimdir'
+    outside.mkdir()
+    victim = outside / 'victim.txt'
+    victim.write_bytes(b'do not follow me\n')
+
+    (destination / 'sub').symlink_to(outside, target_is_directory=True)
+    (destination / 'planted.csv').symlink_to(victim)
+
+    path_io = contained_path_io_factory(
+        local_base(destination), overwrite=True)()
+
+    # The entry name a server would send for a file in that subtree...
+    with pytest.raises(PathContainmentError):
+        path_io.contained(destination / 'sub' / 'OWNED.csv')
+
+    # ...and a link pre-planted at the exact name the transfer creates,
+    # which is M18's own shape (the README's fixed `/tmp/test.pdf`).
+    # Asserted at the *open*, not at `contained()`: containment answers
+    # "is this location inside the base", and this one is -- the link
+    # sits in the tree. What must refuse it is the `O_NOFOLLOW` on the
+    # write, so that is the seam the assertion belongs at.
+    planted = path_io.contained(destination / 'planted.csv')
+    with pytest.raises(PathContainmentError):
+        _open_guarded(planted, 'wb', True)
+
+    assert victim.read_bytes() == b'do not follow me\n'
+    assert sorted(p.name for p in outside.iterdir()) == ['victim.txt'], (
+        f'the traversal escaped into {outside}')
+
+
+async def test_a_symlinked_client_path_is_followed_by_the_transfer(
+    ftp_auth: Any, tmp_path: pathlib.Path,
+) -> None:
+    """A KNOWN GAP, asserted as it behaves rather than as it should.
+
+    When ``client_path`` *itself* is a symbolic link, the download
+    follows it and writes the remote bytes into the link's target.
+    Reproduced here against a live FTP server, and reproduced equally
+    against the commit before the ``open_within()`` rewrite -- so this
+    is **pre-existing, not a regression** from that change, and it is
+    recorded here rather than fixed under an acceptance run.
+
+    Why it happens: ``local_base(client_path)`` makes the caller's own
+    path the containment base, and ``resolve_within`` canonicalises the
+    base. A base that *is* a link therefore resolves to the link's
+    target before ``guarded_opener`` is ever handed a path, so the
+    ``O_NOFOLLOW`` on the leaf is applied to the target's name and finds
+    no link there.
+
+    Whether it is a defect is a real design question, not an oversight:
+    for a *directory* download, a symlinked destination is the ordinary
+    case of downloading into a mounted volume, and refusing it would
+    break that. For a *single-file* download it is M18's shape with the
+    caller supplying the link, and ``_open``'s own docstring claims to
+    refuse "a symlink at the target". Those two cannot both be honoured
+    by one rule about the base.
+
+    The test asserts today's behaviour so the gap is visible and so any
+    future fix is a deliberate, reviewed change to a red test rather
+    than a silent one. The attacker-planted cases -- the ones inside a
+    directory the caller named -- are refused, and the test above is
+    what proves it.
+    """
+    victim = tmp_path / 'victim.txt'
+    victim.write_bytes(b'original\n')
+    target = tmp_path / 'client-path-link.csv'
+    target.symlink_to(victim)
+
+    result = await download_into(target, ftp_auth)
+
+    assert_envelope(result, 'FTP')
+    assert result['ok'] is True, result['error']
+    assert victim.read_bytes() == REMOTE_FIXTURE, (
+        'behaviour changed -- the symlinked client_path is no longer '
+        'followed. That is very likely the FIX for this gap: delete '
+        'this test and tighten the one above.')
+
+
+async def test_a_crlf_header_is_refused_before_the_socket_opens() -> None:
+    """N6/N7 against a real origin: the answer no longer depends on it.
+
+    A CR in a header value *was* refused -- by ``aiohttp``, at
+    serialisation, with a bare ``ValueError``, and serialisation happens
+    after the connection is open. So which failure a caller got for one
+    and the same mistake depended on whether the host answered: an
+    unreachable host produced a ``CONNECT`` envelope (the connect failed
+    first, the headers were never serialised), a reachable one produced
+    an un-enveloped ``ValueError``.
+
+    That nondeterminism is the defect, so the assertion is about
+    *placement*, and dialling a **reachable** origin is what makes it
+    meaningful -- against a dead port the old code passed this too.
+
+    ``ConfigurationError`` escaping synchronously is the documented
+    contract for a caller-configuration mistake, not a bug (AGW-35):
+    these are unretryable programming errors, so they are raised once
+    rather than returned as an envelope a retry loop would re-attempt
+    forever. What N6/N7 changed is that the refusal is now this typed
+    error raised at construction *before any socket is opened*, rather
+    than a bare ``ValueError`` from deep inside a live connection.
+
+    So: the same typed error from a reachable origin and from a dead
+    port. Identical answers to the same mistake is exactly the property
+    the placement buys, and comparing the two is what a single call
+    cannot show.
+    """
+    bad_headers = {'X-Injected': 'value\r\nX-Smuggled: yes'}
+
+    with pytest.raises(ConfigurationError) as reachable:
+        await request(
+            f'{BASE_HTTP}/echo',
+            protocol='HTTP',
+            protocol_info={
+                'request_type': 'GET',
+                'headers': bad_headers,
+                'timeout': 30,
+            },
+        )
+
+    # Port 1 on this container answers nothing. Under the old code this
+    # call produced a CONNECT envelope while the one above raised, which
+    # is the nondeterminism; now both raise the same refusal.
+    with pytest.raises(ConfigurationError) as unreachable:
+        await request(
+            'http://127.0.0.1:1/echo',
+            protocol='HTTP',
+            protocol_info={
+                'request_type': 'GET',
+                'headers': bad_headers,
+                'timeout': 30,
+            },
+        )
+
+    # Named by ordinal, so a CR in the message cannot split a log line
+    # the way it would have split the request.
+    assert 'U+000D' in str(reachable.value), reachable.value
+    assert str(reachable.value) == str(unreachable.value), (
+        'the refusal still depends on whether the host answered')
+
+
+# -------------------- security: recursive download and the R22 traversal --
+
+
+async def test_ftp_recursive_directory_download_still_works(
+    ftp_auth: Any, tmp_path: pathlib.Path,
+) -> None:
+    """The case ``open_within()`` changes most, against a real server.
+
+    A directory download is where ``aioftp`` composes the *server's*
+    entry names onto the local destination and writes them through the
+    contained path-IO layer -- so every write goes through the new
+    descriptor walk, and the tree is created by it. A containment
+    construction that is too strict breaks exactly here (and nowhere in
+    the single-file tests), which is why the positive case is asserted
+    before the traversal refusal below.
+    """
+    destination = tmp_path / 'tree'
+
+    result = await request(
+        FTP_HOST,
+        protocol='FTP',
+        auth=ftp_auth,
+        protocol_info={
+            'port': FTP_PORT,
+            'command': 'download',
+            'server_path': 'pub',
+            'client_path': str(destination),
+            'timeout': 30,
+        },
+    )
+
+    assert_envelope(result, 'FTP')
+    assert result['ok'] is True, result['error']
+
+    landed = sorted(p.name for p in destination.rglob('*') if p.is_file())
+    assert 'report.csv' in landed, landed
+    fetched = next(destination.rglob('report.csv'))
+    assert fetched.read_bytes() == REMOTE_FIXTURE
+
+
+@requires_hostkey
+async def test_sftp_recursive_directory_download_still_works(
+    sftp_auth: Any, tmp_path: pathlib.Path,
+) -> None:
+    """The same for SFTP, whose recursion is asyncssh's rather than ours.
+
+    ``asyncssh`` walks the remote tree itself and writes through the
+    contained local filesystem object, so this exercises the second of
+    the two seams the rewrite touched.
+
+    ``recurse`` is deliberately not passed: the client decides it from
+    the remote ``lstat`` (M28 -- it used to be written into the
+    caller's own dict by reference, which left it set for every later
+    call). Passing it here would test the caller instead of that.
+    """
+    destination = tmp_path / 'tree'
+
+    result = await request(
+        SFTP_HOST,
+        protocol='SFTP',
+        auth=sftp_auth,
+        protocol_info={
+            'port': SFTP_PORT,
+            'mode': 'get',
+            'remote_path': 'pub',
+            'local_path': str(destination),
+            'known_hosts': KNOWN_HOSTS,
+            'timeout': 30,
+        },
+    )
+
+    assert_envelope(result, 'SFTP')
+    assert result['ok'] is True, result['error']
+
+    landed = sorted(p.name for p in destination.rglob('*') if p.is_file())
+    assert 'report.csv' in landed, landed
+    fetched = next(destination.rglob('report.csv'))
+    assert fetched.read_bytes() == REMOTE_FIXTURE
+
+
+async def test_a_traversing_entry_name_cannot_escape_the_named_directory(
+    ftp_auth: Any, tmp_path: pathlib.Path,
+) -> None:
+    """R22's actual threat model: the hostile name comes from the SERVER.
+
+    Every other path test here supplies the dangerous path as the
+    *caller*. This one does not -- the escape M17 described is a server
+    listing an entry called ``../victimdir/OWNED`` during a recursive
+    download, which ``aioftp`` composes onto the local destination and
+    writes, at mode 0644, outside the directory the caller named.
+
+    A cooperative server will not emit such a name, so the equivalent
+    reachable assertion is made against the seam that decides it: the
+    contained path-IO layer the recursion writes through, bound to the
+    same base a real download binds it to, asked to resolve the entry
+    name a hostile server would have sent. Refusing it there is what
+    refuses it on the wire.
+
+    The live half is the sibling test above: the same layer, bound the
+    same way, passes a real recursive download. Together they say the
+    containment is tight enough to refuse the escape and loose enough
+    to let the legitimate tree through -- neither of which either test
+    shows alone.
+    """
+    destination = tmp_path / 'tree'
+    destination.mkdir()
+    outside = tmp_path / 'victimdir'
+    outside.mkdir()
+
+    path_io = contained_path_io_factory(
+        local_base(destination), overwrite=False)()
+
+    for hostile in ('../victimdir/OWNED', '../../etc/OWNED', '/etc/OWNED'):
+        with pytest.raises(PathContainmentError):
+            path_io.contained(pathlib.Path(hostile))
+
+    assert list(outside.iterdir()) == [], 'the traversal escaped'
