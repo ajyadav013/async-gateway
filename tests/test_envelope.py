@@ -1779,6 +1779,45 @@ QUERY_SECRET_VALUES = (
 )
 
 
+#: The URL component the secret is planted in, as a format string over
+#: ``{pair}``. **This is the axis the round-4 generator did not have**,
+#: and its absence is why this differential passed while
+#: ``/p;api_key=S`` leaked: every spelling it emitted was a ``?``-
+#: introduced query with no fragment, so the one thing the two maskers
+#: still disagreed about -- which *component* each one scans -- was held
+#: constant across the entire corpus.
+#:
+#: Each row is somewhere a real server reads a real parameter:
+#:
+#: * ``;`` in a path segment -- RFC 3986 path parameters, which PHP and
+#:   Java servlet containers parse as parameters.
+#: * a fragment, plain and after a query. OAuth 2.0's implicit grant
+#:   returns ``#access_token=...``, so a fragment pair is a live
+#:   credential by design rather than by accident.
+#: * a query *after* a fragment, which is not valid grammar and is
+#:   exactly why it leaked: no component-scoped rule owns it, and
+#:   ``urlsplit`` files the whole thing under ``fragment``.
+#: * userinfo, whose secret no pair rule can see at all -- it is here so
+#:   the equality assertion covers the masker that *does* see it.
+#:
+#: Deliberately *not* here: a bare ``/p/api_key=S`` path segment with no
+#: delimiter introducing it. Nothing parses that as a parameter -- ``;``
+#: is the path-parameter spelling and it has its own rows -- so masking
+#: it would mean masking any ``name=value`` anywhere in any prose, which
+#: is a bound this module has never claimed. The rows below are each a
+#: place a real parser reads a real parameter; that is the line.
+QUERY_COMPONENTS = (
+    '/p?{pair}',
+    '/p;{pair}',
+    '/p;{pair}/more',
+    '/p#{pair}',
+    '/p#frag?{pair}',
+    '/p?a=1#{pair}',
+    '/p;a=1?b=2#c=3&{pair}',
+    '/p?a=1#frag;{pair}',
+)
+
+
 def query_spellings() -> Iterator[str]:
     """Generate query strings carrying a secret, spelled every way.
 
@@ -1787,15 +1826,28 @@ def query_spellings() -> Iterator[str]:
     incident, and every finding this module has produced was a spelling
     nobody had listed yet. What is generated is the *disagreement
     surface* the two query rules share -- separator, the secret's
-    position, the name before it, the value's encoding, the scheme, and
-    what follows.
+    position, the name before it, the value's encoding, the scheme, what
+    follows, and now the **component the secret sits in**.
+
+    That last axis is this round's addition and the reason the round-4
+    corpus missed a live leak: it emitted only ``?``-introduced queries
+    with no fragment, so it varied everything about a pair *except*
+    where in the URL it was. :data:`QUERY_COMPONENTS` varies exactly
+    that, which is what makes the equality assertion in
+    :func:`test_the_two_maskers_agree_on_every_query_spelling` catch a
+    component one masker scans and the other does not.
 
     Yields:
-        A URL or scheme-less URL whose query carries
-        :data:`QUERY_SECRET` under a sensitive name.
+        A URL or scheme-less URL carrying :data:`QUERY_SECRET` under a
+        sensitive name, somewhere a server would read it.
     """
-    prefixes = ('https://host/p', 'host/p', 'https://user@host/p')
+    prefixes = ('https://host', 'host', 'https://user@host',
+                f'https://user:{QUERY_SECRET}@host')
     tails = ('', 'page=2', 'x=a%20b', 'flag')
+    for prefix, component, separator, name, value in itertools.product(
+            prefixes, QUERY_COMPONENTS, QUERY_SEPARATOR_SPELLINGS,
+            QUERY_SECRET_NAMES, QUERY_SECRET_VALUES):
+        yield prefix + component.format(pair=f'{name}={value}')
     for prefix, separator, innocent, name, value in itertools.product(
             prefixes, QUERY_SEPARATOR_SPELLINGS, QUERY_INNOCENT_NAMES,
             QUERY_SECRET_NAMES, QUERY_SECRET_VALUES):
@@ -1803,12 +1855,17 @@ def query_spellings() -> Iterator[str]:
         # The secret *second*, after an insensitive name -- the shape the
         # `parse_qsl` folding argument does not cover, and the one N1 was
         # reported as.
-        yield f'{prefix}?{innocent}=1{separator}{pair}'
+        yield f'{prefix}/p?{innocent}=1{separator}{pair}'
+        # The same, but with the insensitive name in a *different*
+        # component from the secret: a rule that masks only the
+        # component holding the first pair leaks the second.
+        yield f'{prefix}/p;{innocent}=1?{pair}'
+        yield f'{prefix}/p?{innocent}=1#{pair}'
         # And the secret first, which that argument does cover, so a
         # regression reinstating it still fails on the row above.
         for tail in tails:
-            yield f'{prefix}?{pair}{separator}{tail}' if tail else (
-                f'{prefix}?{pair}')
+            yield f'{prefix}/p?{pair}{separator}{tail}' if tail else (
+                f'{prefix}/p?{pair}')
 
 
 def test_the_two_maskers_agree_on_every_query_spelling() -> None:
@@ -1837,6 +1894,17 @@ def test_the_two_maskers_agree_on_every_query_spelling() -> None:
     claim and the right one -- a difference in rendering is how a
     divergence first shows itself, one release before it becomes a
     difference in what is masked.
+
+    The equality half is what caught this round, and only after the
+    corpus grew the axis it was missing. The round-4 generator varied
+    separator, position, name and encoding but emitted ``?``-introduced
+    queries with no fragment throughout, so it held constant the one
+    thing the maskers still disagreed about -- the *component*. With
+    :data:`QUERY_COMPONENTS` varying that, ``/p;api_key=S`` and
+    ``/p#frag?api_key=S`` are in the corpus: measured against the
+    pre-fix module, 640 of these 1664 spellings published the secret
+    through :func:`redact_url` and 320 were rendered differently by the
+    two maskers. Both assertions are zero, not fewer.
     """
     leaked: list[tuple[str, list[str]]] = []
     disagreed: list[tuple[str, str, str]] = []
@@ -1856,7 +1924,7 @@ def test_the_two_maskers_agree_on_every_query_spelling() -> None:
         if from_url != from_text:
             disagreed.append((spelling, from_url, from_text))
 
-    assert checked > 500, (
+    assert checked > 1500, (
         f'only {checked} spellings were generated, so this row is close '
         f'to vacuous -- the generator has stopped producing queries')
     assert leaked == [], (
@@ -1868,35 +1936,60 @@ def test_the_two_maskers_agree_on_every_query_spelling() -> None:
         f'{disagreed[:5]}')
 
 
-def test_the_two_query_rules_are_generated_from_one_separator_set() -> None:
+def test_the_two_maskers_run_one_scan_over_one_surface() -> None:
     """The agreement is by construction, and this is what proves it.
 
     The differential above says the two maskers agree *today*, over the
     shapes generated today. This says they cannot be made to disagree by
-    the edit that has now produced three findings -- teaching one rule a
-    separator and not the other -- because there is one place to teach.
+    the edit that has now produced *four* findings -- and the fourth is
+    why this row no longer asserts what it used to.
 
-    The query-separator counterpart of
-    :func:`test_the_deleted_character_set_is_taken_from_the_parser`: a
-    structural check that the shared definition is still shared, which
-    fails when someone re-hardcodes a class rather than one release later
-    from a leak. It asserts *behaviour* per separator rather than pattern
-    source, so a rewrite keeping the property passes.
+    Rounds one to three were about the separator: one rule knew ``;``
+    and the other did not, so the fix was a shared
+    :data:`_QUERY_SEPARATORS` and this test asserted both rules derived
+    from it. They did, and they diverged anyway -- because a shared
+    constant says what a separator *is* and nothing about *where each
+    masker looks*. ``redact_url`` scanned ``parts.query`` alone, so
+    ``/p;api_key=S`` and ``/p#frag?api_key=S`` were masked by
+    ``redact_text`` and published in the clear by ``redact_url``.
+
+    So the structural claim is now the stronger one: there is no second
+    query rule to keep in step. ``redact_url`` masks by calling the same
+    :func:`_mask_in_string` that :func:`redact_text` calls, over the
+    whole URL. That is asserted three ways -- the shared entry point
+    still masks alone, no component-scoped rule has reappeared, and the
+    two maskers render every component identically -- so a future edit
+    reintroducing a component-scoped rule fails here rather than one
+    release later from a leak.
     """
-    separators = redaction._QUERY_SEPARATORS
+    # 1. The shared scan is what does the masking: it alone, with no
+    #    parse and no component split, already masks every spelling.
+    for component in ('/p;api_key=', '/p?api_key=', '/p#frag?api_key=',
+                      '/p#api_key=', '/a;b?c&api_key='):
+        raw = f'https://h{component}{QUERY_SECRET}'
+        assert redaction._mask_in_string(
+            raw, redaction._sensitive_names(())) == redact_url(raw)
 
-    for separator in separators:
-        assert redaction._QUERY_SEPARATOR_SPLIT.split(
-            f'a=1{separator}b=2') == ['a=1', separator, 'b=2']
-        assert redact_url(
-            f'https://h/p?x=1{separator}api_key={QUERY_SECRET}') == (
-                f'https://h/p?x=1{separator}api_key={REDACTED}')
-        assert redact_text(
-            f'host/p?x=1{separator}api_key={QUERY_SECRET}') == (
-                f'host/p?x=1{separator}api_key={REDACTED}')
+    # 2. No component-scoped masking rule exists to fall out of step.
+    #    `_mask_query` was that rule; its absence is the fix.
+    assert not hasattr(redaction, '_mask_query')
+    assert not hasattr(redaction, '_QUERY_SEPARATOR_SPLIT')
+
+    # 3. Every introducer and separator behaves identically through both
+    #    maskers, in whichever component it lands in.
+    for introducer in redaction._PAIR_INTRODUCERS:
+        for separator in redaction._QUERY_SEPARATORS:
+            spelling = (
+                f'https://h/p{introducer}x=1{separator}'
+                f'api_key={QUERY_SECRET}')
+            expected = (
+                f'https://h/p{introducer}x=1{separator}'
+                f'api_key={REDACTED}')
+            assert redact_url(spelling) == expected
+            assert redact_text(spelling) == expected
 
     assert redaction._QUERY_DELIMITERS == (
-        redaction._QUERY_START + separators)
+        redaction._PAIR_INTRODUCERS + redaction._QUERY_SEPARATORS)
 
 
 def test_redact_url_masking_stays_linear_on_a_hostile_query() -> None:
