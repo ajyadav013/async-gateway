@@ -39,6 +39,7 @@ and ``recurse=True`` was written into the caller's own
 sharing that ``protocol_info`` (M28).
 """
 
+import errno
 import logging
 import re
 import socket
@@ -1746,3 +1747,27 @@ async def test_agw40_a_get_of_an_absent_remote_path_still_fails(
     assert envelope['ok'] is False
     assert envelope['error']['code'] == 'SFTP_STATUS'
     assert 'get' not in double.sftp.names()
+
+
+async def test_a_residual_oserror_reports_path_not_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The table's last row, the sibling of the FTP one (NEW-R10-1).
+
+    ``asyncssh`` hands a socket-level ``OSError`` to the dispatch bare,
+    so this row is reachable, and the common traveller on it is a
+    **local** filesystem failure from a ``get``'s own write. Calling
+    that ``CONNECT`` invited a retry that re-downloads the body and
+    counted a full disk here against the remote host's breaker. All
+    four protocols now answer ``PATH``; the trade for the rarer genuine
+    socket ``OSError`` is argued at the FTP row.
+    """
+    trusting_double(
+        monkeypatch,
+        StubSFTPClient(
+            operation_error=OSError(errno.EHOSTUNREACH, 'No route to host')))
+
+    result = await sftp_call(host_key=SERVER_HOST_KEY)
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'PATH'

@@ -20,6 +20,7 @@ fixture's **recorded request count**, which is this suite's replacement
 for a mock's call count.
 """
 
+from pathlib import Path
 from time import monotonic
 from typing import Any
 
@@ -1954,3 +1955,86 @@ async def test_an_open_circuits_refusal_names_the_destination_redacted(
     assert 'circuit open for' in message
     assert '/loop' in message
     assert 's3cret' not in message
+
+
+# --- NEW-R10-1: a local disk fault is not the remote side's fault ----------
+
+
+async def test_a_local_write_failure_is_not_retried(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """A disk the network cannot heal is not worth re-downloading.
+
+    ``safe_writer`` runs *inside* the retried callable, so a missing
+    parent directory was a failure the loop treated as the network's:
+    measured at **4x amplification** -- the entire body pulled down
+    again on every attempt for a fault no remote can fix.
+
+    The recorded request count is the assertion, and it has to be:
+    the envelope is identical either way, so a test asserting only the
+    code would pass at four attempts exactly as it does at one.
+    """
+    http_server.respond('/body', body=b'a body worth not re-downloading')
+
+    result = await _get_with(
+        http_server,
+        http_file_download_config={
+            'download_filepath': str(tmp_path / 'absent' / 'out.bin')},
+        circuit_breaker_config={
+            'retry_config': {
+                'name': 'local-write',
+                'allowed_retries': 3,
+                'delay': 0,
+            },
+        },
+    )
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'PATH'
+    assert len(http_server.requests) == 1, (
+        f'the body was fetched {len(http_server.requests)} times for one '
+        'call: a local disk failure is being retried as though the '
+        'network might heal it. Add the error to '
+        'DEFAULT_ABORTABLE_EXCEPTIONS.')
+
+
+async def test_local_write_failures_do_not_open_the_destinations_breaker(
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+) -> None:
+    """A full disk here says nothing about the server's health.
+
+    The sharper half of the same defect, and the one with blast radius
+    past the failing call. A counted local failure drives the *shared*
+    breaker for that destination, so measured: six disk failures opened
+    the circuit and the next perfectly healthy call -- with a writable
+    destination, against a server that had answered every time -- came
+    back ``CIRCUIT_OPEN``. One caller with a bad path takes an endpoint
+    offline for every other caller in the process.
+
+    The same reasoning already applied to this library's own refusals
+    (N7's ``InvalidCommand``); this is the surface nobody had applied it
+    to.
+    """
+    http_server.respond('/body', body=b'a healthy answer')
+    breaker = {'maximum_failures': 3, 'timeout': 600}
+
+    for attempt in range(6):
+        refused = await _get_with(
+            http_server,
+            http_file_download_config={
+                'download_filepath': str(
+                    tmp_path / f'absent{attempt}' / 'out.bin')},
+            circuit_breaker_config=dict(breaker),
+        )
+        assert refused['error']['code'] == 'PATH'
+
+    healthy = await _get_with(
+        http_server, circuit_breaker_config=dict(breaker))
+
+    refused_code = healthy['error'] and healthy['error']['code']
+    assert healthy['ok'] is True, (
+        f'a healthy call was refused with {refused_code} after six '
+        'local disk failures: the breaker for a healthy destination is '
+        'being opened by faults on this machine.')

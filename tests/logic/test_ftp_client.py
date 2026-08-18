@@ -17,6 +17,7 @@ by a double that never handshakes.
 """
 
 import asyncio
+import errno
 import inspect
 import logging
 import socket
@@ -1494,3 +1495,36 @@ async def test_a_real_connection_reset_is_still_a_transport_failure(
 
     assert result['ok'] is False
     assert result['error']['code'] == 'CONNECT'
+
+
+async def test_a_residual_oserror_reports_path_not_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The table's last row, and why it says ``PATH`` (NEW-R10-1).
+
+    An ``OSError`` that is not a ``ConnectionError`` reaches this
+    client's dispatch bare -- ``aioftp`` hands one up directly, unlike
+    ``aiohttp``, which wraps every socket failure in a
+    ``ClientConnectionError``. The row used to call it ``CONNECT``,
+    which is a claim about the *remote* side: it carries a retry
+    recommendation and it counts against that destination's breaker.
+
+    The common traveller on this row is a **local** filesystem failure
+    from the download's own write, for which both of those are wrong,
+    so all four protocols now answer ``PATH``. The trade is named
+    rather than hidden: a genuine socket ``OSError`` no
+    ``ConnectionError`` covers now also reports ``PATH``. That is the
+    rarer case and the safer direction -- mislabelling a network fault
+    as local costs one retry the caller must ask for, while
+    mislabelling a local fault as network takes a healthy destination
+    offline for every caller in the process.
+    """
+    install_ftp_double(
+        monkeypatch,
+        client=RecordingFTPClient(
+            command_error=OSError(errno.EHOSTUNREACH, 'No route to host')))
+
+    result = await ftp_call()
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'PATH'
