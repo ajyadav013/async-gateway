@@ -26,6 +26,7 @@ kernel decides atomically and there is no window to race into.
 """
 
 import asyncio
+import errno
 import fcntl
 import os
 import shutil
@@ -37,10 +38,13 @@ from pathlib import Path
 from typing import Any, Optional, Text
 from unittest import mock
 
+import aiofiles
+
 import pytest
 
 from async_gateway.utils.exceptions import (
     ConfigurationError,
+    LocalWriteError,
     PathContainmentError,
 )
 from async_gateway.utils.paths import (
@@ -922,19 +926,144 @@ async def test_writing_to_an_existing_directory_reports_what_went_wrong(
     assert 'overwrite=True' not in str(caught.value)
 
 
-async def test_a_missing_parent_directory_is_reported_as_itself(
+async def test_a_missing_parent_directory_is_a_typed_local_write_failure(
     tmp_path: Path,
 ) -> None:
-    """Not every refused open is a security finding.
+    """Not every refused open is a security finding -- but all are typed.
 
-    ``safe_writer`` translates exactly two failures -- a symlink and an
-    existing file -- and lets the rest through unchanged. Translating
-    more would report a mistyped directory as a path-containment
-    attack, which is both wrong and alarming.
+    This row used to assert the opposite half of the same idea: that a
+    missing parent escaped ``safe_writer`` as a bare
+    ``FileNotFoundError``, on the reasoning that reporting it as a
+    path-containment attack would be wrong and alarming. The reasoning
+    still holds and the conclusion did not: it *is* not a containment
+    finding, and it is also not something a library whose whole contract
+    is a typed envelope may hand back raw. On HTTP it matched no
+    transport family and reached ``request()`` as the interpreter's own
+    exception (NEW-R10-1).
+
+    So the distinction is kept in the *class* and dropped from the
+    escape: ``LocalWriteError``, a sibling of ``PathContainmentError``
+    rather than a subclass, sharing its ``PATH`` code because a caller
+    acts on both the same way, while a security finding stays
+    distinguishable by type.
     """
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(LocalWriteError) as raised:
         async with safe_writer(tmp_path / 'no-such-dir' / 'f.bin'):
             pass
+
+    assert raised.value.code == 'PATH'
+    assert isinstance(raised.value.__cause__, FileNotFoundError)
+    assert not isinstance(raised.value, PathContainmentError), (
+        'a missing directory is an operational failure, not a '
+        'containment finding; sharing the code must not blur the class.')
+
+
+async def test_a_write_that_fails_mid_body_is_typed_and_leaves_no_file(
+    tmp_path: Path,
+) -> None:
+    """The *write* seam, which the open seam's guard cannot reach.
+
+    A missing parent fails at ``open``. A full disk does not -- ENOSPC,
+    EDQUOT and EFBIG are raised by ``write`` on a file that opened
+    perfectly, so a guard placed only at the open lets exactly the
+    fault an operator most fears escape raw. Measured through
+    ``request()``: a 200 KB download under an 8 KiB ``RLIMIT_FSIZE``
+    reached the caller as a bare ``OSError``.
+
+    The partial file must also be gone: what a failed write leaves is a
+    truncated body, and M19's rule is that this library never orphans
+    one.
+    """
+    target = tmp_path / 'partial.bin'
+
+    with pytest.raises(LocalWriteError) as raised:
+        async with safe_writer(target) as handle:
+            await handle.write(b'a chunk that lands')
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+    assert raised.value.code == 'PATH'
+    assert 'No space left on device' in str(raised.value)
+    assert not target.exists(), (
+        'a failed write must not orphan the partial file it wrote')
+
+
+async def test_a_close_that_fails_flushing_is_typed_and_leaves_no_file(
+    tmp_path: Path,
+) -> None:
+    """The seam a write-side check alone cannot reach.
+
+    ``aiofiles`` buffers, so a body small enough to fit the buffer never
+    reaches the ``write`` syscall at all: its first and only syscall is
+    the flush inside ``close()``, which runs on the **success** path
+    after the block has already exited cleanly. Measured end to end -- a
+    200 KB download under an 8 KiB ``RLIMIT_FSIZE`` reached
+    ``request()`` as a raw ``OSError`` from exactly here while every
+    other arm was green (NEW-R10-1).
+
+    The half-written file must be removed for the same reason a failed
+    write's is (M19): what a failed flush leaves is a truncated body,
+    and this library never orphans one.
+    """
+    target = tmp_path / 'flushed.bin'
+
+    async def refuse() -> None:
+        """Fail the flush the way an exhausted filesystem does.
+
+        Returns:
+            Never; this always raises.
+
+        Raises:
+            OSError: Always, with ``ENOSPC``. Patched onto the handle
+                rather than onto the builtin writer, whose ``close`` is
+                an immutable attribute of a C type.
+        """
+        raise OSError(errno.ENOSPC, 'No space left on device')
+
+    opened = aiofiles.open
+
+    async def refusing_open(*args: Any, **kwargs: Any) -> Any:
+        """Open normally, then make only the flush fail.
+
+        Args:
+            args: Forwarded to ``aiofiles.open``.
+            kwargs: Forwarded to ``aiofiles.open``.
+
+        Returns:
+            The real handle, with ``close`` replaced.
+        """
+        handle = await opened(*args, **kwargs)
+        handle.close = refuse
+        return handle
+
+    with mock.patch.object(aiofiles, 'open', refusing_open), \
+            pytest.raises(LocalWriteError) as raised:
+        async with safe_writer(target) as writing:
+            await writing.write(b'small enough to stay in the buffer')
+
+    assert raised.value.code == 'PATH'
+    assert 'No space left on device' in str(raised.value)
+    assert not target.exists(), (
+        'a failed flush must not orphan the truncated file it left')
+
+
+async def test_a_failure_inside_the_block_keeps_its_own_diagnosis(
+    tmp_path: Path,
+) -> None:
+    """A non-``OSError`` failure is not reclassified on its way out.
+
+    ``safe_writer`` types local *filesystem* refusals. A body that fails
+    for its own reason -- a cancelled transfer, a decode error, a bug --
+    is the caller's exception and must arrive as itself, or the one
+    conversion point would be reporting a library bug as a disk problem.
+    """
+    target = tmp_path / 'aborted.bin'
+
+    with pytest.raises(ZeroDivisionError):
+        async with safe_writer(target) as handle:
+            await handle.write(b'partial')
+            raise ZeroDivisionError('the block failed for its own reason')
+
+    assert not target.exists()
 
 
 def test_caller_path_is_callable_synchronously(tmp_path: Path) -> None:

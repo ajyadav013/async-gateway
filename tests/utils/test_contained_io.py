@@ -18,6 +18,7 @@ still delegates.
 """
 
 import asyncio
+import errno
 import os
 import threading
 from pathlib import Path
@@ -30,6 +31,7 @@ import asyncssh
 import pytest
 
 from async_gateway.utils.contained_io import (
+    ClassifyingLocalFile,
     ContainedLocalFS,
     ContainedPathIO,
     contained_download,
@@ -38,8 +40,64 @@ from async_gateway.utils.contained_io import (
 )
 from async_gateway.utils.exceptions import (
     ConfigurationError,
+    LocalWriteError,
     PathContainmentError,
 )
+
+
+class _FullDisk:
+    """A file object whose every write and flush reports ENOSPC.
+
+    The write-side fault, produced without a full filesystem. Both
+    wrappers reach the disk through an ordinary file object, so
+    substituting one that raises the real errno drives the real arm --
+    and unlike closing a descriptor out from under a live handle, it
+    leaves nothing for the garbage collector to trip over.
+    """
+
+    @staticmethod
+    def _refuse() -> None:
+        """Raise the error an exhausted filesystem raises.
+
+        Returns:
+            Never; this always raises.
+
+        Raises:
+            OSError: Always, with ``ENOSPC``.
+        """
+        raise OSError(errno.ENOSPC, 'No space left on device')
+
+    def write(self, data: bytes, *args: Any) -> int:
+        """Refuse to write.
+
+        Args:
+            data: The block, unused.
+            args: An offset, for the asyncssh shape.
+
+        Returns:
+            Never; this always raises.
+        """
+        self._refuse()
+        raise AssertionError('unreachable')
+
+    def seek(self, *args: Any) -> int:
+        """Seek, which asyncssh does before every write.
+
+        Args:
+            args: The offset and whence, unused.
+
+        Returns:
+            0, always -- the seek is not what this double refuses.
+        """
+        return 0
+
+    def close(self) -> None:
+        """Refuse to flush.
+
+        Returns:
+            Never; this always raises.
+        """
+        self._refuse()
 
 
 def escaping(base: Path, name: Text = 'OWNED') -> Text:
@@ -260,39 +318,103 @@ async def test_the_ftp_layer_refuses_to_overwrite_unless_asked(
     assert (base / 'f.bin').read_bytes() == b'replaced'
 
 
-async def test_an_unrecognised_ftp_open_failure_arrives_as_itself(
+async def test_an_environmental_ftp_open_failure_is_typed_not_containment(
     tmp_path: Path,
 ) -> None:
-    """R28: an OSError the classifier does not recognise is re-raised.
+    """An OSError the classifier does not recognise is typed, not raw.
 
     The guarded open earns three different kinds of ``OSError`` and only
-    two of them mean something to this library: ``ELOOP``/``EMLINK`` is a
-    refused symlink and ``EEXIST`` is a refused overwrite. Everything
-    else -- a parent directory that is not there, a plain file standing
-    where a directory component was expected -- belongs to the caller's
-    environment, not to containment, and
-    :func:`~async_gateway.utils.paths.classify_refusal` answers None for
-    it so the original error propagates untranslated.
+    two of them are findings about *containment*: ``ELOOP``/``EMLINK``
+    is a refused symlink and ``EEXIST`` is a refused overwrite.
+    Everything else -- a parent directory that is not there, a plain
+    file standing where a directory component was expected -- belongs to
+    the caller's environment.
 
-    Delete this and the wrapper is free to report a missing directory as
-    a ``PathContainmentError``: an operator would read a filesystem
-    mistake as a hostile server, and would have no ``errno`` left to fix
-    it by. Both errno families are driven because they reach the
-    classifier through its two different arms -- ``ENOENT`` is refused
-    before the ``EEXIST`` test, ``ENOTDIR`` after it.
+    This row used to require the residue to propagate as the raw
+    ``errno`` exception. Half of that was right and is still asserted:
+    an operator must not read a filesystem mistake as a hostile server,
+    so ``LocalWriteError`` is deliberately **not** a
+    ``PathContainmentError`` and the original ``errno`` stays reachable
+    on ``__cause__``. The other half was the defect: raw was also how it
+    reached ``request()`` on the HTTP path, past every transport family,
+    as a bare ``FileNotFoundError`` (NEW-R10-1).
+
+    Both errno families are driven because they reach the classifier
+    through its two different arms -- ``ENOENT`` is refused before the
+    ``EEXIST`` test, ``ENOTDIR`` after it.
     """
     base = tmp_path / 'downloads'
     base.mkdir()
     (base / 'plain').write_bytes(b'a file, not a directory')
     layer = path_io(base)
 
-    with pytest.raises(FileNotFoundError):
-        async with layer.open(base / 'absent' / 'f.bin', mode='wb'):
-            pass
+    for candidate, errno_class in (
+        (base / 'absent' / 'f.bin', FileNotFoundError),
+        (base / 'plain' / 'f.bin', NotADirectoryError),
+    ):
+        with pytest.raises(LocalWriteError) as raised:
+            async with layer.open(candidate, mode='wb'):
+                pass
 
-    with pytest.raises(NotADirectoryError):
-        async with layer.open(base / 'plain' / 'f.bin', mode='wb'):
-            pass
+        assert raised.value.code == 'PATH'
+        assert not isinstance(raised.value, PathContainmentError), (
+            'an environmental failure must stay distinguishable from a '
+            'containment finding, or an operator reads a mistyped path '
+            'as a hostile server.')
+        assert isinstance(raised.value.__cause__, errno_class), (
+            'the original errno must stay reachable, or there is '
+            'nothing left to fix the environment by.')
+
+
+async def test_a_local_write_failure_mid_transfer_is_typed_on_ftp(
+    tmp_path: Path,
+) -> None:
+    """The write and close seams, which the open seam's guard cannot reach.
+
+    A missing parent fails at ``open``. A full disk does not -- ENOSPC,
+    EDQUOT and EFBIG are raised by the ``write`` syscall on a file that
+    opened perfectly, or by the flush inside ``close`` for a body small
+    enough to sit in the buffer. ``aioftp`` funnels both through its own
+    ``PathIOError``, so a full disk arrived at the FTP dispatch as an
+    ``AIOFTPException`` and was classified ``TRANSPORT`` -- a verdict
+    about the *remote* server for a fault on this machine, carrying the
+    retry and the breaker count that verdict carries (NEW-R10-1).
+
+    Driven through a file object that raises ENOSPC, so the fault is the
+    real errno an exhausted disk produces and the test needs no full
+    filesystem to produce it. The end-to-end ``RLIMIT_FSIZE`` run
+    confirms the same arm against a real kernel refusal.
+    """
+    layer = path_io(tmp_path)
+    full_disk = _FullDisk()
+
+    with pytest.raises(LocalWriteError) as on_write:
+        await layer.write(full_disk, b'a block the disk will not take')
+    assert on_write.value.code == 'PATH'
+
+    with pytest.raises(LocalWriteError) as on_close:
+        await layer.close(full_disk)
+    assert on_close.value.code == 'PATH'
+
+
+async def test_a_non_oserror_ftp_path_failure_is_left_to_aioftp(
+    tmp_path: Path,
+) -> None:
+    """The classifier claims local IO, not everything ``aioftp`` raises.
+
+    ``PathIOError`` is ``aioftp``'s universal wrapper: it carries a
+    ``ValueError`` from the library's own misuse guard as readily as an
+    ``OSError`` from the disk. Unwrapping it unconditionally would let
+    this module report an ``aioftp`` bug -- or one of ours -- as a full
+    disk, which is the one-conversion-point rule inverted.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    layer = path_io(base)
+
+    async with layer.open(base / 'f.bin', mode='wb') as handle:
+        with pytest.raises(aioftp.PathIOError):
+            await layer.write(handle, b'bytes')
 
 
 async def test_the_ftp_layer_permits_the_bases_own_parent_exactly(
@@ -661,25 +783,51 @@ async def test_the_local_fs_reads_without_the_write_guards(
         await handle.close()
 
 
-async def test_an_unrecognised_local_fs_open_failure_arrives_as_itself(
+async def test_an_environmental_local_fs_open_failure_is_typed(
     tmp_path: Path,
 ) -> None:
-    """R28: the same untranslated propagation, on the SFTP wrapper.
+    """The same typed classification, on the SFTP wrapper.
 
-    Both wrappers share one guarded open, and the row above proves the
-    re-raise through the FTP one. This is the second caller, asserted
-    because the sharing is an implementation detail a future change is
-    free to undo: the day ``ContainedLocalFS.open`` grows its own
-    handling, a wrapper that swallowed a ``FileNotFoundError`` into a
-    containment error would pass every other row in this module.
+    Both wrappers share one guarded open, and the row above proves it
+    through the FTP one. This is the second caller, asserted because the
+    sharing is an implementation detail a future change is free to undo:
+    the day ``ContainedLocalFS.open`` grows its own handling, a wrapper
+    that let a bare ``FileNotFoundError`` escape -- or that collapsed it
+    into a containment error -- would pass every other row here.
     """
     base = tmp_path / 'downloads'
     base.mkdir()
     filesystem = ContainedLocalFS(base)
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(LocalWriteError) as raised:
         await filesystem.open(
             os.fsencode(str(base / 'absent' / 'f.bin')), 'wb')
+
+    assert raised.value.code == 'PATH'
+    assert isinstance(raised.value.__cause__, FileNotFoundError)
+    assert not isinstance(raised.value, PathContainmentError)
+
+
+async def test_a_local_write_failure_mid_transfer_is_typed_on_sftp(
+    tmp_path: Path,
+) -> None:
+    """The SFTP write and close seams, the sibling of the FTP row above.
+
+    ``asyncssh`` adds no wrapper of its own: a write-side ``OSError``
+    went straight up to the dispatch, matched ``(OSError, ConnectError)``
+    and reported ``CONNECT`` -- a network verdict for a local disk
+    (NEW-R10-1). Both seams are driven, because a body small enough to
+    sit in the buffer never fails at ``write`` at all.
+    """
+    handle = ClassifyingLocalFile(_FullDisk(), tmp_path / 'f.bin')
+
+    with pytest.raises(LocalWriteError) as on_write:
+        await handle.write(b'a block the disk will not take', 0)
+    assert on_write.value.code == 'PATH'
+
+    with pytest.raises(LocalWriteError) as on_close:
+        await handle.close()
+    assert on_close.value.code == 'PATH'
 
 
 async def test_the_local_fs_opens_off_the_event_loop(

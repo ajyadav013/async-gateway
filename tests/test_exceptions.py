@@ -34,6 +34,7 @@ from async_gateway.utils.exceptions import (
     GatewayTimeoutError,
     HostKeyError,
     HttpStatusError,
+    LocalWriteError,
     PathContainmentError,
     ProtocolError,
     ResponseTooDeepError,
@@ -64,6 +65,11 @@ HIERARCHY = [
     (SerializationError, AsyncGatewayError, 'SERIALIZATION', 502),
     (UnsafeXmlError, SerializationError, 'XML_UNSAFE', 502),
     (PathContainmentError, AsyncGatewayError, 'PATH', 400),
+    # Shares `PATH` with the row above and is a sibling of it, not a
+    # subclass. Both mean "the local destination will not take this
+    # file", so a caller branches on the code once; only one of them is
+    # a security finding, so the classes stay distinct (NEW-R10-1).
+    (LocalWriteError, AsyncGatewayError, 'PATH', 400),
     (TransportError, AsyncGatewayError, 'TRANSPORT', 502),
     (ConnectError, TransportError, 'CONNECT', 502),
     (DnsError, TransportError, 'DNS', 502),

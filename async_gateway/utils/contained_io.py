@@ -125,8 +125,8 @@ def _open_guarded(path: Path, mode: str, overwrite: bool) -> io.BytesIO:
         PathContainmentError: If the target is a symbolic link.
         ConfigurationError: If the target exists and ``overwrite`` is
             False.
-        OSError: For every other reason the open failed -- a missing
-            parent, a permission failure -- reported as itself.
+        LocalWriteError: For every other reason the open failed -- a
+            missing parent, a permission failure, a full disk.
     """
     # `type: ignore[return-value]` -- the declared return is `io.BytesIO`
     # because that is what `aioftp.pathio.AbstractPathIO._open` declares
@@ -147,10 +147,13 @@ def _open_guarded(path: Path, mode: str, overwrite: bool) -> io.BytesIO:
         # ``OSError``, so R22-AC3's typed contract held on one protocol
         # and not the other two. Already in a thread, so the classifier's
         # stat is off the loop.
-        refusal = classify_refusal(path, err)
-        if refusal is None:
-            raise
-        raise refusal from err
+        #
+        # `classify_refusal` is total since NEW-R10-1, so there is no
+        # longer a residual-`OSError` arm to re-raise from here -- a
+        # missing parent directory now becomes a `LocalWriteError` on
+        # this seam exactly as it does on the HTTP one, rather than
+        # escaping to be re-classified as `CONNECT` by the FTP dispatch.
+        raise classify_refusal(path, err) from err
 
 
 class ContainedPathIO(aioftp.pathio.AsyncPathIO):
@@ -404,6 +407,74 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
             return await opened
         return await asyncio.wait_for(opened, self.timeout)
 
+    async def write(self, file: io.BytesIO, data: Any) -> int:
+        """Write a block, classifying a local filesystem refusal.
+
+        The open half of NEW-R10-1 is :meth:`_open` above; this is the
+        other half, and only this one can see a full disk. ENOSPC,
+        EDQUOT and EFBIG are raised by the ``write`` syscall on a file
+        that opened perfectly, so no amount of care at the open can
+        catch them.
+
+        Args:
+            file: The open local file.
+            data: The block to write.
+
+        Returns:
+            The number of bytes written.
+
+        Raises:
+            LocalWriteError: If the local filesystem refused the write.
+        """
+        return int(await self._classifying(super().write(file, data)))
+
+    async def close(self, file: io.BytesIO) -> None:
+        """Close a local file, classifying a refusal from its flush.
+
+        The third seam, and the one the write override alone misses: a
+        buffered handle defers small writes, so the first syscall to
+        fail can be the flush inside ``close``.
+
+        Args:
+            file: The open local file.
+
+        Returns:
+            None.
+
+        Raises:
+            LocalWriteError: If the local filesystem refused the flush.
+        """
+        await self._classifying(super().close(file))
+
+    async def _classifying(self, awaited: Any) -> Any:
+        """Await ``awaited``, typing a local filesystem refusal.
+
+        ``aioftp`` wraps every path-layer failure in a ``PathIOError``
+        carrying the original in ``reason``, so the ``OSError`` is one
+        unwrap away rather than absent. Unwrapping it here is what
+        makes a full disk report ``PATH`` on FTP exactly as it does on
+        HTTP -- without it the wrapper reached the dispatch as an
+        ``AIOFTPException`` and was classified ``TRANSPORT``, inviting
+        a retry of a body this disk will refuse again.
+
+        Args:
+            awaited: The parent operation's awaitable.
+
+        Returns:
+            Whatever the parent returned.
+
+        Raises:
+            LocalWriteError: If the wrapped failure was an ``OSError``.
+        """
+        try:
+            return await awaited
+        except aioftp.PathIOError as err:
+            reason = err.reason
+            cause = reason[1] if reason is not None else None
+            if not isinstance(cause, OSError):
+                raise
+            raise classify_refusal(self.base, cause) from err
+
 
 def contained_path_io_factory(
     base: PathLike,
@@ -437,6 +508,72 @@ def contained_path_io_factory(
             *args, base=base, overwrite=overwrite, **kwargs)
 
     return factory
+
+
+class ClassifyingLocalFile(LocalFile):
+    """``asyncssh``'s local file handle, with typed write failures.
+
+    The SFTP counterpart of :meth:`ContainedPathIO.write` and
+    :meth:`ContainedPathIO.close`, and it exists for exactly the reason
+    those do (NEW-R10-1). :class:`ContainedLocalFS` guards the *open*;
+    a full disk is not an open failure. ENOSPC, EDQUOT and EFBIG are
+    raised by the ``write`` -- or by the flush inside ``close`` for a
+    body small enough to sit in the buffer -- on a file that opened
+    perfectly, and ``asyncssh`` passes them straight up to the dispatch,
+    where an ``OSError`` matched ``(OSError, ConnectError)`` and was
+    reported as ``CONNECT``: a network verdict for a local disk, with
+    the retry and the breaker count that verdict carries.
+
+    A subclass rather than a wrapper, so ``isinstance`` checks and any
+    method this does not override keep asyncssh's own behaviour.
+
+    Attributes:
+        path: The local path, for the diagnostic. ``LocalFile`` keeps
+            only the handle, and a message naming no file is not
+            actionable.
+    """
+
+    def __init__(self, file: Any, path: Path) -> None:
+        """Wrap an open local file with its own path.
+
+        Args:
+            file: The open file object, as ``LocalFile`` takes.
+            path: The path it was opened at.
+        """
+        super().__init__(file)
+        self.path = path
+
+    async def write(self, data: bytes, offset: int) -> int:
+        """Write ``data``, classifying a local filesystem refusal.
+
+        Args:
+            data: The bytes to write.
+            offset: Where in the file to write them.
+
+        Returns:
+            The number of bytes written.
+
+        Raises:
+            LocalWriteError: If the local filesystem refused the write.
+        """
+        try:
+            return await super().write(data, offset)
+        except OSError as err:
+            raise classify_refusal(self.path, err) from err
+
+    async def close(self) -> None:
+        """Close the file, classifying a refusal from its flush.
+
+        Returns:
+            None.
+
+        Raises:
+            LocalWriteError: If the local filesystem refused the flush.
+        """
+        try:
+            await super().close()
+        except OSError as err:
+            raise classify_refusal(self.path, err) from err
 
 
 class ContainedLocalFS:
@@ -696,7 +833,7 @@ class ContainedLocalFS:
             _open_guarded, target, mode, self.overwrite)
         if _writes(mode):
             await asyncio.to_thread(_make_sparse, handle)
-        return LocalFile(handle)
+        return ClassifyingLocalFile(handle, target)
 
 
 def _make_sparse(handle: io.BytesIO) -> None:

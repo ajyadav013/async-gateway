@@ -58,6 +58,8 @@ from async_gateway.utils.constants import (CIRCUIT_BREAKER_BACKOFF,
                                            CIRCUIT_BREAKER_TIMEOUT)
 from async_gateway.utils.exceptions import (AsyncGatewayError,
                                             ConfigurationError,
+                                            LocalWriteError,
+                                            PathContainmentError,
                                             ResponseTooLargeError)
 
 #: A reading of the injected clock, in seconds. Monotonic by contract:
@@ -116,9 +118,23 @@ RETRIABLE_FAILURES: Final[tuple[type[BaseException], ...]] = (
 #: caller repeating one CR-bearing ``server_path`` five times drove the
 #: destination's circuit to OPEN, so the sixth call -- and every other
 #: caller's call to that host -- got ``CIRCUIT_OPEN`` for a typo (N7).
+#:
+#: The two **local-filesystem** entries are NEW-R10-1, and they are the
+#: same argument reaching a surface nobody had applied it to. A download
+#: writes through ``utils.paths.safe_writer``, which runs *inside* the
+#: retried callable, so a missing parent directory or a symlink planted
+#: at the destination was a failure the loop treated as the network's:
+#: measured at **4x amplification** -- the entire body re-downloaded once
+#: per attempt for a fault no remote can heal -- and at **breaker
+#: poisoning**, where six local disk failures opened the destination's
+#: circuit and the next healthy call to a healthy server got
+#: ``CIRCUIT_OPEN``. Neither is evidence about the remote side, which is
+#: the whole of what a breaker exists to measure.
 DEFAULT_ABORTABLE_EXCEPTIONS: Final[tuple[type[BaseException], ...]] = (
     ConfigurationError,
     ResponseTooLargeError,
+    LocalWriteError,
+    PathContainmentError,
     aioftp.errors.InvalidCommand,
 )
 

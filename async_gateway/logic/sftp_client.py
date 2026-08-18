@@ -141,8 +141,10 @@ from async_gateway.utils.exceptions import (
     DnsError,
     GatewayTimeoutError,
     HostKeyError,
+    LocalWriteError,
     SftpStatusError,
     TransportError,
+    faults_of,
     unwrap_cause,
 )
 from async_gateway.utils.http_file_config import validated_verb
@@ -205,8 +207,23 @@ TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
     (asyncio.TimeoutError, GatewayTimeoutError),
     (socket.gaierror, DnsError),
     (ConnectionError, ConnectError),
-    (OSError, ConnectError),
+    # The residual `OSError`, reporting `PATH` rather than the `CONNECT`
+    # it used to -- the same change, for the same reason, as the row at
+    # the foot of `logic.ftp_client`'s table. A `get` writes to the
+    # local disk through `utils.contained_io`, so a full disk or an
+    # unwritable directory reached this row and was reported as a
+    # *connection* failure: retried, and counted against the remote
+    # host's breaker (NEW-R10-1).
+    (OSError, LocalWriteError),
 )
+
+#: The families this dispatch catches, derived from the table above --
+#: the fourth of the four dispatch sites the derivation now reaches
+#: (NEW-R10-1). ``asyncssh.Error`` is appended because
+#: ``transport_error_for`` classifies it below the table, as this
+#: family's catch-all, rather than in it.
+TRANSPORT_FAULTS: Tuple[type[BaseException], ...] = (
+    faults_of(TRANSPORT_ERRORS) + (asyncssh.Error,))
 
 # The modes that accept a `recurse` keyword, so a directory target can be
 # expressed to them at all. `asyncssh.SFTPClient.remove` takes a path and
@@ -717,8 +734,7 @@ class SFTPRequest(BaseRequestClass):
                 f'circuit open for '
                 f'{redact_url(self.url, extra_params=self.redact_params)}'
             ) from err
-        except (FailsafeError, asyncssh.Error, OSError,
-                asyncio.TimeoutError) as err:
+        except (FailsafeError,) + TRANSPORT_FAULTS as err:
             raise transport_error_for(
                 err, redact_params=self.redact_params) from err
 

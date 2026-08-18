@@ -52,7 +52,8 @@ import asyncssh
 import pytest
 
 from async_gateway.async_gateway import request
-from async_gateway.logic.sftp_client import SFTPRequest
+from async_gateway.logic.sftp_client import (
+    SFTPRequest, transport_error_for)
 from async_gateway.utils.envelope import GatewayResponse, new_envelope
 from async_gateway.utils.exceptions import ConfigurationError
 
@@ -1248,6 +1249,30 @@ async def test_an_open_circuit_is_reported_as_an_open_circuit(
     assert envelope['error'] is not None
     assert envelope['error']['code'] == 'CIRCUIT_OPEN'
     assert envelope['status_code'] == 503
+
+
+def test_r28_a_failure_of_no_family_is_re_raised_by_the_classifier() -> None:
+    """The classifier's last arm, and the sibling of the FTP row.
+
+    ``transport_error_for`` is total over the families it names and
+    deliberately not over exceptions in general: a ``KeyError`` here is
+    this library's own bug and must propagate rather than become an
+    envelope that hides it.
+
+    Called directly, because reaching the arm through ``handle_request``
+    now requires a failure the dispatch clause catches and the
+    classifier does not name -- and both derive from
+    :data:`~async_gateway.logic.sftp_client.TRANSPORT_FAULTS`, so the
+    pair cannot drift apart. Before NEW-R10-1 the arm was reached only
+    incidentally, by a ``PathContainmentError`` on its way out; that one
+    now aborts the retry loop and propagates as itself.
+    """
+    bug = KeyError('a library bug, not a transport failure')
+
+    with pytest.raises(KeyError) as raised:
+        transport_error_for(bug)
+
+    assert raised.value is bug
 
 
 async def test_a_library_bug_propagates_instead_of_becoming_an_envelope(

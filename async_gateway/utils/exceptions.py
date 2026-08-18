@@ -29,13 +29,46 @@ and the ``ClientResponseError`` family all stringify to the full URL,
 query string included.
 """
 
-from collections.abc import Collection
-from typing import ClassVar, Optional
+from collections.abc import Collection, Sequence
+from typing import ClassVar, Optional, Tuple
 
 from async_gateway.utils.redaction import redact_text
 from async_gateway.utils.status_map import status_for
 
 CAUSE_CHAIN_MAX_DEPTH = 10
+
+#: A protocol client's classification table: ordered ``(family, error
+#: class)`` rows, most specific first, because the families overlap.
+ClassificationTable = Sequence[Tuple[type, type]]
+
+
+def faults_of(table: ClassificationTable) -> Tuple[type[BaseException], ...]:
+    """Return the ``except`` clause derived from a classification table.
+
+    The one function that makes "a client catches exactly what it can
+    classify" hold by construction instead of by four tables happening
+    to agree. Each protocol's dispatch spells its catch clause as
+    ``faults_of(TRANSPORT_ERRORS) + (...)``, so a family added to the
+    left column of that table is caught by the same client in the same
+    commit, with no second edit to remember.
+
+    The derivation reached only the two HTTP-family clients when it was
+    introduced for AGW-R9-1: ``logic.ftp_client`` and
+    ``logic.sftp_client`` kept hand-written tuples beside their own
+    tables, so the round-9 claim that divergence was "no longer
+    representable" covered **two of the four dispatch sites**. This
+    function is where the remaining two join, which is what the claim
+    was supposed to mean.
+
+    Args:
+        table: The client's ordered classification table.
+
+    Returns:
+        Its left column as a tuple, in the same order -- catchable by
+        an ``except`` clause, and never out of step with what
+        ``transport_error_for`` beside it can name.
+    """
+    return tuple(family for family, _ in table)
 
 
 class AsyncGatewayError(Exception):
@@ -154,6 +187,44 @@ class UnsafeXmlError(SerializationError):
 
 class PathContainmentError(AsyncGatewayError):
     """Raised when a resolved path escapes its target directory."""
+
+    code: ClassVar[str] = 'PATH'
+
+
+class LocalWriteError(AsyncGatewayError):
+    """Raised when the *local* filesystem refuses a download's write.
+
+    A missing parent directory, an unwritable one, a full disk: the
+    remote side answered perfectly and this machine could not keep what
+    it sent. It reports ``PATH``/400 alongside
+    :class:`PathContainmentError` because the two answer the same
+    question -- "the local destination you named will not take this
+    file" -- and a caller acts on both the same way: fix the path or the
+    disk, then call again.
+
+    It is a sibling of :class:`PathContainmentError` rather than a
+    subclass of it, and deliberately **not** a
+    :class:`TransportError`. Both distinctions are load-bearing.
+
+    Not a containment failure, because a caller reading ``PATH`` on a
+    ``PathContainmentError`` is being told a *security* boundary was
+    crossed -- a symlink, a server-composed path escaping the base --
+    and a full disk is not that. The shared code keeps the caller's
+    branch simple; the distinct class keeps a security finding
+    distinguishable from an operational one.
+
+    Not a transport failure, because a transport verdict carries a
+    retry recommendation that is wrong here twice over. Re-dialling the
+    remote cannot create the missing directory, and each attempt
+    re-downloads the whole body -- measured at 4x amplification for one
+    call. Worse, a transport verdict *counts*: six local disk failures
+    drove the destination's breaker OPEN, so the next healthy call to a
+    healthy server got ``CIRCUIT_OPEN`` for a full disk on this machine
+    (NEW-R10-1). It is therefore also listed in
+    :data:`~async_gateway.helpers.internal.circuit_breaker_helper.DEFAULT_ABORTABLE_EXCEPTIONS`,
+    which is what makes those two properties hold rather than merely be
+    documented here.
+    """
 
     code: ClassVar[str] = 'PATH'
 

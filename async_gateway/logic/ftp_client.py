@@ -58,8 +58,10 @@ from async_gateway.utils.exceptions import (
     DnsError,
     FtpStatusError,
     GatewayTimeoutError,
+    LocalWriteError,
     TlsError,
     TransportError,
+    faults_of,
     unwrap_cause,
 )
 from async_gateway.utils.http_file_config import validated_verb
@@ -155,8 +157,38 @@ TRANSPORT_ERRORS: Sequence[Tuple[type, type]] = (
     (ssl.SSLError, TlsError),
     (socket.gaierror, DnsError),
     (ConnectionError, ConnectError),
-    (OSError, ConnectError),
+    # The residual `OSError`, and it reports `PATH` rather than the
+    # `CONNECT` it used to. This row is reached by two very different
+    # failures and used to call both a connection problem: a socket
+    # error `ConnectionError` above does not name, and a **local
+    # filesystem** failure from the download's own write. The second is
+    # the common one and the verdict was wrong for it -- a full disk is
+    # not evidence the server is unhealthy, and `CONNECT` both invited
+    # a retry that re-downloads the body and counted the failure
+    # against that destination's breaker (NEW-R10-1).
+    #
+    # All four protocols now answer `PATH` for a local write failure.
+    # The cost is named rather than hidden: a socket-level `OSError`
+    # that reaches this row -- one `ConnectionError` does not already
+    # cover -- now also reports `PATH`. That is the rarer case, and it
+    # is the direction to err in: mislabelling a network fault as local
+    # costs a caller one retry they must ask for, while mislabelling a
+    # local fault as network takes a healthy destination offline for
+    # every caller in the process.
+    (OSError, LocalWriteError),
 )
+
+#: The families this dispatch catches, derived from the table above.
+#: Hand-written here until NEW-R10-1: the round-9 fix claimed the
+#: divergence was "no longer representable" because the clause was
+#: derived, but the derivation reached only the two HTTP-family
+#: clients, and this module kept its own tuple beside its own table --
+#: two of the four dispatch sites, which is the same gap one round
+#: later. ``aioftp.AIOFTPException`` is appended because
+#: ``transport_error_for`` classifies it below the table, as the
+#: family's catch-all, rather than in it.
+TRANSPORT_FAULTS: Tuple[type[BaseException], ...] = (
+    faults_of(TRANSPORT_ERRORS) + (aioftp.AIOFTPException,))
 
 
 def tls_context_for(ssl_config: Mapping[str, Any]) -> ssl.SSLContext:
@@ -471,8 +503,7 @@ class FTPRequest(BaseRequestClass):
                 f'circuit open for '
                 f'{redact_url(self.url, extra_params=self.redact_params)}'
             ) from err
-        except (FailsafeError, aioftp.AIOFTPException, OSError,
-                asyncio.TimeoutError) as err:
+        except (FailsafeError,) + TRANSPORT_FAULTS as err:
             raise transport_error_for(
                 err, redact_params=self.redact_params) from err
 

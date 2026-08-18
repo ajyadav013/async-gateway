@@ -60,6 +60,7 @@ from async_gateway.utils.exceptions import (
     TlsError,
     TransportError,
     UnsupportedVerbError,
+    faults_of,
     unwrap_cause,
 )
 from async_gateway.utils.http_file_config import HTTP_VERBS
@@ -97,6 +98,37 @@ TRANSPORT_ERRORS: Sequence[
     (aiohttp.ClientError, TransportError),
 )
 
+# There is deliberately **no** `OSError` row here, where
+# `logic.ftp_client` and `logic.sftp_client` both have one, and the
+# asymmetry is argued rather than left as the gap it used to be
+# (NEW-R10-1).
+#
+# The failure is real and was measured: a download writes through
+# `utils.paths.safe_writer`, which runs *inside* the retried callable,
+# so a missing parent directory or a full disk arrived at this dispatch
+# as an ordinary `OSError`, matched no row, and `raise cause from None`
+# handed the caller a raw `FileNotFoundError` out of a library whose
+# whole contract is an envelope.
+#
+# It is fixed one layer down instead, and that placement is the point.
+# `utils.paths.classify_refusal` is now **total** -- every `OSError` at
+# a write seam gets a class, `LocalWriteError` for the residue -- so the
+# fault reaches this module already typed, propagates as the
+# `AsyncGatewayError` it is, and `request()`'s one conversion point
+# turns it into a `PATH` envelope. Catching it here as well would be
+# redundant on the download path and *wrong* on another: an upload's
+# pre-dispatch open is a caller-side file problem this library
+# deliberately lets escape as its own errno (AGW-38), and a blanket row
+# here would silently convert those three documented escapes too.
+#
+# The two protocol tables keep their row because `aioftp` and
+# `asyncssh` can hand their dispatch a socket-level `OSError` directly;
+# `aiohttp` wraps every one of those in a `ClientConnectionError`, which
+# the row above already names. So the absence is a fact about aiohttp,
+# not an oversight -- and `LOCAL_IO` in the cross-protocol fault matrix
+# is what holds all four to the same answer regardless of which layer
+# each one answers at.
+
 #: The families the HTTP-family dispatch catches, derived from the table
 #: above rather than restated beside it.
 #:
@@ -116,8 +148,13 @@ TRANSPORT_ERRORS: Sequence[
 #: unrepresentable: a family added to the classification table is caught
 #: by every client that maps through it, in the same commit, with no
 #: second edit to remember.
-TRANSPORT_FAULTS: Tuple[type[BaseException], ...] = tuple(
-    family for family, _ in TRANSPORT_ERRORS)
+#:
+#: ``faults_of`` is the shared derivation rather than a local
+#: comprehension because the same guarantee is now owed to all four
+#: dispatch sites, not just the two that ride ``aiohttp`` -- see
+#: :func:`~async_gateway.utils.exceptions.faults_of` (NEW-R10-1).
+TRANSPORT_FAULTS: Tuple[type[BaseException], ...] = faults_of(
+    TRANSPORT_ERRORS)
 
 
 def default_json_serialize(obj: Any) -> str:

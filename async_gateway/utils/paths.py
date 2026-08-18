@@ -120,9 +120,9 @@ import errno
 import fcntl
 import os
 import stat
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path, PurePath
-from typing import AsyncIterator, Callable, Final, Optional, Union
+from typing import AsyncIterator, Callable, Final, Union
 
 import aiofiles
 import aiofiles.os
@@ -131,6 +131,7 @@ from aiofiles.threadpool.binary import AsyncBufferedIOBase
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
     ConfigurationError,
+    LocalWriteError,
     PathContainmentError,
 )
 
@@ -850,14 +851,14 @@ def _what_is_there(path: str) -> str:
     return 'file'
 
 
-def classify_refusal(path: PathLike, err: OSError) -> Optional[
-        AsyncGatewayError]:
-    """Return the typed error a refused guarded open should raise.
+def classify_refusal(path: PathLike, err: OSError) -> AsyncGatewayError:
+    """Return the typed error a refused local write should raise.
 
-    Classification only. The open has already failed and nothing has
-    been written, so reading the filesystem here cannot be raced into
-    permitting anything -- which is what makes an ``islink`` legitimate
-    *after* the refusal when it would be a vulnerability before it.
+    Classification only. The open (or the write) has already failed and
+    nothing usable has been left behind, so reading the filesystem here
+    cannot be raced into permitting anything -- which is what makes an
+    ``islink`` legitimate *after* the refusal when it would be a
+    vulnerability before it.
 
     Blocking, and deliberately so: the two write seams that need it are
     already inside a thread when the refusal arrives -- the protocol
@@ -869,23 +870,41 @@ def classify_refusal(path: PathLike, err: OSError) -> Optional[
     on the HTTP one, so R22-AC3's default was untypeable by a caller
     that used both.
 
+    **Total, since NEW-R10-1**: every ``OSError`` gets a class, and the
+    residual ones become :class:`LocalWriteError`. It used to answer
+    None for "belongs to neither", which delegated the decision back to
+    three call sites that each made it differently -- FTP re-raised into
+    a clause that classified an ``OSError`` as ``CONNECT``, SFTP's
+    reported ``PATH``, and HTTP had no ``OSError`` row at all so a
+    missing parent directory reached ``request()`` as a raw
+    ``FileNotFoundError``. Returning an answer for every input is what
+    makes the four protocols agree by construction rather than by three
+    tables happening to line up.
+
     Args:
-        path: The path the open refused.
-        err: What ``os.open`` raised.
+        path: The path the write refused.
+        err: What the filesystem raised.
 
     Returns:
         A ``PathContainmentError`` when the target was a symbolic link, a
         ``ConfigurationError`` when it was an ordinary existing file and
-        the caller did not ask to overwrite, or None when the failure
-        belongs to neither -- a missing parent directory, a full disk --
-        and the original ``OSError`` should propagate untranslated.
+        the caller did not ask to overwrite or a directory, and a
+        ``LocalWriteError`` for every other local failure -- a missing
+        parent directory, an unwritable one, a full disk.
     """
     if err.errno in SYMLINK_ERRNOS:
         return PathContainmentError(
             f'refusing to write through the symbolic link at '
             f'{str(path)!r}')
     if err.errno != errno.EEXIST:
-        return None
+        # The local filesystem said no for a reason that is neither a
+        # containment finding nor a policy refusal. Named as itself so a
+        # caller can tell "this machine could not keep the file" from
+        # "the network failed", and so no retry is spent re-downloading
+        # a body this disk will refuse again.
+        return LocalWriteError(
+            f'cannot write the local file {str(path)!r}: {err.strerror} '
+            f'(errno {err.errno})')
     kind = _what_is_there(os.fspath(path))
     if kind == 'symlink':
         return PathContainmentError(
@@ -937,11 +956,13 @@ async def safe_writer(
     Raises:
         PathContainmentError: If the target is a symbolic link.
         ConfigurationError: If the target exists and ``overwrite`` is
-            False.
-        OSError: For every other reason the file could not be opened --
-            a missing parent directory, a permission failure -- reported
-            as itself rather than translated into a security finding it
-            is not.
+            False, or is a directory.
+        LocalWriteError: For every other reason the local file could not
+            be opened, written, or flushed -- a missing parent
+            directory, a permission failure, a full disk. It used to
+            raise the bare ``OSError`` instead, which on the HTTP path
+            matched no transport family and escaped ``request()`` raw
+            (NEW-R10-1).
     """
     try:
         handle: AsyncBufferedIOBase = await aiofiles.open(
@@ -949,18 +970,43 @@ async def safe_writer(
     except OSError as err:
         # In a thread: the classifier stats the path, and R20 bans that
         # on the loop. The protocol wrappers are already in one.
-        refusal = await asyncio.to_thread(classify_refusal, path, err)
-        if refusal is None:
-            raise
-        raise refusal from err
+        raise await asyncio.to_thread(classify_refusal, path, err) from err
 
     try:
         yield handle
-    except BaseException:
-        await handle.close()
+    except BaseException as err:
+        # `suppress`, and it is not hiding a failure: `err` is the
+        # reason this block failed and is the one the caller must see.
+        # A `close()` that fails while unwinding is the *same* fault
+        # arriving a second time -- the buffered flush of the write that
+        # already raised -- and letting it propagate from here would
+        # replace the real diagnosis with its own. The file is removed
+        # either way, so nothing is left behind by the suppression.
+        with suppress(OSError):
+            await handle.close()
         await safe_unlink(path)
+        if isinstance(err, OSError):
+            # The *write* half, and it is not the open half repeated. A
+            # missing parent fails at the open above; ENOSPC, EDQUOT and
+            # EFBIG fail here, on a write to a file that opened
+            # perfectly. Classified through the same function, so the
+            # two halves cannot disagree about what a full disk is.
+            raise await asyncio.to_thread(
+                classify_refusal, path, err) from err
         raise
-    await handle.close()
+
+    try:
+        await handle.close()
+    except OSError as err:
+        # The third seam, and the one a write-side check alone misses.
+        # `aiofiles` buffers, so a body small enough to fit the buffer
+        # never fails at `write()` at all -- the first and only syscall
+        # is the flush inside `close()`, on the success path, after the
+        # block above has exited cleanly. Measured: a 200 KB download
+        # under an 8 KiB `RLIMIT_FSIZE` reached `request()` as a raw
+        # `OSError` from exactly here, with every other arm green.
+        await safe_unlink(path)
+        raise await asyncio.to_thread(classify_refusal, path, err) from err
 
 
 async def safe_unlink(path: PathLike) -> None:

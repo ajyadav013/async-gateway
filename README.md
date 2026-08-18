@@ -831,6 +831,7 @@ from async_gateway.utils.exceptions import (
     GatewayTimeoutError,
     HostKeyError,
     HttpStatusError,
+    LocalWriteError,
     PathContainmentError,
     ProtocolError,
     ResponseTooLargeError,
@@ -851,6 +852,7 @@ AsyncGatewayError                 GATEWAY              502
 ├── SerializationError            SERIALIZATION        502 (400 request side)
 │   └── UnsafeXmlError            XML_UNSAFE           502
 ├── PathContainmentError          PATH                 400
+├── LocalWriteError               PATH                 400
 ├── TransportError                TRANSPORT            502
 │   ├── ConnectError              CONNECT              502
 │   ├── DnsError                  DNS                  502
@@ -884,7 +886,7 @@ message text.
 | `PROCESSOR` | Your own pre/post-processor callback failed | No |
 | `SERIALIZATION` | A body will not parse, or will not serialise | No |
 | `XML_UNSAFE` | An XML prolog declares a DOCTYPE | No |
-| `PATH` | A local path escapes its target directory, or is a symlink | No |
+| `PATH` | A local path escapes its target directory or is a symlink (`PathContainmentError`), or the local filesystem refused the write — missing parent, unwritable directory, full disk (`LocalWriteError`) | No |
 | `TRANSPORT` | Any other client-side transport failure | Sometimes |
 | `CONNECT` | The connection was refused or reset | Yes |
 | `DNS` | The host name does not resolve | Yes, transiently |

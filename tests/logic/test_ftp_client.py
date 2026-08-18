@@ -960,6 +960,33 @@ async def test_r28_an_open_circuit_is_reported_as_an_open_circuit(
     assert result['status_code'] == 503
 
 
+def test_r28_a_failure_of_no_family_is_re_raised_by_the_classifier() -> None:
+    """The classifier's last arm: not every exception is this protocol's.
+
+    ``transport_error_for`` is total over the families it names and
+    deliberately *not* total over exceptions in general. A ``KeyError``
+    or a ``TypeError`` arriving here is this library's own bug, and the
+    one-conversion-point rule says a bug propagates rather than becoming
+    an ``ok=False`` envelope that hides it.
+
+    A direct call, because reaching this arm through ``handle_request``
+    now requires a failure the dispatch clause catches and the
+    classifier does not name -- and the two are derived from one table
+    (:data:`~async_gateway.logic.ftp_client.TRANSPORT_FAULTS`), which is
+    the property that makes the pair impossible to write by accident.
+    Before NEW-R10-1 this arm was reached incidentally, by a
+    ``PathContainmentError`` that ``aioftp`` had wrapped; that failure
+    now aborts the retry loop and propagates as itself, so the arm needs
+    a test of its own rather than a passer-by.
+    """
+    bug = KeyError('a library bug, not a transport failure')
+
+    with pytest.raises(KeyError) as raised:
+        transport_error_for(bug)
+
+    assert raised.value is bug
+
+
 async def test_a_library_bug_propagates_instead_of_becoming_an_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
