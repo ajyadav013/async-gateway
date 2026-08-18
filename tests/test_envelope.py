@@ -40,6 +40,7 @@ from async_gateway.helpers.common.date_helper import (
     monotonic_now,
     utc_now_iso,
 )
+from async_gateway.logic import protocol_mapping
 from async_gateway.logic.http_client import HttpRequest, transport_error_for
 from async_gateway.utils import redaction
 from async_gateway.utils.envelope import (
@@ -70,6 +71,7 @@ from async_gateway.utils.redaction import (
 
 from tests.fixtures.http_server import RecordingHTTPServer
 from tests.fixtures.protocol_transports import (
+    CONTRACT_CALL,
     contract_call,
     install_transport,
 )
@@ -372,6 +374,162 @@ async def test_r8_ac2_every_protocol_returns_one_key_set_on_failure(
     assert set(result.keys()) == EXPECTED_KEYS
     assert result['ok'] is False
     assert result['error'] is not None
+
+
+# --- The tracing half of the same contract, on the same five rows ----------
+#
+# Three findings in as many review rounds have been the *same* defect: a fix
+# landed on one protocol client and its siblings were left behind. M20 (the
+# envelope's `request_tracer` assigned on the success path only, so every
+# failure reported `[]`) was closed in `logic/http_client.py` and not in
+# `logic/soap_client.py`. H17 (per-request trace state bound in `__init__`,
+# where concurrent calls share whichever context built the objects) was
+# closed in the same module and, again, not in the other. `redact_params`
+# on the SOAP tracer was the round before that.
+#
+# What those have in common is not the bug, it is the *shape*: nothing in
+# the suite asserted a tracing property across protocols, so each client
+# was only ever held to whatever its own module's tests happened to check,
+# and a property fixed in one place stayed broken in the next. The two rows
+# below close that by driving the same assertion from `CONTRACT_ROWS` --
+# the table the envelope contract above already uses -- so a protocol
+# registered later is covered the day it is added to that list, and a fix
+# ported to one client and not the others fails here rather than in a
+# reviewer's spot-check.
+#
+# Neither row hardcodes a count. FTP and SFTP attach no tracers at all
+# (`aioftp` and `asyncssh` have no equivalent of `aiohttp.TraceConfig`), so
+# a row demanding a non-empty tracer would be asserting a feature those
+# protocols do not have. Instead each row derives what to expect from the
+# client itself -- how many tracers it attached -- which is one rule that
+# reads as "none" for FTP and SFTP and as "all of them" for the HTTP
+# family, and needs no edit when a protocol grows or loses tracing.
+#
+# Deriving it that way is not a stylistic preference; it is what makes the
+# row bite. A first draft asserted only that the failure path reports as
+# many collectors as the success path, and a mutant that deleted the
+# envelope assignment from `logic/http_client.py` outright *survived* it:
+# with the key never written, both paths report `[]` and the two sides
+# agree perfectly. A relation between two paths cannot detect a defect
+# that breaks both. The anchor below is external to both.
+
+
+def attached_tracer_count(protocol: str) -> int:
+    """Return how many tracers ``protocol``'s client attaches to a call.
+
+    The objective baseline the trace rows below compare against, read off
+    a freshly-constructed client rather than written down here, so the
+    expectation tracks the code instead of a table someone has to
+    remember to update. A protocol with no tracing support answers 0.
+
+    Args:
+        protocol: A protocol name from :data:`CONTRACT_CALL`.
+
+    Returns:
+        The number of ``aiohttp.TraceConfig`` objects the client attaches,
+        which is the number of collector mappings a call must report.
+    """
+    call = CONTRACT_CALL[protocol]
+    built = protocol_mapping[protocol](
+        call['url'],
+        BasicAuth('user', 'password'),
+        new_envelope(url=call['url'], protocol=protocol, payload={}),
+        info=dict(call['protocol_info']),
+        redact_params=frozenset(),
+    )
+    return len(getattr(built, 'trace_config', []))
+
+
+@pytest.mark.parametrize('protocol', CONTRACT_ROWS)
+async def test_m20_a_failed_call_traces_as_richly_as_a_successful_one(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+) -> None:
+    """A failure keeps the trace it recorded, on every protocol (M20).
+
+    The diagnostics a ``request_tracer`` carries are worth least on the
+    call that worked and most on the call that did not -- a refused
+    connection's ``on_request_exception``, a hung DNS lookup's
+    ``on_dns_resolvehost_start`` with no matching end. A client that
+    assigns the key while copying a *response* into the envelope only
+    ever reaches that line when a response came back, so it throws the
+    trace away in exactly the case someone is reading it.
+
+    Both paths are asserted against :func:`attached_tracer_count` rather
+    than against each other, because the two paths are not an honest
+    baseline for one another: a client that never writes the key reports
+    ``[]`` on both and satisfies any comparison between them. The count
+    of tracers the client attached is external to both paths and is the
+    number of collector mappings each is obliged to carry -- zero for a
+    protocol without tracing, so the row means something for FTP and
+    SFTP today and keeps meaning it the day either grows tracers.
+
+    Args:
+        protocol: The protocol under test, from the contract table.
+
+    Returns:
+        None.
+    """
+    expected = attached_tracer_count(protocol)
+
+    install_transport(monkeypatch, protocol, succeeds=True)
+    succeeded = await request(**contract_call(protocol))
+
+    install_transport(monkeypatch, protocol, succeeds=False)
+    failed = await request(**contract_call(protocol))
+
+    assert succeeded['ok'] is True
+    assert failed['ok'] is False
+    assert len(succeeded['request_tracer']) == expected, (
+        f'{protocol} attaches {expected} tracer(s) but reports '
+        f'{len(succeeded["request_tracer"])} collector(s) on a successful '
+        'call. The envelope is dropping a trace that was recorded.')
+    assert len(failed['request_tracer']) == expected, (
+        f'{protocol} attaches {expected} tracer(s) but reports '
+        f'{len(failed["request_tracer"])} collector(s) on a *failed* call. '
+        'A trace assigned only where a response arrived is discarded on '
+        'the calls it exists for (M20).')
+
+
+@pytest.mark.parametrize('protocol', CONTRACT_ROWS)
+def test_h17_no_protocol_binds_trace_state_at_construction(
+    protocol: str,
+) -> None:
+    """Per-request trace state is bound per call, not per object (H17).
+
+    ``trace_collectors_for`` binds this call's results into the *running
+    task's* context, and a task started by ``asyncio.gather`` gets its
+    own copy of that context. Bind at construction and every concurrent
+    call's results land in whichever context happened to build the
+    objects -- one mapping, shared, reported to every caller.
+
+    Today ``request()`` constructs and awaits inside one task, so the
+    bleed is latent rather than live; this row is what keeps it latent.
+    It asserts the property at the only moment it is observable without
+    concurrency: a freshly-constructed protocol object has bound
+    nothing, so there is no shared mapping for a later refactor -- one
+    that hoists construction out of the awaiting task -- to hand out.
+
+    Args:
+        protocol: The protocol under test, from the contract table.
+
+    Returns:
+        None.
+    """
+    call = CONTRACT_CALL[protocol]
+    built = protocol_mapping[protocol](
+        call['url'],
+        BasicAuth('user', 'password'),
+        new_envelope(url=call['url'], protocol=protocol, payload={}),
+        info=dict(call['protocol_info']),
+        redact_params=frozenset(),
+    )
+
+    for attribute in ('trace_collectors', 'reported_collectors'):
+        assert getattr(built, attribute, []) == [], (
+            f'{protocol} bound {attribute} in __init__. Per-request trace '
+            'state on a shared object is the mapping concurrent calls '
+            'collide in (H17); bind it inside handle_request.')
 
 
 # --- E2: ok is False exactly when error is set -----------------------------
