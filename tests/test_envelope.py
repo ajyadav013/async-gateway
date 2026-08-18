@@ -11,6 +11,7 @@ and R10's logger and redaction criteria. Each test names the invariant or
 acceptance criterion it proves.
 """
 
+import ast
 import asyncio
 import importlib
 import inspect
@@ -160,6 +161,161 @@ def files_containing(pattern: str) -> list[str]:
         name for name, source in package_sources()
         if expression.search(source)
     ]
+
+
+#: Every call by which Python can create, truncate or otherwise write a
+#: local file. Matched on the *final* attribute, so ``open``,
+#: ``aiofiles.open``, ``os.open`` and ``pathlib.Path(...).write_bytes``
+#: are all one entry each and a new spelling of the same syscall
+#: (``anyio.open_file``) is caught by the name it ends in.
+#:
+#: The set is deliberately wider than what the package uses today: it
+#: names the seam, not the current call list, so a write introduced
+#: through a helper nobody has reached for yet is still a finding rather
+#: than a silent omission.
+WRITE_SEAMS: frozenset[str] = frozenset({
+    'copy',
+    'copy2',
+    'copyfile',
+    'copyfileobj',
+    'copytree',
+    'fdopen',
+    'link',
+    'mknod',
+    'mkstemp',
+    'move',
+    'mkdtemp',
+    'NamedTemporaryFile',
+    'open',
+    'open_file',
+    'symlink',
+    'TemporaryFile',
+    'touch',
+    'write_bytes',
+    'write_text',
+})
+
+
+def dotted_name(node: ast.expr) -> str:
+    """Render an attribute chain as its dotted source spelling.
+
+    Args:
+        node: The ``func`` expression of a call.
+
+    Returns:
+        ``'aiofiles.open'`` for ``aiofiles.open``, or the bare final
+        attribute for a chain not rooted in a plain name
+        (``Path(p).write_bytes`` renders as ``write_bytes``), so a write
+        reached through a temporary is still classified by what it does.
+    """
+    parts: list[str] = []
+    current: ast.expr = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    return '.'.join(reversed(parts)) if parts else ''
+
+
+def _reads_only(call: ast.Call) -> bool:
+    """Report whether ``call`` is an open whose mode cannot write.
+
+    Only a *literal* read mode counts. A mode computed at runtime --
+    ``open(path, mode)`` in :func:`~async_gateway.utils.contained_io.
+    _open_guarded`, where ``mode`` is whatever ``aioftp`` or ``asyncssh``
+    asked for -- is treated as a write, because it can be one.
+
+    Args:
+        call: The call node to inspect.
+
+    Returns:
+        True when the second positional argument (or the ``mode``
+        keyword) is a string constant containing no writing character.
+    """
+    mode: object = None
+    if len(call.args) > 1 and isinstance(call.args[1], ast.Constant):
+        mode = call.args[1].value
+    for keyword in call.keywords:
+        if keyword.arg == 'mode' and isinstance(keyword.value, ast.Constant):
+            mode = keyword.value.value
+    return isinstance(mode, str) and not set(mode) & set('wxa+')
+
+
+def write_seams_in(source: str) -> list[tuple[int, str, str]]:
+    """Find every call in ``source`` that can create or truncate a file.
+
+    Reads are dropped -- an ``open(..., 'rb')`` cannot write -- and so is
+    ``os.open`` with ``O_DIRECTORY`` in its flags, which opens a
+    directory to walk it. Everything else that names a seam is returned,
+    whether or not it looks guarded: deciding *that* is the caller's job
+    and the whole point of the census.
+
+    Args:
+        source: A module's source text.
+
+    Returns:
+        One ``(line, dotted name, enclosing function)`` triple per
+        writing call, ordered by line. The enclosing name is the
+        innermost ``def``/``async def``/``class`` chain, so a finding
+        names the function to look in rather than only a line number.
+    """
+    found: list[tuple[int, str, str]] = []
+
+    def walk(node: ast.AST, enclosing: str) -> None:
+        """Descend ``node``, recording seams against their scope.
+
+        Args:
+            node: The subtree to walk.
+            enclosing: The dotted name of the innermost enclosing
+                definition, or ``''`` at module level.
+
+        Returns:
+            None.
+        """
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.AsyncFunctionDef,
+                                  ast.ClassDef,
+                                  ast.FunctionDef)):
+                walk(child, f'{enclosing}.{child.name}'
+                     if enclosing else child.name)
+                continue
+            if isinstance(child, ast.Call):
+                name = dotted_name(child.func)
+                writes = (not _reads_only(child)
+                          and not _opens_a_directory(child))
+                if name.rsplit('.', 1)[-1] in WRITE_SEAMS and writes:
+                    found.append((child.lineno, name, enclosing))
+            walk(child, enclosing)
+
+    walk(ast.parse(source), '')
+    return sorted(found)
+
+
+def _opens_a_directory(call: ast.Call) -> bool:
+    """Report whether ``call`` is an ``os.open`` of a directory.
+
+    ``open_within`` walks the destination's ancestors a component at a
+    time, opening each as a directory descriptor. Those opens create
+    nothing -- ``O_DIRECTORY`` refuses anything that is not already a
+    directory, and no ``O_CREAT`` is in the flags -- so they are not
+    write seams. Recognised by the flag constant appearing anywhere in
+    the flags expression rather than by line number, so the exemption
+    follows the code if it moves.
+
+    Args:
+        call: The call node to inspect.
+
+    Returns:
+        True when the call names ``os.open`` and its flags mention a
+        directory-open constant.
+    """
+    if dotted_name(call.func) != 'os.open' or len(call.args) < 2:
+        return False
+    return any(
+        isinstance(node, ast.Name) and node.id in {'DIRECTORY_FLAGS'}
+        for node in ast.walk(call.args[1])
+    )
 
 
 def closed_port() -> int:
@@ -1369,29 +1525,76 @@ def test_the_write_route_enumeration_reaches_every_guarded_open() -> None:
     nothing in it notices a route that was never listed -- which is the
     same shape as the two-of-four gap ``LOCAL_IO`` had, one level up.
     So the list is checked against the package rather than against
-    itself: every module that opens a local file for writing, through
-    ``safe_writer`` or through the guarded opener directly, must be
-    represented by at least one enumerated route.
+    itself.
+
+    It is checked by **census, not by grep**, and that distinction is
+    the whole value of the row. A search for ``safe_writer(`` or
+    ``guarded_opener(`` finds the writes that are already guarded, which
+    is precisely the set that needs no guarding: an unguarded ``open(p,
+    'wb')`` added to a module in neither set spells neither name, so the
+    grep matched nothing, the module never entered ``writing_modules``,
+    and the row stayed green while the defect it names walked straight
+    past it. A guard blind to the shape it exists to catch is not a
+    guard.
+
+    So the package's AST is walked instead, for every call that can
+    create or truncate a local file -- ``open``, ``os.open``,
+    ``aiofiles.open``, ``Path.write_bytes``, a ``shutil`` copy, a
+    temporary file -- and each occurrence must sit at a site named
+    below. The exemptions are the *sites*, not the modules: naming
+    ``paths.py`` as a writing module would re-admit an unguarded write
+    anywhere else in it, which is the failure this replaced.
 
     Returns:
         None.
     """
-    writing_modules = set(files_containing(
-        r'safe_writer\(|guarded_opener\('))
-    covered = {
-        'helpers/internal/request_helper.py',
-        'utils/http_file_config.py',
-        'utils/contained_io.py',
-        'utils/paths.py',
+    # Every place the package may open a local file for writing, as
+    # `module::enclosing function`. A site earns its place by being the
+    # guard itself or by going through it; anything else is a finding.
+    permitted = {
+        # The two guards. `safe_writer` is the async one every HTTP-
+        # family route funnels through, and its `aiofiles.open` carries
+        # `guarded_opener`; `_open_guarded` is the synchronous twin the
+        # two transfer protocols reach through their path-IO layer, and
+        # its two `open` calls are the read arm and the guarded write
+        # arm of one branch.
+        'utils/paths.py::safe_writer',
+        'utils/contained_io.py::_open_guarded',
+        # `open_within` is what `guarded_opener` opens *through*: the
+        # descriptor walk that applies O_NOFOLLOW to a leaf resolved
+        # against an open parent. It is the syscall the guard is made
+        # of, not a route around it.
+        'utils/paths.py::open_within',
+    }
+    # The three upload reads in `request_helper.py` are mode-literal
+    # `'rb'`, so the census drops them on mode alone and they need no
+    # entry above. `_walk_to_parent`'s `os.open` is dropped for the
+    # complementary reason: `O_DIRECTORY`, no `O_CREAT`, so it opens an
+    # existing directory and creates nothing.
+    census = {
+        f'{module}::{enclosing}': (line, name)
+        for module, source in package_sources()
+        for line, name, enclosing in write_seams_in(source)
+    }
+    unclaimed = {
+        site: where for site, where in census.items()
+        if site not in permitted
     }
 
-    assert writing_modules <= covered, (
-        f'{sorted(writing_modules - covered)} opens a local file for '
-        'writing and is claimed by no route in WRITE_ROUTES. Add the '
-        'route (and its driver arm) rather than widening this set: an '
-        'unenumerated write path is a path no guard watches, which is '
-        'how the single-file transfer arm came to write through a '
-        'symlink for the life of the release.')
+    assert not unclaimed, (
+        'the package can create or truncate a local file at '
+        + ', '.join(
+            f'{site.split("::")[0]}:{line} ({name})'
+            for site, (line, name) in sorted(unclaimed.items()))
+        + ', which is not one of the guarded sites and is claimed by no '
+        'route in WRITE_ROUTES. Route the write through `safe_writer` '
+        '(async) or `_open_guarded` (the transfer path) rather than '
+        'adding it here: a write outside those is a write with no '
+        'O_NOFOLLOW, no overwrite refusal and no containment check, '
+        'which is how the single-file transfer arm came to write '
+        'through a symlink for the life of the release. If a new '
+        'guarded route is genuinely needed, add it to WRITE_ROUTES and '
+        'its driver arm first, and name the site here second.')
 
 
 @pytest.mark.parametrize('protocol', ['FTP', 'SFTP'])
