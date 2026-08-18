@@ -46,17 +46,26 @@ normalisation can reconcile them, so the separator run accepts every
 spelling and masks on any reading. That is the fail-closed direction this
 module errs in throughout.
 
-The query rule has now had the same history, one level up: not two
-readings of one string, but two *maskers* with a separator set each.
-``redact_text``'s split on ``;`` and ``redact_url``'s did not, so
-``?x=1;api_key=S`` was masked in ``error['message']`` and published in
-the clear in the envelope ``url`` and in ``validated_url``'s
-``ConfigurationError`` -- the surfaces that call ``redact_url`` alone
-(N1). The round before had fixed the same ``;`` in the other rule and
-recorded the reasoning in a docstring rather than in code, which is how
-one fix came to cover one of two callers. Both rules are now generated
-from ``_QUERY_SEPARATORS``, so a separator cannot be taught to one and
-missed by the other.
+The query rule has now had the same history, one level up, and it took
+three rounds to stop unifying the wrong thing. Not two readings of one
+string but two *maskers*: ``redact_text``'s split on ``;`` and
+``redact_url``'s did not, so ``?x=1;api_key=S`` was masked in
+``error['message']`` and published in the clear in the envelope ``url``
+and in ``validated_url``'s ``ConfigurationError`` -- the surfaces that
+call ``redact_url`` alone (N1). Round one taught the ``;`` to one rule.
+Round two shared the separator *set* between both. Round three found
+them disagreeing anyway, because sharing what a separator *is* says
+nothing about *where each masker looks*: ``redact_url`` scanned
+``parts.query`` alone while ``redact_text`` scanned the whole string, so
+``/p;api_key=S`` in a path segment and ``/p#frag?api_key=S`` after a
+fragment leaked on exactly the same surfaces as before.
+
+So the unified thing is now the **surface**, not the constant. There is
+one pair scan, ``_mask_in_string``, run over the whole string by both
+maskers; ``redact_url`` adds only the userinfo drop that needs a parsed
+netloc. No component is enumerated anywhere, so no component can be
+forgotten -- which is the property the two previous rounds each failed
+to buy, having unified a value rather than the code path.
 
 That query-pair rule asks nothing about the string around it, and the
 asking is what it replaces. A predicate classifying "is this a URL?"
@@ -127,9 +136,11 @@ _EMBEDDED_URL: Final[re.Pattern[str]] = re.compile(
     r'[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s<>"\'`]+')
 
 # The characters that separate one query pair from the next. **This is
-# the module's one definition of what a query separator is, and both
-# maskers derive from it** -- `_QUERY_SEPARATOR_SPLIT` below records why
-# that sentence is load-bearing rather than tidy.
+# the module's one definition of what a query separator is**, and there
+# is now exactly one rule reading it -- `_QUERY_PAIR`, which both
+# maskers run via `_mask_in_string`. It used to be read by two, which is
+# the arrangement the module docstring records three rounds of findings
+# against.
 #
 # `;` is in the set because it is a query separator too. It is the legacy
 # form -- once recommended by the HTML 4.01 spec, still parsed by PHP,
@@ -137,14 +148,16 @@ _EMBEDDED_URL: Final[re.Pattern[str]] = re.compile(
 # reads `?a=1;api_key=S` as two parameters, the second of them secret.
 _QUERY_SEPARATORS: Final[str] = '&;'
 
-# What introduces the *first* pair. Only the free-text rule needs it: by
-# the time `redact_url` has a query component, `urlsplit` has removed the
-# `?` that introduced it.
-_QUERY_START: Final[str] = '?'
+# What introduces the *first* pair of a run. `?` opens a query; `#`
+# opens a fragment, and a fragment carries `name=value` pairs in the one
+# flow that matters most here -- OAuth 2.0's implicit grant returns
+# `#access_token=...`, a live credential, by design. Both are here for
+# the same reason: a pair after either is read as a pair by something.
+_PAIR_INTRODUCERS: Final[str] = '?#'
 
-# Every character that can bound a pair in free text, for the classes
-# below. Derived rather than retyped, for the reason `_SEPARATOR_RUN` is.
-_QUERY_DELIMITERS: Final[str] = _QUERY_START + _QUERY_SEPARATORS
+# Every character that can bound a pair, for the classes below. Derived
+# rather than retyped, for the reason `_SEPARATOR_RUN` is.
+_QUERY_DELIMITERS: Final[str] = _PAIR_INTRODUCERS + _QUERY_SEPARATORS
 
 # One `name=value` pair introduced by any of those delimiters, wherever it
 # sits. There is deliberately no test of what surrounds it: see the module
@@ -165,46 +178,58 @@ _QUERY_DELIMITERS: Final[str] = _QUERY_START + _QUERY_SEPARATORS
 # construction rather than by review: a separator is excluded from both
 # classes in the same breath it is added to the set, so the linearity
 # argument cannot be invalidated by adding one.
-_QUERY_PAIR: Final[re.Pattern[str]] = re.compile(
-    r'([{delims}])([^{delims}=\s]+)=([^{delims}\s]*)'.format(
-        delims=re.escape(_QUERY_DELIMITERS)))
+#
+# Both pair patterns are built by this one function, from that one
+# delimiter set, and they differ in exactly one axis: whether whitespace
+# ends a value. That axis is the *only* legitimate difference between
+# the two maskers -- see `_URL_QUERY_PAIR` -- so making it the sole
+# parameter is what stops a second difference being introduced by
+# writing a second pattern out by hand, which is how the last three
+# findings arrived.
 
-# The same separator set again, shaped for a URL's *query component* --
-# the string `urlsplit` returns with the `?` already stripped.
-#
-# This constant exists because the two maskers used to disagree about the
-# question it answers, and the disagreement was the leak (N1).
-# `redact_url` split its query with `parse_qsl`, which splits on `&`
-# alone, while `_QUERY_PAIR` splits on `;` as well. So
-# `?x=1;api_key=SECRETPW` was masked by `redact_text` and published
-# **unmasked** in the envelope `url` -- on the `ok=True` and `ok=False`
-# paths alike -- and in the `ConfigurationError` that names a rejected
-# URL. Those are precisely the surfaces that call `redact_url` *alone*
-# and never reach the composed second pass.
-#
-# The previous round fixed `;` in `_QUERY_PAIR` only, reasoning that
-# `parse_qsl` folds `;api_key=S` into the preceding value and masks it
-# there. That holds only where the *preceding* name is itself sensitive,
-# which in `?x=1;api_key=S` it is not -- and the reasoning was then
-# written into `redact_url`'s docstring as a claim that `redact_text`
-# covers the case, which is false for exactly the two surfaces that never
-# call it. A comment asserting another function's coverage is not a
-# mechanism, and this is the third finding produced by two hand-maintained
-# rules drifting apart.
-#
-# So the separator is not defined twice any more. Both maskers read
-# `_QUERY_SEPARATORS`, and a separator cannot be taught to one rule and
-# missed by the other -- the same "make the class of miss
-# unrepresentable" move `_SEPARATOR_RUN` makes for the userinfo escapes.
-#
-# A *capturing* split, so the separators come back among the pieces and
-# the query is rebuilt with the caller's own spelling: rewriting a legacy
-# `;` to `&` would change what the record says the caller sent. Splitting
-# on a one-character class also has nothing to backtrack, so this adds no
-# work to the event-loop path `log_failure` runs on.
-_QUERY_SEPARATOR_SPLIT: Final[re.Pattern[str]] = re.compile(
-    '([{}])'.format(re.escape(_QUERY_SEPARATORS)))
 
+def _pair_pattern(*, whitespace_ends_a_value: bool) -> 're.Pattern[str]':
+    """Build a ``name=value`` pair pattern over the shared delimiters.
+
+    Args:
+        whitespace_ends_a_value: True for free text, where a value that
+            ran past a space would swallow the rest of a sentence; False
+            for a whole string already known to be one URL, where a
+            space is inside the value and the tail is still the secret.
+
+    Returns:
+        The compiled pattern, capturing the delimiter, the name and the
+        value.
+    """
+    delims = re.escape(_QUERY_DELIMITERS)
+    space = r'\s' if whitespace_ends_a_value else ''
+    return re.compile(
+        r'([{delims}])([^{delims}{space}=]+)=([^{delims}{space}]*)'.format(
+            delims=delims, space=space))
+
+
+_QUERY_PAIR: Final[re.Pattern[str]] = _pair_pattern(
+    whitespace_ends_a_value=True)
+
+# The same rule for a string that is *entirely* one URL, where a space
+# inside a value is part of the value rather than the end of it.
+#
+# `redact_url` needs this and `redact_text` must not have it. A secret
+# spelled `?api_key=my secret key` reaches the envelope whole, so ending
+# the value at the space would publish two thirds of it; the same value
+# inside a *sentence* has no end but the space, and a rule that ran past
+# it would mask the rest of the traceback. That difference is real, it
+# predates this fix, and it is the one difference between the two
+# maskers that is not a defect.
+#
+# So it is expressed as an argument to one shared builder rather than as
+# a second hand-written pattern. The delimiters -- and therefore which
+# components a pair can be found in -- come from the same constants for
+# both, which is the property three rounds of findings were about: a
+# component or separator cannot be taught to one masker and missed by
+# the other, because neither masker enumerates any.
+_URL_QUERY_PAIR: Final[re.Pattern[str]] = _pair_pattern(
+    whitespace_ends_a_value=False)
 
 # `scheme:` plus whatever separator run follows it, captured separately.
 # Only *this* much is a pattern; where the userinfo ends is decided by
@@ -498,20 +523,38 @@ def _at(origin: Optional[list[int]], offset: int) -> int:
     return offset if origin is None else origin[offset]
 
 
-def _mask_in_string(text: str, sensitive: frozenset[str]) -> str:
+def _mask_in_string(
+    text: str,
+    sensitive: frozenset[str],
+    *,
+    pairs: 're.Pattern[str]' = _QUERY_PAIR,
+) -> str:
     """Apply the two masking passes that cannot recurse.
 
+    **The one masking surface both public maskers run.**
+    :func:`redact_text` calls it on free text and :func:`redact_url`
+    calls it on a whole URL, and neither has a rule of its own -- which
+    is the fix for three rounds of the two disagreeing. They differ only
+    in the ``pairs`` argument, and only about whitespace.
+
     Split out of :func:`redact_text` so :func:`redact_url` can reuse it
-    as its parse-failure fallback without the two calling each other
-    forever: :func:`redact_text`'s third pass hands each embedded URL to
-    :func:`redact_url`, so a fallback that re-entered :func:`redact_text`
-    would hand the same unparseable URL straight back. Everything here
-    is pure regex substitution and re-enters nothing.
+    without the two calling each other forever: :func:`redact_text`'s
+    third pass hands each embedded URL to :func:`redact_url`, so a
+    re-entry into :func:`redact_text` would hand the same URL straight
+    back. Everything here is pure regex substitution and re-enters
+    nothing.
 
     Args:
         text: The string to mask.
         sensitive: The casefolded names whose query values are masked,
             already resolved by :func:`_sensitive_names`.
+        pairs: Which pair pattern to scan with -- :data:`_QUERY_PAIR`
+            for free text, where whitespace ends a value, or
+            :data:`_URL_QUERY_PAIR` for a string that is entirely one
+            URL, where it does not. Both come from
+            :func:`_pair_pattern` and therefore from one delimiter set,
+            so they cannot differ about which components a pair can sit
+            in.
 
     Returns:
         ``text`` with sensitive query values and URL userinfo masked.
@@ -520,8 +563,9 @@ def _mask_in_string(text: str, sensitive: frozenset[str]) -> str:
         """Redact the one query value this match spans, if it is secret.
 
         Whether the name is sensitive is :func:`_is_sensitive`'s
-        question, and asking it there rather than here is what keeps this
-        masker and :func:`_mask_query` deciding alike.
+        question, and asking it there rather than here keeps the answer
+        in one place, alongside the caller-supplied names
+        :func:`_sensitive_names` folds in.
 
         Args:
             match: The matched delimiter, name and value.
@@ -538,7 +582,7 @@ def _mask_in_string(text: str, sensitive: frozenset[str]) -> str:
             return match.group(0)
         return f'{delimiter}{name}={REDACTED}'
 
-    return _mask_userinfo(_QUERY_PAIR.sub(mask_pair, text))
+    return _mask_userinfo(pairs.sub(mask_pair, text))
 
 
 def _is_sensitive(name: str, sensitive: frozenset[str]) -> bool:
@@ -562,55 +606,6 @@ def _is_sensitive(name: str, sensitive: frozenset[str]) -> bool:
     """
     return (name.casefold() in sensitive
             or unquote(name).casefold() in sensitive)
-
-
-def _mask_query(query: str, sensitive: frozenset[str]) -> str:
-    """Mask the sensitive values in a URL's query component.
-
-    :func:`redact_url`'s half of the shared separator rule. It takes the
-    query as :func:`urllib.parse.urlsplit` hands it over -- with the
-    leading ``?`` already removed -- and returns it with the value of
-    every sensitive-named pair replaced.
-
-    Written by hand over :data:`_QUERY_SEPARATOR_SPLIT` rather than with
-    :func:`urllib.parse.parse_qsl` and :func:`urllib.parse.urlencode`,
-    and both halves of that are the fix for N1:
-
-    * ``parse_qsl`` splits on ``&`` alone, so ``x=1;api_key=S`` was one
-      pair named ``x`` -- insensitive, therefore published whole, secret
-      included. Splitting on this module's own separator set is what
-      makes the two maskers agree by construction.
-    * ``urlencode`` would re-encode the pairs it did *not* mask, so a
-      query the caller wrote as ``a=b c`` came back as ``a=b+c`` and
-      ``x=<tag>`` as ``x=%3Ctag%3E`` -- this library rewriting text it was
-      asked only to mask. Substituting into the split pieces leaves every
-      untouched character, and every original separator, exactly as it
-      arrived. That also makes this masker agree with
-      :func:`redact_text`'s rendering, which is what the differential
-      test asserts.
-
-    A piece carrying no ``=`` is left alone rather than treated as a
-    valueless name: it has no value to mask, and rewriting it would
-    change the record for no gain.
-
-    Args:
-        query: The query component, without its leading ``?``.
-        sensitive: The casefolded names whose values are masked, already
-            resolved by :func:`_sensitive_names`.
-
-    Returns:
-        The query with sensitive values replaced by :data:`REDACTED`, or
-        ``query`` unchanged when nothing needed masking. The sentinel's
-        asterisks are left literal -- percent-encoded they would still
-        hide the value, but a caller reading the redacted URL could not
-        tell a masked parameter from a real one.
-    """
-    pieces = _QUERY_SEPARATOR_SPLIT.split(query)
-    for index, piece in enumerate(pieces):
-        name, separator, _value = piece.partition('=')
-        if separator and _is_sensitive(name, sensitive):
-            pieces[index] = f'{name}={REDACTED}'
-    return ''.join(pieces)
 
 
 def _sensitive_names(extra_params: Collection[str]) -> frozenset[str]:
@@ -702,27 +697,47 @@ def redact_cookies(cookies: Mapping[str, str]) -> dict[str, str]:
 
 
 def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
-    """Strip URL userinfo and mask sensitive query-parameter values.
+    """Strip URL userinfo and mask sensitive ``name=value`` pairs.
 
     ``https://user:pw@host/p?api_key=x`` becomes
     ``https://host/p?api_key=***redacted***``. Parameter order and every
     other component are preserved, and a URL needing no masking is returned
     as it came in rather than re-encoded.
 
-    Parameters are split on :data:`_QUERY_SEPARATORS` -- ``&`` and the
-    legacy ``;`` -- which is the same set :func:`redact_text`'s pair rule
-    uses, because both are generated from that one constant. So
-    ``?x=1;api_key=S`` is masked here, and the two maskers cannot disagree
-    about what a separator is.
+    **This function no longer has a masking rule of its own.** The pair
+    masking is :func:`_mask_in_string`, exactly as :func:`redact_text`
+    runs it, over the whole URL; the only thing this adds is dropping the
+    userinfo out of a netloc ``urlsplit`` was able to identify. That
+    division is the fix for a class of defect, and the class is worth
+    naming because this is its fourth round:
 
-    That sentence used to read the other way round: this function split on
-    ``&`` alone and its docstring claimed :func:`redact_text` covered the
-    ``;`` case. It did not, for the two surfaces that matter most --
-    the envelope ``url`` and ``validated_url``'s ``ConfigurationError``
-    call this function *alone*, never through :func:`redact_value`'s
-    composition, so a secret after a ``;`` was published in the clear
-    (N1). A docstring asserting another function's coverage is not a
-    mechanism; a shared constant is.
+    * round 1 -- ``_QUERY_PAIR`` did not know ``;`` was a separator.
+    * round 4 (N1) -- the separator set was unified into
+      :data:`_QUERY_SEPARATORS`, but only :func:`redact_text` used it;
+      this function still split with ``parse_qsl``.
+    * this round -- the separator set *is* shared, and the two maskers
+      still disagreed, because they scanned different **components**.
+      This one masked ``parts.query`` alone, so a secret anywhere else in
+      the URL was published: ``/p;api_key=S`` in the path (RFC 3986 path
+      parameters, which PHP and servlet containers read as parameters)
+      and ``/p#frag?api_key=S`` after a fragment were both masked by
+      :func:`redact_text` and published in the clear here -- in the
+      envelope ``url`` on the ``ok=True`` and ``ok=False`` paths alike,
+      and in ``validated_url``'s ``ConfigurationError``.
+
+    Each round unified one more thing the two rules had a copy of: first
+    the separator character, then the separator *set*. Sharing a constant
+    stops them disagreeing about what a separator is; it says nothing
+    about *where each one looks*, and that was the next place to
+    disagree. So the surface is unified rather than the constant: there
+    is one scan over one string, and a component cannot be forgotten
+    because no component is enumerated. A future URL grammar that puts a
+    pair somewhere new is covered by construction -- the scan never asked
+    which component it was in.
+
+    What remains here is only reassembly, and it is deliberately the
+    smaller half: :func:`urlsplit` is consulted to find a *credential*,
+    never to find a pair.
 
     Args:
         url: The URL to redact.
@@ -733,13 +748,22 @@ def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
     Returns:
         The redacted URL, or ``url`` unchanged when nothing needed
         masking. A URL that cannot be *parsed* is still masked, by the
-        regex passes :func:`redact_text` uses -- it is kept rather than
-        discarded, because it is diagnostic data rather than a security
-        boundary, but keeping it is not the same as keeping its
-        credentials.
+        same scan -- it is kept rather than discarded, because it is
+        diagnostic data rather than a security boundary, but keeping it
+        is not the same as keeping its credentials.
     """
+    # The pair scan first and unconditionally, over the whole string. It
+    # needs no parse to succeed, which is why the unparseable URL below
+    # needs no separate rule: `_mask_in_string` has already run on it.
+    #
+    # `_URL_QUERY_PAIR` because the argument is a whole URL: a space in
+    # `?api_key=my secret key` is inside the value, and ending there
+    # would publish two thirds of the secret in the envelope `url`.
+    masked = _mask_in_string(
+        url, _sensitive_names(extra_params), pairs=_URL_QUERY_PAIR)
+
     try:
-        parts = urlsplit(url)
+        parts = urlsplit(masked)
     except ValueError:
         # Echoing the input here was the leak (M1/AGW-34). The ticket
         # accepted it on the condition that no caller-visible surface
@@ -751,41 +775,30 @@ def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
         # the one input that reaches this branch being, definitionally,
         # the one the caller gets told about.
         #
-        # The regex passes need no successful parse, which is exactly
-        # why they are the right fallback: an unclosed IPv6 bracket
-        # defeats `urlsplit` and not a character class. `_mask_in_string`
-        # rather than `redact_text` because the latter's third pass
-        # would hand this same URL back here and spin.
-        return _mask_in_string(url, _sensitive_names(extra_params))
+        # An unclosed IPv6 bracket defeats `urlsplit` and not a
+        # character class, so the scan above stands on its own here.
+        return masked
 
     netloc = parts.netloc
-    if '@' in netloc:
-        netloc = netloc.rsplit('@', 1)[1]
-    elif '@' in url:
+    if '@' not in netloc:
         # A parse that *succeeded* is not proof there is no credential to
         # drop -- only proof that `urlsplit` found no authority to put it
         # in. `http:/\/user:BACKSLASHPW@host/p` splits happily, into an
-        # empty netloc and a path holding the whole credential, so this
-        # branch dropped nothing and the password reached the envelope
-        # `url` and the log record's `extra['url']` in the clear
-        # (NEW-M1b). The unparseable fallback did not run either: there
-        # was no exception to trigger it.
+        # empty netloc and a path holding the whole credential, so a
+        # netloc-only rule dropped nothing and the password reached the
+        # envelope `url` and the log record's `extra['url']` in the clear
+        # (NEW-M1b).
         #
-        # So the credential rule no longer hangs off the parse verdict at
-        # all. `urlsplit` decides where a credential goes when it finds
-        # an authority; where it does not, `_mask_userinfo` reads the
-        # string, which is the same masker the fallback below uses and
-        # needs no parse to agree with. Fail-closed: the parse being
-        # *unhelpful* now masks exactly as the parse being *impossible*
-        # does, rather than being the one case that masks nothing.
-        return _mask_in_string(url, _sensitive_names(extra_params))
+        # `_mask_in_string` already ran `_mask_userinfo` over the whole
+        # string, so that credential is masked wherever the parser put
+        # it. There is nothing further to reassemble: rebuilding through
+        # `urlunsplit` could only re-encode components this function was
+        # asked to leave alone.
+        return masked
 
-    query = _mask_query(parts.query, _sensitive_names(extra_params))
-
-    if netloc == parts.netloc and query == parts.query:
-        return url
+    netloc = netloc.rsplit('@', 1)[1]
     return urlunsplit(
-        (parts.scheme, netloc, parts.path, query, parts.fragment))
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
