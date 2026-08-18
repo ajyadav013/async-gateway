@@ -541,7 +541,10 @@ that is empty — an empty directory and a single file stay distinguishable.
 ### `protocol_info` — SOAP
 
 SOAP reuses the HTTP transport, so every HTTP key above applies except
-`request_type` (always POST) and the two file-transfer configs. In addition:
+`request_type` (always POST) and the two file-transfer configs — MTOM is out of
+scope, so a SOAP call writes no local file. That list of exceptions is asserted
+against the code rather than only stated here: a key `HttpRequest` reads and
+`SoapRequest` does not is a test failure, in both directions. In addition:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

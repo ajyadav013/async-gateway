@@ -79,6 +79,7 @@ from async_gateway.logic.http_client import (
     validated_allow_redirects,
     validated_allowed_schemes,
     validated_cookies,
+    validated_cross_origin_headers,
     validated_headers,
     validated_http_auth,
     validated_max_redirects,
@@ -921,8 +922,31 @@ class SoapRequest(BaseRequestClass):
         self.verify_ssl: bool = self.info.get('verify_ssl', True)
         self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(
             total=validated_timeout(self.timeout))
+        # Read before the session, which is validated *against* it --
+        # the same order `logic/http_client.py` uses, and for the same
+        # reason: a session default naming one of these headers is
+        # admissible precisely because the caller has declared that
+        # header safe to forward.
+        #
+        # It was not read at all until NEW-R10-3: this line passed
+        # `validated_session`'s `frozenset()` default, so
+        # `protocol_info["cross_origin_headers"]` was silently ignored
+        # on SOAP. A bare string, a list naming `Authorization`, and
+        # `42` each raised `ConfigurationError` on HTTP and were
+        # **accepted** here -- and the README claims every HTTP key
+        # applies to SOAP except three named ones, so this was a
+        # fourth, undocumented, exception.
+        #
+        # Silently ignoring it is the worse half. A caller who named
+        # `X-Request-Id` here got the header dropped across a
+        # cross-origin redirect with no diagnostic, and one who named
+        # `Authorization` -- refused outright on HTTP because no
+        # insistence makes that safe -- got no refusal at all.
+        self.cross_origin_forward: frozenset[str] = (
+            validated_cross_origin_headers(
+                self.info.get('cross_origin_headers')))
         self.session: Optional[aiohttp.ClientSession] = validated_session(
-            self.info.get('session'))
+            self.info.get('session'), self.cross_origin_forward)
         # `redact_params` is passed for the reason `logic/http_client.py`
         # passes it, and omitting it here was a latent leak rather than a
         # stylistic difference. The tracer this library builds records
@@ -1068,6 +1092,7 @@ class SoapRequest(BaseRequestClass):
                 allowed_schemes=self.allowed_schemes,
                 allow_redirects=self.allow_redirects,
                 max_redirects=self.max_redirects,
+                cross_origin_forward=self.cross_origin_forward,
                 trace_collectors=self.trace_collectors,
                 # MTOM. Refused at the transport rather than here, which
                 # is the only placement that works: `read_response` writes

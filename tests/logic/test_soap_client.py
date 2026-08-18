@@ -1937,3 +1937,107 @@ async def test_an_undecodable_response_body_is_reported_before_any_parse(
     # than raising and losing the body with it.
     assert result['text']
     assert result['protocol_details']['soap_body'] is None
+
+
+# --- NEW-R10-3: the cross-origin hatch, honoured on SOAP too ---------------
+
+
+async def test_the_cross_origin_hatch_is_honoured_on_soap(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """A header SOAP's caller declares safe actually survives the hop.
+
+    The load-bearing half of NEW-R10-3, and the one a refusal test
+    cannot reach. ``SoapRequest`` passed ``validated_session``'s
+    ``frozenset()`` default and never read
+    ``protocol_info['cross_origin_headers']`` at all -- so the key was
+    silently ignored, and the README's claim that every HTTP key applies
+    to SOAP had an undocumented fourth exception.
+
+    Wiring the *validator* in fixes the refusals. It does not fix this:
+    a client that validated the value and then discarded it would pass
+    every hostile-value row while the hatch still did nothing. Only
+    driving a real cross-origin redirect and reading what the second
+    origin received can tell the two apart, so that is what this does.
+
+    ``Authorization`` rides along as the control. The hatch widens the
+    allowlist into headers this library has no opinion about; it must
+    never re-admit one it recognises as a credential, or it is the leak
+    again spelled as a config key.
+    """
+    elsewhere = RecordingHTTPServer()
+    await elsewhere.start()
+    try:
+        elsewhere.respond('/end', body=envelope_for(SOAP_11), headers=XML_11)
+        http_server.respond(
+            '/start',
+            status=302,
+            headers={'Location': elsewhere.url_for('/end')})
+
+        envelope = await request(
+            url=http_server.url_for('/start'),
+            protocol='SOAP',
+            data='<Ping/>',
+            protocol_info={
+                'headers': {
+                    'X-Request-Id': 'trace-me',
+                    'Authorization': 'Bearer supersecret',
+                },
+                'cross_origin_headers': ['X-Request-Id'],
+            },
+        )
+
+        assert envelope['ok'] is True
+        crossed = elsewhere.requests[-1].headers
+        assert crossed.get('X-Request-Id') == 'trace-me', (
+            'the declared header did not survive the cross-origin hop, '
+            'so cross_origin_headers is validated and then discarded -- '
+            'which is NEW-R10-3 with a nicer error message.')
+        assert 'Authorization' not in crossed, (
+            'the hatch must widen into the unknown region only; a '
+            'credential header crossing an origin boundary is the leak '
+            'the allowlist exists to prevent.')
+        # The first origin, which the caller did address, gets both.
+        assert http_server.requests[-1].headers.get(
+            'Authorization') == 'Bearer supersecret'
+    finally:
+        await elsewhere.close()
+
+
+async def test_an_undeclared_header_still_stops_at_the_origin_on_soap(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """The control: the hatch opens for the named header and no other.
+
+    Without this row the one above is satisfied by a SOAP client that
+    forwards *everything* across an origin boundary -- which would pass
+    "the declared header crossed" while destroying the guard the
+    declaration exists to make an exception to.
+    """
+    elsewhere = RecordingHTTPServer()
+    await elsewhere.start()
+    try:
+        elsewhere.respond('/end', body=envelope_for(SOAP_11), headers=XML_11)
+        http_server.respond(
+            '/start',
+            status=302,
+            headers={'Location': elsewhere.url_for('/end')})
+
+        envelope = await request(
+            url=http_server.url_for('/start'),
+            protocol='SOAP',
+            data='<Ping/>',
+            protocol_info={
+                'headers': {'X-Request-Id': 'trace-me', 'X-Other': 'nope'},
+                'cross_origin_headers': ['X-Request-Id'],
+            },
+        )
+
+        assert envelope['ok'] is True
+        crossed = elsewhere.requests[-1].headers
+        assert crossed.get('X-Request-Id') == 'trace-me'
+        assert 'X-Other' not in crossed, (
+            'only the header the caller named may cross; forwarding the '
+            'rest turns an opt-in hatch into no allowlist at all.')
+    finally:
+        await elsewhere.close()

@@ -653,6 +653,77 @@ async def test_every_protocol_answers_for_every_fault_category(
         "client's table is the divergence AGW-R9-1 was.")
 
 
+#: The ``protocol_info`` keys SOAP is documented as *not* honouring,
+#: with the reason each is excluded. The README states the parity claim
+#: -- "SOAP reuses the HTTP transport, so every HTTP key above applies
+#: except..." -- and it was prose only, so a fourth exception could
+#: appear without anything noticing. One did: ``cross_origin_headers``
+#: was passed as ``validated_session``'s ``frozenset()`` default and
+#: silently ignored, so a bare string, ``42`` and a list naming
+#: ``Authorization`` were all refused on HTTP and **accepted** on SOAP
+#: (NEW-R10-3).
+SOAP_EXCEPTED_KEYS: frozenset[str] = frozenset({
+    # Always POST: a SOAP call's verb is not the caller's to choose.
+    'request_type',
+    # The two file-transfer configs. MTOM is out of scope (R18), so a
+    # multipart body is refused rather than written and SOAP hands the
+    # transport a literal None -- which is also its LOCAL_IO exemption.
+    'http_file_download_config',
+    'http_file_upload_config',
+})
+
+
+def _info_keys(client: Any) -> frozenset[str]:
+    """Return the ``protocol_info`` keys a client's constructor reads.
+
+    Read off the source rather than a declared list, because a declared
+    list is the thing that goes stale: the point is to catch a key the
+    code reads or fails to read, and only the code can say which.
+
+    Args:
+        client: The protocol class to inspect.
+
+    Returns:
+        Every name passed to ``self.info.get(...)`` in its module.
+    """
+    return frozenset(re.findall(
+        r"self\.info\.get\(\s*'([a-z_]+)'", inspect.getsource(client)))
+
+
+def test_soap_honours_every_http_key_it_does_not_document_an_exception_for(
+) -> None:
+    """The README's SOAP parity claim, asserted instead of stated.
+
+    "SOAP reuses the HTTP transport, so every HTTP key above applies
+    except ``request_type`` and the two file-transfer configs" was
+    prose, and prose does not fail. NEW-R10-3 is what that costs: a
+    fourth exception appeared -- ``cross_origin_headers``, read by
+    ``HttpRequest`` and simply not read by ``SoapRequest`` -- and the
+    key it silently ignored is the one that *widens a security guard*,
+    so a caller naming ``Authorization`` got a refusal on one protocol
+    and silence on the other.
+
+    Both directions are checked. A key HTTP reads and SOAP does not is
+    an undocumented exception; a key in the exception list that SOAP now
+    reads is a stale exception. Either way the table and the code have
+    diverged, which is the only condition this row exists to catch.
+    """
+    http_keys = _info_keys(http_client.HttpRequest)
+    soap_keys = _info_keys(soap_client.SoapRequest)
+
+    unhonoured = http_keys - soap_keys - SOAP_EXCEPTED_KEYS
+    assert not unhonoured, (
+        f'SOAP silently ignores {sorted(unhonoured)}, which HttpRequest '
+        'reads and the README promises SOAP honours. Wire it through, '
+        'or add it to SOAP_EXCEPTED_KEYS *and* to the README with the '
+        'reason -- an undocumented fourth exception is NEW-R10-3.')
+
+    stale = SOAP_EXCEPTED_KEYS & soap_keys
+    assert not stale, (
+        f'{sorted(stale)} is listed as a SOAP exception and SOAP now '
+        'reads it, so the list and the README are stale.')
+
+
 #: The four dispatch sites, each with the classification table its
 #: ``except`` clause must be derived from. The round-9 fix claimed
 #: divergence was "no longer representable" because the clause was
