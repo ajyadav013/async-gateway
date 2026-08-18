@@ -390,6 +390,17 @@ rewriting `response['url']` from a pre-processor is a supported use — but it
 may not *remove* a key, because the protocol clients read them and
 `result['ok']` is the documented success predicate.
 
+**A pre-processor may not rewrite `response['protocol']`.** It is the one field
+this library reads back off the envelope and *routes on*: the protocol object
+uses it to key its per-destination circuit breaker. Rewriting it to a non-string
+crashed inside the protocol client, and rewriting it to a *valid* protocol name
+silently pointed the call at another caller's breaker. Doing so now raises a
+`ProcessorError` naming the field. Every other key stays writable, including
+`url`, `payload`, `headers` and any state of your own you stash on the envelope
+— none of them decide where the call goes. A **post-processor** may rewrite
+anything at all, `protocol` included: by then the call has been made and there
+is nothing left to route.
+
 A post-processor that raises therefore forfeits the envelope, response body
 included. That is the cost of the guarantee that nothing but an
 `AsyncGatewayError` escapes `request()`: an `ok=False` envelope would dress a

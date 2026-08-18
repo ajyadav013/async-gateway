@@ -279,10 +279,27 @@ async def run_processor(
             f'{type(err).__name__}') from err
 
 
+#: The envelope keys this library **reads back and routes on**, and
+#: therefore the ones a processor may not rewrite (NEW-3).
+#:
+#: Membership is decided by one question -- does any code path read this
+#: value off the envelope after a processor could have touched it, and
+#: act on it? -- and today exactly one key answers yes:
+#: ``BaseRequestClass.__init__`` reads ``response['protocol']`` to build
+#: the breaker registry's key.
+#:
+#: A frozenset rather than a literal at the check, so the set is one
+#: named thing a future story can extend when it makes another key
+#: routing-relevant, and so the docstring above and the code below
+#: cannot disagree about what is frozen.
+DISPATCH_CONTROLLING_KEYS: Final[frozenset[str]] = frozenset({'protocol'})
+
+
 def checked_envelope(
     response: GatewayResponse,
     *,
     setting: str,
+    dispatch: Optional[Mapping[str, Any]] = None,
 ) -> GatewayResponse:
     """Return ``response`` once a processor has left it whole.
 
@@ -306,23 +323,70 @@ def checked_envelope(
     a silent ``None`` for the caller's actual payload, dispatching a call
     the caller never asked for. Refusing says what happened instead.
 
-    Only *removal* is refused, never a changed value. A pre-processor
-    rewriting ``url`` is the point of the hook, and this library has no
-    business policing what a caller writes into an envelope it gave them.
+    **Two things are refused: removing any key, and rewriting a
+    dispatch-controlling one.** Everything else a processor writes is its
+    own business, and deliberately so.
+
+    The line between them is not "what looks dangerous" -- it is whether
+    this library *reads the value back and acts on it*. Exactly one key
+    does that: :data:`DISPATCH_CONTROLLING_KEYS`.
+    ``BaseRequestClass.__init__`` reads ``response['protocol']`` to build
+    the breaker registry's ``(family, host, port)`` key, so a
+    pre-processor rewriting it did two things (NEW-3). A non-``str``
+    value gave a bare ``AttributeError: 'int' object has no attribute
+    'lower'`` from inside ``destination_of``, past the boundary and
+    inside the one conversion ``try`` where nothing catches it. Worse, a
+    *valid* string silently retargeted the key: an FTP call whose
+    processor wrote ``'HTTPS'`` accumulated its failures under
+    ``('https', host, 443)`` -- a breaker belonging to **other callers'
+    HTTPS traffic to that host**. That is cross-caller state corruption
+    rather than a crash, and it is the half a type check alone would
+    have left in place.
+
+    Refusing the rewrite is chosen over re-validating it, because there
+    is no rewrite worth honouring: the protocol was already resolved from
+    the caller's own ``protocol`` argument at the boundary, and a hook
+    that could change it would be a second, undocumented way to choose a
+    protocol client -- ``resolve_protocol`` running once is what makes
+    the value checked and the value dispatched the same value.
+
+    ``url`` stays **writable**, and the asymmetry is FI-14's, not a new
+    judgement. A processor rewriting ``url`` is the documented point of
+    the hook, and it is safe for a specific reason worth stating: this
+    module *overwrites* ``response['url']`` from ``target_url`` a few
+    lines after the processor runs, so the rewrite reaches no dispatch
+    decision at all -- it cannot downgrade an HTTPS call to plaintext,
+    which is exactly what FI-14 established by moving the scheme check
+    after the processor and checking the URL actually dispatched. The
+    key is reportorial by the time anything reads it. If a later story
+    makes ``url`` decide where the call goes, it becomes
+    dispatch-controlling and moves into the frozen set with the scheme
+    check that guards it.
+
+    Payload-shaping keys -- ``payload``, ``headers``, ``cookies``, and
+    the caller's own stashed state -- stay writable for the same reason:
+    nothing routes on them.
 
     Args:
         response: The envelope the processor was handed and may have
             mutated.
         setting: The parameter name to quote in a failure.
+        dispatch: The dispatch-controlling values as this library
+            resolved them, to compare the returned envelope against.
+            None for the post-processor, which runs after every dispatch
+            decision has been made and therefore has nothing left to
+            corrupt.
 
     Returns:
-        The same object, unchanged, once every key is still present.
+        The same object, unchanged, once every key is still present and
+        no dispatch-controlling key has been rewritten.
 
     Raises:
         ProcessorError: If the callback removed any key the envelope was
-            built with, naming them. It is not a ``ConfigurationError``
-            for the same reason a raising callback is not: the config was
-            valid and the callback ran.
+            built with, or rewrote a dispatch-controlling one, naming
+            them. It is not a ``ConfigurationError`` for the same reason
+            a raising callback is not: the config was valid and the
+            callback ran.
     """
     missing = sorted(set(GatewayResponse.__annotations__) - set(response))
     if missing:
@@ -331,6 +395,24 @@ def checked_envelope(
             f'envelope it was passed. A processor may change what the '
             f"envelope holds, but the key set is this library's "
             f'contract with its caller and the protocol clients read it')
+    # Iterated rather than subscripted, and that is a typing constraint
+    # rather than a style choice: `GatewayResponse` is a `TypedDict`, so
+    # `response[key]` for a non-literal `key` is a mypy error. Walking
+    # `.items()` asks the same question -- does any snapshotted field
+    # differ now? -- without ever indexing by a computed name.
+    resolved = dispatch or {}
+    changed = sorted(
+        key for key, value in response.items()
+        if key in resolved and resolved[key] != value)
+    if changed:
+        raise ProcessorError(
+            f'{setting}["function"] rewrote {changed} on the response '
+            f'envelope it was passed. A processor may change what the '
+            f'envelope holds, but not the fields this library dispatches '
+            f'on: they were resolved from the arguments to request() and '
+            f'are read back to route the call, so rewriting one either '
+            f'crashes inside a protocol client or silently retargets '
+            f"another caller's circuit breaker")
     return response
 
 
@@ -774,15 +856,22 @@ async def request(
     )
 
     if pre_processor is not None:
+        # Snapshot *before* the callback runs, so the comparison after it
+        # is against what this library resolved rather than against
+        # whatever the callback left behind.
+        dispatch = {
+            key: value for key, value in response.items()
+            if key in DISPATCH_CONTROLLING_KEYS}
         response['pre_processor_response'] = await run_processor(
             *pre_processor, response, setting='pre_processor_config')
         # The envelope goes to a protocol client next, which reads keys
         # off it directly. A pre-processor that removed one is refused
         # here, at the boundary, rather than surfacing as a bare
         # `KeyError` from inside the conversion `try` where nothing
-        # catches it.
+        # catches it -- and so is one that rewrote `protocol`, which the
+        # protocol object reads back to key its circuit breaker (NEW-3).
         response = checked_envelope(
-            response, setting='pre_processor_config')
+            response, setting='pre_processor_config', dispatch=dispatch)
 
     # FI-14. The scheme check runs *after* the pre-processor and against
     # the value that is then handed to the protocol object -- one variable,
@@ -864,6 +953,15 @@ async def request(
         # have this function return an object whose shape the library
         # promises and no longer has, which is a broken contract however
         # self-inflicted. Refusing is the honest report.
+        #
+        # No `dispatch` argument, and that omission is deliberate rather
+        # than an oversight (NEW-3). Every dispatch decision has already
+        # been made by the time this runs -- the protocol object was
+        # built, the breaker was keyed, the call went out -- so there is
+        # nothing left for a rewrite to corrupt, and freezing `protocol`
+        # here would only stop a caller annotating the result they are
+        # about to be handed. The rule is "immutable while it still
+        # decides something", not "immutable forever".
         response = checked_envelope(
             response, setting='post_processor_config')
     return response

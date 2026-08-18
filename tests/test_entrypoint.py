@@ -34,6 +34,7 @@ from aiohttp import BasicAuth
 import pytest
 
 from async_gateway.async_gateway import (
+    DISPATCH_CONTROLLING_KEYS,
     HTTP_FAMILY_SCHEMES,
     URL_DISPATCHED_PROTOCOLS,
     dispatch_url_for,
@@ -1523,3 +1524,200 @@ async def test_new2_the_documented_processor_call_still_works(
     assert result['pre_processor_response'] == 'ran:pre'
     assert result['post_processor_response'] == 'ran:post'
     assert seen == [('HTTPS', 'pre'), ('HTTPS', 'post')]
+
+
+# --- NEW-3: what a processor may and may not rewrite -----------------------
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        # The crash half. `destination_of` calls `.lower()` on this
+        # value, so anything without one was a bare `AttributeError`
+        # from inside a protocol object -- past the boundary and inside
+        # the one conversion `try`, where `except AsyncGatewayError`
+        # cannot see it.
+        pytest.param(123, id='an-int-has-no-lower'),
+        pytest.param(None, id='none-has-no-lower'),
+        pytest.param(['SFTP'], id='a-list-has-no-lower'),
+        # The *worse* half, and the reason a type check alone would not
+        # have been the fix. Every one of these is a perfectly good
+        # `str` that `destination_of` lowers without complaint -- and
+        # then keys the shared, process-lifetime breaker registry with.
+        # An FTP call whose processor writes 'HTTPS' accumulates its
+        # failures under ('https', host, 443), a breaker belonging to
+        # other callers' HTTPS traffic to that host. That is
+        # cross-caller state corruption, and it is silent.
+        pytest.param('HTTPS', id='a-valid-string-retargeting-the-breaker'),
+        pytest.param('SFTP', id='another-registered-protocol'),
+        pytest.param('ftp', id='the-same-protocol-in-another-case'),
+        pytest.param('anything', id='an-unregistered-name'),
+    ],
+)
+async def test_a_pre_processor_may_not_rewrite_the_dispatch_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+    value: Any,
+) -> None:
+    """``protocol`` is read back to route the call, so it is frozen.
+
+    ``checked_envelope`` refused *removal* only, on the reasoning that
+    this library has no business policing what a caller writes into an
+    envelope it gave them. That holds for every key the library never
+    reads again -- and ``protocol`` is not one of them:
+    ``BaseRequestClass.__init__`` reads it to build the breaker
+    registry's ``(family, host, port)`` key.
+
+    Both failure shapes are on this list on purpose. A non-``str``
+    crashes, which is loud; a valid ``str`` does not, which is why it
+    is the more dangerous row. A fix that only type-checked the
+    rewritten value would have passed the first three rows and left the
+    last four corrupting another caller's breaker.
+
+    Args:
+        monkeypatch: The patcher, for the doubled dispatch.
+        value: What the processor writes over ``protocol``.
+
+    Returns:
+        None.
+    """
+    capture_dispatch(monkeypatch)
+
+    async def retarget(response: GatewayResponse) -> str:
+        """Rewrite the dispatch-controlling protocol field.
+
+        Args:
+            response: The envelope, mutated in place.
+
+        Returns:
+            A marker that must never be reached.
+        """
+        response['protocol'] = value
+        return 'retargeted'
+
+    with pytest.raises(ProcessorError) as raised:
+        await request(
+            'http://host/p',
+            protocol='HTTP',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={'function': retarget},
+        )
+
+    # Named, so the caller is told which field they may not touch
+    # rather than being left to guess from a crash site.
+    assert "rewrote ['protocol']" in str(raised.value)
+    assert 'pre_processor_config' in str(raised.value)
+
+
+async def test_a_pre_processor_may_still_rewrite_the_reported_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FI-14's decision stands: ``url`` is writable, and safely so.
+
+    The freeze is scoped to what this library *routes on*, and ``url``
+    is deliberately not in that set even though it looks like the most
+    dangerous key on the envelope. The reason is structural rather than
+    a judgement call: ``request()`` overwrites ``response['url']`` from
+    ``target_url`` a few lines after the processor returns, and the
+    scheme guard runs against that same variable -- which is precisely
+    what FI-14 established. The processor's write reaches no dispatch
+    decision, so freezing it would cost a documented use for no safety.
+
+    This row is the control that says the NEW-3 fix did not quietly
+    widen into FI-14's territory.
+
+    Args:
+        monkeypatch: The patcher, for the doubled dispatch.
+
+    Returns:
+        None.
+    """
+    dispatched = capture_dispatch(monkeypatch)
+
+    async def rewrite(response: GatewayResponse) -> str:
+        """Rewrite every writable field a caller might reasonably touch.
+
+        Args:
+            response: The envelope, mutated in place.
+
+        Returns:
+            A marker proving the callback ran to completion.
+        """
+        response['url'] = 'http://rewritten.invalid/x'
+        response['payload'] = {'replaced': True}
+        response['headers'] = {'x-annotation': 'mine'}
+        response['protocol_details'] = {'caller': 'state'}
+        return 'annotated'
+
+    result = await request(
+        'https://host/p',
+        protocol='HTTPS',
+        protocol_info={'request_type': 'GET'},
+        pre_processor_config={'function': rewrite},
+    )
+
+    assert result['pre_processor_response'] == 'annotated'
+    assert result['ok'] is True
+    # The rewrite did not reach dispatch: the call still went to the
+    # caller's own URL, under the caller's own protocol.
+    assert dispatched[0].url == 'https://host/p'
+    assert result['protocol'] == 'HTTPS'
+
+
+async def test_a_post_processor_may_rewrite_anything_it_likes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After dispatch there is nothing left to corrupt.
+
+    The rule NEW-3 settles is "immutable while it still decides
+    something", not "immutable forever". By the time a post-processor
+    runs, the protocol object has been built, the breaker keyed and the
+    call made -- so ``protocol`` is reportorial, and freezing it would
+    only stop a caller annotating the result they are about to receive.
+
+    Asserting the asymmetry rather than leaving it implied, because it
+    is the kind of scope decision a later change silently widens.
+
+    Args:
+        monkeypatch: The patcher, for the doubled dispatch.
+
+    Returns:
+        None.
+    """
+    capture_dispatch(monkeypatch)
+
+    async def relabel(response: GatewayResponse) -> str:
+        """Rewrite the protocol after every decision has been made.
+
+        Args:
+            response: The envelope, mutated in place.
+
+        Returns:
+            A marker proving the callback ran.
+        """
+        response['protocol'] = 'RELABELLED'
+        return 'relabelled'
+
+    result = await request(
+        'https://host/p',
+        protocol='HTTPS',
+        protocol_info={'request_type': 'GET'},
+        post_processor_config={'function': relabel},
+    )
+
+    assert result['post_processor_response'] == 'relabelled'
+    assert result['protocol'] == 'RELABELLED'
+
+
+def test_every_dispatch_controlling_key_is_a_real_envelope_key() -> None:
+    """The frozen set cannot name a key the envelope does not have.
+
+    ``checked_envelope`` indexes ``response[key]`` for every member, so
+    a typo in :data:`DISPATCH_CONTROLLING_KEYS` would be a ``KeyError``
+    on the *success* path of every call with a pre-processor -- a
+    library bug reaching the caller as a bare builtin, which is the one
+    thing this module's contract is built to prevent.
+    """
+    assert DISPATCH_CONTROLLING_KEYS <= set(
+        GatewayResponse.__annotations__)
+    # And it is non-empty, or the guard is silently inert.
+    assert DISPATCH_CONTROLLING_KEYS
