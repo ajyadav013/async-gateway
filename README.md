@@ -1535,22 +1535,60 @@ The public surface is `async_gateway.async_gateway.request()`, the envelope in
 
 ### Cutting a release
 
+Releases are automated by
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml). A maintainer
+edits two files and merges; the workflow builds, publishes to PyPI, tags the
+commit, and writes the GitHub Release. There is no manual `python -m build`,
+no `twine upload`, and no hand-written `git tag`.
+
 The version lives in **exactly one file**: `pyproject.toml`. Bump `version`
 there and nowhere else.
 
 ```text
-# 1. Bump `version` in pyproject.toml. That is the only file to edit.
-# 2. Update CHANGELOG.md.
-# 3. Build and check the artifacts.
+# 1. Bump `version` in pyproject.toml. That is the only file to edit for it.
+# 2. In CHANGELOG.md, replace `unreleased` in that version's heading with the
+#    release date:  ## [1.1.0] — unreleased   ->   ## [1.1.0] — 2026-08-18
+# 3. Merge to the default branch. That is the whole release.
+```
+
+What happens then, in order:
+
+| Job | Does | Gates the next on |
+|-----|------|-------------------|
+| `release-gate` | Reads the name and version from `pyproject.toml`, asks PyPI whether that exact version exists, and refuses to continue if the CHANGELOG heading still says `unreleased`. | The version being new **and** the changelog being dated. |
+| `ci-gate` | Asks the Actions API whether every `ci.yml` run for this exact commit finished green. | CI having actually passed. |
+| `build` | `python -m build` plus `twine check`, uploading the artifacts. | A valid wheel and sdist. |
+| `publish` | Uploads to PyPI over Trusted Publishing (OIDC). No API token is stored anywhere. | A successful upload. |
+| `github-release` | Creates the annotated tag `vX.Y.Z` and a GitHub Release whose body is that version's CHANGELOG section. | — |
+
+Two consequences worth knowing:
+
+- **A merge that does not bump the version is a clean no-op**, not a failure.
+  PyPI versions are immutable, so `release-gate` skips when the declared
+  version is already published. This is why every merge can safely trigger the
+  workflow.
+- **Forgetting the CHANGELOG date blocks the release rather than mis-shipping
+  it.** Publishing a version whose own changelog says it is unreleased would be
+  incoherent and unfixable — a PyPI version cannot be re-uploaded once spent —
+  so the workflow stops and tells you which heading to edit.
+
+**One-time setup before the first release.** `async-gateway` has never been
+uploaded, so Trusted Publishing needs a
+[pending publisher](https://pypi.org/manage/account/publishing/) registered by
+hand first: project `async-gateway`, owner `ajyadav013`, repository
+`async-gateway`, workflow `publish.yml`, environment `pypi` — and a GitHub
+environment named `pypi` on the repository. Without it the first upload fails
+with `invalid-publisher`. The header comment in the workflow says the same
+thing, at the place where someone debugging that failure will look.
+
+To build the artifacts locally — for inspection, not for publishing — note that
+`build` is not part of the `dev` extra and must be installed separately:
+
+```text
 pip install build twine
 python -m build
 twine check dist/*
-# 4. Tag the release commit.
-git tag -a v1.0.0 -m 'v1.0.0'
-git push origin v1.0.0
 ```
-
-`build` is not part of the `dev` extra; install it separately, as above.
 
 ---
 

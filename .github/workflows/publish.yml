@@ -1,0 +1,386 @@
+# Publish async-gateway to PyPI via Trusted Publishing (OIDC) -- no API token.
+#
+# ---------------------------------------------------------------------------
+# FIRST-RUN PREREQUISITE: configure a PyPI *pending publisher* before merging.
+# ---------------------------------------------------------------------------
+# `async-gateway` has never been uploaded to PyPI (that is the whole point of
+# the rename away from `asyncio-requests`), so there is no project for a
+# trusted publisher to attach to yet. Trusted Publishing solves this with a
+# *pending* publisher, which must be created by hand, once, before the first
+# release:
+#
+#   https://pypi.org/manage/account/publishing/  ->  "Add a new pending
+#   publisher", with exactly:
+#
+#       PyPI Project Name : async-gateway
+#       Owner             : ajyadav013
+#       Repository name   : async-gateway
+#       Workflow name     : publish.yml
+#       Environment name  : pypi
+#
+# The `environment: pypi` on the publish job below must match that last field
+# character for character, and a GitHub environment of that name must exist on
+# the repository. Skip this and the very first run fails at upload with
+# "invalid-publisher" -- which reads like a broken workflow but is a missing
+# one-time registration. Once the first upload lands, the pending publisher
+# converts into a normal trusted publisher automatically and never needs
+# touching again.
+#
+# ---------------------------------------------------------------------------
+# HOW A RELEASE IS CUT
+# ---------------------------------------------------------------------------
+# Bump `version` in pyproject.toml (the only place it lives), replace the
+# `unreleased` marker in that version's CHANGELOG.md heading with the release
+# date, merge to the default branch. Everything below is automatic.
+#
+# PyPI versions are immutable, so a merge that does *not* bump the version
+# cannot be re-uploaded. `release-gate` therefore asks PyPI whether the
+# declared version already exists: a new version publishes, an unchanged one
+# is skipped cleanly. That is what makes "every merge triggers this workflow"
+# safe rather than noisy -- the no-op is the common case.
+#
+# ---------------------------------------------------------------------------
+# WHY `workflow_run` AND NOT `push`
+# ---------------------------------------------------------------------------
+# This library's `ci.yml` is the entire quality argument for a release: lint,
+# types, and tests across CPython 3.10-3.14, a clean-venv install of the real
+# wheel *and* the real sdist, five shuffled-order seeds, and a coverage
+# ratchet. Publishing an artifact that has not cleared those checks would
+# discard the guarantee the CI exists to provide, so the release is gated on
+# CI actually having passed for the exact commit being released.
+#
+# Two ways to do that, and the rejected one first: re-running the checks
+# inside this workflow duplicates a 500-line matrix that would then drift out
+# of step with the original, and doubles the cost of every merge to prove
+# something already proven minutes earlier.
+#
+# So this triggers on `workflow_run` -- CI completing -- instead. That has
+# real subtleties, each handled explicitly below:
+#
+#   * It only fires for the copy of this file on the *default branch*. Edits
+#     on a feature branch have no effect until merged; this workflow cannot be
+#     tested from a PR, and the first live exercise is its first merge.
+#   * `github.sha` and a bare `actions/checkout` both point at the default
+#     branch tip, *not* at the commit CI ran on. Every job below therefore
+#     pins `ref:` to `github.event.workflow_run.head_sha`.
+#   * It fires for CI runs on every branch and every event, including
+#     pull requests and the monthly cron. The `if:` on `release-gate` narrows
+#     it to a successful `push` run on the default branch.
+#   * The `conclusion` is *not* implied by the trigger -- `completed` includes
+#     failure and cancellation. It is checked explicitly.
+#
+# `workflow_run` alone would still leave the manual paths (`workflow_dispatch`,
+# a published Release, a pushed tag) ungated, so `ci-gate` re-establishes the
+# guarantee from the Actions API for whichever commit is being released,
+# regardless of what triggered the run. Under `workflow_run` that is a
+# tautology; under the manual triggers it is the only thing standing between a
+# stray dispatch and an unverified upload.
+#
+# ---------------------------------------------------------------------------
+# AFTER THE PUBLISH
+# ---------------------------------------------------------------------------
+# `github-release` creates the annotated tag `vX.Y.Z` and a GitHub Release
+# whose body is that version's CHANGELOG section, so the tag/Release ledger
+# stays in lockstep with PyPI with no manual `git tag`. It is idempotent: a
+# re-run over an already-released version is a clean no-op. The tag it pushes
+# uses `GITHUB_TOKEN`, and GitHub deliberately does not re-trigger workflows
+# from token-authored refs -- so the `v*` tag trigger below cannot loop.
+
+name: Publish to PyPI
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  release-gate:
+    name: Resolve the commit, and decide whether it is releasable
+    # Under `workflow_run`, only a *successful* `push` run on the default
+    # branch is a release candidate. Every other trigger is a deliberate human
+    # action and passes straight through to `ci-gate`, which re-checks CI from
+    # the API rather than trusting the trigger.
+    if: >-
+      github.event_name != 'workflow_run'
+      || (github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push'
+          && github.event.workflow_run.head_branch
+             == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.check.outputs.should_publish }}
+      version: ${{ steps.check.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - id: resolve
+        name: Resolve the commit under release
+        # `github.sha` is the default-branch tip on a `workflow_run`, which is
+        # not necessarily the commit CI ran against -- a second merge landing
+        # while CI was in flight is enough to make them differ. Everything
+        # downstream keys off this one value so the built artifact, the checked
+        # CI result, and the created tag all describe the same commit.
+        env:
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${WORKFLOW_RUN_SHA:-}" ]; then
+            sha="$WORKFLOW_RUN_SHA"
+          else
+            sha="$EVENT_SHA"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "::notice::Release candidate commit: $sha"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+
+      - id: check
+        name: Compare the declared version against PyPI
+        # The distribution name is read from `pyproject.toml` rather than
+        # written into the URL. A hardcoded name is the single likeliest defect
+        # in a workflow adapted from another project's: it would probe some
+        # other distribution, always 404, and publish on every merge forever --
+        # and it would do so silently, because a 404 is the *success* path here.
+        # `tests/test_packaging.py` asserts the probe URL interpolates the
+        # parsed value and hardcodes no distribution name.
+        run: |
+          set -euo pipefail
+          version="$(grep -E '^version *= *"' pyproject.toml \
+            | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          dist="$(grep -E '^name *= *"' pyproject.toml \
+            | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ -z "$version" ] || [ -z "$dist" ]; then
+            echo "::error::could not parse name/version from pyproject.toml" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/$dist/$version/json")"
+          case "$code" in
+            200)
+              echo "::notice::$dist $version is already on PyPI (HTTP $code)" \
+                   "-- skipping. Bump the version to release."
+              echo "should_publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "::notice::$dist $version is not on PyPI (HTTP $code)" \
+                   "-- will build and publish."
+              echo "should_publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # Anything else is PyPI being unreachable or unhealthy, not an
+              # answer. Failing closed costs a re-run; guessing "not published"
+              # on a 503 would republish, and guessing "published" would skip a
+              # real release silently.
+              echo "::error::PyPI returned HTTP $code for $dist $version;" \
+                   "refusing to guess whether it is already published" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Refuse to release a version whose CHANGELOG says "unreleased"
+        # Only meaningful when something is actually about to ship.
+        #
+        # The heading for an unshipped version reads `## [1.0.0] — unreleased`.
+        # The extraction below would happily lift that section's *body* into a
+        # GitHub Release, and the result is incoherent: a published release
+        # whose own changelog entry states it has not been released, and which
+        # then stays that way in the repository forever because nothing
+        # afterwards forces the date in.
+        #
+        # Failing here converts a documentation slip into a blocked release
+        # rather than a wrong one. The fix is one edit and a re-merge; the fix
+        # after the fact is a PyPI version burned on a typo, because PyPI
+        # versions are immutable and cannot be re-uploaded.
+        if: steps.check.outputs.should_publish == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          heading="$(awk -v ver="$VERSION" \
+            'index($0, "## [" ver "]") == 1 { print; exit }' CHANGELOG.md)"
+          if [ -z "$heading" ]; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' heading." \
+                 "Add the section before releasing $VERSION." >&2
+            exit 1
+          fi
+          if printf '%s' "$heading" | grep -qi 'unreleased'; then
+            echo "::error::CHANGELOG.md still marks $VERSION as unreleased:" >&2
+            echo "  $heading" >&2
+            echo "::error::Replace 'unreleased' in that heading with the" \
+                 "release date (e.g. '## [$VERSION] — 2026-08-18') and merge" \
+                 "again. Publishing a version whose own changelog says it is" \
+                 "unreleased is incoherent, and PyPI versions cannot be" \
+                 "re-uploaded once spent." >&2
+            exit 1
+          fi
+          echo "CHANGELOG heading for $VERSION is dated: $heading"
+
+  ci-gate:
+    name: Require a green CI run for this exact commit
+    needs: release-gate
+    if: needs.release-gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Assert every CI run for the commit completed successfully
+        # Asked of the Actions API rather than inferred from the trigger, so
+        # the guarantee holds identically for `workflow_dispatch`, a published
+        # Release, and a pushed tag -- none of which say anything about CI.
+        #
+        # The rule is deliberately the strict one: *every* CI run recorded
+        # against this sha must be `completed` with conclusion `success`. A sha
+        # can carry more than one run (a push and a pull_request run share a
+        # head sha; a re-dispatch adds another), and "the newest one is green"
+        # would let a green re-run paper over a red original. In-flight and
+        # cancelled runs fail closed too -- an unfinished check is not a
+        # passed check.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ needs.release-gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          runs="$(gh api \
+            "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+            --jq '.workflow_runs[] | "\(.status) \(.conclusion) \(.html_url)"')"
+          if [ -z "$runs" ]; then
+            echo "::error::No CI run recorded for $SHA. The release is gated" \
+                 "on ci.yml having passed for this exact commit; push the" \
+                 "commit and let CI run before releasing." >&2
+            exit 1
+          fi
+          echo "CI runs for $SHA:"
+          echo "$runs"
+          bad="$(echo "$runs" | grep -v '^completed success ' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::CI is not green for $SHA -- refusing to publish" \
+                 "an unverified build. Offending runs:" >&2
+            echo "$bad" >&2
+            exit 1
+          fi
+          echo "::notice::CI is green for $SHA."
+
+  build:
+    name: Build distributions
+    needs: [release-gate, ci-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-gate.outputs.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build wheel + sdist and validate
+        # An *isolated* build, for the same reason `ci.yml`'s
+        # `build-and-install` job builds in isolation: the dev extra pins
+        # `setuptools<76` while `build` requires `setuptools>=77.0.3`, and the
+        # two cannot share an interpreter. Nothing installs the dev extra here,
+        # but keeping the build isolated keeps the released artifact byte-for-
+        # byte comparable with the one CI already installed and imported.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: [release-gate, build]
+    runs-on: ubuntu-latest
+    # Must match the "Environment name" on the PyPI trusted publisher exactly
+    # (see the first-run prerequisite at the top of this file).
+    environment: pypi
+    permissions:
+      id-token: write   # required for OIDC trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Belt and braces against the immutable-version race: `release-gate`
+          # already checked, but two merges in flight can both pass that check
+          # and only one upload can win. Skipping beats failing the second.
+          skip-existing: true
+          # PEP 740 build attestations, for supply-chain provenance. This is
+          # also the action's default; set explicitly to document the intent.
+          # If Sigstore's Rekor transparency log is returning errors at upload
+          # time, flip to false to unblock the release and restore it after.
+          attestations: true
+
+  github-release:
+    name: Tag + GitHub Release
+    needs: [release-gate, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create the git tag and the Release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-gate.outputs.sha }}
+
+      - name: Create the tag and the Release from the CHANGELOG section
+        # `VERSION` comes from `release-gate` (parsed out of the repository's
+        # own pyproject.toml, never from event input) but is passed through
+        # `env:` rather than interpolated into the script body, as ordinary
+        # workflow-injection hygiene: an expression spliced into a shell script
+        # is executed by the shell, an environment variable is not.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release-gate.outputs.version }}
+          SHA: ${{ needs.release-gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          # Idempotent: on a re-run the Release already exists and a second
+          # create would fail, so do nothing instead.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::Release $tag already exists -- nothing to do."
+            exit 0
+          fi
+          # This version's CHANGELOG section: the lines between its
+          # `## [x.y.z]` heading and the next `## [` heading, both headings
+          # excluded (the Release title already carries the tag). The newest
+          # version is the last section in the file, in which case there is no
+          # next heading and the capture runs to EOF -- which is correct.
+          awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 { capture = 1; next }
+            capture && index($0, "## [") == 1 { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::warning::No CHANGELOG body for $VERSION -- using a" \
+                 "generic Release note."
+            printf 'Release %s. See CHANGELOG.md for details.\n' "$tag" \
+              > release-notes.md
+          fi
+          # Creates the annotated tag on the released commit -- pinned by sha,
+          # not left to default to the branch tip, which may have moved on
+          # since CI ran -- and publishes the Release in one step.
+          gh release create "$tag" --target "$SHA" --title "$tag" \
+            --notes-file release-notes.md
+          echo "::notice::Created tag and GitHub Release $tag at $SHA."

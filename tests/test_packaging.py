@@ -44,6 +44,7 @@ from tests.fixtures.http_server import RecordingHTTPServer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'ci.yml'
+PUBLISH_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'publish.yml'
 PYPROJECT = REPO_ROOT / 'pyproject.toml'
 PACKAGE_ROOT = REPO_ROOT / 'async_gateway'
 REPOSITORY_URL = 'https://github.com/ajyadav013/async-gateway'
@@ -485,10 +486,15 @@ def test_no_fork_inherited_version_survives_in_the_shipped_tree() -> None:
     """``2.7.3`` appears nowhere outside the spec and ticket history (R5-AC3).
 
     The spec, the stories file and the tickets all *discuss* the old version
-    and must keep doing so; the package, the packaging config and the CI
-    workflow must not mention it at all.
+    and must keep doing so; the package, the packaging config and the
+    workflows must not mention it at all.
     """
-    haystacks = [PYPROJECT, CI_WORKFLOW, *sorted(PACKAGE_ROOT.rglob('*.py'))]
+    haystacks = [
+        PYPROJECT,
+        CI_WORKFLOW,
+        PUBLISH_WORKFLOW,
+        *sorted(PACKAGE_ROOT.rglob('*.py')),
+    ]
     offenders = [
         str(path.relative_to(REPO_ROOT))
         for path in haystacks
@@ -1074,3 +1080,195 @@ def test_py_typed_ships_in_both_artifacts(tmp_path: Path) -> None:
     assert in_sdist == [f'{sdist_root}/async_gateway/py.typed'], (
         f'py.typed is missing from the sdist (found {in_sdist!r}); '
         f'an install from source would ship untyped')
+
+
+# --- The release workflow ---------------------------------------------------
+#
+# `publish.yml` is the one workflow whose failures are expensive rather than
+# merely annoying: a PyPI version is immutable, so a release that goes out
+# wrong cannot be re-uploaded and cannot be taken back. It is also the
+# workflow that gets exercised least -- once per release, and never from a
+# pull request, because `workflow_run` only fires for the copy of the file on
+# the default branch. The checks below are the substitute for the review pass
+# a frequently-run workflow gets for free.
+
+
+def _publish_workflow_text() -> str:
+    """Read ``publish.yml`` as text.
+
+    Text rather than parsed YAML for the reason the module docstring gives
+    for the CI matrix: PyYAML is not a dependency of this project, and
+    adding one so a test can read a workflow would be a poor trade.
+
+    Returns:
+        The workflow source.
+
+    Raises:
+        AssertionError: If the workflow is missing.
+    """
+    assert PUBLISH_WORKFLOW.is_file(), (
+        f'{PUBLISH_WORKFLOW} is missing; releases are automated by it and '
+        'the README documents it as the release procedure'
+    )
+    return PUBLISH_WORKFLOW.read_text(encoding='utf-8')
+
+
+def test_the_release_workflow_derives_the_distribution_name() -> None:
+    """The PyPI probe interpolates the parsed name, never a literal.
+
+    This is the defect that cannot be caught by running the workflow. The
+    probe treats **404 as the publish path**, so a URL naming the wrong
+    distribution -- the likeliest single error when adapting a release
+    workflow from another project -- does not fail. It 404s forever and
+    republishes on every merge, and every run is green while it does.
+
+    Asserted on the URL rather than on the whole file: the header comment
+    legitimately names ``async-gateway`` several times, because the PyPI
+    pending-publisher registration it walks through cannot be described
+    without it.
+    """
+    source = _publish_workflow_text()
+    probes = re.findall(r'https://pypi\.org/pypi/(\S+?)/json', source)
+    assert probes, (
+        'no `https://pypi.org/pypi/<dist>/<version>/json` probe found in '
+        f'{PUBLISH_WORKFLOW}; the version check is what makes a merge '
+        'without a version bump a no-op instead of a failed release'
+    )
+    hardcoded = [probe for probe in probes if '$' not in probe]
+    assert not hardcoded, (
+        f'the PyPI probe hardcodes {hardcoded}; it must interpolate the '
+        'name and version parsed from pyproject.toml, or it will query '
+        'the wrong distribution, 404 forever, and republish every merge'
+    )
+
+
+def test_the_release_workflow_refuses_an_unreleased_changelog() -> None:
+    """A version still marked ``unreleased`` blocks the release.
+
+    ``CHANGELOG.md`` heads an unshipped version ``## [1.0.0] - unreleased``.
+    Nothing about publishing rewrites that word, so without this guard the
+    release ships an artifact whose own changelog says it was never
+    released -- and the wrong text is then permanent, because the version
+    is spent and PyPI will not accept a re-upload. The guard converts a
+    documentation slip into a blocked release rather than a wrong one.
+    """
+    source = _publish_workflow_text()
+    assert 'unreleased' in source.lower(), (
+        f'{PUBLISH_WORKFLOW} does not check for an `unreleased` CHANGELOG '
+        'heading; it would happily publish a version documented as '
+        'unreleased, and PyPI versions cannot be re-uploaded'
+    )
+
+
+def test_the_release_workflow_gates_on_ci_for_the_released_commit() -> None:
+    """Publishing requires a green ``ci.yml`` run for that exact commit.
+
+    ``ci.yml`` is the entire quality argument for a release -- five
+    interpreters, a clean-venv install of the real wheel and the real
+    sdist, shuffled orders, the coverage ratchet. Publishing without it
+    would discard that guarantee at the one moment it is load-bearing.
+
+    Both halves are asserted. The gate must consult ``ci.yml``'s own runs,
+    and it must do so for the released commit rather than the branch tip:
+    on a ``workflow_run`` the two differ whenever a second merge lands
+    while CI is in flight, and a tip-based check would then certify a
+    commit nobody built.
+    """
+    source = _publish_workflow_text()
+    assert 'actions/workflows/ci.yml/runs' in source, (
+        f'{PUBLISH_WORKFLOW} does not query ci.yml run results; the '
+        'release would not be gated on CI having passed'
+    )
+    assert 'head_sha=' in source, (
+        f'{PUBLISH_WORKFLOW} does not filter CI runs by head sha; a green '
+        'run on some other commit would be accepted as proof for this one'
+    )
+
+
+def test_every_release_checkout_pins_the_released_commit() -> None:
+    """No ``actions/checkout`` in the release workflow floats to the tip.
+
+    A bare checkout resolves to the default branch's current tip, which on
+    a ``workflow_run`` is not necessarily the commit CI approved. Left
+    unpinned, the workflow can verify one commit and then build, publish
+    and tag a different one -- with no error anywhere, because both
+    commits are perfectly valid. Every checkout is therefore pinned to the
+    resolved sha, and this counts them rather than trusting review.
+    """
+    source = _publish_workflow_text()
+    checkouts = len(re.findall(r'uses:\s*actions/checkout@', source))
+    pinned = len(re.findall(r'^\s*ref:\s*\$\{\{', source, re.MULTILINE))
+    assert checkouts, f'{PUBLISH_WORKFLOW} checks out nothing'
+    assert pinned == checkouts, (
+        f'{PUBLISH_WORKFLOW} has {checkouts} checkout step(s) but only '
+        f'{pinned} pinned `ref:`; an unpinned checkout floats to the '
+        'branch tip and can publish a commit CI never verified'
+    )
+
+
+def test_the_release_workflow_pins_actions_the_way_ci_does() -> None:
+    """Both workflows pin the same shared actions to the same majors.
+
+    A release built by ``actions/checkout@v4`` in CI and some other major
+    in ``publish.yml`` is not the artifact CI verified. Comparing the two
+    files against each other rather than against a written-down version
+    keeps this true through the next bump, which will touch ``ci.yml``
+    first and is exactly when the two drift.
+    """
+    pattern = re.compile(r'uses:\s*(actions/[\w-]+)@(v\d+)')
+
+    def majors(source: str) -> Dict[str, str]:
+        found: Dict[str, str] = {}
+        for action, major in pattern.findall(source):
+            found.setdefault(action, major)
+        return found
+
+    ci = majors(CI_WORKFLOW.read_text(encoding='utf-8'))
+    release = majors(_publish_workflow_text())
+    shared = sorted(set(ci) & set(release))
+    assert shared, (
+        'the two workflows share no `actions/*` step, which is not '
+        'credible -- one of them has stopped checking out the repository'
+    )
+    disagreements = {
+        action: (ci[action], release[action])
+        for action in shared
+        if ci[action] != release[action]
+    }
+    assert not disagreements, (
+        f'ci.yml and publish.yml pin different majors for {disagreements} '
+        '(ci, publish); the released artifact must be built by the same '
+        'actions that verified it'
+    )
+
+
+def test_the_readme_documents_the_automated_release() -> None:
+    """The README's release recipe matches what the workflow does.
+
+    The failure this prevents is a maintainer following a stale recipe:
+    hand-building, ``twine upload``-ing and hand-tagging a release the
+    workflow was going to cut anyway, and burning the version doing it.
+    The recipe must name the workflow, and it must tell the maintainer to
+    date the CHANGELOG heading -- the one step the automation cannot do
+    for them and the one the guard above will otherwise block on.
+    """
+    readme = (REPO_ROOT / 'README.md').read_text(encoding='utf-8')
+    _, _, after = readme.partition('### Cutting a release')
+    section, _, _ = after.partition('\n## ')
+    assert section, 'the README has no `### Cutting a release` section'
+    assert 'publish.yml' in section, (
+        'the README release recipe does not name the workflow that '
+        'actually performs the release'
+    )
+    assert 'CHANGELOG' in section, (
+        'the README release recipe does not tell the maintainer to date '
+        'the CHANGELOG heading, which the workflow requires'
+    )
+    # Matched as a *command line* rather than as a substring: the prose above
+    # says "no `twine upload`", and a substring check would read the sentence
+    # ruling the step out as the step itself.
+    upload = re.compile(r'^\s*(python -m )?twine upload\b', re.MULTILINE)
+    assert not upload.search(section), (
+        'the README still instructs a manual `twine upload`; publishing '
+        'is automated and a manual upload would spend the version'
+    )
