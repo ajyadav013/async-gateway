@@ -102,6 +102,40 @@ class UnsupportedVerbError(ConfigurationError):
     code: ClassVar[str] = 'CONFIG'
 
 
+class ProcessorError(AsyncGatewayError):
+    """Raised when a caller's own processor callback failed.
+
+    Deliberately **not** a :class:`ConfigurationError`, because the two are
+    different mistakes and a caller acts on them differently. A malformed
+    ``pre_processor_config`` -- no ``"function"`` key, a ``"params"`` that
+    is not a mapping, a config that is a list -- is a *configuration*
+    mistake: the call could never have been formed, nothing ran, and it is
+    refused before dispatch with ``CONFIG``/400. This one says the
+    opposite: the configuration was well-formed, this library called
+    exactly what the caller asked it to call, and *that function* raised.
+    Reporting a bug inside the caller's own callback as though the caller
+    had mis-spelled a config key would send them looking at the wrong
+    thing.
+
+    It exists at all because the one-conversion-point contract admits no
+    exceptions: ``request()`` may only ever raise an
+    ``AsyncGatewayError``, so a callback's ``RuntimeError`` cannot simply
+    be let through, however clearly it belongs to the caller. The original
+    is chained as ``__cause__``, so :func:`unwrap_cause` puts its type and
+    message in ``error['cause']`` and nothing about it is lost.
+
+    A post-processor raising therefore forfeits the envelope, response
+    body included, and that is the accepted cost of keeping the invariant
+    absolute -- converting it to an ``ok=False`` envelope instead would
+    dress a bug in the caller's cleanup function up as a failed request
+    and overwrite the very ``ok=True`` result the caller was about to
+    read. A callback that must not cost its caller the response handles
+    its own failures.
+    """
+
+    code: ClassVar[str] = 'PROCESSOR'
+
+
 class SerializationError(AsyncGatewayError):
     """Raised when a body cannot be serialised or cannot be parsed.
 

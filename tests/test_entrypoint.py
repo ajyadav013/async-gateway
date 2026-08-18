@@ -49,9 +49,28 @@ from async_gateway.logic.sftp_client import SFTPRequest
 from async_gateway.logic.soap_client import SoapRequest
 from async_gateway.utils.constants import HTTP_TIMEOUT
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
-from async_gateway.utils.exceptions import ConfigurationError
+from async_gateway.utils.exceptions import (
+    ConfigurationError,
+    ProcessorError,
+)
 
 AUTH: Final[BasicAuth] = BasicAuth('user', 'password')
+
+
+async def _valid_processor(response: GatewayResponse, **params: Any) -> str:
+    """Behave exactly as a documented processor callback should.
+
+    Shared by the NEW-2 rows whose hostile value is somewhere *other*
+    than the function, so each of those tests varies one thing only.
+
+    Args:
+        response: The envelope, as ``request()`` passes it.
+        params: The caller's own ``params``, unused.
+
+    Returns:
+        A sentinel.
+    """
+    return 'processed'
 
 # One call per registered protocol that is valid for that protocol and for
 # no other reason: FTP and SFTP address a bare host and require no
@@ -866,3 +885,403 @@ async def test_agw35_a_deferred_rejection_envelopes_at_config_400(
     assert result['error']['code'] == 'CONFIG'
     assert result['status_code'] == 400
     assert len(gateway_records(caplog)) == 1
+
+
+# --- NEW-2: the two processor configs, validated like every other input ---
+#
+# `pre_processor_config['function']` was indexed and awaited with zero
+# checking, so two documented public parameters were a direct route to a
+# bare builtin: 18 of 20 hostile shapes a security review drove through the
+# public API escaped `request()` un-enveloped. The invariant matrix in
+# `tests/test_entrypoint_invariant.py` asserts only that *nothing bare*
+# escapes; these tests assert the part that matters to a caller reading the
+# error -- which of the two errors they get, and why the split is where it
+# is.
+
+
+async def test_new2_a_non_mapping_processor_config_raises_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config that is not a mapping was ``TypeError: list indices ...``.
+
+    The shape a caller most easily produces by passing the function
+    itself where the config was wanted.
+    """
+    capture_dispatch(monkeypatch)
+
+    with pytest.raises(ConfigurationError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config=['function'],
+        )
+
+    assert 'pre_processor_config' in str(raised.value)
+    assert 'list' in str(raised.value)
+
+
+async def test_new2_a_missing_function_key_raises_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``KeyError('function')`` was the single most likely escape.
+
+    A well-shaped mapping with the key mis-spelled is an ordinary typo,
+    and it reached the caller as the rawest possible builtin.
+    """
+    capture_dispatch(monkeypatch)
+
+    with pytest.raises(ConfigurationError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={'fn': _valid_processor},
+        )
+
+    assert 'function' in str(raised.value)
+
+
+async def test_new2_a_non_callable_function_raises_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-callable is a config error, not a callback failure.
+
+    The distinction this asserts is the one the mutation proof found
+    unguarded: ``run_processor`` would convert this too, but as a
+    ``ProcessorError``, telling a caller their *function* failed when in
+    fact they never supplied one. The code is what a caller branches on,
+    so the split has to be asserted and not merely intended.
+    """
+    capture_dispatch(monkeypatch)
+
+    with pytest.raises(ConfigurationError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={'function': 'not callable'},
+        )
+
+    assert raised.value.code == 'CONFIG'
+    assert raised.value.status_code == 400
+    assert 'callable' in str(raised.value)
+
+
+async def test_new2_a_non_mapping_params_raises_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``TypeError: argument after ** must be a mapping, not str``."""
+    capture_dispatch(monkeypatch)
+
+    with pytest.raises(ConfigurationError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={
+                'function': _valid_processor, 'params': 'nope'},
+        )
+
+    assert 'params' in str(raised.value)
+
+
+async def test_new2_a_non_str_params_key_raises_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``TypeError: keywords must be strings``, from the ``**`` expansion.
+
+    Asserted as ``CONFIG`` for the same reason the non-callable row is:
+    ``run_processor`` catches the ``TypeError`` regardless, so without
+    this test the guard could be deleted and only the *classification*
+    would change -- silently, and in the direction that misleads.
+    """
+    capture_dispatch(monkeypatch)
+
+    with pytest.raises(ConfigurationError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={
+                'function': _valid_processor, 'params': {1: 'v'}},
+        )
+
+    assert raised.value.code == 'CONFIG'
+    assert 'str' in str(raised.value)
+
+
+async def test_new2_params_may_not_shadow_the_response_keyword(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``got multiple values for keyword argument 'response'``.
+
+    Refused rather than resolved, because either resolution is wrong: the
+    caller's value would hide the envelope the hook exists to pass, and
+    the envelope would silently discard a value the caller explicitly
+    supplied. ``CONFIG`` again, and again asserted rather than assumed --
+    dropping this guard leaves the call failing as a ``ProcessorError``,
+    which reads as "your function is broken" for a config the caller can
+    see is not.
+    """
+    capture_dispatch(monkeypatch)
+
+    with pytest.raises(ConfigurationError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={
+                'function': _valid_processor,
+                'params': {'response': 'mine'}},
+        )
+
+    assert raised.value.code == 'CONFIG'
+    assert 'response' in str(raised.value)
+
+
+async def test_new2_the_post_config_is_validated_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed *post*-processor config refuses the call up front.
+
+    The deliberate half of the placement. Validating it lazily, where it
+    is used, would mean a caller with a typo in their post-processor
+    config discovers it only after the request has gone out -- and a
+    request cannot be un-sent. Nothing is dispatched here, which is the
+    assertion.
+    """
+    dispatched = capture_dispatch(monkeypatch)
+
+    with pytest.raises(ConfigurationError):
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            post_processor_config={'function': None},
+        )
+
+    assert dispatched == []
+
+
+async def test_new2_a_raising_callback_is_a_processor_error_not_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller's own callback blowing up is a different fault entirely.
+
+    The configuration was accepted and this library called exactly what
+    it was asked to call, so reporting ``CONFIG`` would send the caller
+    to look at their config table when the bug is in their function. The
+    original is chained, so nothing about it is lost.
+    """
+    capture_dispatch(monkeypatch)
+
+    async def explode(response: GatewayResponse) -> str:
+        """Fail the way a buggy caller callback does.
+
+        Args:
+            response: The envelope, unused.
+
+        Returns:
+            Never; this always raises.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        raise RuntimeError("inside the caller's own code")
+
+    with pytest.raises(ProcessorError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={'function': explode},
+        )
+
+    assert raised.value.code == 'PROCESSOR'
+    assert raised.value.status_code == 500
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert 'inside the caller' in str(raised.value.__cause__)
+
+
+async def test_new2_a_callback_raising_a_typed_error_is_passed_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A callback that raises this library's own error keeps its code.
+
+    Re-wrapping it as a ``ProcessorError`` would bury the code the caller
+    deliberately chose, which is the opposite of helpful: a caller who
+    raises ``ConfigurationError`` from their own validation hook has
+    already said what they want reported.
+    """
+    capture_dispatch(monkeypatch)
+
+    async def refuse(response: GatewayResponse) -> str:
+        """Refuse the call with this library's own typed error.
+
+        Args:
+            response: The envelope, unused.
+
+        Returns:
+            Never; this always raises.
+
+        Raises:
+            ConfigurationError: Always.
+        """
+        raise ConfigurationError('the caller rejected this call themselves')
+
+    with pytest.raises(ConfigurationError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={'function': refuse},
+        )
+
+    assert raised.value.code == 'CONFIG'
+    assert 'themselves' in str(raised.value)
+
+
+async def test_new2_a_pre_processor_emptying_the_envelope_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ninth escape: a *valid* callback that removes an envelope key.
+
+    Neither half is hostile alone, which is why one-dimensional coverage
+    could not reach it. The config is well-formed and the callback
+    succeeds; the crash came later, when ``http_client`` read
+    ``self.response['payload']`` from inside the one conversion ``try``
+    where an ``except AsyncGatewayError`` cannot see a ``KeyError``.
+    """
+    capture_dispatch(monkeypatch)
+
+    async def strip(response: GatewayResponse) -> str:
+        """Remove the key both HTTP and SOAP read before dispatch.
+
+        Args:
+            response: The envelope, mutated in place.
+
+        Returns:
+            A marker proving the callback itself succeeded.
+        """
+        response.pop('payload')
+        return 'stripped'
+
+    with pytest.raises(ProcessorError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={'function': strip},
+        )
+
+    assert 'payload' in str(raised.value)
+
+
+async def test_new2_a_post_processor_emptying_the_envelope_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same guard on the far side, for a different reason.
+
+    Nothing in this library reads the envelope after the post-processor,
+    so this cannot crash -- but ``result['ok']`` is the documented and
+    only success predicate, and returning an object that no longer has it
+    is a broken contract however self-inflicted.
+    """
+    capture_dispatch(monkeypatch)
+
+    async def strip(response: GatewayResponse) -> str:
+        """Remove the success predicate from the finished envelope.
+
+        Args:
+            response: The envelope, mutated in place.
+
+        Returns:
+            A marker proving the callback itself succeeded.
+        """
+        response.pop('ok')
+        return 'stripped'
+
+    with pytest.raises(ProcessorError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            post_processor_config={'function': strip},
+        )
+
+    assert 'ok' in str(raised.value)
+
+
+async def test_new2_a_processor_may_still_change_what_the_envelope_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard refuses *removal* only, never a rewritten value.
+
+    Mutating the envelope is the point of the hook -- FI-14 depends on a
+    pre-processor being able to rewrite ``response['url']`` -- so a guard
+    that froze the envelope would break the documented use while fixing
+    the crash. This is the control row that says it did not.
+    """
+    capture_dispatch(monkeypatch)
+
+    async def annotate(response: GatewayResponse) -> str:
+        """Overwrite envelope values without removing any key.
+
+        Args:
+            response: The envelope, mutated in place.
+
+        Returns:
+            A marker proving the callback ran.
+        """
+        response['url'] = 'http://rewritten/p'
+        response['payload'] = {'replaced': True}
+        return 'annotated'
+
+    result = await request(
+        'https://host/p',
+        protocol='HTTPS',
+        protocol_info={'request_type': 'GET'},
+        pre_processor_config={'function': annotate},
+    )
+
+    assert result['pre_processor_response'] == 'annotated'
+    assert result['ok'] is True
+
+
+async def test_new2_the_documented_processor_call_still_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control row: the README's own shape, with ``params``, passes.
+
+    Every rejection above is worthless if the validator also refuses the
+    documented call -- a library that rejects everything leaks no bare
+    exceptions either.
+    """
+    capture_dispatch(monkeypatch)
+    seen: list[Any] = []
+
+    async def record(response: GatewayResponse, tag: str = '') -> str:
+        """Accept the envelope and a caller-supplied parameter.
+
+        Args:
+            response: The envelope, as ``request()`` passes it.
+            tag: One value from the caller's own ``params``.
+
+        Returns:
+            The tag, so the envelope carries proof of the round trip.
+        """
+        seen.append((response['protocol'], tag))
+        return f'ran:{tag}'
+
+    result = await request(
+        'https://host/p',
+        protocol='HTTPS',
+        protocol_info={'request_type': 'GET'},
+        pre_processor_config={'function': record, 'params': {'tag': 'pre'}},
+        post_processor_config={'function': record, 'params': {'tag': 'post'}},
+    )
+
+    assert result['pre_processor_response'] == 'ran:pre'
+    assert result['post_processor_response'] == 'ran:post'
+    assert seen == [('HTTPS', 'pre'), ('HTTPS', 'post')]

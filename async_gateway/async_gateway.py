@@ -10,7 +10,7 @@ failed network call.
 
 import logging
 import traceback
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 from typing import Any, Dict, Final, Optional, Tuple, Union
 from urllib.parse import urlsplit
 
@@ -27,6 +27,7 @@ from async_gateway.utils.envelope import (
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
     ConfigurationError,
+    ProcessorError,
     StackExhaustedError,
 )
 from async_gateway.utils.redaction import (
@@ -84,6 +85,257 @@ def resolve_protocol(
     raise ConfigurationError(
         f'protocol must be one of {sorted(protocol_mapping)}, '
         f'got {protocol!r}')
+
+
+#: The keyword ``request()`` hands every processor callback. A caller's
+#: ``params`` may not also carry it: ``f(response=env, **{'response': x})``
+#: is a ``TypeError`` for multiple values, and silently dropping one of the
+#: two would mean the callback saw an envelope its caller never chose.
+PROCESSOR_RESERVED_KWARG: Final[str] = 'response'
+
+
+def validated_processor_config(
+    config: object,
+    *,
+    setting: str,
+) -> Tuple[Callable[..., Any], Dict[str, Any]]:
+    """Return a processor config's callable and params, shape proven.
+
+    The ``validated_*`` family's newest member, and it exists for the
+    reason every other one does: ``pre_processor_config['function']`` was
+    indexed and awaited with **zero** checking, so a documented public
+    parameter (README's argument table; this module's own entry-point
+    docstring) was a direct route to a bare builtin. Eighteen of twenty
+    hostile shapes a security review drove through the public API escaped
+    ``request()`` un-enveloped -- ``KeyError('function')`` for a config
+    missing the key, ``TypeError('list indices must be integers or
+    slices, not str')`` for a config that is a list, ``TypeError('...
+    argument after ** must be a mapping, not str')`` for a non-mapping
+    ``params``. A caller cannot be asked to catch three builtin types for
+    three spellings of one configuration mistake, and the contract does
+    not name any of them.
+
+    Checked here, at the boundary, and called from ``request()`` *outside*
+    its one conversion ``try`` -- the placement
+    :func:`~async_gateway.helpers.internal.base.validated_protocol_info`
+    and :func:`~async_gateway.helpers.internal.base.credentials_of`
+    already use, and the settled contract of AGW-35: an unretryable
+    caller-configuration mistake raises once, synchronously, rather than
+    becoming an ``ok=False`` envelope a retry loop would re-attempt
+    forever.
+
+    Both configs are validated *before* either runs, so a malformed
+    ``post_processor_config`` is refused before the call is dispatched
+    rather than after the remote side has already been contacted. A caller
+    whose post-processor config has a typo in it should not discover that
+    by having the request go out.
+
+    What is deliberately **not** checked is whether ``function`` returns
+    an awaitable, or whether its signature accepts ``response``. Both are
+    knowable only by calling it, and a callback that refuses its argument
+    or returns a plain value has *run* -- that is
+    :class:`~async_gateway.utils.exceptions.ProcessorError` territory, not
+    configuration. What is checked is everything decidable without
+    calling: the config's shape, the key's presence, the callable's
+    callability, the params' mapping-ness, its keys' str-ness, and the
+    one collision this library's own call would cause.
+
+    Args:
+        config: ``pre_processor_config`` or ``post_processor_config``
+            exactly as the caller supplied it, of whatever type they
+            actually passed. Only a truthy value reaches here; None and an
+            empty mapping are the documented "no processor" call.
+        setting: The parameter name to quote in a failure, so a caller
+            with both configured is told which one they got wrong.
+
+    Returns:
+        The callable to await and a new dict of the keyword arguments to
+        award it, copied so a caller mutating their own ``params`` between
+        the check and the call cannot change what is passed.
+
+    Raises:
+        ConfigurationError: If the config is not a mapping, omits
+            ``"function"``, names a ``"function"`` that is not callable,
+            carries a ``"params"`` that is not a mapping or whose keys are
+            not all ``str``, or whose ``params`` names ``"response"``,
+            which this library supplies itself.
+    """
+    if not isinstance(config, Mapping):
+        raise ConfigurationError(
+            f'{setting} must be a mapping with a "function" key, got '
+            f'{type(config).__name__}')
+    if 'function' not in config:
+        raise ConfigurationError(
+            f'{setting} is missing required key "function"')
+
+    function = config['function']
+    if not callable(function):
+        raise ConfigurationError(
+            f'{setting}["function"] must be callable, got '
+            f'{type(function).__name__}')
+
+    params = config.get('params')
+    if params is None:
+        params = {}
+    if not isinstance(params, Mapping):
+        raise ConfigurationError(
+            f'{setting}["params"] must be a mapping of keyword-argument '
+            f'names to values, got {type(params).__name__}')
+    for name in params:
+        if not isinstance(name, str):
+            raise ConfigurationError(
+                f'{setting}["params"] keys must be str, since they are '
+                f'passed as keyword arguments, got '
+                f'{type(name).__name__}')
+    if PROCESSOR_RESERVED_KWARG in params:
+        raise ConfigurationError(
+            f'{setting}["params"] may not name '
+            f'{PROCESSOR_RESERVED_KWARG!r}: this library passes the '
+            f'envelope under that keyword itself, so supplying it too '
+            f'would give the callable two values for one argument')
+    return function, dict(params)
+
+
+async def run_processor(
+    function: Callable[..., Any],
+    params: Dict[str, Any],
+    response: GatewayResponse,
+    *,
+    setting: str,
+) -> Any:
+    """Await one caller-supplied processor and return what it produced.
+
+    The counterpart to :func:`validated_processor_config`, and the reason
+    the two are separate functions rather than one. That one refuses a
+    config that could never work; this one runs a config that *can* and
+    reports what happens when the caller's own code fails anyway. Both
+    outcomes used to be the same bare builtin escaping ``request()``, and
+    collapsing them into one error would tell a caller their configuration
+    was wrong when their function was.
+
+    Everything the callable can do wrong is caught here, including the two
+    shapes :func:`validated_processor_config` deliberately leaves alone
+    because they are undecidable before the call: a function that does not
+    accept ``response`` (``TypeError: got an unexpected keyword
+    argument``) and one that returns a non-awaitable (``TypeError: 'int'
+    object can't be awaited``). Both mean the callback did not honour the
+    documented contract, and both arrive as the same
+    :class:`~async_gateway.utils.exceptions.ProcessorError` as a callback
+    that raised outright.
+
+    ``BaseException`` is not caught. A ``KeyboardInterrupt`` or an
+    ``asyncio.CancelledError`` raised inside a caller's callback is not
+    that callback failing -- it is the process or the task being torn
+    down, and converting either into a gateway error would swallow a
+    cancellation this library has no business absorbing.
+
+    Args:
+        function: The callable :func:`validated_processor_config`
+            approved.
+        params: The keyword arguments it approved, already copied.
+        response: The envelope, passed under
+            :data:`PROCESSOR_RESERVED_KWARG`.
+        setting: The parameter name to quote in a failure.
+
+    Returns:
+        Whatever the callable's awaited result is, stored verbatim on the
+        envelope. This library never inspects it.
+
+    Raises:
+        ProcessorError: If the callable raises, refuses the ``response``
+            keyword, or returns something that cannot be awaited. The
+            original is chained, so its type and message reach the caller
+            through the cause chain.
+        AsyncGatewayError: Unchanged, if the callback raised one itself. A
+            caller who deliberately raises this library's own typed error
+            from their callback has said what they want reported, and
+            re-wrapping it as a ``ProcessorError`` would bury the code
+            they chose.
+    """
+    try:
+        return await function(**{PROCESSOR_RESERVED_KWARG: response},
+                              **params)
+    except AsyncGatewayError:
+        raise
+    except Exception as err:
+        raise ProcessorError(
+            f'{setting}["function"] '
+            f'{_processor_name(function)} failed: '
+            f'{type(err).__name__}') from err
+
+
+def checked_envelope(
+    response: GatewayResponse,
+    *,
+    setting: str,
+) -> GatewayResponse:
+    """Return ``response`` once a processor has left it whole.
+
+    A processor is handed the *live* envelope, which is the documented
+    design -- FI-14 depends on a pre-processor being able to rewrite
+    ``response['url']``, and a caller stashing their own state on it is a
+    supported use. Handing over a live mutable object does mean a callback
+    can also *remove* from it, and a pre-processor that did was the ninth
+    escape found while extending the invariant matrix: ``response.clear()``
+    or ``del response['payload']`` left ``http_client`` reading
+    ``self.response['payload']`` and ``soap_client`` reading it two lines
+    into building the SOAP body, both as a bare ``KeyError('payload')``
+    from inside a protocol object -- past the boundary and inside the one
+    conversion ``try``, where the ``except AsyncGatewayError`` cannot see
+    it.
+
+    Checked here, once, rather than by scattering ``.get()`` defaults
+    through the protocol clients. Those clients act on an envelope this
+    module built and are entitled to assume its key set: making each read
+    defensive would spread the invariant across four files and substitute
+    a silent ``None`` for the caller's actual payload, dispatching a call
+    the caller never asked for. Refusing says what happened instead.
+
+    Only *removal* is refused, never a changed value. A pre-processor
+    rewriting ``url`` is the point of the hook, and this library has no
+    business policing what a caller writes into an envelope it gave them.
+
+    Args:
+        response: The envelope the processor was handed and may have
+            mutated.
+        setting: The parameter name to quote in a failure.
+
+    Returns:
+        The same object, unchanged, once every key is still present.
+
+    Raises:
+        ProcessorError: If the callback removed any key the envelope was
+            built with, naming them. It is not a ``ConfigurationError``
+            for the same reason a raising callback is not: the config was
+            valid and the callback ran.
+    """
+    missing = sorted(set(GatewayResponse.__annotations__) - set(response))
+    if missing:
+        raise ProcessorError(
+            f'{setting}["function"] removed {missing} from the response '
+            f'envelope it was passed. A processor may change what the '
+            f"envelope holds, but the key set is this library's "
+            f'contract with its caller and the protocol clients read it')
+    return response
+
+
+def _processor_name(function: Callable[..., Any]) -> str:
+    """Return a name for ``function`` safe to put in a message.
+
+    ``repr()`` of an arbitrary caller object can be anything at all --
+    including a credential, for an auth-ish object with a chatty
+    ``__repr__``. A ``__qualname__`` is the function's own name and
+    nothing else, and the type name is the fallback for a callable class
+    instance or a builtin that has none.
+
+    Args:
+        function: The processor callable being described.
+
+    Returns:
+        The callable's qualified name, or its type's name.
+    """
+    name = getattr(function, '__qualname__', None)
+    return name if isinstance(name, str) else type(function).__name__
 
 
 def dispatch_url_for(
@@ -294,13 +546,22 @@ async def request(
         } #Optional
     }
     :param pre_processor_config: Expects Dict {
-        "function": function_address, #required
+        "function": function_address, #required, an async callable
         "params": {
             "param1": value1
-        } #optional
-    } Optional
+        } #optional, a mapping of str keyword names. It may not name
+            "response": this library passes the envelope under that
+            keyword itself
+    } Optional. Both configs are validated *before either runs*, so a
+        malformed post-processor config is refused before the call is
+        dispatched rather than after the remote side has been contacted.
+        The callable is awaited with ``response=<the live envelope>``; it
+        may change what the envelope holds -- rewriting
+        ``response['url']`` from a pre-processor is a supported use -- but
+        it may not *remove* a key, because the protocol clients read them
     :param post_processor_config: Expects Dict
-    {"function": function_address, "params": {"param1": value1}} Optional
+    {"function": function_address, "params": {"param1": value1}} Optional,
+    same shape and same rules
     :param kwargs: Accepted and ignored. Present so a caller passing a
         keyword this version does not read gets the call it asked for
         rather than a ``TypeError``; every option this library acts on is
@@ -366,6 +627,33 @@ async def request(
         ``result['error']['code'] == 'CONFIG'``; a caller who only checks
         ``result['ok']`` sees the envelope-borne ones and none of the
         escaping ones.
+
+        A malformed ``pre_processor_config`` or
+        ``post_processor_config`` joins the escaping set above: not a
+        mapping, no ``"function"`` key, a non-callable ``"function"``, a
+        ``"params"`` that is not a mapping of ``str`` keys, or a
+        ``"params"`` naming ``"response"``. Both are checked before
+        either runs and before anything is dispatched.
+    :raises ProcessorError: If a *valid* processor config's callable
+        fails -- it raised, it refused the ``response`` keyword, it
+        returned something that cannot be awaited, or it removed a key
+        from the envelope it was handed. Deliberately distinct from
+        ``ConfigurationError``: the configuration was accepted and this
+        library called exactly what the caller asked for, so the fault is
+        in the caller's own function rather than in how they configured
+        it. Reports ``PROCESSOR``/500 and chains the original as
+        ``__cause__``.
+
+        It escapes rather than becoming an envelope, and for a
+        post-processor that means forfeiting the response body. That is
+        the accepted cost of the one-conversion-point invariant: an
+        ``ok=False`` envelope would dress a bug in the caller's own
+        cleanup function up as a failed request and overwrite the
+        ``ok=True`` result they were about to read. A callback that must
+        not cost its caller the response handles its own failures. A
+        callback that raises an ``AsyncGatewayError`` itself is passed
+        through untouched, since it has already said what it wants
+        reported.
     """
     # `protocol` and `protocol_info` -- including the keys the chosen
     # protocol requires -- are validated here, at the boundary, before an
@@ -390,6 +678,24 @@ async def request(
     info: Dict[str, Any] = validated_protocol_info(
         protocol_info, required=protocol_class.REQUIRED_INFO_KEYS)
 
+    # Both processor configs, checked here and *both before either runs*.
+    # These are documented public parameters and were the last two read
+    # with no validation at all: `pre_processor_config['function']` was
+    # indexed and awaited raw, so a missing key, a non-callable, a
+    # non-mapping config or a non-mapping `params` each escaped
+    # `request()` as a bare builtin (NEW-2). Validating the *post* config
+    # up here too is the deliberate half: a typo in it is refused before
+    # the call is dispatched, rather than after the remote side has been
+    # contacted and can no longer be un-contacted.
+    pre_processor = (
+        validated_processor_config(
+            pre_processor_config, setting='pre_processor_config')
+        if pre_processor_config else None)
+    post_processor = (
+        validated_processor_config(
+            post_processor_config, setting='post_processor_config')
+        if post_processor_config else None)
+
     if data is None:
         data = {}
 
@@ -407,12 +713,16 @@ async def request(
         redact_query_params=redact_query_params,
     )
 
-    if pre_processor_config:
-        response['pre_processor_response'] = await \
-            pre_processor_config['function'](response=response,
-                                             **pre_processor_config.get(
-                                                 'params',
-                                                 {}))
+    if pre_processor is not None:
+        response['pre_processor_response'] = await run_processor(
+            *pre_processor, response, setting='pre_processor_config')
+        # The envelope goes to a protocol client next, which reads keys
+        # off it directly. A pre-processor that removed one is refused
+        # here, at the boundary, rather than surfacing as a bare
+        # `KeyError` from inside the conversion `try` where nothing
+        # catches it.
+        response = checked_envelope(
+            response, setting='pre_processor_config')
 
     # FI-14. The scheme check runs *after* the pre-processor and against
     # the value that is then handed to the protocol object -- one variable,
@@ -483,10 +793,17 @@ async def request(
         log_failure(
             protocol_name, target_url, response, exc, redact_query_params)
 
-    if post_processor_config:
-        response['post_processor_response'] = \
-            await post_processor_config['function'](
-                response=response,
-                **post_processor_config.get(
-                    'params', {}))
+    if post_processor is not None:
+        response['post_processor_response'] = await run_processor(
+            *post_processor, response, setting='post_processor_config')
+        # Checked on this side too, and for a different reason than the
+        # pre-processor's: no protocol client reads the envelope after
+        # this point, so nothing here can crash -- but the caller does,
+        # and `result['ok']` is the documented and only success
+        # predicate (R8-AC2). A post-processor that deleted it would
+        # have this function return an object whose shape the library
+        # promises and no longer has, which is a broken contract however
+        # self-inflicted. Refusing is the honest report.
+        response = checked_envelope(
+            response, setting='post_processor_config')
     return response

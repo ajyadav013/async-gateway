@@ -27,6 +27,11 @@ STATUS_BY_CODE: Final[Mapping[str, int]] = MappingProxyType({
     'PROTOCOL': 502,
 
     'CONFIG': 400,
+    # The caller's own callback raised. 500 rather than 400: the
+    # configuration was accepted, so this is not a request the caller
+    # malformed -- it is code inside their own function failing while this
+    # library ran it.
+    'PROCESSOR': 500,
     # 502 is the response side (a body that will not parse). The request
     # side -- a body that will not serialise -- is the caller's mistake and
     # passes 400 explicitly.

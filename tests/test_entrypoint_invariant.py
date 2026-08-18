@@ -66,8 +66,41 @@ one to the dev set to reach inputs an explicit matrix already reaches is
 a poor trade. The matrix is parametrised instead, and each family below
 names the *reason* it is hostile so that the next reviewer extends it
 rather than replacing it.
+
+**The blind spot this file had, and the mechanism that closes it.** The
+first 570-row version varied ``headers``, ``cookies``, verbs, ``urls``,
+``protocol_info``, ``data`` and ``auth`` -- and never set
+``pre_processor_config``, ``post_processor_config`` or ``**kwargs`` at
+all. Those three were documented public parameters of ``request()`` the
+whole time, and a review that drove twenty hostile shapes through the
+processor configs found **eighteen** bare builtins (NEW-2). The matrix
+reported the invariant safe on a surface it had never touched.
+
+The lesson is not "add three more families". Hand-listing the parameters
+to cover is what produced a list that was silently three short, and
+hand-listing them again produces a list that goes stale the day a
+parameter is added. So the parameter list is **derived from
+``inspect.signature(request)``** and
+:func:`test_every_public_parameter_of_request_is_covered` fails if any
+parameter has no hostile family bound to it. A future parameter is
+therefore covered *on arrival*: adding one to ``request()`` turns this
+file red until someone writes the hostile values for it, which is exactly
+the moment the thinking is cheapest.
+
+**Pairs, not just singletons.** The ninth escape found while extending
+this file existed precisely because coverage was one-dimensional: a
+*valid* pre-processor that mutated the envelope it was handed left the
+protocol client reading a key that was no longer there. No single-
+parameter row could reach it, because the hostile thing was the
+interaction between a processor and the dispatch that follows it.
+:data:`HOSTILE_PAIRS` therefore varies two parameters at once across the
+security-relevant combinations. It is deliberately a curated list rather
+than the full cross product: 7 families of ~15 values each squared is
+~11,000 rows per protocol, which would trade a tractable suite for
+coverage of pairs nobody has a reason to suspect.
 """
 
+import inspect
 from typing import Any, Final
 
 import pytest
@@ -272,6 +305,304 @@ HOSTILE_AUTH: Final[tuple[Any, ...]] = (
     42,
     object(),
 )
+
+
+async def _good_processor(response: Any = None, **params: Any) -> str:
+    """Behave exactly as a documented processor callback should.
+
+    Args:
+        response: The envelope, as ``request()`` passes it.
+        params: The caller's own ``params``, unused.
+
+    Returns:
+        A sentinel, so a row can tell "it ran" from "it was skipped".
+    """
+    return 'processed'
+
+
+async def _raising_processor(response: Any = None, **params: Any) -> str:
+    """Fail the way a caller's own buggy callback does.
+
+    Args:
+        response: The envelope, unused.
+        params: The caller's own ``params``, unused.
+
+    Returns:
+        Never; this always raises.
+
+    Raises:
+        RuntimeError: Always. A bare builtin, deliberately: the point is
+            that this library converts it rather than letting it out.
+    """
+    raise RuntimeError("the caller's own callback failed")
+
+
+async def _clearing_processor(response: Any = None, **params: Any) -> str:
+    """Empty the live envelope the callback was handed.
+
+    The ninth escape's shape. A processor is given the real envelope by
+    design, so it can also remove from it -- and a protocol client then
+    read ``self.response['payload']`` as a bare ``KeyError`` from inside
+    the one conversion ``try``, where nothing catches it.
+
+    Args:
+        response: The envelope, cleared in place.
+        params: The caller's own ``params``, unused.
+
+    Returns:
+        A sentinel.
+    """
+    response.clear()
+    return 'cleared'
+
+
+async def _payload_deleting_processor(
+    response: Any = None,
+    **params: Any,
+) -> str:
+    """Remove the one envelope key both HTTP and SOAP read before dispatch.
+
+    Narrower than :func:`_clearing_processor` and kept beside it: a
+    guard that checked only for a *wholly* emptied envelope would let
+    this through, and this is the shape that actually crashed.
+
+    Args:
+        response: The envelope, missing ``payload`` on return.
+        params: The caller's own ``params``, unused.
+
+    Returns:
+        A sentinel.
+    """
+    response.pop('payload', None)
+    return 'deleted'
+
+
+def _sync_processor(response: Any = None, **params: Any) -> str:
+    """Return a plain value instead of an awaitable.
+
+    ``await 'x'`` is ``TypeError: 'str' object can't be awaited``, raised
+    at the ``await`` in ``request()`` rather than anywhere a caller can
+    see. Undecidable before the call, which is why it is a runtime
+    concern rather than a config one.
+
+    Args:
+        response: The envelope, unused.
+        params: The caller's own ``params``, unused.
+
+    Returns:
+        A string, which is not awaitable.
+    """
+    return 'not awaitable'
+
+
+def _no_response_kwarg() -> str:
+    """Accept none of the arguments a processor is called with.
+
+    Args:
+        None.
+
+    Returns:
+        A string, never reached: binding fails first with ``TypeError:
+        got an unexpected keyword argument 'response'``.
+    """
+    return 'never reached'
+
+
+#: Processor configurations, hostile in every way the two documented
+#: ``*_processor_config`` parameters can be. This family is NEW-2 itself
+#: and is the blind spot the module docstring describes: these two
+#: parameters were documented public surface (README's argument table,
+#: ``request()``'s own docstring) and the matrix had never set them, so
+#: eighteen of twenty shapes reached the caller as bare builtins --
+#: ``KeyError('function')``, ``TypeError('list indices must be integers
+#: or slices, not str')``, ``TypeError('... argument after ** must be a
+#: mapping, not str')``.
+#:
+#: The rows fall into two groups on purpose, because the library answers
+#: them differently and a caller acts on the difference. The malformed
+#: *configurations* are refused with ``ConfigurationError`` before
+#: anything runs; the well-formed configs whose *callable* misbehaves
+#: raise ``ProcessorError`` after it ran. Both are typed, which is all
+#: this file asserts -- the split itself is asserted in
+#: ``tests/test_entrypoint.py``, where the code and message belong.
+HOSTILE_PROCESSOR_CONFIGS: Final[tuple[Any, ...]] = (
+    # Shapes that are not the documented mapping at all.
+    'a bare string',
+    42,
+    ['function'],
+    (('function', _good_processor),),
+    object(),
+    # A mapping, but not the documented one.
+    {'fn': _good_processor},
+    {'params': {'x': 1}},
+    {'function': None},
+    {'function': 'not callable'},
+    {'function': 42},
+    {'function': []},
+    # A valid callable with malformed `params`.
+    {'function': _good_processor, 'params': 'not a mapping'},
+    {'function': _good_processor, 'params': ['a', 'list']},
+    {'function': _good_processor, 'params': 42},
+    {'function': _good_processor, 'params': {1: 'non-str key'}},
+    {'function': _good_processor, 'params': {None: 'non-str key'}},
+    # `response` is the keyword this library supplies; a caller naming it
+    # too is `TypeError: got multiple values for keyword argument`.
+    {'function': _good_processor, 'params': {'response': 'collision'}},
+    # Well-formed configs whose callable is the problem.
+    {'function': _raising_processor},
+    {'function': _sync_processor},
+    {'function': _no_response_kwarg},
+    {'function': lambda response=None, **k: 42},
+    # Well-formed, and the callback mutilates the envelope it was handed.
+    {'function': _clearing_processor},
+    {'function': _payload_deleting_processor},
+    # Valid rows, kept in the same family so the hostile ones cannot pass
+    # by the parameter being ignored outright.
+    {'function': _good_processor},
+    {'function': _good_processor, 'params': {'extra': 'value'}},
+)
+
+#: ``**kwargs`` values. The documented contract is that an unread keyword
+#: is *accepted and ignored*, so that a caller passing an option this
+#: version does not know gets the call they asked for rather than a
+#: ``TypeError``. That promise is only worth having if it holds for
+#: keywords that collide with this library's own internal names -- which
+#: is what these rows are: ``response`` is the keyword processors are
+#: called with, ``function`` and ``params`` are the processor config's
+#: own keys, and ``info``/``started``/``self`` are local names inside
+#: ``request()``.
+HOSTILE_KWARGS: Final[tuple[dict[str, Any], ...]] = (
+    {'unknown_option': 1},
+    {'response': 'collides with the processor keyword'},
+    {'function': None},
+    {'params': {'x': 1}},
+    {'info': 'collides with a local'},
+    {'started': 'collides with a local'},
+    {'self': 'looks like a method call'},
+    {'timeout': 5},
+    {'headers': {'X': 'y'}},
+    {'kwargs': {'nested': True}},
+    {'protocol_name': 'HTTP'},
+    {'target_url': 'http://elsewhere/'},
+)
+
+#: Two parameters varied at once, for the security-relevant combinations.
+#:
+#: The reason this exists is measured, not theoretical: the ninth escape
+#: found while extending this file was a *valid* pre-processor whose
+#: envelope mutation only became a crash once the call was dispatched.
+#: One-dimensional coverage cannot reach a defect whose two halves are
+#: individually harmless, and every pair below names a mechanism by which
+#: one parameter changes what another does.
+#:
+#: Curated rather than exhaustive. The full cross product of the seven
+#: families is ~11,000 rows per protocol; these are the pairs where an
+#: interaction is plausible, and the module docstring says why that
+#: trade is made.
+HOSTILE_PAIRS: Final[tuple[tuple[str, Any, str, Any], ...]] = tuple(
+    [
+        # A processor runs *before* the URL scheme guard (FI-14) and
+        # *before* dispatch, so it is the parameter most able to change
+        # what another one means. Crossed with every other family's
+        # sharpest value.
+        ('pre_processor_config', processor, second, value)
+        for processor in (
+            {'function': _good_processor},
+            {'function': _clearing_processor},
+            {'function': _payload_deleting_processor},
+            {'function': _raising_processor},
+            {'function': 'not callable'},
+        )
+        for second, value in (
+            ('url', None),
+            ('url', 'http://[::1'),
+            ('data', object()),
+            ('auth', None),
+            ('headers', {'X-Injected': 'value\r\nX-Smuggled: 1'}),
+            ('cookies', {'session': 'value\x00null'}),
+            ('request_type', 'close'),
+            ('protocol_info', 'a bare string'),
+        )
+    ] + [
+        # Both processors configured together: the post-processor runs
+        # after the conversion point, on an envelope a failed call
+        # finalised, so a pre-processor failure and a post-processor
+        # failure interact through what the envelope holds by then.
+        ('pre_processor_config', pre, 'post_processor_config', post)
+        for pre in (
+            {'function': _good_processor},
+            {'function': _clearing_processor},
+            {'function': _raising_processor},
+        )
+        for post in (
+            {'function': _good_processor},
+            {'function': _clearing_processor},
+            {'function': _raising_processor},
+            {'function': None},
+        )
+    ] + [
+        # A post-processor crossed with a call that *fails*, so it runs
+        # against a finalised error envelope rather than a success one.
+        ('post_processor_config', post, second, value)
+        for post in (
+            {'function': _good_processor},
+            {'function': _clearing_processor},
+            {'function': _payload_deleting_processor},
+        )
+        for second, value in (
+            ('url', None),
+            ('data', object()),
+            ('request_type', 'close'),
+            ('headers', {'X-Injected': 'value\r\nX-Smuggled: 1'}),
+        )
+    ] + [
+        # Two non-processor parameters whose validators run in a fixed
+        # order, so one rejecting first can hide the other entirely.
+        ('url', url, second, value)
+        for url in (None, 'http://[::1', '')
+        for second, value in (
+            ('headers', {'X-Injected': 'value\r\nX-Smuggled: 1'}),
+            ('protocol_info', 'a bare string'),
+            ('data', object()),
+            ('auth', None),
+        )
+    ]
+)
+
+#: Which hostile family covers which ``request()`` parameter. The keys
+#: are asserted against ``inspect.signature(request)`` by
+#: :func:`test_every_public_parameter_of_request_is_covered`, so this
+#: mapping cannot silently fall behind the signature -- adding a
+#: parameter to ``request()`` fails that test until a family is bound to
+#: it here.
+#:
+#: ``protocol`` maps to the verb family rather than to one of its own:
+#: an unregistered or non-``str`` protocol is rejected by
+#: ``resolve_protocol`` before any envelope exists, and
+#: ``tests/test_entrypoint.py`` asserts that rejection with its message
+#: and code. What belongs *here* is the surface that reaches further in,
+#: which for the protocol name is the per-protocol verb each one resolves
+#: -- and every family below is already parametrised over all five
+#: protocols, so the protocol axis is crossed with every other family
+#: rather than tested alone.
+COVERING_FAMILY: Final[dict[str, str]] = {
+    'url': 'HOSTILE_URLS',
+    'data': 'HOSTILE_DATA',
+    'auth': 'HOSTILE_AUTH',
+    'protocol': 'PROTOCOLS',
+    'protocol_info': 'HOSTILE_PROTOCOL_INFO',
+    'pre_processor_config': 'HOSTILE_PROCESSOR_CONFIGS',
+    'post_processor_config': 'HOSTILE_PROCESSOR_CONFIGS',
+    'kwargs': 'HOSTILE_KWARGS',
+}
+
+
+#: Names in :data:`HOSTILE_PAIRS` that live inside ``protocol_info``
+#: rather than being top-level ``request()`` parameters. One table can
+#: then name both levels, and the pair test merges each row at the right
+#: depth without a per-row branch.
+_INFO_KEYS: Final[frozenset[str]] = frozenset(
+    {'headers', 'cookies', 'request_type', 'command', 'mode'})
 
 
 def _prepare(
@@ -540,6 +871,161 @@ async def test_no_auth_object_escapes_the_entry_point(
     call = _prepare(monkeypatch, protocol, http_server)
     call['auth'] = auth
     await _assert_only_typed_escapes(**call)
+
+
+@pytest.mark.parametrize('protocol', PROTOCOLS)
+@pytest.mark.parametrize('which',
+                         ('pre_processor_config', 'post_processor_config'))
+@pytest.mark.parametrize('config', HOSTILE_PROCESSOR_CONFIGS)
+async def test_no_processor_config_escapes_the_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+    http_server: RecordingHTTPServer,
+    protocol: str,
+    which: str,
+    config: Any,
+) -> None:
+    """NEW-2's class: no processor configuration produces a bare builtin.
+
+    The family the matrix never set. Both parameters are driven with the
+    same values, because they are documented as the same shape and were
+    read by the same unvalidated two lines.
+
+    Args:
+        monkeypatch: The patcher, for the doubled lane.
+        http_server: The loopback server, for the live lane.
+        protocol: The protocol under test.
+        which: ``'pre_processor_config'`` or ``'post_processor_config'``.
+        config: One hostile processor configuration.
+
+    Returns:
+        None.
+    """
+    call = _prepare(monkeypatch, protocol, http_server)
+    call[which] = config
+    await _assert_only_typed_escapes(**call)
+
+
+@pytest.mark.parametrize('protocol', PROTOCOLS)
+@pytest.mark.parametrize('extra', HOSTILE_KWARGS)
+async def test_no_extra_keyword_escapes_the_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+    http_server: RecordingHTTPServer,
+    protocol: str,
+    extra: dict[str, Any],
+) -> None:
+    """``**kwargs`` is documented as accepted and ignored; hold it to that.
+
+    An unread keyword must not crash the call, and specifically must not
+    crash it by colliding with a name this library uses internally --
+    which is what every row here is chosen to do.
+
+    Args:
+        monkeypatch: The patcher, for the doubled lane.
+        http_server: The loopback server, for the live lane.
+        protocol: The protocol under test.
+        extra: One extra keyword argument mapping.
+
+    Returns:
+        None.
+    """
+    call = _prepare(monkeypatch, protocol, http_server)
+    call.update(extra)
+    await _assert_only_typed_escapes(**call)
+
+
+@pytest.mark.parametrize('protocol', PROTOCOLS)
+@pytest.mark.parametrize(
+    'first,first_value,second,second_value',
+    HOSTILE_PAIRS,
+    ids=lambda value: repr(value)[:40],
+)
+async def test_no_pair_of_parameters_escapes_the_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+    http_server: RecordingHTTPServer,
+    protocol: str,
+    first: str,
+    first_value: Any,
+    second: str,
+    second_value: Any,
+) -> None:
+    """Two hostile parameters at once, for the pairs that can interact.
+
+    The one-dimensional matrix could not have found the ninth escape,
+    because neither half of it was hostile alone: a *valid* pre-processor
+    that emptied the envelope only crashed once the dispatch that follows
+    read a key from it.
+
+    ``headers``, ``cookies`` and ``request_type`` are ``protocol_info``
+    keys rather than top-level parameters and are merged in as such, so
+    one table can name both levels without a per-row branch at the call
+    site.
+
+    Args:
+        monkeypatch: The patcher, for the doubled lane.
+        http_server: The loopback server, for the live lane.
+        protocol: The protocol under test.
+        first: The first parameter's name.
+        first_value: The first parameter's hostile value.
+        second: The second parameter's name.
+        second_value: The second parameter's hostile value.
+
+    Returns:
+        None.
+    """
+    call = _prepare(monkeypatch, protocol, http_server)
+    for name, value in ((first, first_value), (second, second_value)):
+        if name in _INFO_KEYS:
+            call['protocol_info'][name] = value
+        else:
+            call[name] = value
+    await _assert_only_typed_escapes(**call)
+
+
+def test_every_public_parameter_of_request_is_covered() -> None:
+    """The mechanism that stops this file going stale (NEW-2's real half).
+
+    The matrix's blind spot was not a missing test, it was a
+    **hand-written list of parameters that was silently three short**:
+    ``pre_processor_config``, ``post_processor_config`` and ``**kwargs``
+    had been documented public surface all along, and a review found
+    eighteen bare builtins behind them.
+
+    Hand-listing them again would go stale the same way, so the list is
+    read off ``inspect.signature(request)`` and compared with
+    :data:`COVERING_FAMILY`. Adding a parameter to ``request()`` fails
+    this test until a hostile family is bound to it -- which is the
+    point: a future parameter is covered *on arrival* rather than
+    remembered about later.
+
+    Returns:
+        None.
+    """
+    signature = set(inspect.signature(request).parameters)
+    assert signature, (
+        'inspect.signature(request) reported no parameters at all, which '
+        'means this test is checking nothing')
+
+    uncovered = sorted(signature - set(COVERING_FAMILY))
+    assert not uncovered, (
+        f'request() takes {uncovered} and no hostile family in this file '
+        f'covers them. That is exactly how the processor configs went '
+        f'unchecked for the life of the package: they were public, '
+        f'documented, and nobody had added them to the matrix. Add '
+        f'hostile values for each and bind them in COVERING_FAMILY.')
+
+    stale = sorted(set(COVERING_FAMILY) - signature)
+    assert not stale, (
+        f'COVERING_FAMILY claims to cover {stale}, which request() no '
+        f'longer takes. A stale entry hides a real gap, because the '
+        f'count looks right.')
+
+    missing = sorted(
+        name for name in set(COVERING_FAMILY.values())
+        if name not in globals())
+    assert not missing, (
+        f'COVERING_FAMILY names {missing}, which this module does not '
+        f'define. The binding has to point at a family that exists or it '
+        f'proves nothing.')
 
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
