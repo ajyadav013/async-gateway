@@ -12,6 +12,7 @@ acceptance criterion it proves.
 """
 
 import asyncio
+import importlib
 import itertools
 import json
 import logging
@@ -1597,6 +1598,27 @@ FUZZ_USERINFO = [
 FUZZ_HOSTS = ['127.0.0.1', '[::1', '[::1]', 'host:1', 'ho\tst']
 FUZZ_TAILS = ['/p', '?a=1', '#f', '']
 
+#: The axis NEW-1 came in through, and the reason it is an axis rather
+#: than a row: what leaked was not one character but a whole *class* the
+#: corpus could not express. Every spelling above began at the URL, so a
+#: leading C0-control or space -- which ``_urlsplit`` lstrips **before**
+#: it deletes tab/newline/CR -- was structurally ungenerable, and the
+#: 27 C0 characters that are not tab, newline or CR shifted the parser's
+#: offsets without shifting the scanner's. ``\x00//user:PW@h/p`` is a
+#: protocol-relative reference both readers find a password in; the
+#: scanner's ``\A``-anchored separator run found ``\x00`` at offset 0,
+#: matched nothing, and published it.
+#:
+#: Crossed with every other axis rather than sampled, because the two
+#: halves of the parser's normalisation interact: ``'\t\x00'`` is the
+#: row that fails if the strip and the delete are applied in the wrong
+#: order, and only a product produces it next to a separator run that
+#: also carries whitespace.
+FUZZ_LEADS = [
+    '', '\x00', '\x01', '\x1f', ' ', '\x0b', '\x0c',
+    '\x00 \x1f', '\t\x00', '  ',
+]
+
 
 def fuzz_spellings() -> set[str]:
     """Generate every URL spelling the differential check reads.
@@ -1617,16 +1639,25 @@ def fuzz_spellings() -> set[str]:
     a password out of -- could not be produced at all, and the two
     maskers disagreed about it for a release (F2).
 
+    :data:`FUZZ_LEADS` is the same lesson a third time, and the reason
+    every axis here is a *product* rather than a list of remembered
+    inputs. The generator began each spelling at the URL, so nothing it
+    produced could carry a leading C0 character -- and that was the one
+    half of ``_urlsplit``'s normalisation ``_parser_view`` did not model
+    (NEW-1). A corpus is only as strong as the shapes it can express,
+    and both times the gap has been a *position* nothing could be
+    generated at, not a character nobody thought of.
+
     Returns:
         The distinct spellings to check, de-duplicated.
     """
     spellings: set[str] = set()
     for parts in itertools.product(
-            FUZZ_SCHEMES, FUZZ_SEPARATORS, FUZZ_USERINFO,
+            FUZZ_LEADS, FUZZ_SCHEMES, FUZZ_SEPARATORS, FUZZ_USERINFO,
             FUZZ_HOSTS, FUZZ_TAILS):
-        scheme, separators, userinfo, host, tail = parts
+        lead, scheme, separators, userinfo, host, tail = parts
         prefix = f'{scheme}:' if scheme else ''
-        url = f'{prefix}{separators}{userinfo}@{host}{tail}'
+        url = f'{lead}{prefix}{separators}{userinfo}@{host}{tail}'
         spellings.add(url)
         try:
             spellings.add(str(yarl.URL(url)))
@@ -1820,6 +1851,154 @@ def test_the_deleted_character_set_is_taken_from_the_parser() -> None:
     assert redaction._URL_IGNORED == frozenset({'\t', '\n', '\r'})
 
 
+@pytest.mark.parametrize(
+    'lead',
+    [
+        pytest.param('', id='no-prefix'),
+        pytest.param(' ', id='a-space'),
+        pytest.param('\x00', id='a-null'),
+        pytest.param('\x00 \x1f', id='a-mixed-run'),
+        # The order-pinning row. `\t` is *both* a C0 character the
+        # parser lstrips and one of the three it deletes, so this run
+        # is the only shape that tells CPython's order from its
+        # reverse. Strip-then-delete (CPython's, and this module's)
+        # consumes `\t\x00` at the strip and reads `mailto:bob@...` --
+        # which is what `urlsplit` actually reports for this string.
+        # Delete-then-strip removes the `\t` first, leaves `\x00` for
+        # the strip, and lands one offset further along, where the
+        # scanner reads a *separator run* before `mailto:` and masks
+        # the address a plain `mailto:bob@corp.example` keeps.
+        #
+        # Without this row a module that models the parser's two steps
+        # in the wrong order passes every other assertion in the file.
+        pytest.param('\t\x00', id='a-tab-then-a-null-pinning-the-order'),
+        pytest.param('\t\x00\t ', id='the-same-run-with-more-of-both'),
+    ],
+)
+def test_a_stripped_prefix_does_not_change_what_counts_as_a_credential(
+    lead: str,
+) -> None:
+    """The strip decides *offsets*, and must decide nothing else.
+
+    ``_parser_view``'s lstrip exists so the scanner walks the parser's
+    offsets. It is not a licence to reach a different verdict about the
+    same URL, and before it was added the module reached one: with no
+    prefix ``mailto:bob@corp.example`` kept its address -- ``mailto``
+    is not a scheme ``urllib.parse`` reads a netloc after, so a bare
+    userinfo under it is an address and not a token -- while
+    ``' mailto:bob@corp.example'`` masked it, because the leading space
+    was read as a *separator run* and a separator run means "authority,
+    mask the bare token too".
+
+    One character of leading whitespace flipping an address into a
+    credential is the same disagreement this module keeps having, just
+    pointed the other way: over-masking rather than under-masking. It
+    costs a diagnostic instead of a secret, which is why it survived,
+    but it is still two readings of one string.
+
+    So each row asserts the verdict is the prefix's business only for
+    where the credential *is*, never for whether there is one.
+    """
+    # `mailto:` is outside `uses_netloc`, so a bare userinfo under it
+    # is an address: kept, with or without a prefix.
+    assert redact_text(
+        f'{lead}mailto:bob@corp.example') == f'{lead}mailto:bob@corp.example'
+    # `http:` is inside it, so the same shape is a token: masked, with
+    # or without a prefix.
+    assert redact_text(
+        f'{lead}http:TOKENPW@h/p') == f'{lead}http:{REDACTED}@h/p'
+    # And a `user:password` is a credential under any scheme at all.
+    assert redact_text(
+        f'{lead}a:u:ANYSCHEMEPW@h/p') == f'{lead}a:u:{REDACTED}@h/p'
+
+
+def test_the_stripped_character_set_is_taken_from_the_parser() -> None:
+    """The *other* constant, and the one whose absence was NEW-1.
+
+    ``_urlsplit`` normalises in two steps -- lstrip
+    ``_WHATWG_C0_CONTROL_OR_SPACE``, then delete
+    ``_UNSAFE_URL_BYTES_TO_REMOVE`` -- and this module modelled only the
+    second for five rounds. The row above has asserted the deletion set
+    comes from the parser since NEW-M1c; nothing asserted the strip set,
+    because nothing read one.
+
+    So this is that row's twin, and it exists for the same reason: a
+    hand-written copy of either half is a spelling waiting to diverge,
+    and the half that was missing is exactly the half that leaked.
+    """
+    assert redaction._C0_OR_SPACE == (
+        urllib.parse._WHATWG_C0_CONTROL_OR_SPACE)
+    # The set is C0 plus the space -- 33 characters, which is 27 more
+    # than the six `_AUTHORITY_SEPARATORS` used to name.
+    assert set(redaction._C0_OR_SPACE) == {
+        chr(point) for point in range(0x20)} | {' '}
+
+
+def test_the_separator_run_consumes_everything_the_parser_may_strip(
+) -> None:
+    r"""The two halves are derived from one constant, not written twice.
+
+    ``_parser_view`` strips a C0 run at offset 0 because the parser
+    does. A URL quoted *inside prose* has no offset 0 of its own,
+    though -- ``redact_text`` sees the sentence as the head -- so the
+    run has to be consumed by :data:`_AUTHORITY_SEPARATORS` instead,
+    and the set that shipped listed ``\\v`` and ``\\f`` but not
+    ``\\x00``. That asymmetry was the surviving half of NEW-1: the same
+    URL was masked bare and published inside a traceback.
+
+    Deriving the separator set from the strip set is what closes it by
+    construction, so this asserts the containment rather than the
+    membership of any one character.
+    """
+    separators = set(redaction._AUTHORITY_SEPARATORS)
+
+    assert set(redaction._C0_OR_SPACE) <= separators
+    assert {'/', '\\'} <= separators
+
+
+def test_an_interpreter_without_the_strip_constant_masks_more(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fallback must fail **closed**, and be seen to.
+
+    Both constants are private names, so both are read with a fallback,
+    and a fallback nothing exercises is how a fallback quietly becomes
+    the operative value. The deletion set's fallback is the WHATWG
+    three; the strip set's deliberately is **not** a hand-spelled
+    WHATWG set, because hand-spelling it is the mistake this whole
+    module is a record of.
+
+    It is instead every character at or below U+0020 -- a *superset* of
+    any C0-or-space definition CPython could adopt. On an interpreter
+    that renamed the constant this module therefore strips more than
+    the parser does, which costs a diagnostic character position and
+    cannot cost a password. That is the direction the choice has to
+    fall, and this row is what proves it falls that way rather than
+    asserting it in a comment.
+    """
+    monkeypatch.delattr(
+        urllib.parse, '_WHATWG_C0_CONTROL_OR_SPACE', raising=True)
+    reloaded = importlib.reload(redaction)
+    try:
+        assert not hasattr(urllib.parse, '_WHATWG_C0_CONTROL_OR_SPACE')
+        # A superset of the real set, never a subset: masking more is
+        # the recoverable failure.
+        assert set(reloaded._C0_OR_SPACE) >= {
+            chr(point) for point in range(0x21)}
+        # And it still masks, which is the only thing the fallback is
+        # for -- a fail-closed constant that broke the masker would be
+        # no better than a fail-open one.
+        masked = reloaded.redact_text('\x00//user:FALLBACKPW@h/p')
+        assert 'FALLBACKPW' not in masked
+        assert masked == f'\x00//user:{reloaded.REDACTED}@h/p'
+    finally:
+        # Restored for every later test in the session: this module is
+        # imported by name at the top of this file, and leaving the
+        # reloaded copy in `sys.modules` would leave those references
+        # pointing at a module built from a mutated `urllib.parse`.
+        monkeypatch.undo()
+        importlib.reload(redaction)
+
+
 def test_masking_reports_the_string_the_caller_actually_passed() -> None:
     """Scanning the parser's view must not rewrite the diagnostic.
 
@@ -1838,6 +2017,49 @@ def test_masking_reports_the_string_the_caller_actually_passed() -> None:
 
     assert 'VIEWPW' not in masked
     assert masked == f'http:\t//user:{REDACTED}@host/p'
+
+
+@pytest.mark.parametrize(
+    'url, secret',
+    [
+        pytest.param(
+            '\x00//user:KEEPNULLPW@host/p', 'KEEPNULLPW', id='a-null'),
+        pytest.param(
+            '  //user:KEEPSPACEPW@host/p', 'KEEPSPACEPW', id='two-spaces'),
+        pytest.param(
+            '\x00 \x1f//user:KEEPMIXEDPW@host/p', 'KEEPMIXEDPW',
+            id='a-mixed-c0-and-space-run'),
+        pytest.param(
+            '\t\x00//user:KEEPBOTHPW@host/p', 'KEEPBOTHPW',
+            id='a-run-spanning-both-normalisation-steps'),
+    ],
+)
+def test_a_stripped_prefix_survives_into_the_diagnostic(
+    url: str,
+    secret: str,
+) -> None:
+    r"""The strip decides where to mask, never what to report.
+
+    The twin of the row above, for the half of the normalisation NEW-1
+    added. ``_parser_view`` now lstrips a leading C0 run because
+    ``_urlsplit`` does -- but the caller typed that run, and the
+    redacted URL is a record of what they typed. A fix that scanned the
+    stripped view *and returned it* would mask correctly and silently
+    rewrite every diagnostic, reporting ``//u:***@h`` for a call the
+    caller made as ``\\x00//u:PW@h``.
+
+    That is not a cosmetic difference: a leading null is often the
+    whole reason a request behaved oddly, and deleting it from the log
+    hides the evidence of the very thing being debugged.
+    """
+    masked = redact_text(url)
+
+    assert secret not in masked
+    assert masked == url.replace(secret, REDACTED)
+    # And the same string, character for character, on the other three
+    # surfaces -- the disagreement between them is what NEW-1 was.
+    assert redact_url(url) == masked
+    assert redact_value(url) == masked
 
 
 @pytest.mark.parametrize(
@@ -1887,6 +2109,38 @@ def test_masking_reports_the_string_the_caller_actually_passed() -> None:
         pytest.param(
             'a:u:NONNETLOCPW@h/p', 'NONNETLOCPW',
             id='a-password-under-a-scheme-outside-the-netloc-table'),
+        # NEW-1. A leading C0 character is the *parser's* business --
+        # `_urlsplit` lstrips it before it does anything else -- so
+        # unlike the rows above, both readers DO report a password
+        # here. These are on this parametrisation anyway because it
+        # checks all four surfaces at once, and the surviving half of
+        # NEW-1 was one surface (`extra['traceback']`) disagreeing with
+        # the other three.
+        pytest.param(
+            '\x00//user:NULLPW@ftp.invalid/f', 'NULLPW',
+            id='a-null-before-a-protocol-relative-authority'),
+        pytest.param(
+            '\x1f//user:UNITSEPPW@h/p', 'UNITSEPPW',
+            id='a-unit-separator-before-the-same'),
+        pytest.param(
+            '\x01//user:SOHPW@h/p', 'SOHPW',
+            id='a-start-of-heading-before-the-same'),
+        # The order-dependent row: a tab *then* a null. CPython strips
+        # the C0 run first and deletes tab/newline/CR second, so the
+        # tab is still present when the strip runs and the strip stops
+        # at it. A view built in the other order would see `//` at
+        # offset 0 and mask; a view built in CPython's order sees
+        # `\t\x00//` and must reach the authority through the
+        # separator run instead. Both must mask, which is the point.
+        pytest.param(
+            '\t\x00//user:ORDERPW@h/p', 'ORDERPW',
+            id='a-tab-then-a-null-the-order-dependent-shape'),
+        pytest.param(
+            '\x00\t//:COLONFIRSTPW@127.0.0.1', 'COLONFIRSTPW',
+            id='a-null-then-a-tab-with-an-empty-username'),
+        pytest.param(
+            '\x00http://user:SCHEMEDPW@h/p', 'SCHEMEDPW',
+            id='a-null-before-a-scheme-ful-url'),
     ],
 )
 def test_whitespace_in_the_separator_run_is_masked(

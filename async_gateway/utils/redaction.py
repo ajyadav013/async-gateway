@@ -239,7 +239,43 @@ _URL_QUERY_PAIR: Final[re.Pattern[str]] = _pair_pattern(
 # The scheme run is bounded at 32 for the same reason `_EMBEDDED_URL`'s
 # is: unbounded, it retries from every offset on a long string carrying
 # no `:`. 32 characters is far longer than any registered scheme.
+
+# The other half of the parser's normalisation, and modelling only the
+# first half is what NEW-1 was. `urllib/parse.py`'s `_urlsplit` runs
+# **two** steps before it parses anything:
 #
+#     url = url.lstrip(_WHATWG_C0_CONTROL_OR_SPACE)
+#     for b in _UNSAFE_URL_BYTES_TO_REMOVE:
+#         url = url.replace(b, '')
+#
+# `_URL_IGNORED` above modelled the deletion and not the lstrip, so 27
+# C0 characters shifted the parser's offsets without shifting the
+# scanner's. `\x00//user:PW@ftp.invalid/f` is a protocol-relative
+# reference `urlsplit` and `yarl` both read a full netloc out of, while
+# the scanner -- whose `\A` anchor requires the separator run at offset
+# 0 -- found `\x00` there instead, matched nothing, and published the
+# password on the envelope `url`, `extra['url']` and the raised
+# `ConfigurationError` across all five protocols.
+#
+# The fix is not "add the 27 characters": that is the hand-listing this
+# module's whole history argues against, and it would be a sixth
+# spelling the moment CPython's set moved. It is to read the parser's
+# own constant and apply the parser's own two steps in the parser's own
+# order, which :func:`_parser_view` now does.
+#
+# The fallback is the fail-closed direction, and it is deliberately
+# *not* the WHATWG set spelled out by hand. If the private name is
+# absent, this masks **more**, not less: every character at or below
+# U+0020 is treated as leading noise the parser might strip, which is a
+# superset of any C0-or-space definition CPython could adopt. Over-
+# stripping costs a diagnostic character position; under-stripping
+# publishes a password, and only one of those is recoverable. A test
+# exercises this branch directly, because an untested fallback is how a
+# fallback becomes the operative value without anyone noticing.
+_C0_OR_SPACE: Final[str] = getattr(
+    _parse, '_WHATWG_C0_CONTROL_OR_SPACE',
+    ''.join(chr(point) for point in range(0x21)))
+
 # `//` is the separator RFC 3986 gives; every other spelling is what
 # group 2 exists to consume -- `/\/`, `\\`, `///`, ` //`, or nothing at
 # all. A browser, `yarl` and `urlsplit` disagree about which of those
@@ -252,7 +288,26 @@ _URL_QUERY_PAIR: Final[re.Pattern[str]] = _pair_pattern(
 # password, while `aiohttp` round-trips the same string to
 # `http:///%20//user:PW@host/p` and puts the password in the envelope
 # `url`, `extra['url']` and the logged traceback (NEW-M1c).
-_AUTHORITY_SEPARATORS: Final[str] = '/\\ \t\n\r\v\f'
+#
+# Which whitespace, though, is `_C0_OR_SPACE`'s question and not a
+# second hand-written answer to it -- and that distinction is the other
+# half of NEW-1. `_parser_view` strips a C0 run at offset 0 because the
+# parser does, but a URL quoted *inside prose* has no offset 0 of its
+# own: `redact_text` sees `...not parseable: \x00//:PW@h` as one string
+# whose head is the sentence, so nothing is stripped and the run has to
+# be consumed here, by the separator pattern, exactly as ` //` already
+# is. The set that shipped listed `\v` and `\f` -- both C0 -- and not
+# `\x00` through `\x1f`, so the space and the vertical tab were masked
+# in prose and the null was published (NEW-1, on `extra['traceback']`).
+#
+# Deriving it from the same constant the strip uses is what makes the
+# two agree by construction: a character the parser may ignore at the
+# head of a URL is a character this pattern may consume before an
+# authority, and neither list can grow a member the other lacks. `/`
+# and `\` are added because they are separators RFC 3986 and the
+# browsers give, which no normalisation strips.
+_AUTHORITY_SEPARATORS: Final[str] = ''.join(
+    sorted(set('/\\') | set(_C0_OR_SPACE)))
 
 # Each separator in *both* spellings it can reach this module in: the
 # character, and its percent-encoded form, which is what a round trip
@@ -336,11 +391,10 @@ _AT_SIGN: Final[frozenset[str]] = frozenset('@')
 # point of this line: a hand-written copy is a fifth spelling waiting to
 # diverge, which is the entire history of this module.
 #
-# A private name, so it is read defensively: on an interpreter that has
-# renamed or dropped it, the fallback is the same three characters the
-# WHATWG URL standard fixes, and the standard is what CPython is
-# tracking. A test asserts the two agree on this interpreter, so the
-# fallback cannot quietly become the operative value.
+# A private name, so it is read defensively -- see `_C0_OR_SPACE` below
+# for what the fallback deliberately does. A test asserts the two agree
+# on this interpreter, so the fallback cannot quietly become the
+# operative value.
 _URL_IGNORED: Final[frozenset[str]] = frozenset(
     getattr(_parse, '_UNSAFE_URL_BYTES_TO_REMOVE', ('\t', '\n', '\r')))
 
@@ -366,7 +420,7 @@ def _offsets_of(text: str, characters: frozenset[str]) -> list[int]:
 
 
 def _parser_view(text: str) -> tuple[str, Optional[list[int]]]:
-    """Return ``text`` as ``urlsplit`` sees it, plus the map back to it.
+    r"""Return ``text`` as ``urlsplit`` sees it, plus the map back to it.
 
     **This is the fix for the class of defect, not for one more input
     shape.** Four rounds of findings have now come from the same root
@@ -376,13 +430,33 @@ def _parser_view(text: str) -> tuple[str, Optional[list[int]]]:
     guarantees a fifth spelling exists; the only durable answer is to
     stop having two.
 
-    So the deletion ``urlsplit`` performs is performed here first, from
-    ``urllib.parse``'s own constant. ``http:<TAB>//user:PW@[::1/p``
-    reaches a server as ``http://user:PW@[::1/p`` -- the tab is simply
-    gone -- while the scanner read the ``//`` after it as the start of a
-    *path*, ended the authority before the ``@``, and masked nothing. It
-    now scans the same characters the parser will, so the two cannot
-    disagree about where the credential is (NEW-M1c).
+    So the normalisation ``urlsplit`` performs is performed here first,
+    from ``urllib.parse``'s own constants and in ``urllib.parse``'s own
+    order. ``http:<TAB>//user:PW@[::1/p`` reaches a server as
+    ``http://user:PW@[::1/p`` -- the tab is simply gone -- while the
+    scanner read the ``//`` after it as the start of a *path*, ended the
+    authority before the ``@``, and masked nothing. It now scans the
+    same characters the parser will, so the two cannot disagree about
+    where the credential is (NEW-M1c).
+
+    **Both** of the parser's steps, which is NEW-1 and the reason this
+    docstring is not the one that shipped. ``_urlsplit`` lstrips
+    :data:`_C0_OR_SPACE` *and then* deletes :data:`_URL_IGNORED`; this
+    modelled only the deletion, so 27 C0 characters moved the parser's
+    offsets and not the scanner's, and ``\x00//user:PW@h/p`` -- a
+    protocol-relative reference both readers find a password in -- had
+    a ``\x00`` where the scanner's ``\A``-anchored separator run needed
+    the ``//``. Nothing matched and the password was published whole.
+    Modelling half of a normalisation is modelling a *different*
+    normalisation, and the offsets it produces are wrong by exactly the
+    part left out.
+
+    The order is load-bearing and is CPython's, not a choice made here:
+    lstrip first, delete second. Deleting first would let a tab hide a
+    C0 character from the strip -- ``\t\x00//u:PW@h/p`` strips to
+    ``\x00//...`` under one order and to ``//...`` under the other --
+    and a scanner that picked the other order would be a sixth spelling
+    of the same defect rather than a fix for the fifth.
 
     Masking has to land on the caller's *original* string, though: the
     returned diagnostic is a record of what they actually passed, and
@@ -400,20 +474,36 @@ def _parser_view(text: str) -> tuple[str, Optional[list[int]]]:
         text: The string about to be scanned for credentials.
 
     Returns:
-        The text with every character :data:`_URL_IGNORED` deleted, and a
-        list whose *i*-th entry is where view offset *i* sits in the
-        original -- one entry longer than the view, so the end offset
-        maps too. The list is None when nothing was deleted and the two
-        coordinate systems are therefore the same.
+        The text normalised as ``_urlsplit`` normalises it -- leading
+        :data:`_C0_OR_SPACE` stripped, then every :data:`_URL_IGNORED`
+        character deleted -- and a list whose *i*-th entry is where view
+        offset *i* sits in the original, one entry longer than the view
+        so the end offset maps too. The list is None when the
+        normalisation changed nothing and the two coordinate systems are
+        therefore the same.
     """
-    if not _URL_IGNORED.intersection(text):
+    head = len(text) - len(text.lstrip(_C0_OR_SPACE))
+    if not head and not _URL_IGNORED.intersection(text):
         return text, None
     origin = [
-        offset for offset, char in enumerate(text)
-        if char not in _URL_IGNORED
+        offset for offset in range(head, len(text))
+        if text[offset] not in _URL_IGNORED
     ]
     view = ''.join(text[offset] for offset in origin)
     origin.append(len(text))
+    # The parser ignored the leading run; the caller still typed it, and
+    # what comes back is a record of what they typed. View offset 0 is
+    # therefore sliced from original offset 0 rather than from `head`,
+    # so the ignored prefix stays in the diagnostic exactly as the
+    # deleted characters further in do.
+    #
+    # Safe for every offset that is not 0, because no offset other than
+    # 0 is ever both looked up and left of a mask: `_mask_userinfo`
+    # starts `read` at 0 and only advances it, and the `keep_to` it
+    # slices to is at least 1 whenever a mask happens at all -- a match
+    # that ends at view offset 0 carries neither a scheme nor a
+    # separator run, and `_bears_an_authority` refuses it.
+    origin[0] = 0
     return view, origin
 
 
