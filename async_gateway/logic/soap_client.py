@@ -936,23 +936,30 @@ class SoapRequest(BaseRequestClass):
         # three of them.
         self.trace_config: List[aiohttp.TraceConfig] = validated_trace_config(
             self.info, self.session, redact_params=self.redact_params)
-        self.trace_collectors: List[MutableMapping[str, Any]] = (
-            trace_collectors_for(self.session, self.trace_config))
-        # Derived from the bind above, exactly as `logic/http_client.py`
-        # derives its own, rather than re-read off the tracers. Two
-        # reasons, and the first is why this is a type fix and not a
-        # rewrite: reading `tracer.results_collector` reached an
+        # Both collector lists are *bound per call*, in
+        # :meth:`handle_request`, not here -- the same placement
+        # `logic/http_client.py` uses, and for the same reason (H17). A
+        # tracer is a session-level object a caller may reuse across
+        # concurrent calls, so the mapping this call's results go into
+        # cannot be chosen at construction: `trace_collectors_for` binds
+        # a fresh one into the *running task's* context, and a task
+        # started by `asyncio.gather` gets its own copy of that context.
+        # Binding here would put every concurrent call's results in
+        # whichever context happened to build the objects. Empty until
+        # then, so a call that raises before dispatch still reports `[]`
+        # rather than a stale mapping.
+        #
+        # `reported_collectors` is derived from that bind, exactly as
+        # `logic/http_client.py` derives its own, rather than re-read off
+        # the tracers: reading `tracer.results_collector` reaches an
         # attribute `aiohttp.TraceConfig` does not declare -- this
         # library attaches it in `request_tracer()` -- so the only other
         # way to type the line was a `type: ignore` for a lookup the
-        # module next door already avoids. The second is that the two
-        # HTTP-family protocols now put the same kind of object into the
-        # same envelope key, which is what `request_tracer` being one
-        # documented key means. A caller-supplied session leaves
-        # `trace_config` empty either way, so `[]` is still what such a
-        # call reports.
-        self.reported_collectors: List[MutableMapping[str, Any]] = (
-            [] if self.session is not None else list(self.trace_collectors))
+        # module next door already avoids. It is deliberately narrower
+        # than `trace_collectors`: only the tracers this library
+        # attached, so a caller-supplied session still reports `[]`.
+        self.trace_collectors: List[MutableMapping[str, Any]] = []
+        self.reported_collectors: List[MutableMapping[str, Any]] = []
         self.max_response_bytes: int = validated_max_response_bytes(
             self.info.get('max_response_bytes', MAX_RESPONSE_BYTES))
         self.allow_redirects: bool = validated_allow_redirects(
@@ -998,6 +1005,22 @@ class SoapRequest(BaseRequestClass):
             ConnectError: When the connection is refused or reset.
             TransportError: For any other client-side transport failure.
         """
+        # Bound here, inside the coroutine, and deliberately not in
+        # `__init__` -- see the note on the attributes there (H17).
+        self.trace_collectors = trace_collectors_for(
+            self.session, self.trace_config)
+        self.reported_collectors = (
+            [] if self.session is not None else list(self.trace_collectors))
+        # Put them on the envelope *now*, not after a successful parse.
+        # These are the live mappings the callbacks write into, so the
+        # envelope tracks them in place -- which is the only way a
+        # *failed* call carries a trace at all. Assigning in
+        # :meth:`_answer` meant every failure reported `[]`, including
+        # the connection error whose `on_request_exception` is the one
+        # event M20 is about: the tracer recorded it faithfully and the
+        # envelope threw it away. `logic/http_client.py` closed this on
+        # its side and this module was left behind.
+        self.response['request_tracer'] = self.reported_collectors
         if self.session is not None:
             return await self._exchange(self.session)
         async with aiohttp.ClientSession(
@@ -1085,6 +1108,15 @@ class SoapRequest(BaseRequestClass):
         3. **Only then the status**, so a 500 that carried neither a Fault
            nor a parse problem is the ``HTTP_STATUS`` it is.
 
+        ``request_tracer`` is **not** written here. It is assigned in
+        :meth:`handle_request`, at the moment the trace scope is bound,
+        because the mappings are live: the callbacks keep writing into
+        them and the envelope tracks them in place. Assigning here
+        instead made the key reachable only on the path that got a
+        response back, so every failed call reported ``[]`` -- including
+        the connection error whose ``on_request_exception`` the tracer
+        had recorded correctly and the envelope then discarded.
+
         Args:
             result: What the transport boundary returned.
 
@@ -1099,7 +1131,6 @@ class SoapRequest(BaseRequestClass):
         self.response['headers'] = redact_headers(result['headers'])
         self.response['cookies'] = redact_cookies(result['cookies'])
         self.response['text'] = result['text']
-        self.response['request_tracer'] = self.reported_collectors
         self.response['protocol_details'] = {
             'soap_version': self.soap_version,
             'soap_body': None,
