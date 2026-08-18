@@ -462,9 +462,23 @@ def install_transport(
 #: :data:`LOCAL_IO_CATEGORIES` below is the second axis, kept separate
 #: because its rows are driven the opposite way round -- the transport
 #: must *succeed* for the disk to be reached at all.
+#:
+#: ``TIMEOUT`` and ``TIMEOUT_BUILTIN`` are one category on 3.11+ and two
+#: on 3.10, and the split is the behavioural half of AGW-N1. Every
+#: protocol's fault for ``TIMEOUT`` is ``asyncio.TimeoutError()``, which
+#: from 3.11 *is* the builtin -- so on every interpreter this guard has
+#: ever run on, the row asked a question the tables could answer: on
+#: 3.11+ because the two names denote one class, and on 3.10 because
+#: ``asyncio.TimeoutError`` is the one name every table did have. The
+#: guard has a ``TIMEOUT`` category and it passed, twice, while two of
+#: three tables were missing the class a socket read actually raises.
+#: ``TIMEOUT_BUILTIN`` raises the *builtin* by name, which is the same
+#: object on 3.11+ (a free duplicate) and the discriminating one on
+#: 3.10.
 FAULT_CATEGORIES: tuple[str, ...] = (
     'TLS',
     'TIMEOUT',
+    'TIMEOUT_BUILTIN',
     'CONNECT',
     'DNS',
     'PROTOCOL',
@@ -561,6 +575,7 @@ def _dns_error() -> aiohttp.ClientConnectorDNSError:
 _AIOHTTP_FAULTS: dict[str, Callable[[], BaseException]] = {
     'TLS': lambda: ssl.SSLError('handshake failed'),
     'TIMEOUT': lambda: asyncio.TimeoutError(),
+    'TIMEOUT_BUILTIN': lambda: TimeoutError('timed out'),
     'CONNECT': lambda: aiohttp.ClientConnectionError('connection refused'),
     'DNS': _dns_error,
     'PROTOCOL': lambda: aiohttp.ClientPayloadError('malformed chunk'),
@@ -573,12 +588,14 @@ PROTOCOL_FAULTS: dict[str, dict[str, Callable[[], BaseException]]] = {
     'FTP': {
         'TLS': lambda: ssl.SSLError('handshake failed'),
         'TIMEOUT': lambda: asyncio.TimeoutError(),
+        'TIMEOUT_BUILTIN': lambda: TimeoutError('timed out'),
         'CONNECT': lambda: ConnectionRefusedError('connection refused'),
         'DNS': lambda: socket.gaierror('name not resolved'),
         'PROTOCOL': lambda: aioftp.AIOFTPException('malformed reply'),
     },
     'SFTP': {
         'TIMEOUT': lambda: asyncio.TimeoutError(),
+        'TIMEOUT_BUILTIN': lambda: TimeoutError('timed out'),
         'CONNECT': lambda: ConnectionRefusedError('connection refused'),
         'DNS': lambda: socket.gaierror('name not resolved'),
         'PROTOCOL': lambda: asyncssh.ProtocolError('bad packet'),
@@ -592,6 +609,7 @@ PROTOCOL_FAULTS: dict[str, dict[str, Callable[[], BaseException]]] = {
 EXPECTED_CODE: dict[str, str] = {
     'TLS': 'TLS',
     'TIMEOUT': 'TIMEOUT',
+    'TIMEOUT_BUILTIN': 'TIMEOUT',
     'CONNECT': 'CONNECT',
     'DNS': 'DNS',
     'PROTOCOL': 'TRANSPORT',

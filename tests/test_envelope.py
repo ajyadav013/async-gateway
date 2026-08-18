@@ -833,16 +833,67 @@ def test_every_dispatch_site_catches_exactly_what_it_classifies(
         f'it; that is what makes the pair impossible to desynchronise.')
 
 
-#: The dispatch sites whose classification table ends in a residual
-#: ``OSError`` row. Only these two can mis-file a timeout as a local
-#: disk fault, because only these two have a row for it to fall into --
-#: the HTTP family's table ends at ``aiohttp.ClientError`` and an
-#: unmatched timeout there is simply not classified.
-OSERROR_TAILED_SITES: Final[tuple[str, ...]] = ('ftp_client', 'sftp_client')
+def classification_table_sites() -> tuple[str, ...]:
+    """Return every module that declares its own classification table.
+
+    **Discovered, not listed**, and that is the whole of AGW-N1's
+    second half. The row below used to run against a hand-written
+    ``('ftp_client', 'sftp_client')`` justified by a real-sounding
+    argument -- only those two end their table in a residual
+    ``OSError``, so only those two can *mis-file* a timeout as a local
+    disk fault. The argument was true and the scope it produced was
+    wrong: it selected on how bad the consequence is, when the property
+    being guarded is whether the table names both classes at all. The
+    HTTP family's table does not mis-file an unmatched timeout, it
+    fails to file it -- ``transport_error_for`` re-raises, and a raw
+    ``TimeoutError`` leaves ``request()`` un-enveloped. That is the
+    worse outcome, and the guard's own scope note is what excused it.
+
+    So the set comes off the filesystem. A fourth table cannot opt out
+    by not being thought of, and a table deleted from a module drops
+    out here rather than leaving a row asserting nothing.
+
+    Returns:
+        The ``logic`` module names declaring a ``TRANSPORT_ERRORS``
+        table, sorted.
+    """
+    return tuple(sorted(
+        path.stem for path in (PACKAGE_ROOT / 'logic').glob('*.py')
+        if re.search(
+            r'^TRANSPORT_ERRORS', path.read_text(encoding='utf-8'),
+            re.MULTILINE)
+    ))
 
 
-@pytest.mark.parametrize('module', OSERROR_TAILED_SITES)
-def test_both_timeout_classes_are_named_where_oserror_is_the_tail(
+def test_the_timeout_guard_covers_every_classification_table() -> None:
+    """The arity, so a table cannot be guarded by not being listed.
+
+    The sibling of
+    :func:`test_the_derivation_reaches_every_dispatch_site`, and here
+    for the same reason: the row below holds each *discovered* site to
+    its table, and nothing in it would notice the discovery itself
+    silently returning fewer sites than there are tables. AGW-N1 was
+    two-of-three; this asserts three-of-three against a count taken a
+    different way.
+
+    Returns:
+        None.
+    """
+    tables = [
+        name for name, source in package_sources()
+        if name.startswith('logic/')
+        and re.search(r'^TRANSPORT_ERRORS', source, re.MULTILINE)
+    ]
+
+    assert len(classification_table_sites()) == len(tables), (
+        f'{len(tables)} modules declare a TRANSPORT_ERRORS table and the '
+        f'timeout guard discovered {len(classification_table_sites())}. '
+        f'A table the guard cannot see is AGW-N1: the fix landed on two '
+        f'of the three tables because the third was not in scope.')
+
+
+@pytest.mark.parametrize('module', classification_table_sites())
+def test_both_timeout_classes_are_named_in_every_table(
     module: str,
 ) -> None:
     """``asyncio.TimeoutError`` and ``TimeoutError``, spelled out.
@@ -850,21 +901,40 @@ def test_both_timeout_classes_are_named_where_oserror_is_the_tail(
     They are the same object from **3.11**. On 3.10 -- which
     ``requires-python`` admits and the CI matrix claims -- they are
     unrelated classes, so a table naming only the ``asyncio`` one does
-    not match the *builtin* raised by a socket read. And because the
-    builtin is an ``OSError``, on these two sites it did not merely go
-    unclassified: it fell through to the residual ``OSError`` row and a
-    slow server was reported ``PATH``/400 -- telling the caller their
-    own disk was at fault, and keeping the timing-out destination out
-    of its own circuit breaker.
+    not match the *builtin* a socket read raises. What happens next
+    depends on the table's tail, and both outcomes are failures of the
+    same contract:
+
+    * where the table ends in a residual ``OSError`` row (FTP, SFTP)
+      the builtin -- an ``OSError`` -- falls into it, and a slow server
+      is reported ``PATH``/400: the caller is told their own disk is at
+      fault and the timing-out destination stays out of its breaker.
+    * where it does not (the HTTP family, deliberately) the builtin
+      matches nothing, ``transport_error_for`` re-raises it, and a raw
+      ``TimeoutError`` leaves ``request()`` un-enveloped -- the one
+      thing this library promises cannot happen (AGW-N1).
+
+    The second is the worse of the two, and it is the one the earlier
+    version of this row excluded from its scope: it was parametrised
+    over a hand-written ``('ftp_client', 'sftp_client')`` on exactly the
+    argument above, that only an ``OSError``-tailed table can *mis-file*
+    a timeout. True, and the wrong selector -- the property is whether
+    the table names both classes, not how badly it behaves when it does
+    not. :func:`classification_table_sites` now discovers the set.
 
     **Asserted against the source text, which is the only thing that
     can be.** Every runtime form of this question -- ``is``,
     ``issubclass``, raising one and catching the other -- is answered by
     the interpreter running the suite, and on 3.11+ every one of them
-    says the table is fine whatever it names. That is precisely how
-    this shipped: green on 3.12, 3.13 and 3.14, broken on the one leg
-    nobody had run. Reading the table as text asks the same question on
-    every interpreter.
+    says the table is fine whatever it names. That is how this shipped
+    twice: green on 3.12, 3.13 and 3.14 both times, broken on the one
+    leg nobody had run. It is also why the cross-protocol fault-category
+    guard's ``TIMEOUT`` row could not catch AGW-N1 -- it raises
+    ``asyncio.TimeoutError()``, which on 3.11+ *is* the builtin, so on
+    every interpreter that guard passes: on 3.11+ because the two names
+    are one class, and on 3.10 because the class it raises is the one
+    name the table did have. Reading the table as text asks the same
+    question on every interpreter.
 
     ``circuit_breaker_helper.RETRIABLE_FAILURES`` already named both,
     with a comment explaining why, so the knowledge was in the codebase
@@ -880,18 +950,15 @@ def test_both_timeout_classes_are_named_where_oserror_is_the_tail(
         encoding='utf-8')
     table = source.split('TRANSPORT_ERRORS')[1].split(')\n\n')[0]
 
-    assert '(OSError, LocalWriteError)' in table, (
-        f'logic.{module} no longer ends its table with a residual '
-        f'OSError row, so this test is guarding a shape that has '
-        f'changed; re-read it rather than deleting it')
     for spelling in ('(asyncio.TimeoutError, GatewayTimeoutError)',
                      '(TimeoutError, GatewayTimeoutError)'):
         assert spelling in table, (
             f'the TRANSPORT_ERRORS table in logic.{module} does not name '
             f'{spelling}. On Python 3.10 the two timeout classes are '
-            f'unrelated, so the one that is missing falls through to '
-            f'the (OSError, LocalWriteError) row and a socket timeout '
-            f'is reported PATH/400 instead of TIMEOUT/504.')
+            f'unrelated, so a timeout arriving as the one that is '
+            f'missing either falls through to a residual (OSError, '
+            f'LocalWriteError) row and reports PATH/400, or matches no '
+            f'row at all and escapes request() raw.')
 
 
 def test_the_derivation_reaches_every_dispatch_site() -> None:

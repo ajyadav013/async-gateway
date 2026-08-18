@@ -90,7 +90,31 @@ JsonSerializer = Callable[[Any], str]
 # which is the one place this library must not itself fail.
 TRANSPORT_ERRORS: Sequence[
     Tuple[type[BaseException], type[AsyncGatewayError]]] = (
+    # BOTH timeout classes, for the reason `logic.ftp_client` and
+    # `logic.sftp_client` name theirs: `asyncio.TimeoutError is
+    # TimeoutError` only from 3.11, and `requires-python` is `>=3.10`.
+    # The fix reached those two tables and not this one (AGW-N1), and
+    # this table's failure mode is the worse of the two. It has no
+    # residual `OSError` row to mis-file into, so on 3.10 a builtin
+    # `TimeoutError` matched nothing at all and `transport_error_for`
+    # re-raised it -- a raw `TimeoutError` out of `request()`, out of a
+    # library whose whole contract is that only its own bugs escape the
+    # envelope. `logic.soap_client` imports this table's derived catch
+    # clause, so one omission was two protocols.
+    #
+    # Measured on a real 3.10.18: `transport_error_for(TimeoutError())`
+    # re-raised, where the FTP table's answered `GatewayTimeoutError` /
+    # `TIMEOUT`. `circuit_breaker_helper.RETRIABLE_FAILURES` lists the
+    # builtin, so the breaker retried and handed over a
+    # `RetriesExhausted` whose cause matched no row either.
+    #
+    # `aiohttp` wraps its *own* timeouts in `ServerTimeoutError`, a
+    # subclass of `asyncio.TimeoutError` that the row above already
+    # catches -- which is why nothing on the wire produced this and the
+    # reachable triggers are a bare builtin from below `aiohttp` or one
+    # a caller names in `abortable_exceptions`.
     (asyncio.TimeoutError, GatewayTimeoutError),
+    (TimeoutError, GatewayTimeoutError),
     (aiohttp.ClientSSLError, TlsError),
     (ssl.SSLError, TlsError),
     (aiohttp.ClientConnectorDNSError, DnsError),
