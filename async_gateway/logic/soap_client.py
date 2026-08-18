@@ -922,8 +922,20 @@ class SoapRequest(BaseRequestClass):
             total=validated_timeout(self.timeout))
         self.session: Optional[aiohttp.ClientSession] = validated_session(
             self.info.get('session'))
+        # `redact_params` is passed for the reason `logic/http_client.py`
+        # passes it, and omitting it here was a latent leak rather than a
+        # stylistic difference. The tracer this library builds records
+        # `unwrap_cause(params.exception)` into the envelope's
+        # `request_tracer`, and a transport exception can name the whole
+        # URL, query string included. Without the caller's own sensitive
+        # parameter names the tracer masks the built-in set only -- so a
+        # caller who declared `redact_query_params=['session_id']` got it
+        # honoured on the envelope `url` and in the exception message,
+        # and published in the clear in the trace record of the same
+        # call. Invariant E9 promises all four credential surfaces, not
+        # three of them.
         self.trace_config: List[aiohttp.TraceConfig] = validated_trace_config(
-            self.info, self.session)
+            self.info, self.session, redact_params=self.redact_params)
         self.trace_collectors: List[MutableMapping[str, Any]] = (
             trace_collectors_for(self.session, self.trace_config))
         # Derived from the bind above, exactly as `logic/http_client.py`

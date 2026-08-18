@@ -38,6 +38,7 @@ one are the recording server and nothing else.
 import asyncio
 import logging
 import sys
+from types import SimpleNamespace
 from typing import Any, Final
 from xml.etree.ElementTree import Element, fromstring, tostring
 
@@ -46,11 +47,13 @@ import aiohttp
 import pytest
 
 from async_gateway.async_gateway import request
+from async_gateway.helpers.common.date_helper import monotonic_now
 from async_gateway.logic import soap_client
 from async_gateway.logic.soap_client import (
     ENVELOPE_NAMESPACE,
     SOAP_11,
     SOAP_12,
+    SoapRequest,
     build_envelope,
     exceeds_depth,
     parse_soap_response,
@@ -62,8 +65,9 @@ from async_gateway.utils.constants import (
     HTTP_TIMEOUT,
     MAX_FAULT_DETAIL_DEPTH,
 )
-from async_gateway.utils.envelope import GatewayResponse
+from async_gateway.utils.envelope import GatewayResponse, new_envelope
 from async_gateway.utils.exceptions import ConfigurationError
+from async_gateway.utils.redaction import REDACTED
 from async_gateway.utils.request_tracer import request_tracer
 
 from tests.fixtures.http_server import RecordingHTTPServer
@@ -1356,6 +1360,68 @@ async def test_r18_ac8_a_soap_call_populates_the_request_tracer(
     assert result['ok'] is True
     assert result['request_tracer'] != []
     assert result['request_tracer'][0] != {}
+
+
+async def test_the_tracer_this_client_builds_gets_the_callers_redactions(
+    http_server: RecordingHTTPServer,
+) -> None:
+    """Reuse means reusing the arguments too, not just the function.
+
+    ``validated_trace_config`` takes ``redact_params`` and hands it to
+    the tracer it builds, so that tracer's exception record masks the
+    caller's own sensitive query-parameter names as well as the built-in
+    set. ``logic/http_client.py`` passes it; this client did not, and the
+    omission was invisible precisely because both clients call the same
+    function and get a working tracer either way.
+
+    What it cost is one surface out of four. A transport exception can
+    name the whole URL, query string included, and
+    ``on_request_exception`` records ``unwrap_cause(...)`` of it into
+    ``request_tracer``. So a caller who declared
+    ``redact_query_params=['session_id']`` had it honoured on the
+    envelope ``url`` and in ``error['message']``, and published in the
+    clear in the trace record of the same call -- invariant E9 promises
+    all four credential surfaces, not three.
+
+    Asserted against the tracer this client actually builds rather than
+    through a provoked transport failure, and deliberately so: *which*
+    ``aiohttp`` exceptions carry a URL is that library's business and
+    changes between releases, so a test resting on one would go quietly
+    vacuous the day it stopped. What this library controls -- and
+    therefore what is worth pinning -- is that the caller's set reaches
+    the tracer at all.
+
+    Args:
+        http_server: The loopback recording server fixture.
+
+    Returns:
+        None.
+    """
+    secret = 'TRACERSECRET9'
+    url = f'{http_server.url_for("/soap")}?session_id={secret}'
+
+    client = SoapRequest(
+        url,
+        None,
+        new_envelope(url=url, protocol='SOAP', payload='<Ping/>'),
+        info={'operation': 'Ping'},
+        redact_params=frozenset({'session_id'}),
+    )
+
+    # Exactly one tracer, built by this library because the call named
+    # no session of its own.
+    tracer, = client.trace_config
+    context = SimpleNamespace(results={}, start=monotonic_now())
+    for callback in tracer.on_request_exception:
+        await callback(
+            None,
+            context,
+            SimpleNamespace(exception=ValueError(f'refused {url}')),
+        )
+
+    recorded = context.results['on_request_exception_message']
+    assert secret not in recorded
+    assert REDACTED in recorded
 
 
 async def test_r18_ac8_the_deadline_is_honoured(
