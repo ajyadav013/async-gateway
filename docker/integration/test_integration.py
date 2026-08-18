@@ -59,6 +59,7 @@ from async_gateway.utils.contained_io import (
 from async_gateway.utils.exceptions import (
     ConfigurationError,
     PathContainmentError,
+    ProcessorError,
 )
 
 BASE_HTTP = cfg.BASE_HTTP
@@ -551,6 +552,133 @@ async def test_userinfo_is_masked_on_a_real_request(
     # implementation detail as a requirement.
     for surface in (result['url'], record.url, record.traceback):
         assert cfg.HTTP_HOST in surface
+
+
+# ------------------- security: the component the query scan used to miss --
+#
+# The round after NEW-M1c. `redact_url` had a masking rule of its own --
+# it split `parts.query` with `parse_qsl` -- while `redact_text` scanned
+# the whole string, so the two agreed about what a *separator* was and
+# still disagreed about *where to look*. Two spellings put a secret
+# outside `parts.query` and therefore outside the only component
+# `redact_url` read:
+#
+#   * `/p;api_key=S`      -- RFC 3986 path parameters, which PHP and
+#                            servlet containers read as parameters, and
+#                            which `urlsplit` files under `path`; and
+#   * `/p#frag?api_key=S` -- a `?` *after* the `#`, which `urlsplit`
+#                            files entirely under `fragment`.
+#
+# Both were masked by `redact_text` and published in the clear by
+# `redact_url` -- in the envelope `url` on the ok=True and ok=False paths
+# alike. The fix deleted the second rule: there is now one scan over the
+# whole string, and no component is enumerated.
+#
+# Proved in-process by the unit suite; proved *on the wire* here, which
+# is a different question. `aiohttp` re-spells what it is handed -- it is
+# the third reader of the string, after `urlsplit` and the masker -- so
+# the URL that reaches the envelope and the rendered traceback is not
+# necessarily the one the caller passed. `yarl` keeps `;api_key=S` in the
+# path verbatim and strips `#frag?api_key=S` from the request target
+# entirely, and neither of those is knowable without a real round trip.
+#
+# Each spelling is driven on BOTH outcomes, because the two are produced
+# by different code and the bug was present in both: the ok=True path
+# reports a URL nothing failed about, and the ok=False path adds the
+# error prose and the logged traceback.
+
+
+#: The component each spelling hides the secret in, and the route that
+#: reaches a live handler for it. `/echo{suffix}` and
+#: `/status/404{suffix}` exist in `docker/http/server.py` precisely so
+#: the path-parameter spelling can be driven to a real 200 as well as to
+#: a real failure -- without them it 404s on the route table and the
+#: ok=True half of the assertion cannot be made at all.
+COMPONENT_SPELLINGS = {
+    'path-parameter': ('/echo;api_key=', '/status/404;api_key='),
+    'after-fragment': ('/echo#frag?api_key=', '/status/404#frag?api_key='),
+}
+
+
+@pytest.mark.parametrize(
+    ('ok_path', 'fail_path'),
+    COMPONENT_SPELLINGS.values(),
+    ids=list(COMPONENT_SPELLINGS))
+async def test_a_secret_outside_the_query_is_masked_on_a_real_request(
+    ok_path: str,
+    fail_path: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A secret outside ``parts.query`` must not survive a round trip.
+
+    Three surfaces, each produced by a different call -- ``redact_url``
+    for the envelope, ``redact_value`` for ``extra['url']`` and
+    ``redact_text`` for ``extra['traceback']`` -- and two outcomes,
+    because the defect published the URL on both.
+
+    The success path can only assert the envelope: nothing failed, so
+    there is no error prose and no record to read. The failure path
+    asserts all three, and it is the one with teeth -- the traceback is
+    rendered from a chained exception that stringifies the URL, which is
+    the surface that leaked in three of the four previous rounds.
+
+    Args:
+        ok_path: A path, carrying the secret, that reaches a 200.
+        fail_path: A path, carrying the secret, that reaches a 404.
+        caplog: Captures the library's own log record.
+    """
+    secret = 'sup3rs3cr3t-key'
+
+    # 1. The success path. `ok=True` reports a URL too, and that is the
+    #    half a "we only redact failures" reading would miss.
+    ok_result = await request(
+        f'{BASE_HTTP}{ok_path}{secret}',
+        protocol='HTTP',
+        protocol_info={'request_type': 'GET', 'timeout': 15},
+    )
+
+    assert_envelope(ok_result, 'HTTP')
+    assert ok_result['ok'] is True, (
+        f'the {ok_path} route did not reach a handler, so this asserts '
+        f'nothing about the ok=True path: {ok_result["error"]}')
+    assert secret not in ok_result['url']
+
+    # 2. The failure path: the envelope, the error prose that names the
+    #    URL, and the two log surfaces.
+    with caplog.at_level(logging.WARNING, logger='async_gateway'):
+        result = await request(
+            f'{BASE_HTTP}{fail_path}{secret}',
+            protocol='HTTP',
+            protocol_info={'request_type': 'GET', 'timeout': 15},
+        )
+
+    assert_envelope(result, 'HTTP')
+    assert result['ok'] is False
+
+    assert secret not in result['url']
+    assert secret not in str(result['error'])
+
+    records = [
+        record for record in caplog.records
+        if record.name.startswith('async_gateway')
+        and hasattr(record, 'traceback')
+    ]
+    assert records, 'the failure logged no record to inspect'
+    record = records[-1]
+
+    assert secret not in record.url
+    assert secret not in record.traceback
+
+    # "Absent" must not be allowed to mean "the URL never reached the
+    # surface" -- that would pass against a library reporting nothing at
+    # all. Every surface must still carry the host, and the *masked*
+    # parameter name must still be visible, which is what distinguishes
+    # "the pair was found and masked" from "the whole tail was dropped".
+    for surface in (
+            ok_result['url'], result['url'], record.url, record.traceback):
+        assert cfg.HTTP_HOST in surface
+        assert 'api_key=' in surface, (
+            f'the parameter was discarded rather than masked: {surface}')
 
 
 # ------------------------------------------------------------------- FTP --
@@ -1127,6 +1255,242 @@ async def test_soap_non_fault_error_is_an_http_status() -> None:
     assert_envelope(result, 'SOAP')
     assert result['ok'] is False
     assert result['error']['code'] != 'SOAP_FAULT'
+
+
+# ----------------------------- the processor hooks, against a real server --
+#
+# NEW-2. `pre_processor_config['function']` was indexed and awaited with
+# no checking at all, so a documented public parameter was a direct route
+# to a bare builtin escaping `request()`: `KeyError('function')` for a
+# config missing the key, `TypeError` in three different spellings for a
+# config that is a list, a non-callable function, or a non-mapping
+# `params`. A caller cannot be asked to catch three builtin types for one
+# configuration mistake, and the contract names none of them.
+#
+# The fix splits the question in two, and the split is the thing worth
+# asserting live:
+#
+#   * `validated_processor_config` refuses what is decidable WITHOUT
+#     calling -- shape, key, callability, params -- as a
+#     `ConfigurationError` (CONFIG/400), raised synchronously, outside
+#     the one conversion `try`, and BEFORE anything is dispatched; and
+#   * `ProcessorError` (PROCESSOR/500) reports a config that was valid
+#     and a callback that then failed anyway -- it raised, it refused the
+#     `response` keyword, it returned a non-awaitable, or it removed a
+#     key from the envelope it was handed.
+#
+# Both were proven in-process only. Against a live server two further
+# properties become observable and neither is visible to a double: that a
+# malformed config is refused with the socket never opened -- the server
+# is right there to have logged a hit and does not -- and that the
+# envelope-key check survives a callback mutating the *real* envelope a
+# real transfer is about to read, rather than a constructed one.
+
+
+async def a_working_processor(response: Dict[str, Any]) -> str:
+    """Return a marker, having touched nothing.
+
+    Args:
+        response: The live envelope, passed under ``response``.
+
+    Returns:
+        A marker the test asserts reached the envelope.
+    """
+    return 'processor-ran'
+
+
+async def a_raising_processor(response: Dict[str, Any]) -> str:
+    """Raise the way a caller's own buggy callback would.
+
+    ``KeyError`` deliberately: a bare builtin is exactly what used to
+    escape ``request()``, so the assertion is that this one does not.
+
+    Args:
+        response: The live envelope, passed under ``response``.
+
+    Returns:
+        Never; this always raises.
+
+    Raises:
+        KeyError: Always.
+    """
+    raise KeyError('a key the callback expected and did not find')
+
+
+async def a_key_removing_processor(response: Dict[str, Any]) -> str:
+    """Delete an envelope key the protocol client goes on to read.
+
+    ``payload`` specifically -- ``http_client`` reads
+    ``self.response['payload']`` and ``soap_client`` reads it two lines
+    into building the SOAP body, both from inside the one conversion
+    ``try`` where ``except AsyncGatewayError`` cannot see a ``KeyError``.
+
+    Args:
+        response: The live envelope, passed under ``response``.
+
+    Returns:
+        A marker, which the caller never sees because the boundary
+        refuses the envelope first.
+    """
+    del response['payload']
+    return 'removed'
+
+
+#: Every shape of malformed config, and the substring the refusal must
+#: name so the caller is told *which* mistake they made rather than only
+#: that they made one.
+MALFORMED_CONFIGS = {
+    'not-a-mapping': ('a string, not a config', 'must be a mapping'),
+    'a-list': ([{'function': a_working_processor}], 'must be a mapping'),
+    'no-function-key': ({'params': {}}, 'missing required key'),
+    'function-not-callable': ({'function': 'nope'}, 'must be callable'),
+    'params-not-a-mapping': (
+        {'function': a_working_processor, 'params': 'nope'},
+        '["params"] must be a mapping'),
+    'params-key-not-str': (
+        {'function': a_working_processor, 'params': {1: 'x'}},
+        'keys must be str'),
+    'params-names-response': (
+        {'function': a_working_processor, 'params': {'response': 'x'}},
+        'may not name'),
+}
+
+
+@pytest.mark.parametrize('setting',
+                         ['pre_processor_config', 'post_processor_config'])
+@pytest.mark.parametrize(
+    ('config', 'expected'),
+    MALFORMED_CONFIGS.values(),
+    ids=list(MALFORMED_CONFIGS))
+async def test_a_malformed_processor_config_never_reaches_the_server(
+    setting: str,
+    config: object,
+    expected: str,
+) -> None:
+    """A malformed config is a typed refusal, and the call never goes out.
+
+    Two assertions, and the second is the one only a live server can
+    make. The first is that the failure is a ``ConfigurationError``
+    carrying ``CONFIG``/400 and naming the setting -- not the bare
+    ``KeyError`` or one of the three ``TypeError`` spellings that used to
+    escape. The second is that it is raised *before dispatch*: the
+    ``post_processor_config`` row is the proof, since a config validated
+    only at the moment it runs would have contacted the server first and
+    the remote side cannot be un-contacted.
+
+    Args:
+        setting: Which of the two hooks carries the bad config.
+        config: The malformed config, in one of its shapes.
+        expected: A substring the message must carry, so the caller is
+            told which mistake this was.
+    """
+    before = await request(
+        f'{BASE_HTTP}/echo', protocol='HTTP',
+        protocol_info={'request_type': 'GET', 'timeout': 15})
+    assert before['ok'] is True, 'the server was not reachable to begin with'
+
+    with pytest.raises(ConfigurationError) as caught:
+        await request(
+            f'{BASE_HTTP}/echo',
+            protocol='HTTP',
+            protocol_info={'request_type': 'GET', 'timeout': 15},
+            **{setting: config},
+        )
+
+    assert caught.value.code == 'CONFIG'
+    assert caught.value.status_code == 400
+    assert setting in str(caught.value)
+    assert expected in str(caught.value)
+
+
+@pytest.mark.parametrize('setting',
+                         ['pre_processor_config', 'post_processor_config'])
+async def test_a_processor_that_raises_is_a_typed_processor_error(
+    setting: str,
+) -> None:
+    """A valid config whose callback raises reports PROCESSOR, not KeyError.
+
+    Distinct from ``ConfigurationError`` on purpose: the configuration
+    was accepted and this library called exactly what the caller asked
+    for, so the fault is in the caller's function rather than in how they
+    configured it. The original is chained, so the caller can still see
+    what actually went wrong.
+
+    Args:
+        setting: Which of the two hooks carries the raising callback.
+    """
+    with pytest.raises(ProcessorError) as caught:
+        await request(
+            f'{BASE_HTTP}/echo',
+            protocol='HTTP',
+            protocol_info={'request_type': 'GET', 'timeout': 15},
+            **{setting: {'function': a_raising_processor}},
+        )
+
+    assert caught.value.code == 'PROCESSOR'
+    assert caught.value.status_code == 500
+    assert setting in str(caught.value)
+    # The cause chain, which is how the caller reaches the real fault --
+    # a `ProcessorError` that swallowed it would be no better than the
+    # bare builtin it replaced.
+    assert isinstance(caught.value.__cause__, KeyError)
+
+
+@pytest.mark.parametrize('setting',
+                         ['pre_processor_config', 'post_processor_config'])
+async def test_a_processor_removing_an_envelope_key_is_refused(
+    setting: str,
+) -> None:
+    """Removing a key the protocol client reads is refused at the boundary.
+
+    A processor is handed the *live* envelope, which is the documented
+    design -- rewriting ``response['url']`` is the point of the hook. A
+    live mutable object can also be deleted from, and a pre-processor
+    that did left ``http_client`` reading ``self.response['payload']`` as
+    a bare ``KeyError`` from inside the conversion ``try``.
+
+    The pre row is the one with the real transfer behind it: the envelope
+    is broken *before* the request is dispatched, so the assertion is
+    that the boundary catches it rather than the protocol client. The
+    post row breaks an envelope a real 200 has already filled in.
+
+    Args:
+        setting: Which of the two hooks removes the key.
+    """
+    with pytest.raises(ProcessorError) as caught:
+        await request(
+            f'{BASE_HTTP}/echo',
+            protocol='HTTP',
+            protocol_info={'request_type': 'GET', 'timeout': 15},
+            **{setting: {'function': a_key_removing_processor}},
+        )
+
+    assert caught.value.code == 'PROCESSOR'
+    assert caught.value.status_code == 500
+    assert setting in str(caught.value)
+    assert 'payload' in str(caught.value)
+
+
+async def test_working_processors_run_around_a_real_request() -> None:
+    """The hooks' happy path, so the refusals above are not vacuous.
+
+    Every other test in this section asserts that something is refused.
+    Without this one they would all pass against a library that refused
+    *every* processor config, which is the failure mode a negative-only
+    section invites.
+    """
+    result = await request(
+        f'{BASE_HTTP}/echo',
+        protocol='HTTP',
+        protocol_info={'request_type': 'GET', 'timeout': 15},
+        pre_processor_config={'function': a_working_processor},
+        post_processor_config={'function': a_working_processor},
+    )
+
+    assert_envelope(result, 'HTTP')
+    assert result['ok'] is True
+    assert result['pre_processor_response'] == 'processor-ran'
+    assert result['post_processor_response'] == 'processor-ran'
 
 
 # ------------------------------------------------------------ concurrency --

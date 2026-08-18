@@ -67,6 +67,33 @@ async def echo(request: web.Request) -> web.Response:
     return web.json_response(request_report(request, body))
 
 
+async def echo_suffix(request: web.Request) -> web.Response:
+    """Echo, but matching whatever trails the path segment.
+
+    ``/echo`` matches ``/echo`` and nothing else, so a URL carrying RFC
+    3986 **path parameters** -- ``/echo;api_key=S``, which PHP and
+    servlet containers read as parameters and which the redaction scan
+    must therefore mask -- 404s on the route table before the handler is
+    reached. That still exercises the failure path, but it leaves the
+    ``ok=True`` half of the redaction assertion untestable against a
+    live server: there is no success envelope to inspect.
+
+    This route matches the segment plus any suffix, so the same URL
+    reaches a handler and returns 200. The reported ``path`` is the raw
+    one, which is what proves the parameter really travelled the wire
+    rather than being normalised away by ``yarl`` before the request was
+    built.
+
+    Args:
+        request: The inbound aiohttp request.
+
+    Returns:
+        A 200 carrying the request report.
+    """
+    body = await request.text()
+    return web.json_response(request_report(request, body))
+
+
 async def status(request: web.Request) -> web.Response:
     """Answer with the status code named in the path.
 
@@ -260,7 +287,11 @@ def build_app() -> web.Application:
     """
     app = web.Application(client_max_size=32 * 1024 * 1024)
     app.router.add_route('*', '/echo', echo)
+    # Registered after `/echo` so the exact route still wins for a plain
+    # `/echo`; this one picks up `/echo;api_key=S` and friends.
+    app.router.add_route('*', '/echo{suffix:[;,].*}', echo_suffix)
     app.router.add_route('*', '/status/{code:\\d+}', status)
+    app.router.add_route('*', '/status/{code:\\d+}{suffix:[;,].*}', status)
     app.router.add_get('/slow', slow)
     app.router.add_get('/large', large)
     app.router.add_get('/nested-multipart', nested_multipart)
