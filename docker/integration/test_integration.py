@@ -1740,54 +1740,6 @@ async def test_a_symlink_planted_in_the_destination_is_refused(
         f'the traversal escaped into {outside}')
 
 
-async def test_a_symlinked_client_path_is_followed_by_the_transfer(
-    ftp_auth: Any, tmp_path: pathlib.Path,
-) -> None:
-    """A KNOWN GAP, asserted as it behaves rather than as it should.
-
-    When ``client_path`` *itself* is a symbolic link, the download
-    follows it and writes the remote bytes into the link's target.
-    Reproduced here against a live FTP server, and reproduced equally
-    against the commit before the ``open_within()`` rewrite -- so this
-    is **pre-existing, not a regression** from that change, and it is
-    recorded here rather than fixed under an acceptance run.
-
-    Why it happens: ``local_base(client_path)`` makes the caller's own
-    path the containment base, and ``resolve_within`` canonicalises the
-    base. A base that *is* a link therefore resolves to the link's
-    target before ``guarded_opener`` is ever handed a path, so the
-    ``O_NOFOLLOW`` on the leaf is applied to the target's name and finds
-    no link there.
-
-    Whether it is a defect is a real design question, not an oversight:
-    for a *directory* download, a symlinked destination is the ordinary
-    case of downloading into a mounted volume, and refusing it would
-    break that. For a *single-file* download it is M18's shape with the
-    caller supplying the link, and ``_open``'s own docstring claims to
-    refuse "a symlink at the target". Those two cannot both be honoured
-    by one rule about the base.
-
-    The test asserts today's behaviour so the gap is visible and so any
-    future fix is a deliberate, reviewed change to a red test rather
-    than a silent one. The attacker-planted cases -- the ones inside a
-    directory the caller named -- are refused, and the test above is
-    what proves it.
-    """
-    victim = tmp_path / 'victim.txt'
-    victim.write_bytes(b'original\n')
-    target = tmp_path / 'client-path-link.csv'
-    target.symlink_to(victim)
-
-    result = await download_into(target, ftp_auth)
-
-    assert_envelope(result, 'FTP')
-    assert result['ok'] is True, result['error']
-    assert victim.read_bytes() == REMOTE_FIXTURE, (
-        'behaviour changed -- the symlinked client_path is no longer '
-        'followed. That is very likely the FIX for this gap: delete '
-        'this test and tighten the one above.')
-
-
 async def test_a_crlf_header_is_refused_before_the_socket_opens() -> None:
     """N6/N7 against a real origin: the answer no longer depends on it.
 
@@ -2392,4 +2344,382 @@ async def test_the_guards_hold_on_a_volume_owned_by_another_uid(
     result = await download_into(linked, ftp_auth)
     assert_path_refusal(result, linked)
     assert 'hard link' in str(result['error']), result['error']
+    assert victim.read_bytes() == b'do not follow me\n'
+
+
+# ------------- AGW-N4: a symlinked destination the caller named ----------
+#
+# The gap this section closes was, until AGW-N4, asserted here as a
+# KNOWN GAP -- a test that recorded "the symlinked `client_path` IS
+# followed" so the behaviour was visible rather than silent. It is
+# fixed, so the recording test is gone and these assert the fix.
+#
+# What was wrong. `resolve_within` is contracted to canonicalise the
+# *parent* and hand the final component back verbatim, so `O_NOFOLLOW`
+# still has a link left to refuse. A single-file transfer is the one
+# caller that hands it an EMPTY candidate -- `under()` splits
+# `client_path` against itself and `relative_to` leaves nothing over --
+# and that empty tail fell into the `..` arm, whose whole-path
+# `resolve()` canonicalises the leaf too. The link was therefore
+# resolved away before the open and the guard was handed its target: the
+# transfer wrote straight through into the victim at mode 0644 and
+# answered ok=True, where the identical HTTP download answered PATH/400.
+#
+# Why it is re-asserted HERE, against live servers, having already been
+# fixed and proven on the host. Every host assertion was made on
+# macOS/APFS, and this fix is made of exactly the three primitives a
+# filesystem is entitled to implement differently: `O_NOFOLLOW`, the
+# `dir_fd`-relative open, and the mode a create requests. So each case
+# below runs on BOTH filesystems the container offers -- the image's
+# overlayfs and a mounted volume -- and the foreign-uid case runs where
+# the process does not own the directory, because a guard that quietly
+# depended on ownership would pass under `tmp_path` and fail in the
+# deployment this library is actually used in.
+#
+# Three questions, asked of FTP and of SFTP:
+#
+#   1. a symlinked single-file destination is REFUSED, PATH/400, and
+#      the victim behind the link still holds its own bytes;
+#   2. the same for the RECURSIVE arm, which is a different code path
+#      -- `aioftp` and `asyncssh` each compose the server's entry names
+#      themselves -- and which must keep working for the legitimate
+#      case of a symlinked destination *directory*; and
+#   3. a legitimate transfer still SUCCEEDS, at mode 0600. A guard made
+#      only of refusal rows is satisfied by a route that refuses
+#      everything, so the success row is what makes the refusals mean
+#      something.
+
+
+async def assert_symlinked_destination_is_refused(
+    protocol: str,
+    transfer: Any,
+    scratch: pathlib.Path,
+    auth: Any,
+) -> None:
+    """Assert one protocol refuses a symlinked single-file destination.
+
+    The victim's bytes are checked afterwards rather than only the
+    envelope code: a route that wrote through the link and complained
+    afterwards would satisfy a code-only assertion, and writing through
+    was the actual defect.
+
+    Args:
+        protocol: The protocol name the envelope must carry.
+        transfer: The coroutine function that runs one download,
+            called as ``transfer(destination, auth)``.
+        scratch: The directory to work in, on the filesystem under test.
+        auth: The credential fixture for ``protocol``.
+    """
+    victim = scratch / 'victim.txt'
+    victim.write_bytes(b'do not follow me\n')
+    before = victim.stat()
+
+    destination = scratch / 'client-path-link.csv'
+    destination.symlink_to(victim)
+
+    result = await transfer(destination, auth)
+
+    assert_envelope(result, protocol)
+    assert result['ok'] is False, (
+        f'the transfer followed a symlinked destination and wrote into '
+        f'{victim} -- AGW-N4, the empty-candidate arm resolving the '
+        f'leaf away before O_NOFOLLOW could refuse it')
+    assert result['error']['code'] == 'PATH', (
+        f"expected a PATH refusal, got {result['error']}")
+    assert result['status_code'] == 400, result['status_code']
+
+    assert victim.read_bytes() == b'do not follow me\n', (
+        f'{victim} was rewritten through the link')
+    assert victim.stat().st_mode == before.st_mode, (
+        f'{victim} changed mode from {before.st_mode:#o} to '
+        f'{victim.stat().st_mode:#o} -- the write reached it')
+    assert destination.is_symlink(), (
+        f'{destination} is no longer a link: it was replaced rather '
+        f'than refused')
+
+
+@both_filesystems
+async def test_ftp_refuses_a_symlinked_client_path(
+    ftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """AGW-N4 on FTP's single-file arm, on both container filesystems."""
+    await assert_symlinked_destination_is_refused(
+        'FTP', download_into, scratch, ftp_auth)
+
+
+@requires_hostkey
+@both_filesystems
+async def test_sftp_refuses_a_symlinked_local_path(
+    sftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """AGW-N4 on SFTP's single-file arm, whose recursion is asyncssh's.
+
+    The same question as the FTP row, asked of the other client. The two
+    compose their local paths independently, so agreeing here is a
+    result rather than a restatement.
+    """
+    async def transfer(local: pathlib.Path, auth: Any) -> Dict[str, Any]:
+        """Run one SFTP get with overwrite opted in.
+
+        Args:
+            local: The local destination under test.
+            auth: The SFTP credential fixture.
+
+        Returns:
+            The envelope ``request()`` returned.
+        """
+        return await sftp_get_to(local, auth, overwrite=True)
+
+    await assert_symlinked_destination_is_refused(
+        'SFTP', transfer, scratch, sftp_auth)
+
+
+async def assert_recursive_refuses_a_planted_link(
+    protocol: str,
+    walk: Any,
+    scratch: pathlib.Path,
+    auth: Any,
+) -> None:
+    """Assert one protocol's recursion will not write through a link.
+
+    The link is planted at the path the walk *actually* writes, and that
+    path is discovered rather than assumed: a first download into a
+    throwaway directory reports where ``report.csv`` lands, and the link
+    goes at exactly that relative path in a second, fresh destination.
+    Guessing it would be the difference between a real assertion and a
+    vacuous one -- a link at a name the walk never touches is trivially
+    intact afterwards, and the test would pass having proven nothing.
+
+    Args:
+        protocol: The protocol name the envelope must carry.
+        walk: The coroutine function running one recursive download,
+            called as ``walk(destination, auth)``.
+        scratch: The directory to work in, on the filesystem under test.
+        auth: The credential fixture for ``protocol``.
+    """
+    probe = scratch / 'probe'
+    probe.mkdir()
+    result = await walk(probe, auth)
+    assert_envelope(result, protocol)
+    assert result['ok'] is True, (
+        f'the probe download failed, so the landing path is unknown: '
+        f"{result['error']}")
+    landed = [p for p in probe.rglob('report.csv') if p.is_file()]
+    assert landed, (
+        f'report.csv did not land anywhere under {probe}, so this test '
+        f'cannot know where to plant the link')
+    relative = landed[0].relative_to(probe)
+
+    destination = scratch / 'tree'
+    destination.mkdir()
+    victim = scratch / 'victim.txt'
+    victim.write_bytes(b'do not follow me\n')
+
+    planted = destination / relative
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.symlink_to(victim)
+
+    result = await walk(destination, auth)
+
+    assert_envelope(result, protocol)
+    assert victim.read_bytes() == b'do not follow me\n', (
+        f'the recursive walk wrote through the link planted at '
+        f'{relative} and rewrote {victim}')
+    assert planted.is_symlink(), (
+        f'{planted} is no longer a link: the walk replaced it rather '
+        f'than refusing it')
+    if result['ok'] is False:
+        assert result['error']['code'] == 'PATH', result['error']
+
+
+async def ftp_walk(
+    destination: pathlib.Path, auth: Any,
+) -> Dict[str, Any]:
+    """Run one recursive FTP download into ``destination``.
+
+    Args:
+        destination: The local directory the tree is written into.
+        auth: The FTP credential fixture.
+
+    Returns:
+        The envelope ``request()`` returned.
+    """
+    return await request(
+        FTP_HOST,
+        protocol='FTP',
+        auth=auth,
+        protocol_info={
+            'port': FTP_PORT,
+            'command': 'download',
+            'server_path': 'pub',
+            'client_path': str(destination),
+            'overwrite': True,
+            'timeout': 30,
+        },
+    )
+
+
+async def sftp_walk(
+    destination: pathlib.Path, auth: Any,
+) -> Dict[str, Any]:
+    """Run one recursive SFTP get into ``destination``.
+
+    ``recurse`` is not passed: the client decides it from the remote
+    ``lstat``, and passing it here would test the caller instead.
+
+    Args:
+        destination: The local directory the tree is written into.
+        auth: The SFTP credential fixture.
+
+    Returns:
+        The envelope ``request()`` returned.
+    """
+    return await sftp_get_to(
+        destination, auth, remote_path='pub', overwrite=True)
+
+
+@both_filesystems
+async def test_ftp_recursive_refuses_a_symlinked_entry_destination(
+    ftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """AGW-N4's sibling on ``aioftp``'s recursion.
+
+    The recursive arm is a different code path from the single-file one
+    -- the client composes the server's entry names onto the
+    destination itself -- so its agreement with the arm above is a
+    result rather than a restatement.
+    """
+    await assert_recursive_refuses_a_planted_link(
+        'FTP', ftp_walk, scratch, ftp_auth)
+
+
+@requires_hostkey
+@both_filesystems
+async def test_sftp_recursive_refuses_a_symlinked_entry_destination(
+    sftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """The same on ``asyncssh``'s own recursion."""
+    await assert_recursive_refuses_a_planted_link(
+        'SFTP', sftp_walk, scratch, sftp_auth)
+
+
+@both_filesystems
+async def test_the_recursive_arm_still_downloads_a_whole_tree(
+    ftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """The capability the refusal above must not have cost.
+
+    A containment fix that refused every recursive write would satisfy
+    both rows above. This is what rules that out: an ordinary directory
+    download into a fresh destination lands its files, with the right
+    bytes, at 0600.
+    """
+    destination = scratch / 'tree'
+
+    result = await ftp_walk(destination, ftp_auth)
+
+    assert_envelope(result, 'FTP')
+    assert result['ok'] is True, result['error']
+
+    landed = [p for p in destination.rglob('*') if p.is_file()]
+    assert landed, f'nothing landed under {destination}'
+    fetched = next(destination.rglob('report.csv'))
+    assert fetched.read_bytes() == REMOTE_FIXTURE
+
+    wide = {
+        str(p): oct(p.stat().st_mode & 0o777)
+        for p in landed
+        if p.stat().st_mode & 0o777 != FILE_MODE
+    }
+    assert wide == {}, (
+        f'a recursive download left these files at a mode other than '
+        f'{FILE_MODE:#o}: {wide}')
+
+
+@both_filesystems
+async def test_a_legitimate_ftp_transfer_still_lands_at_0600(
+    ftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """The success row the refusals above are only meaningful against.
+
+    A guard that refused every destination would pass all four rows
+    above. This is what rules that out, and it asserts the mode as well
+    as the bytes because 0600 is a security property of this release
+    rather than an accident of ``umask``.
+    """
+    destination = scratch / 'ordinary.csv'
+
+    result = await download_to(destination, ftp_auth)
+
+    assert_envelope(result, 'FTP')
+    assert result['ok'] is True, result['error']
+    assert destination.read_bytes() == REMOTE_FIXTURE
+    assert not destination.is_symlink()
+    mode = destination.stat().st_mode & 0o777
+    assert mode == FILE_MODE, (
+        f'{destination} landed at {mode:#o}, not {FILE_MODE:#o}')
+
+
+@requires_hostkey
+@both_filesystems
+async def test_a_legitimate_sftp_transfer_still_lands_at_0600(
+    sftp_auth: Any, scratch: pathlib.Path,
+) -> None:
+    """The same success row for SFTP."""
+    destination = scratch / 'ordinary.csv'
+
+    result = await sftp_get_to(destination, sftp_auth)
+
+    assert_envelope(result, 'SFTP')
+    assert result['ok'] is True, result['error']
+    assert destination.read_bytes() == REMOTE_FIXTURE
+    assert not destination.is_symlink()
+    mode = destination.stat().st_mode & 0o777
+    assert mode == FILE_MODE, (
+        f'{destination} landed at {mode:#o}, not {FILE_MODE:#o}')
+
+
+@requires_volume
+async def test_the_symlink_refusal_holds_under_foreign_ownership(
+    ftp_auth: Any, sftp_auth: Any,
+) -> None:
+    """AGW-N4 where the process does not own the directory.
+
+    `O_NOFOLLOW` is a refusal the kernel makes regardless of uid, so the
+    expected answer is that ownership changes nothing -- and an
+    unsurprising result measured is worth more than an assumed one.
+    Under `tmp_path` the test user creates and owns every component, so
+    a guard that quietly depended on that would pass there and fail in
+    the deployment this library is actually used in.
+
+    Both premises are asserted rather than assumed: a rootless or
+    userns-remapped daemon may hand back a directory this process owns
+    after all, and that would make the test pass while proving nothing.
+    """
+    workdir = pathlib.Path(SCRATCH_DIR) / 'foreign'
+    assert workdir.is_dir(), (
+        f'{workdir} is missing: the image pre-creates it so that Docker '
+        f'seeds the volume with a directory the test user does not own')
+    assert workdir.stat().st_uid != os.getuid(), (
+        f'{workdir} is owned by this process (uid {os.getuid()}), so '
+        f'there is no foreign ownership here to test')
+
+    stem = unique('nofollow')
+    victim = workdir / f'{stem}-victim.txt'
+    victim.write_bytes(b'do not follow me\n')
+
+    ftp_target = workdir / f'{stem}-ftp.csv'
+    ftp_target.symlink_to(victim)
+    result = await download_into(ftp_target, ftp_auth)
+    assert_path_refusal(result, ftp_target)
+    assert victim.read_bytes() == b'do not follow me\n', (
+        'FTP wrote through the link in a directory it does not own')
+
+    sftp_target = workdir / f'{stem}-sftp.csv'
+    sftp_target.symlink_to(victim)
+    result = await sftp_get_to(sftp_target, sftp_auth, overwrite=True)
+    assert_envelope(result, 'SFTP')
+    assert result['ok'] is False, (
+        'SFTP wrote through the link in a directory it does not own')
+    assert result['error']['code'] == 'PATH', result['error']
     assert victim.read_bytes() == b'do not follow me\n'
