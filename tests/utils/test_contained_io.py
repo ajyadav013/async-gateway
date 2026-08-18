@@ -38,6 +38,7 @@ from async_gateway.utils.contained_io import (
     contained_download,
     contained_path_io_factory,
     local_base,
+    local_operand,
 )
 from async_gateway.utils.exceptions import (
     ConfigurationError,
@@ -45,6 +46,7 @@ from async_gateway.utils.exceptions import (
     PathContainmentError,
     ResponseTooLargeError,
 )
+from async_gateway.utils.paths import under
 
 
 class _FullDisk:
@@ -1450,3 +1452,65 @@ def test_local_base_makes_a_relative_operand_absolute() -> None:
     would be refused.
     """
     assert local_base('downloads/tree').is_absolute()
+
+
+def test_a_relative_operand_is_contained_rather_than_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AGW-N3: absolute is necessary, and it was not sufficient.
+
+    The row above asserts only that :func:`local_base` *returns*
+    something absolute, and that passed throughout the defect. It had
+    to: ``local_base`` was never the broken half. The break was that
+    the **operand** handed to the transfer library stayed the caller's
+    original relative spelling while the base went absolute, so
+    :func:`~async_gateway.utils.paths.under` -- which splits by
+    *textual* ``relative_to`` -- compared ``'dest'`` against
+    ``'/abs/dest'``, found no shared prefix, and refused every path the
+    transfer touched with ``PATH``/400. An absolute base and a relative
+    operand is precisely the failing combination, so a test that checks
+    only the base cannot see it.
+
+    This row therefore asserts the property the caller actually
+    experiences: a relative operand is **contained**, not refused, and
+    it resolves to the same location the working directory implies. The
+    equality against :func:`local_operand` is what pins the two halves
+    to one absolutisation -- the invariant whose violation *was* the
+    defect.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'dest').mkdir()
+
+    base = local_base('dest')
+    operand = local_operand('dest')
+
+    # The two halves agree, which is the whole fix.
+    assert operand == str(base)
+    # And a path the client composes onto that operand is contained
+    # rather than refused -- the end-to-end behaviour, at the seam.
+    assert under(base, os.path.join(operand, 'file.bin')) == (
+        tmp_path / 'dest' / 'file.bin')
+
+
+def test_a_relative_operand_still_refuses_an_escaping_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepting a relative operand must not cost the containment.
+
+    The paired negative of the row above, and the reason AGW-N3 is a
+    usability fix rather than a loosening: what was refused was the
+    *caller's own* destination, never the attack. A hostile entry name
+    composed onto the now-absolute operand still escapes the base and
+    is still refused -- so R22 holds for a relative ``client_path`` on
+    exactly the terms it holds for an absolute one.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'dest').mkdir()
+
+    base = local_base('dest')
+    escaping = os.path.join(local_operand('dest'), '..', 'victim', 'OWNED')
+
+    with pytest.raises(PathContainmentError):
+        under(base, escaping)

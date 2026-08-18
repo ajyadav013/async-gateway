@@ -1513,6 +1513,24 @@ def local_base(path: PathLike) -> Path:
     of ``../victimdir/OWNED`` landed as ``downloads/victimdir/OWNED``
     -- outside the tree the caller named, inside the check.
 
+    **The transfer must be handed this same value as its local
+    operand**, not the caller's original spelling, and that is AGW-N3.
+    :func:`~async_gateway.utils.paths.under` splits a composed path into
+    a trusted prefix and an untrusted tail by *textual*
+    ``relative_to`` -- so the prefix it is given has to be the one the
+    client actually composed against. Handed an absolute base while the
+    client composed onto a **relative** ``client_path``/``local_path``,
+    the two can never share a prefix: every path the transfer touched
+    was refused with ``PATH``/400 (``'dest' is not under '/abs/dest'``),
+    for a caller who had done nothing wrong.
+
+    HTTP had no such gap -- ``resolve_caller_path`` simply absolutises
+    against the working directory -- so the same relative path was
+    written by one protocol and refused by two, which is the parity
+    half of AGW-N3. :func:`local_operand` is what the dispatch sites
+    pass down, so that base and operand are the *same* absolutisation
+    and cannot drift apart again.
+
     Args:
         path: The local operand from ``protocol_info``.
 
@@ -1522,3 +1540,27 @@ def local_base(path: PathLike) -> Path:
         is where the base and the candidate are compared as locations.
     """
     return Path(path).absolute()
+
+
+def local_operand(path: PathLike) -> str:
+    """Return the local operand to hand the transfer library, absolute.
+
+    The companion of :func:`local_base`, and deliberately the *same*
+    computation: the base a write is judged against and the operand the
+    client composes onto must be one value, or the textual prefix split
+    in :func:`~async_gateway.utils.paths.under` compares two spellings
+    of one location and refuses everything (AGW-N3).
+
+    A relative path is therefore resolved against the process working
+    directory here, which is what HTTP's ``resolve_caller_path`` has
+    always done -- so all four protocols accept the same
+    ``client_path``/``local_path`` and resolve it the same way.
+
+    Args:
+        path: The local operand from ``protocol_info``.
+
+    Returns:
+        The absolute path as a string, which is what ``aioftp`` and
+        ``asyncssh`` take as their local positional.
+    """
+    return str(local_base(path))

@@ -51,6 +51,7 @@ from async_gateway.utils.contained_io import (
     TransferBudget,
     contained_path_io_factory,
     local_base,
+    local_operand,
 )
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
@@ -904,6 +905,17 @@ class FTPRequest(BaseRequestClass):
             on its own terms if it is missing, and that refusal is a
             transport failure this class already classifies.
         """
+        # Absolutised, and by the same function that computes the
+        # containment base. `_path_io_factory` confines this transfer to
+        # `local_base(self.client_path)`, and `paths.under` splits what
+        # `aioftp` composed by *textual* prefix -- so handing the client
+        # the caller's original relative spelling gave the two sides two
+        # spellings of one directory, which share no prefix, and every
+        # write was refused `PATH`/400 (AGW-N3). HTTP resolved the same
+        # relative path against the working directory and wrote it.
+        local = (
+            local_operand(self.client_path)
+            if self.client_path is not None else None)
         if LOCAL_IS_SOURCE.get(command, False):
-            return self.client_path, self.server_path
-        return self.server_path, self.client_path
+            return local, self.server_path
+        return self.server_path, local

@@ -134,7 +134,7 @@ from async_gateway.helpers.internal.base import (
 from async_gateway.logic.http_client import validated_max_response_bytes
 from async_gateway.utils.constants import MAX_RESPONSE_BYTES
 from async_gateway.utils.contained_io import (
-    TransferBudget, contained_download, local_base)
+    TransferBudget, contained_download, local_base, local_operand)
 from async_gateway.utils.envelope import GatewayResponse, finalise_ok
 from async_gateway.utils.exceptions import (
     AsyncGatewayError,
@@ -915,7 +915,12 @@ class SFTPRequest(BaseRequestClass):
                 sftp,
                 mode,
                 self.remote_path,
-                self.local_path,
+                # The operand and the base are one absolutisation, not
+                # two spellings of it: `contained_download` judges every
+                # composed path against `base` by textual prefix, so a
+                # relative `local_path` here refused the whole transfer
+                # `PATH`/400 (AGW-N3).
+                local_operand(self.local_path),
                 base=local_base(self.local_path),
                 overwrite=self.overwrite,
                 # One budget per call, not per file: the server chooses
@@ -959,6 +964,14 @@ class SFTPRequest(BaseRequestClass):
             on its own terms if it is missing, and that refusal is a
             transport failure this class already classifies.
         """
+        # Absolutised through the same function that computes the
+        # containment base, for the reason AGW-N3 gives: a relative
+        # `local_path` handed to asyncssh while the base is absolute
+        # gives `paths.under` two spellings of one directory to compare
+        # textually, and every write is refused `PATH`/400.
+        local = (
+            local_operand(self.local_path)
+            if self.local_path is not None else None)
         if LOCAL_IS_SOURCE.get(mode, False):
-            return self.local_path, self.remote_path
-        return self.remote_path, self.local_path
+            return local, self.remote_path
+        return self.remote_path, local

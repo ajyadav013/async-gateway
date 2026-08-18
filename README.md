@@ -1347,6 +1347,21 @@ Two more: a **relative** `local_filepath` resolves against the **process working
 directory**, and a destination that is itself a **directory** is reported as a
 directory rather than advising `overwrite=True`, which cannot help there.
 
+**Relative local paths are accepted on every protocol, and all four resolve them
+the same way** — against the process working directory. That applies to HTTP and
+SOAP's `download_filepath` / `local_filepath`, FTP's `client_path`, and SFTP's
+`local_path`. Containment is unaffected: the directory your relative path names
+is still the boundary a hostile server's entry names are checked against, so a
+relative destination is confined exactly as an absolute one is.
+
+**Scope boundary on upload: the source side is not containment-checked.** The
+guarantees above are about where a download is allowed to *write*. On an
+**upload**, a `client_path` / `local_path` / `local_filepath` that is a symbolic
+link pointing outside itself is followed, read, and sent — the caller named the
+file to upload, and this library treats that as the caller's own decision rather
+than a remote party's. If your process uploads paths that a *less-trusted* party
+can influence, resolve and check them yourself before the call.
+
 **A failure part-way through a download removes what it wrote** rather than
 orphaning a partial file — and `delete_local_file_path` is idempotent so your
 own cleanup can still run after it.
