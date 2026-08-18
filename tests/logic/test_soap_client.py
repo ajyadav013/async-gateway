@@ -1139,6 +1139,37 @@ def test_n5_the_depth_check_answers_a_tree_the_parser_can_hold() -> None:
     assert exceeds_depth(fromstring('<detail><a>x</a></detail>'), 64) is False
 
 
+def recursive_exceeds_depth(
+    node: Element,
+    max_depth: int,
+    depth: int = 1,
+) -> bool:
+    """Measure depth recursively, as ``exceeds_depth`` must not.
+
+    Deliberately *not* production code: this is the counterfactual the
+    row below rejects. It is the plausible implementation --
+    self-bounded at ``max_depth``, so it never runs away on its own --
+    and it is exactly what would pass every test that merely feeds
+    ``exceeds_depth`` a deep tree and checks the answer. What separates
+    it from the real one is that it spends a frame per level, so under
+    a squeezed recursion budget it raises ``RecursionError`` where the
+    iterative walk answers.
+
+    Args:
+        node: The subtree to measure, counted as level ``depth``.
+        max_depth: The deepest level permitted.
+        depth: The level ``node`` sits at. Defaults to 1.
+
+    Returns:
+        True when some node sits deeper than ``max_depth``.
+    """
+    if depth > max_depth:
+        return True
+    return any(
+        recursive_exceeds_depth(child, max_depth, depth + 1)
+        for child in node)
+
+
 def test_n5_the_depth_check_needs_no_frames_of_its_own() -> None:
     """Iterative is a security property here, not a style preference.
 
@@ -1161,6 +1192,37 @@ def test_n5_the_depth_check_needs_no_frames_of_its_own() -> None:
 
     The limit is restored in a ``finally`` because leaving it lowered
     would fail unrelated tests in whatever order they happen to run.
+
+    **The headroom is a fraction of the depth cap, not a fixed count,
+    and that is AGW-N2.** This row used to squeeze the budget to
+    ``frames + 10``, chosen as "comfortably under 64" -- reasoning about
+    the *walk's* frames alone, as though the walk were the only thing
+    the interpreter runs. It is not. Under ``--cov`` the tracer's own
+    callback needs frames of its own on top of every call the walk
+    makes, and on 3.10/3.11 that overhead is enough to exhaust a
+    ten-frame budget before the iterative walk can finish: measured on
+    real 3.10.18 and 3.11.15, the smallest margin that completes under
+    the project's ``ctrace`` core is **11**, against **3** on 3.12+
+    where the tracer is cheaper. So the row raised ``RecursionError``
+    from inside ``coverage``'s collector -- green under ``--no-cov``,
+    red on the two oldest legs of a CI matrix that runs *with* coverage,
+    and red for a reason that had nothing to do with the property being
+    guarded.
+
+    Widening it to a fixed larger number would only move the cliff. The
+    margin is therefore ``MAX_FAULT_DETAIL_DEPTH // 2``: still strictly
+    under the depth cap, so a recursive walk self-bounding at the cap
+    provably cannot complete -- which is the whole discrimination this
+    row exists for -- while leaving room for any tracer the suite runs
+    under. And it is *tied to the constant*, so raising the cap widens
+    the budget with it rather than silently re-creating the squeeze.
+
+    The discrimination is asserted rather than assumed:
+    :func:`recursive_exceeds_depth` below is the counterfactual this row
+    must reject, and it is run under the same lowered limit. If the
+    margin were ever widened far enough for a recursive walk to
+    complete, that assertion fails and says so -- the guard cannot
+    quietly stop discriminating.
     """
     deep = fromstring(f'<detail>{nested_detail(5000)}</detail>')
 
@@ -1171,11 +1233,16 @@ def test_n5_the_depth_check_needs_no_frames_of_its_own() -> None:
         frame = frame.f_back
 
     original = sys.getrecursionlimit()
-    # Less headroom than the depth cap, so a recursive walk cannot
-    # complete even though it self-bounds at `MAX_FAULT_DETAIL_DEPTH`.
-    sys.setrecursionlimit(frames + 10)
+    sys.setrecursionlimit(frames + MAX_FAULT_DETAIL_DEPTH // 2)
     try:
         assert exceeds_depth(deep, MAX_FAULT_DETAIL_DEPTH) is True
+
+        # The counterfactual, under the same budget: a recursive walk
+        # bounded by the same cap must still run out of frames. This is
+        # what makes the row a test of *iterativeness* rather than a
+        # test that some function returned True.
+        with pytest.raises(RecursionError):
+            recursive_exceeds_depth(deep, MAX_FAULT_DETAIL_DEPTH)
     finally:
         sys.setrecursionlimit(original)
 
