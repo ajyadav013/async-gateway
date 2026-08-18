@@ -765,16 +765,23 @@ def test_e9_there_is_no_opt_out_of_redaction() -> None:
     assert files_containing(r'redact\s*[=:]\s*False') == []
 
 
-def test_redact_url_strips_userinfo_and_masks_sensitive_parameters(
-) -> None:
-    """The URL redactor covers both halves E9 names (R8, redaction)."""
+def test_redact_url_masks_userinfo_and_sensitive_parameters() -> None:
+    """The URL redactor covers both halves E9 names (R8, redaction).
+
+    E9 is about credential **values**, and a username is not one -- the
+    same bargain :func:`redact_headers` strikes, where an
+    ``Authorization`` header keeps its name and loses its value. So the
+    name is asserted present rather than absent: it is diagnostic, and
+    this function used to drop it only as a side effect of rebuilding
+    the URL through ``urlunsplit``, which is the second userinfo rule
+    F2 removed.
+    """
     redacted = redact_url('https://user:pw@host/p?token=abc&page=2')
 
-    assert 'user' not in redacted
     assert 'pw' not in redacted
     assert 'abc' not in redacted
-    assert 'page=2' in redacted
-    assert redacted.startswith('https://host/p?')
+    assert redacted == (
+        f'https://user:{REDACTED}@host/p?token={REDACTED}&page=2')
 
 
 def test_redact_text_masks_a_url_embedded_anywhere_in_a_string() -> None:
@@ -1146,20 +1153,28 @@ def test_redact_url_masks_a_sensitive_pair_in_a_url_it_cannot_parse(
     [
         pytest.param(
             'https://user:PASS@host/p',
-            'https://host/p',
-            id='parseable-url-loses-userinfo-to-the-third-pass'),
+            f'https://user:{REDACTED}@host/p',
+            id='parseable-url-keeps-the-name-and-masks-the-password'),
         pytest.param(
             'RetriesExhausted: http://u:PASS@h/p failed, retrying',
-            'RetriesExhausted: http://h/p failed, retrying',
+            f'RetriesExhausted: http://u:{REDACTED}@h/p failed, retrying',
             id='inside-prose'),
         pytest.param(
             "see http://user:PA'SS@host/p here",
-            'see http://host/p here',
+            f'see http://user:{REDACTED}@host/p here',
             id='password-holding-a-quote'),
         pytest.param(
             'see http://user:PA"SS@host/p here',
-            'see http://host/p here',
+            f'see http://user:{REDACTED}@host/p here',
             id='password-holding-a-double-quote'),
+        pytest.param(
+            '//u:PASS@h/p',
+            f'//u:{REDACTED}@h/p',
+            id='a-protocol-relative-reference-is-an-authority'),
+        pytest.param(
+            'see //u:PASS@h/p here',
+            'see //u:PASS@h/p here',
+            id='but-only-at-the-start-of-the-string'),
         pytest.param(
             'error: http://user:UNPARSESECRET@[::1/p failed',
             f'error: http://user:{REDACTED}@[::1/p failed',
@@ -1181,17 +1196,29 @@ def test_redact_text_masks_url_userinfo(text: str, expected: str) -> None:
     the three surfaces that get no second pass rely on:
     ``error['message']``, ``error['cause']`` and the logged traceback.
 
-    The embedded-URL pass already covered the *plain* case, and the
-    first two rows are it working -- it drops userinfo outright, which
-    is stronger than masking. The two rows that earn this pass are the
-    ones that pass cannot reach. ``_EMBEDDED_URL`` stops at a quote and
-    a backtick, so a password containing one truncates the match before
-    the ``@`` and the tail is left in the clear; ``urlsplit`` gives up
-    on the unclosed bracket entirely. Both were measured leaking with
-    this pass disabled.
+    Every row is now this pass working, and that is the change F2 made.
+    The first two used to be handled by the embedded-URL pass calling
+    ``redact_url``, which *dropped* the userinfo and returned
+    ``https://host/p``. That drop was a second userinfo rule, it could
+    never render what this scan renders -- it rebuilt the URL from
+    ``urlsplit``'s parts, and ``urlsplit`` deletes tab, newline and
+    carriage return -- and the two publishing different strings is the
+    defect. So there is one rule and one rendering: the name survives
+    where a ``:`` proves it is a name, the password does not.
 
-    The last row is the bound: a rule that fired without a scheme would
-    mask every ``user@host`` in prose, so the scheme is required.
+    The rows that could never have been reached by the old drop are
+    still here and still earn the pass: ``_EMBEDDED_URL`` stops at a
+    quote and a backtick, so a password containing one truncated the
+    match before the ``@`` and left the tail in the clear, and
+    ``urlsplit`` gives up on the unclosed bracket entirely. Both were
+    measured leaking with this pass disabled.
+
+    The last three rows are the bounds. A rule that fired without an
+    authority would mask every ``user@host`` in prose, so an authority
+    is required -- either a scheme, or a separator run at the very start
+    of the string, which is RFC 3986's protocol-relative reference and
+    what ``urlsplit`` reads a live password out of (F2). Anywhere else
+    a ``//`` is a path, and masking there would eat tracebacks.
     """
     assert redact_text(text) == expected
 
@@ -1394,6 +1421,16 @@ def test_redact_text_masks_hostile_userinfo_spellings(
             id='an-at-sign-inside-the-query'),
         pytest.param(
             'http://host/p#frag@ment', id='an-at-sign-inside-the-fragment'),
+        # F2's bound. A separator run *is* an authority at the head of
+        # the string, and is a path anywhere else -- which is what
+        # `urlsplit` reads too. Without the anchor this masks the middle
+        # of every traceback that mentions a path.
+        pytest.param(
+            'see //u:notsecret@h/p here',
+            id='a-separator-run-that-is-not-at-the-start'),
+        pytest.param(
+            'Traceback: File "/x/y.py" line 3 in f  user@host',
+            id='a-traceback-naming-a-path-and-a-user'),
     ],
 )
 def test_redact_text_leaves_a_non_credential_at_sign_alone(
@@ -1404,8 +1441,9 @@ def test_redact_text_leaves_a_non_credential_at_sign_alone(
     A rule that masked every ``@`` would turn each of these into
     asterisks and cost the diagnostic the string exists to provide. The
     scheme requirement stops the first three; the authority-end rule
-    stops the last three, because an ``@`` after the path begins is not
-    in the authority at all.
+    stops the middle three, because an ``@`` after the path begins is
+    not in the authority at all; and the anchor on the scheme-less
+    branch stops the last two.
 
     The two non-netloc-scheme rows are the bound F1's fix had to keep.
     A *bare* userinfo carries no ``:``, so nothing about its shape says
@@ -1523,6 +1561,17 @@ FUZZ_SCHEMES = [
     # not reach it -- so without this row that half of the fix has no
     # failing test behind it.
     'a\t', 'https\n', 'x\r',
+    # **No scheme at all** -- and therefore no colon, which is the
+    # point. This generator emitted `f'{scheme}:{separators}...'`
+    # unconditionally, so every spelling it produced had one, and a
+    # protocol-relative `//u:PW@h/p` was structurally unreachable. That
+    # is a real authority: `urlsplit` reads a full netloc out of it and
+    # reports the password, `_mask_userinfo` required a scheme and
+    # skipped it, and `redact_url` masked it anyway through the parsed
+    # netloc -- so the two maskers published different strings and the
+    # prose surfaces got the password in the clear (F2). The empty
+    # scheme is what makes that shape generable.
+    '',
 ]
 FUZZ_SEPARATORS = [
     '', '/', '//', '///', '/\\', '\\\\', '%2F%2F', '%5C%5C',
@@ -1561,6 +1610,13 @@ def fuzz_spellings() -> set[str]:
     the percent-encoded form still leaked, which is exactly what
     happened while this fix was being written.
 
+    The colon is emitted only for a scheme that exists. It used to be
+    unconditional, and that one character was a blind spot with a live
+    leak behind it: every spelling this generated had a scheme, so the
+    protocol-relative ``//u:PW@h/p`` -- an authority ``urlsplit`` reads
+    a password out of -- could not be produced at all, and the two
+    maskers disagreed about it for a release (F2).
+
     Returns:
         The distinct spellings to check, de-duplicated.
     """
@@ -1569,7 +1625,8 @@ def fuzz_spellings() -> set[str]:
             FUZZ_SCHEMES, FUZZ_SEPARATORS, FUZZ_USERINFO,
             FUZZ_HOSTS, FUZZ_TAILS):
         scheme, separators, userinfo, host, tail = parts
-        url = f'{scheme}:{separators}{userinfo}@{host}{tail}'
+        prefix = f'{scheme}:' if scheme else ''
+        url = f'{prefix}{separators}{userinfo}@{host}{tail}'
         spellings.add(url)
         try:
             spellings.add(str(yarl.URL(url)))
@@ -1659,16 +1716,23 @@ def test_no_url_spelling_leaks_a_credential_a_reader_can_see() -> None:
     parseable" message is the exact path that published a password in
     the clear (M1/AGW-34).
 
-    **A differential is only as good as its oracle, and this one had a
-    hole with a live leak behind it.** It is closed above rather than
-    here, which is the right place, but it is worth naming at the
-    assertion it was silently weakening: the oracle read ``.password``
-    alone, and a *bare* userinfo token parses as a ``username`` with no
-    password. So ``http:TOKEN@h/p`` was generated and never evaluated
-    -- the most dangerous shape of fuzz gap, because the corpus looks
-    like it covers the case and the row is there to read (F1).
+    **A differential is only as good as its oracle, and this one had two
+    holes that each hid a live leak.** Both are closed above rather than
+    here, which is the right place, but they are worth naming at the
+    assertion they were silently weakening:
 
-    The assertion is zero, not fewer.
+    * the oracle read ``.password`` alone, and a *bare* userinfo token
+      parses as a ``username`` with no password. So ``http:TOKEN@h/p``
+      was generated and never evaluated -- the most dangerous shape of
+      fuzz gap, because the corpus looks like it covers the case (F1).
+    * the generator emitted a colon unconditionally, so a
+      protocol-relative ``//u:PW@h/p`` could not be produced at all,
+      and the two maskers disagreed about it undetected (F2).
+
+    Measured against the pre-fix module over the corpus these two fixes
+    produce: 766 spellings published a credential on at least one
+    surface, where the same corpus read by the old ``.password``-only
+    oracle reported far fewer. The assertion is zero, not fewer.
     """
     leaks: list[tuple[str, list[str]]] = []
     checked = 0
@@ -1696,6 +1760,44 @@ def test_no_url_spelling_leaks_a_credential_a_reader_can_see() -> None:
     assert leaks == [], (
         f'{len(leaks)} spellings publish a credential a URL reader can '
         f'see; first five: {leaks[:5]}')
+
+
+def test_the_two_maskers_agree_on_every_url_spelling() -> None:
+    """The class itself, asserted where it actually keeps recurring.
+
+    Six rounds of findings, and rounds 1, 4, 5 and 6 were all the same
+    class: two rules for one job, disagreeing. The leak differential
+    above cannot see that class until it has already become a leak --
+    it asks "is a credential published?", and two maskers can render a
+    credential-free string two different ways for a release before one
+    of those renderings turns out to be the unmasked one.
+
+    So this asserts the stronger property directly, over the same
+    corpus: :func:`redact_url` and :func:`redact_text` return the
+    **same string** for every spelling, credential-bearing or not. That
+    is what the query corpus has asserted since round 5, and its
+    absence here is why F2 shipped -- the userinfo corpus checked only
+    for leaks, so ``//u:S3CRET@h/p`` being masked by one masker and
+    published by the other did not fail anything.
+
+    Measured against the pre-fix module: 3774 of these spellings were
+    rendered differently by the two maskers.
+    """
+    disagreed: list[tuple[str, str, str]] = []
+    corpus = sorted(fuzz_spellings())
+    for url in corpus:
+        from_url, from_text = redact_url(url), redact_text(url)
+        if from_url != from_text:
+            disagreed.append((url, from_url, from_text))
+
+    assert len(corpus) > 10000, (
+        f'only {len(corpus)} spellings were generated, so this row is '
+        f'close to vacuous -- the generators have stopped producing '
+        f'authorities')
+    assert disagreed == [], (
+        f'{len(disagreed)} spellings are masked differently by the two '
+        f'maskers, which is how four of the six findings against this '
+        f'module began; first five: {disagreed[:5]}')
 
 
 def test_the_deleted_character_set_is_taken_from_the_parser() -> None:
@@ -1793,12 +1895,12 @@ def test_whitespace_in_the_separator_run_is_masked(
 ) -> None:
     """The half of NEW-M1c the differential fuzz structurally cannot see.
 
-    The fuzz above asks "does a URL reader report a live password?" and
-    masks wherever one does. These rows are the shapes where **neither**
-    reader reports one and the credential is published anyway --
-    ``urlsplit`` and ``yarl`` both read ``http: //user:PW@h/p`` as a
-    path, so the fuzz's oracle says there is nothing to hide, while the
-    reviewer's finding is that the password appears in the envelope
+    The fuzz above asks "does a URL reader report a live credential?"
+    and masks wherever one does. These rows are the shapes where
+    **neither** reader reports one and the credential is published
+    anyway -- ``urlsplit`` and ``yarl`` both read ``http: //user:PW@h/p``
+    as a path, so the fuzz's oracle says there is nothing to hide, while
+    the reviewer's finding is that the password appears in the envelope
     ``url``, ``extra['url']`` and ``extra['traceback']`` in the clear.
 
     A published credential is a leak whether or not a parser agrees it

@@ -86,7 +86,7 @@ import urllib.parse as _parse
 from bisect import bisect_left
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any, Final, Optional
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote
 
 from aiohttp import BasicAuth
 
@@ -288,8 +288,22 @@ _SEPARATOR_RUN: Final[str] = '(?:[{}]|(?i:{}))*'.format(
 # matched at an offset, because `Pattern.match` returns `Optional` and a
 # run of `*` never fails -- so the None arm would be unreachable code
 # guarded by an untestable branch. A group cannot be absent.
+#
+# `\A` is the second alternative because RFC 3986's authority does not
+# require a scheme: `//u:PW@h/p` is a protocol-relative reference and
+# `urlsplit` reads a full netloc out of it, password and all. Requiring
+# a scheme here is what let `_mask_userinfo` skip that spelling while
+# `redact_url` masked it through the parsed netloc -- the two maskers
+# disagreeing, which is the defect this module's history is made of.
+#
+# It is anchored, and the anchor is the whole reason it is safe: a
+# scheme-less authority is one `urlsplit` finds only at the very start
+# of the string, so matching `//` anywhere else would mask prose the
+# parser reads as a path. The scheme alternative comes *first* so that
+# on `http://...` the zero-width `\A` branch cannot shadow the real
+# scheme at offset 0.
 _SCHEME_PREFIX: Final[re.Pattern[str]] = re.compile(
-    r'([A-Za-z][A-Za-z0-9+.\-]{0,31}:)(' + _SEPARATOR_RUN + ')')
+    r'([A-Za-z][A-Za-z0-9+.\-]{0,31}:|\A)(' + _SEPARATOR_RUN + ')')
 
 # The schemes `urllib.parse` itself reads an authority after, taken from
 # its own `uses_netloc` rather than guessed at here.
@@ -413,9 +427,12 @@ def _bears_an_authority(scheme: 're.Match[str]', *, bare: bool) -> bool:
     hand-rolled answer to a question the parser has already answered is
     how every round of findings against this module has begun.
 
-    A **separator run** introduces an authority under any scheme:
-    ``urlsplit`` reads a full netloc out of ``a://u:PW@h/p``, password
-    and all, whatever it makes of the scheme.
+    A **separator run** introduces an authority under any scheme, and
+    with no scheme at all at the very start of the string: ``urlsplit``
+    reads a full netloc out of both ``a://u:PW@h/p`` and the
+    protocol-relative ``//u:PW@h/p``, password and all. Anywhere other
+    than offset 0 the scheme-less form is a path, so the anchor is what
+    keeps this off ``see //not:an@authority`` in prose (F2).
 
     Without a separator run it depends on what the userinfo looks like,
     and that asymmetry is the point:
@@ -439,7 +456,8 @@ def _bears_an_authority(scheme: 're.Match[str]', *, bare: bool) -> bool:
 
     Args:
         scheme: A :data:`_SCHEME_PREFIX` match -- group 1 the
-            ``scheme:`` and group 2 the separator run that followed.
+            ``scheme:``, or empty for the scheme-less branch, and group
+            2 the separator run that followed.
         bare: True when the userinfo found after it carries no ``:``,
             and so cannot be told from a username by its shape.
 
@@ -448,6 +466,16 @@ def _bears_an_authority(scheme: 're.Match[str]', *, bare: bool) -> bool:
         the authority's.
     """
     prefix, separators = scheme.group(1), scheme.group(2)
+    if not prefix:
+        # `\A` matches only at offset 0, so reaching here at all means
+        # this is the head of the string -- the anchor does the work an
+        # explicit `scheme.start() == 0` would, and a redundant test of
+        # it would be a branch no input can take.
+        #
+        # A separator run is still required: with none, `\A` matched the
+        # empty string before ordinary prose and there is no authority
+        # here at all.
+        return bool(separators)
     if separators or not bare:
         return True
     return prefix[:-1].casefold() in _NETLOC_SCHEMES
@@ -791,47 +819,56 @@ def redact_cookies(cookies: Mapping[str, str]) -> dict[str, str]:
 
 
 def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
-    """Strip URL userinfo and mask sensitive ``name=value`` pairs.
+    """Mask URL userinfo and sensitive ``name=value`` pairs.
 
     ``https://user:pw@host/p?api_key=x`` becomes
-    ``https://host/p?api_key=***redacted***``. Parameter order and every
-    other component are preserved, and a URL needing no masking is returned
-    as it came in rather than re-encoded.
+    ``https://user:***redacted***@host/p?api_key=***redacted***``.
+    Parameter order and every other component are preserved, and a URL
+    needing no masking is returned as it came in rather than re-encoded.
 
-    **This function no longer has a masking rule of its own.** The pair
-    masking is :func:`_mask_in_string`, exactly as :func:`redact_text`
-    runs it, over the whole URL; the only thing this adds is dropping the
-    userinfo out of a netloc ``urlsplit`` was able to identify. That
-    division is the fix for a class of defect, and the class is worth
-    naming because this is its fourth round:
+    **This function has no masking rule of its own at all.** It *is*
+    :func:`_mask_in_string`, over the whole URL, with the one argument
+    that distinguishes a URL from prose -- and that is the entire body.
+    :func:`redact_text` runs the same scan. Nothing is left for the two
+    to disagree about, which is the point, and it took six rounds to
+    arrive at:
 
     * round 1 -- ``_QUERY_PAIR`` did not know ``;`` was a separator.
     * round 4 (N1) -- the separator set was unified into
       :data:`_QUERY_SEPARATORS`, but only :func:`redact_text` used it;
       this function still split with ``parse_qsl``.
-    * this round -- the separator set *is* shared, and the two maskers
-      still disagreed, because they scanned different **components**.
-      This one masked ``parts.query`` alone, so a secret anywhere else in
-      the URL was published: ``/p;api_key=S`` in the path (RFC 3986 path
-      parameters, which PHP and servlet containers read as parameters)
-      and ``/p#frag?api_key=S`` after a fragment were both masked by
-      :func:`redact_text` and published in the clear here -- in the
-      envelope ``url`` on the ``ok=True`` and ``ok=False`` paths alike,
-      and in ``validated_url``'s ``ConfigurationError``.
+    * round 5 -- the separator set *was* shared and the two still
+      disagreed, because they scanned different **components**: this one
+      masked ``parts.query`` alone, so ``/p;api_key=S`` in a path and
+      ``/p#frag?api_key=S`` after a fragment were masked by
+      :func:`redact_text` and published in the clear here. The pair
+      *scan* was unified in response.
+    * round 6 (F2) -- and they disagreed **again**, because unifying the
+      pair scan left the other half of this function alone: a second
+      userinfo rule, ``urlsplit`` plus a netloc drop, that
+      :func:`redact_text` had no counterpart for. ``//u:S3CRET@h/p`` was
+      masked here through the parsed netloc and published whole by
+      :func:`redact_text` into ``error['message']`` and
+      ``extra['traceback']``.
 
-    Each round unified one more thing the two rules had a copy of: first
-    the separator character, then the separator *set*. Sharing a constant
-    stops them disagreeing about what a separator is; it says nothing
-    about *where each one looks*, and that was the next place to
-    disagree. So the surface is unified rather than the constant: there
-    is one scan over one string, and a component cannot be forgotten
-    because no component is enumerated. A future URL grammar that puts a
-    pair somewhere new is covered by construction -- the scan never asked
-    which component it was in.
+    That second rule could never have been brought into agreement, and
+    that is why it is gone rather than corrected. It reassembled the URL
+    from ``urlsplit``'s *parts*, and ``urlsplit`` deletes tab, newline
+    and carriage return -- so on ``http:<TAB>//user:PW@host/p`` it
+    returned ``http://host/p`` while the scan returned the caller's own
+    string minus the secret. Two rules that render differently *by
+    construction* cannot be reconciled by teaching either one another
+    input shape; one of them has to stop existing.
 
-    What remains here is only reassembly, and it is deliberately the
-    smaller half: :func:`urlsplit` is consulted to find a *credential*,
-    never to find a pair.
+    The cost is a rendering change, and it is the fail-closed direction:
+    a masked userinfo is now shown in place, ``https://user:***``, where
+    this function used to drop it and return ``https://host/p``. The
+    username survives exactly where a ``:`` proves it is a username --
+    the bargain :func:`redact_headers` strikes -- and a bare token,
+    which nothing distinguishes from a username by inspection, is masked
+    whole. That was already true of every URL ``urlsplit`` could not
+    parse, and of every one it parsed into an empty netloc, so this
+    makes one rendering universal rather than introducing a new one.
 
     Args:
         url: The URL to redact.
@@ -841,58 +878,20 @@ def redact_url(url: str, *, extra_params: Collection[str] = ()) -> str:
 
     Returns:
         The redacted URL, or ``url`` unchanged when nothing needed
-        masking. A URL that cannot be *parsed* is still masked, by the
-        same scan -- it is kept rather than discarded, because it is
-        diagnostic data rather than a security boundary, but keeping it
-        is not the same as keeping its credentials.
+        masking. A URL that cannot be *parsed* needs no separate rule
+        here and never did: the scan needs no parse to succeed. It is
+        kept rather than discarded, because it is diagnostic data rather
+        than a security boundary, but keeping it is not the same as
+        keeping its credentials.
     """
-    # The pair scan first and unconditionally, over the whole string. It
-    # needs no parse to succeed, which is why the unparseable URL below
-    # needs no separate rule: `_mask_in_string` has already run on it.
-    #
     # `_URL_QUERY_PAIR` because the argument is a whole URL: a space in
     # `?api_key=my secret key` is inside the value, and ending there
-    # would publish two thirds of the secret in the envelope `url`.
-    masked = _mask_in_string(
+    # would publish two thirds of the secret in the envelope `url`. That
+    # is the one legitimate difference between the two maskers, it is an
+    # argument rather than a second rule, and it is now the *only*
+    # difference there is.
+    return _mask_in_string(
         url, _sensitive_names(extra_params), pairs=_URL_QUERY_PAIR)
-
-    try:
-        parts = urlsplit(masked)
-    except ValueError:
-        # Echoing the input here was the leak (M1/AGW-34). The ticket
-        # accepted it on the condition that no caller-visible surface
-        # reached this function uncomposed, and that condition was
-        # false: `validated_url`'s own "url is not parseable" message
-        # calls it directly, so a public `request()` raised
-        # `ConfigurationError: url is not parseable:
-        # http://user:SUPERSECRET123@[::1/p` with the password intact --
-        # the one input that reaches this branch being, definitionally,
-        # the one the caller gets told about.
-        #
-        # An unclosed IPv6 bracket defeats `urlsplit` and not a
-        # character class, so the scan above stands on its own here.
-        return masked
-
-    netloc = parts.netloc
-    if '@' not in netloc:
-        # A parse that *succeeded* is not proof there is no credential to
-        # drop -- only proof that `urlsplit` found no authority to put it
-        # in. `http:/\/user:BACKSLASHPW@host/p` splits happily, into an
-        # empty netloc and a path holding the whole credential, so a
-        # netloc-only rule dropped nothing and the password reached the
-        # envelope `url` and the log record's `extra['url']` in the clear
-        # (NEW-M1b).
-        #
-        # `_mask_in_string` already ran `_mask_userinfo` over the whole
-        # string, so that credential is masked wherever the parser put
-        # it. There is nothing further to reassemble: rebuilding through
-        # `urlunsplit` could only re-encode components this function was
-        # asked to leave alone.
-        return masked
-
-    netloc = netloc.rsplit('@', 1)[1]
-    return urlunsplit(
-        (parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def redact_text(text: str, *, extra_params: Collection[str] = ()) -> str:
