@@ -47,6 +47,7 @@ from types import MappingProxyType
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Final,
     Mapping,
     Optional,
@@ -58,7 +59,12 @@ import aioftp
 import asyncssh
 from asyncssh.sftp import LocalFile, local_fs
 
-from async_gateway.utils.exceptions import PathContainmentError
+from async_gateway.utils.exceptions import (
+    AsyncGatewayError,
+    ConfigurationError,
+    LocalWriteError,
+    PathContainmentError,
+)
 from async_gateway.utils.http_file_config import response_too_large
 from async_gateway.utils.paths import (
     BytesOrPathLike,
@@ -185,6 +191,51 @@ def _shown(path: BytesOrPathLike) -> str:
         Its text form.
     """
     return os.fsdecode(path)
+
+
+def classify_mkdir_refusal(path: Path, err: OSError) -> AsyncGatewayError:
+    """Return the typed error a refused ``mkdir`` should raise.
+
+    :func:`~async_gateway.utils.paths.classify_refusal` with the one arm
+    that cannot apply to a directory replaced. That function is written
+    for the *open* of a file, so its ``EEXIST`` answer is
+    ``ConfigurationError``: "already exists and overwrite is False; pass
+    ``overwrite=True`` to replace it". For a ``mkdir`` that advice is
+    simply false -- ``overwrite`` governs whether a *file* this library
+    writes may replace one already there, and no value of it makes
+    ``mkdir`` succeed over an existing regular file. Telling a caller to
+    retry with a flag that cannot work is the same mistake the directory
+    arm of ``classify_refusal`` already refuses to make.
+
+    So a ``mkdir`` refused because something is already in the way is a
+    :class:`~async_gateway.utils.exceptions.LocalWriteError` -- code
+    ``PATH``, which is what **every other** ``mkdir`` refusal on both
+    protocols already reports: a missing ancestor
+    (``LocalWriteError``), and an escaping path
+    (``PathContainmentError``). Measured before this change, against
+    real loopback servers, with a directory download aimed at a local
+    path occupied by a regular file: FTP answered ``CONFIG``/400 and
+    SFTP answered ``PATH``/400 -- one question, two codes, which is the
+    class of divergence this release has spent eleven rounds closing.
+
+    A symbolic link in the way keeps its ``PathContainmentError``: that
+    is a containment finding and not an operational one, and the
+    distinction between the two is the reason those are separate
+    classes.
+
+    Args:
+        path: The directory the create refused, for the message.
+        err: What the filesystem raised.
+
+    Returns:
+        The typed error, always reporting ``PATH``.
+    """
+    typed = classify_refusal(path, err)
+    if isinstance(typed, ConfigurationError):
+        return LocalWriteError(
+            f'cannot create the local directory {str(path)!r}: something '
+            f'is already there and it is not a directory')
+    return typed
 
 
 def _open_guarded(path: Path, mode: str, overwrite: bool) -> io.BytesIO:
@@ -406,21 +457,39 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
             None.
 
         Raises:
-            PathContainmentError: If the directory escapes the base.
+            PathContainmentError: If the directory escapes the base, or
+                a symbolic link is in the way.
             LocalWriteError: If the local filesystem refused it -- a
-                missing ancestor above all. Classified here for the
-                same reason :meth:`write` and :meth:`close` classify:
-                ``aioftp`` wraps the ``OSError`` in a ``PathIOError``,
-                which reached the FTP dispatch as an
-                ``AIOFTPException`` and was reported ``TRANSPORT``/502
-                -- a network verdict for a local directory, on the very
-                call this method now refuses.
+                missing ancestor above all, or something already
+                occupying the path. Classified here for the same reason
+                :meth:`write` and :meth:`close` classify: ``aioftp``
+                wraps the ``OSError`` in a ``PathIOError``, which
+                reached the FTP dispatch as an ``AIOFTPException`` and
+                was reported ``TRANSPORT``/502 -- a network verdict for
+                a local directory, on the very call this method now
+                refuses.
+
+                Through :func:`classify_mkdir_refusal` and not the
+                plain classifier, so that a path already occupied by a
+                regular file reports ``PATH`` here as it does on SFTP.
+                It used to report ``CONFIG``, because the shared
+                classifier answers ``EEXIST`` with "pass
+                ``overwrite=True`` to replace it" -- advice that is
+                true of a file open and false of a ``mkdir``, where no
+                value of ``overwrite`` can make the call succeed.
         """
         del parents
+        # The tolerance is tested *before* containment, and must stay
+        # there: the base's own parent is by definition outside the
+        # base, so containing it first would refuse the very path this
+        # arm exists to wave through.
         if Path(_shown(path)).absolute() == self.base.parent:
             return
-        await self._classifying(super().mkdir(
-            self.contained(path), parents=False, exist_ok=exist_ok))
+        target = self.contained(path)
+        await self._classifying(
+            super().mkdir(target, parents=False, exist_ok=exist_ok),
+            classify=classify_mkdir_refusal,
+            path=target)
 
     async def rmdir(self, path: Path) -> None:
         """Remove a directory, inside the base or not at all.
@@ -619,7 +688,14 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
         if target is not None:
             await _unlink(target)
 
-    async def _classifying(self, awaited: Any) -> Any:
+    async def _classifying(
+        self,
+        awaited: Any,
+        *,
+        classify: Callable[
+            [Path, OSError], AsyncGatewayError] = classify_refusal,
+        path: Optional[Path] = None,
+    ) -> Any:
         """Await ``awaited``, typing a local filesystem refusal.
 
         ``aioftp`` wraps every path-layer failure in a ``PathIOError``
@@ -632,6 +708,16 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
 
         Args:
             awaited: The parent operation's awaitable.
+            classify: Which classifier types the unwrapped ``OSError``.
+                The write seams take the default;
+                :meth:`mkdir` passes
+                :func:`classify_mkdir_refusal`, whose ``EEXIST`` answer
+                differs because ``overwrite=True`` can replace a file
+                and can never create a directory over one.
+            path: The path the refusal is about, for the message. The
+                write seams have only ``self.base`` to name -- the
+                handle ``aioftp`` hands back does not carry its path --
+                so that stays the default.
 
         Returns:
             Whatever the parent returned.
@@ -646,7 +732,8 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
             cause = reason[1] if reason is not None else None
             if not isinstance(cause, OSError):
                 raise
-            raise classify_refusal(self.base, cause) from err
+            raise classify(
+                self.base if path is None else path, cause) from err
 
 
 def contained_path_io_factory(
@@ -975,13 +1062,35 @@ class ContainedLocalFS:
     async def mkdir(self, path: bytes) -> None:
         """Create a directory, inside the base or not at all.
 
+        The refusal is **typed**, for the same reason
+        :meth:`ContainedPathIO.mkdir` types its own: ``asyncssh``'s
+        ``LocalFS.mkdir`` calls ``os.mkdir`` bare, so a local
+        filesystem refusal left here as a raw ``OSError`` reached the
+        SFTP dispatch's residual-``OSError`` row and was reported by
+        the *dispatch's* judgement rather than by this seam's. That the
+        two happened to agree on ``PATH`` was luck, not construction --
+        the FTP sibling's identical refusal answered ``CONFIG``, and
+        neither wrapper decided anything.
+
         Args:
             path: The directory to create.
 
         Returns:
             None.
+
+        Raises:
+            PathContainmentError: If the directory escapes the base, or
+                a symbolic link is in the way.
+            LocalWriteError: If the local filesystem refused it -- a
+                missing ancestor, an unwritable parent, or something
+                already occupying the path.
         """
-        await local_fs.mkdir(self.contained(path))
+        target = self.contained(path)
+        try:
+            await local_fs.mkdir(target)
+        except OSError as err:
+            raise classify_mkdir_refusal(
+                Path(_shown(target)), err) from err
 
     async def readlink(self, path: bytes) -> bytes:
         """Read the target of a contained local symbolic link.

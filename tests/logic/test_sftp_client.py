@@ -1472,6 +1472,44 @@ async def test_r22_an_ordinary_tree_still_downloads(
     assert landed.stat().st_mode & 0o777 == 0o600
 
 
+async def test_a_recursive_download_refuses_an_occupied_destination(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The directory arm of the real ``_copy``, end to end.
+
+    ``_copy`` asks ``dstfs.isdir`` and then calls ``dstfs.mkdir``
+    before it copies a directory's entries, and this is the row that
+    makes the real client take that path against the real
+    ``ContainedLocalFS``. Until it existed, ``mkdir`` on that class was
+    reached by nothing: the writing double in
+    ``tests/fixtures/protocol_transports.py`` went straight to
+    ``open``, so the one destination-filesystem method that *creates*
+    rather than writes shipped unclassified.
+
+    ``PATH``, matching FTP. Measured before the fix against real
+    loopback servers, the same occupied destination answered
+    ``CONFIG``/400 on FTP and ``PATH``/400 here.
+    """
+    target = tmp_path / 'downloads'
+    target.write_bytes(b'an ordinary file in the way')
+    trusting_double(
+        monkeypatch,
+        StubSFTPClient(attrs=DIRECTORY_ATTRS, remote_tree=hostile_tree()))
+
+    envelope = await sftp_call(
+        host_key=SERVER_HOST_KEY,
+        mode='get',
+        remote_path=REMOTE_TREE_ROOT,
+        local_path=str(target))
+
+    assert envelope['ok'] is False
+    assert envelope['error']['code'] == 'PATH'
+    assert envelope['status_code'] == 400
+    assert target.read_bytes() == b'an ordinary file in the way', (
+        'the refused mkdir must leave what was in the way untouched')
+
+
 async def test_r22_a_server_supplied_symlink_is_not_recreated(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

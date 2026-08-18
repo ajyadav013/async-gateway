@@ -827,6 +827,86 @@ async def test_the_local_fs_still_performs_the_operations(
         os.fsencode(str(base / 'link'))) == os.fsencode(str(base / 'f.bin'))
 
 
+@pytest.mark.parametrize('protocol', ['FTP', 'SFTP'])
+async def test_mkdir_over_an_existing_file_is_PATH_on_both_protocols(
+    tmp_path: Path,
+    protocol: Text,
+) -> None:
+    """One question, one code, on both containment wrappers.
+
+    The divergence, stated as a test. ``mkdir`` over a path already
+    occupied by a regular file is the same local fault whichever
+    transfer library asks for it, and the two wrappers answered it
+    differently: measured against real loopback servers with a
+    directory download aimed at an occupied local path, FTP reported
+    ``CONFIG``/400 and SFTP reported ``PATH``/400.
+
+    ``PATH`` is the settled answer, and not merely the majority one.
+    The neighbouring refusals on this very call already report it -- a
+    missing ancestor is a ``LocalWriteError`` and an escaping path a
+    ``PathContainmentError``, both ``PATH`` -- so ``CONFIG`` was the
+    outlier among ``mkdir``'s own outcomes as well as across the two
+    protocols. What made FTP say ``CONFIG`` was the shared
+    classifier's ``EEXIST`` arm, whose message tells the caller to
+    "pass overwrite=True to replace it": true advice for a *file* open,
+    and false here, because no value of ``overwrite`` lets ``mkdir``
+    succeed over an existing file. Reporting a fault with a remedy that
+    cannot work is the mistake the classifier's directory arm already
+    refuses to make.
+
+    Both wrappers are driven through one parametrised row rather than
+    two tests, deliberately: a shared row is what a future divergence
+    has to break, where two tests can drift apart quietly.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    occupied = base / 'in-the-way'
+    occupied.write_bytes(b'an ordinary file')
+
+    if protocol == 'FTP':
+        with pytest.raises(LocalWriteError) as raised:
+            await path_io(base).mkdir(occupied, parents=True, exist_ok=True)
+    else:
+        with pytest.raises(LocalWriteError) as raised:
+            await ContainedLocalFS(base).mkdir(os.fsencode(str(occupied)))
+
+    assert not isinstance(raised.value, ConfigurationError), (
+        f'{protocol} reported a configuration error for a mkdir over an '
+        'existing file, which is what CONFIG/400 means and is advice no '
+        'caller can act on: overwrite=True governs replacing a file and '
+        'cannot make mkdir succeed over one.'
+    )
+    assert raised.value.code == 'PATH'
+    assert occupied.read_bytes() == b'an ordinary file', (
+        'the refused mkdir must leave the file that was in the way '
+        'exactly as it found it'
+    )
+
+
+async def test_mkdir_keeps_its_containment_answer_for_a_symlink(
+    tmp_path: Path,
+) -> None:
+    """Reclassifying ``EEXIST`` must not flatten a security finding.
+
+    :func:`classify_mkdir_refusal` rewrites only the arm that would
+    have said "pass overwrite=True". A symbolic link in the way is a
+    containment finding, and the whole reason
+    ``PathContainmentError`` and ``LocalWriteError`` are separate
+    classes despite sharing a code is that a caller reading a traceback
+    can still tell a security refusal from an operational one.
+    """
+    base = tmp_path / 'downloads'
+    base.mkdir()
+    (base / 'link').symlink_to(tmp_path / 'elsewhere')
+
+    with pytest.raises(PathContainmentError):
+        await ContainedLocalFS(base).mkdir(
+            os.fsencode(str(base / 'link')))
+
+    with pytest.raises(PathContainmentError):
+        await path_io(base).mkdir(base / 'link', exist_ok=False)
+
+
 async def test_the_local_fs_delegates_its_pure_string_helpers(
     tmp_path: Path,
 ) -> None:

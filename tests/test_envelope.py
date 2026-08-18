@@ -932,6 +932,57 @@ async def test_every_protocol_answers_for_a_local_write_failure(
         'empty or truncated one a cap crossed mid-transfer produces')
 
 
+@pytest.mark.parametrize('protocol', ['FTP', 'SFTP'])
+async def test_a_mkdir_over_an_existing_file_is_one_code_on_both(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    protocol: str,
+) -> None:
+    """The two transfer protocols answer one local fault one way.
+
+    A cross-protocol row rather than two per-protocol ones, on the axis
+    that exists because per-protocol tests written by hand are what
+    drift. Both transfer clients ask their destination filesystem to
+    create a directory before writing into it, and both can be pointed
+    at a path a regular file already occupies -- one question, which
+    they answered two ways: measured against real loopback servers,
+    ``CONFIG``/400 on FTP and ``PATH``/400 on SFTP.
+
+    ``PATH`` is the settled answer because it is what every
+    neighbouring refusal on the same call already reports, and because
+    the ``CONFIG`` message told the caller to pass ``overwrite=True``
+    -- which cannot make a ``mkdir`` succeed over a file.
+
+    The SFTP half only became reachable when the writing double learnt
+    to take ``_copy``'s directory arm: it went straight to ``open``
+    before, so ``ContainedLocalFS.mkdir`` was exercised by nothing.
+
+    Args:
+        monkeypatch: The pytest patcher.
+        tmp_path: The test's temporary directory.
+        protocol: The transfer protocol under test.
+
+    Returns:
+        None.
+    """
+    destination = tmp_path / 'downloads'
+    destination.write_bytes(b'an ordinary file in the way')
+
+    call = local_io_call(protocol, str(destination))
+    install_writing_transport(monkeypatch, protocol, recurse=True)
+
+    result = await request(**call)
+
+    assert result['ok'] is False
+    assert result['error']['code'] == LOCAL_IO_CODE, (
+        f'{protocol} reported {result["error"]["code"]} for a mkdir over '
+        f'an existing file, where the other transfer protocol reports '
+        f'{LOCAL_IO_CODE}. This is the eleventh-round divergence class: '
+        'one local fault, two codes, hidden because no double took the '
+        "real client's directory arm.")
+    assert destination.read_bytes() == b'an ordinary file in the way'
+
+
 @pytest.mark.parametrize('protocol', CONTRACT_ROWS)
 def test_every_protocol_declares_a_local_destination_or_is_exempt(
     protocol: str,

@@ -727,6 +727,51 @@ class FaultingTransport:
 # `utils.contained_io.ContainedPathIO` for FTP,
 # `utils.contained_io.ContainedLocalFS` for SFTP. What decides the
 # answer is the code under test, not the double.
+#
+# --- The audit that stops a fourth instance --------------------------------
+#
+# Three defects in a row were green because of what a double did NOT do,
+# so the doubles were audited against the real clients: every method the
+# real `aioftp.Client` and `asyncssh.SFTPClient` invoke on the objects
+# these doubles stand in for, and whether anything reaches it. Read off
+# the libraries themselves (`self.path_io.<m>` in aioftp's client;
+# `dstfs.<m>` in asyncssh's `_copy`/`_begin_copy`/`_SFTPFileCopier`) and
+# confirmed empirically by instrumenting both contained classes and
+# recording which methods a full run enters.
+#
+#   asyncssh -> ContainedLocalFS   reached by a client-driven test?
+#     open, mkdir, isdir, setstat, symlink, compose_path .... yes
+#     encode, limits ........................................ no (1)
+#     stat, scandir, readlink, basename ..................... no (2)
+#
+#   aioftp -> ContainedPathIO      reached by a client-driven test?
+#     mkdir, open(_open/write/close) ........................ yes
+#     is_file, is_dir, list ................................. no (3)
+#
+# (1) `encode` and `limits` are read by the real `_begin_copy`, which
+#     both SFTP doubles *replace* -- that is the seam containment is
+#     installed at, so a double standing in for it necessarily bypasses
+#     its own calls. Both are pure delegation with no containment step
+#     (`encode` deliberately so: it runs on the destination before any
+#     entry name is composed), and `tests/utils/test_contained_io.py`
+#     asserts each equals the real implementation's answer.
+# (2) The four the *source* filesystem is asked for. On a download the
+#     source is the remote side, so these are reached on a `dstfs` only
+#     by an upload -- which asyncssh routes through `srcfs`, not this
+#     object. Covered directly in `test_contained_io`, including their
+#     containment.
+# (3) aioftp asks these of the *source* too: `download` branches on
+#     `is_file(source)`/`is_dir(source)` and lists the remote tree, all
+#     of which are the client's own remote calls rather than `path_io`
+#     ones during a download. `path_io.is_file`/`is_dir`/`list` are
+#     reached by an **upload** of a local directory, which this library
+#     does not dispatch recursively. Covered directly in
+#     `test_contained_io`, containment included.
+#
+# No unreached method is left unclassified, and none is both
+# containment-bearing and unexercised. The two that were -- `mkdir` on
+# the SFTP side and `setstat` on both -- are the findings this file's
+# doubles were corrected to reach.
 
 #: What a ``LOCAL_IO`` row asks each protocol to write to: a path whose
 #: parent directory does not exist. ENOENT rather than a full disk
@@ -754,6 +799,10 @@ class WritingFTPClientBody:
     payload: bytes = JSON_BODY
 
 
+#: The entry name a directory copy writes inside the destination tree.
+REMOTE_ENTRY: bytes = b'f.bin'
+
+
 class WritingFTPClient(StubFTPClient):
     """An FTP client whose download writes through the real path layer.
 
@@ -775,19 +824,30 @@ class WritingFTPClient(StubFTPClient):
     missing destination directory this row exists to refuse. A double
     that is easier than reality certifies an arm it never exercised.
 
+    The **directory** arm is the same lesson one level along.
+    ``download`` branches on ``is_dir(source)`` and, for a directory,
+    calls ``mkdir(destination_path, ...)`` on the destination *itself*
+    rather than on its parent -- a different path, and the one a
+    caller's occupied ``client_path`` collides with. Kept behind
+    :attr:`recurse` so the existing rows keep exercising the single-file
+    arm they were written for.
+
     Attributes:
         path_io: Set by :class:`WritingFTPContext` from the
             ``path_io_factory`` the client passed, exactly as
             ``aioftp.Client`` would.
+        recurse: True to take ``download``'s directory arm.
     """
 
     path_io: Any = None
+    recurse: bool = False
 
     async def download(self, *args: Any, **kwargs: Any) -> None:
         """Write the downloaded body to the local destination.
 
-        Mirrors ``aioftp.Client.download``'s single-file arm: the
-        parent ``mkdir`` first, then the open and the write.
+        Mirrors ``aioftp.Client.download``: the directory arm creates
+        the destination and writes one entry inside it; the single-file
+        arm creates the destination's *parent* and writes the file.
 
         Args:
             args: ``(source, destination)`` -- remote first.
@@ -797,6 +857,10 @@ class WritingFTPClient(StubFTPClient):
             None, as ``aioftp`` does.
         """
         destination = pathlib.Path(str(args[1]))
+        if self.recurse:
+            await self.path_io.mkdir(
+                destination, parents=True, exist_ok=True)
+            destination = destination / os.fsdecode(REMOTE_ENTRY)
         await self.path_io.mkdir(
             destination.parent, parents=True, exist_ok=True)
         async with self.path_io.open(destination, mode='wb') as handle:
@@ -810,7 +874,43 @@ class WritingSFTPClient(StubSFTPClient):
     reaches ``_begin_copy`` with the ``ContainedLocalFS`` the client
     built, so writing through that object is writing through the code
     under test.
+
+    **It must make every call the real client makes, in the real
+    order** -- the rule :class:`WritingFTPClient` states, and the rule
+    this class broke twice.
+
+    The first break was the **directory arm**. ``asyncssh``'s ``_copy``
+    asks ``dstfs.isdir`` and then ``dstfs.mkdir`` before it copies a
+    directory's entries, and this double went straight to ``open``. So
+    ``ContainedLocalFS.mkdir`` -- the one method on the destination
+    filesystem that creates rather than writes -- was reached by no
+    test at all, and shipped without the classification its FTP
+    counterpart had: measured against real loopback servers, a
+    directory download onto an occupied local path answered ``PATH`` on
+    SFTP and ``CONFIG`` on FTP.
+
+    Attributes:
+        recurse: True to take ``_copy``'s directory arm -- ``isdir``,
+            ``mkdir``, then one file inside -- instead of copying a
+            single file.
+        symlink: True to take ``_copy``'s symbolic-link arm, which
+            calls ``dstfs.symlink`` with the server's own target.
     """
+
+    def __init__(
+        self,
+        *,
+        recurse: bool = False,
+        symlink: bool = False,
+    ) -> None:
+        """Choose which of ``_copy``'s arms this client will exercise.
+
+        Args:
+            recurse: Take the directory arm.
+            symlink: Take the symbolic-link arm.
+        """
+        self.recurse = recurse
+        self.symlink = symlink
 
     async def _begin_copy(
         self,
@@ -822,21 +922,40 @@ class WritingSFTPClient(StubSFTPClient):
         expand_glob: bool,
         *options: Any,
     ) -> None:
-        """Write the downloaded body to the local destination.
+        """Write the downloaded body the way ``_copy`` writes it.
 
         Args:
-            srcfs: The source filesystem, unused.
+            srcfs: The source filesystem, unused -- the remote side is
+                what these doubles stand in for.
             dstfs: The contained destination filesystem under test.
             srcpaths: The remote source operand, unused.
             dstpath: The local destination operand.
             copy_type: ``'get'`` or ``'mget'``, unused.
             expand_glob: Whether the source is a glob, unused.
-            options: ``_begin_copy``'s remaining options, unused.
+            options: ``_begin_copy``'s remaining options, unused --
+                which arm runs is chosen at construction rather than
+                read from here, because this double stands in for the
+                *remote* side's shape and not for asyncssh's own
+                option plumbing.
 
         Returns:
             None, as ``asyncssh`` does.
         """
-        handle = await dstfs.open(os.fsencode(str(dstpath)), 'wb')
+        destination = os.fsencode(str(dstpath))
+        if self.symlink:
+            # `_copy`'s symlink arm: the target string is the server's.
+            await dstfs.symlink(b'/etc/passwd', destination)
+            return
+
+        target = destination
+        if self.recurse:
+            # `_copy`'s directory arm, in its own order: ask before
+            # creating, then compose the entry name onto the parent.
+            if not await dstfs.isdir(destination):
+                await dstfs.mkdir(destination)
+            target = dstfs.compose_path(REMOTE_ENTRY, parent=destination)
+
+        handle = await dstfs.open(target, 'wb')
         await handle.write(WritingFTPClientBody.payload, 0)
         await handle.close()
 
@@ -849,7 +968,19 @@ class WritingFTPContext:
     the whole client, so that binding has to be reproduced or the write
     would go through no containment layer at all -- and the row would
     pass while testing nothing.
+
+    Attributes:
+        recurse: Passed to the client it builds, selecting
+            ``download``'s directory arm.
     """
+
+    def __init__(self, *, recurse: bool = False) -> None:
+        """Record which arm the client this yields will take.
+
+        Args:
+            recurse: True for ``download``'s directory arm.
+        """
+        self.recurse = recurse
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Open a session whose client writes through the caller's layer.
@@ -863,6 +994,7 @@ class WritingFTPContext:
             An async context manager yielding the bound client.
         """
         client = WritingFTPClient()
+        client.recurse = self.recurse
         factory = kwargs['path_io_factory']
         client.path_io = factory(timeout=None)
         return entered(client)
@@ -872,6 +1004,9 @@ def install_writing_transport(
     monkeypatch: pytest.MonkeyPatch,
     protocol: str,
     body: bytes = JSON_BODY,
+    *,
+    recurse: bool = False,
+    symlink: bool = False,
 ) -> None:
     """Replace ``protocol``'s seam with one that reaches the local disk.
 
@@ -890,6 +1025,10 @@ def install_writing_transport(
         protocol: A normalised protocol name that writes locally.
         body: What the transport sends, so an over-cap row can hand
             down more bytes than the ceiling allows.
+        recurse: SFTP only. Take ``_copy``'s directory arm, so
+            ``isdir``/``mkdir`` on the destination filesystem are
+            actually reached.
+        symlink: SFTP only. Take ``_copy``'s symbolic-link arm.
 
     Returns:
         None.
@@ -901,11 +1040,13 @@ def install_writing_transport(
     """
     monkeypatch.setattr(WritingFTPClientBody, 'payload', body)
     if protocol == 'FTP':
-        monkeypatch.setattr(aioftp.Client, 'context', WritingFTPContext())
+        monkeypatch.setattr(
+            aioftp.Client, 'context', WritingFTPContext(recurse=recurse))
     elif protocol == 'SFTP':
+        client = WritingSFTPClient(recurse=recurse, symlink=symlink)
         monkeypatch.setattr(
             asyncssh, 'connect',
-            lambda *a, **k: entered(StubSSHConnection(WritingSFTPClient())))
+            lambda *a, **k: entered(StubSSHConnection(client)))
     else:
         raise ValueError(
             f'{protocol!r} has no doubled local-write seam. HTTP and '
