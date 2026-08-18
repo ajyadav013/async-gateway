@@ -42,6 +42,8 @@ from async_gateway.helpers.common.date_helper import (
     monotonic_now,
     utc_now_iso,
 )
+from async_gateway.helpers.internal.request_helper import (
+    DEFAULT_DOWNLOAD_FILEPATH)
 from async_gateway.logic import (
     ftp_client, http_client, protocol_mapping, sftp_client, soap_client)
 from async_gateway.logic.http_client import (
@@ -63,6 +65,7 @@ from async_gateway.utils.exceptions import (
     PathContainmentError,
     SerializationError,
 )
+from async_gateway.utils.http_file_config import download_file_from_url
 from async_gateway.utils.redaction import (
     PAYLOAD_REDACTION_DEPTH,
     REDACTED,
@@ -90,6 +93,8 @@ from tests.fixtures.protocol_transports import (
     PROTOCOL_FAULTS,
     REMOTE_ENTRY,
     REMOTE_PERMISSIONS,
+    WRITE_FAULTS,
+    WRITE_ROUTES,
     contract_call,
     install_failing_transport,
     install_transport,
@@ -1063,6 +1068,330 @@ async def test_every_protocol_answers_for_a_local_write_failure(
     assert not Path(destination).exists(), (
         'a refused write must leave no file behind -- not even the '
         'empty or truncated one a cap crossed mid-transfer produces')
+
+
+#: A ``multipart/*`` body small enough that no cap is involved. Written
+#: as literal wire bytes rather than built with ``MultipartWriter`` so
+#: the boundary the header names and the boundary the body carries are
+#: the same string by construction.
+MULTIPART_WIRE: bytes = (
+    b'--BOUND\r\n'
+    b'Content-Type: application/octet-stream\r\n\r\n'
+    b'payload-bytes\r\n'
+    b'--BOUND--\r\n'
+)
+
+#: The header that makes the loopback server's answer multipart, and so
+#: sends ``read_response`` down ``handle_multipart_response``.
+MULTIPART_HEADERS: dict[str, str] = {
+    'Content-Type': 'multipart/form-data; boundary=BOUND'}
+
+#: The bytes a ``symlinked-target`` row puts behind the link, so the row
+#: can prove they are still there afterwards.
+VICTIM_CONTENT: bytes = b'a file the caller never named'
+
+#: The ``(route, fault)`` pairs a route genuinely cannot express, with
+#: the reason. An entry here is an argued exemption, not a silent gap --
+#: the same discipline
+#: :data:`~tests.fixtures.protocol_transports.CATEGORY_EXEMPT` applies
+#: one axis up, and for the same reason: the failure mode of a
+#: data-driven guard is a row quietly dropped while the remaining rows
+#: stay green.
+ROUTE_FAULT_INEXPRESSIBLE: dict[tuple[str, str], str] = {
+    ('http-multipart-default', 'missing-parent'): (
+        'the default multipart route writes response.txt into the '
+        'process working directory, and a working directory always '
+        'exists -- there is no parent to remove. Naming a missing one '
+        'would require download_filepath, which is the '
+        'http-multipart-config route immediately below and covers the '
+        'identical open. The remaining two faults are expressible here '
+        'and are exercised.'
+    ),
+}
+
+
+def _write_fault_target(fault: str, tmp_path: Path) -> tuple[Path, Path]:
+    """Stage one local write fault and return where to aim at it.
+
+    Args:
+        fault: A fault id from
+            :data:`~tests.fixtures.protocol_transports.WRITE_FAULTS`.
+        tmp_path: The test's temporary directory.
+
+    Returns:
+        ``(destination, victim)`` -- where the route should be pointed,
+        and the file that must survive it. ``victim`` is ``tmp_path``
+        itself when the fault has no victim to protect, which no
+        assertion reads.
+
+    Raises:
+        ValueError: If ``fault`` names no staged fault. Fail closed: a
+            row silently staging nothing would pass having proven
+            nothing, which is the failure mode this whole guard exists
+            to prevent.
+    """
+    if fault == 'missing-parent':
+        return tmp_path / 'no-such-dir' / 'out.bin', tmp_path
+    if fault == 'unwritable-parent':
+        locked = tmp_path / 'locked'
+        locked.mkdir()
+        os.chmod(locked, 0o500)
+        return locked / 'out.bin', tmp_path
+    if fault == 'symlinked-target':
+        victim = tmp_path / 'victim.txt'
+        victim.write_bytes(VICTIM_CONTENT)
+        link = tmp_path / 'out.bin'
+        link.symlink_to(victim)
+        return link, victim
+    raise ValueError(f'{fault!r} stages no local write fault')
+
+
+async def _drive_write_route(
+    driver: str,
+    protocol: str,
+    destination: Path,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    http_server: RecordingHTTPServer,
+) -> str:
+    """Drive one write route to its refusal and return the code.
+
+    Args:
+        driver: The driver id from
+            :data:`~tests.fixtures.protocol_transports.WRITE_ROUTES`.
+        protocol: The protocol that route belongs to.
+        destination: Where the route should try to write.
+        monkeypatch: The pytest patcher, for the doubled transports.
+        http_server: The loopback server, for the HTTP-family routes.
+
+    Returns:
+        The ``error['code']`` the route answered, or ``'ok=True'`` when
+        it did not refuse at all -- reported rather than raised, so the
+        guard's own message names what happened.
+
+    Raises:
+        ValueError: If ``driver`` names no route. Fail closed, for the
+            reason :func:`_write_fault_target` gives.
+    """
+    if driver in {'explicit_download', 'multipart_default',
+                  'multipart_configured', 'download_helper'}:
+        multipart = driver.startswith('multipart')
+        http_server.respond(
+            LOCAL_IO_PATH,
+            body=MULTIPART_WIRE if multipart else b'{"value": 1}',
+            headers=MULTIPART_HEADERS if multipart else None)
+
+    if driver == 'download_helper':
+        # The standalone public helper the README documents, which
+        # reaches `safe_writer` without going through `request()` at
+        # all -- so no envelope is built and the typed error is what a
+        # caller sees. Compared here against the routes that do build
+        # one, because a caller using both must not have to branch.
+        try:
+            await download_file_from_url(
+                file_download_path=http_server.url_for(LOCAL_IO_PATH),
+                local_filepath=str(destination),
+                request_type='get')
+        except AsyncGatewayError as err:
+            return err.code
+        return 'ok=True'
+
+    if driver == 'multipart_default':
+        # The route that needs **no configuration key at all**: a
+        # `multipart/*` answer on default config still writes
+        # `response.txt`, relative to the process working directory. So
+        # the fault is re-staged under that fixed name and the working
+        # directory is moved onto its parent -- which is also why this
+        # route cannot express `missing-parent`, and says so by
+        # skipping rather than by quietly answering a different
+        # question (see the row's own guard).
+        call = contract_call(protocol)
+        call['url'] = http_server.url_for(LOCAL_IO_PATH)
+        monkeypatch.chdir(destination.parent)
+        named = destination.parent / DEFAULT_DOWNLOAD_FILEPATH
+        if destination.is_symlink():
+            named.symlink_to(destination.readlink())
+    elif driver in {'explicit_download', 'multipart_configured'}:
+        call = local_io_call(protocol, str(destination))
+        call['url'] = http_server.url_for(LOCAL_IO_PATH)
+    else:
+        call = local_io_call(protocol, str(destination))
+        install_writing_transport(
+            monkeypatch, protocol,
+            recurse=driver == 'transfer_recursive')
+
+    result = await request(**call)
+    return 'ok=True' if result['ok'] else result['error']['code']
+
+
+@pytest.mark.parametrize('fault, expected', WRITE_FAULTS)
+@pytest.mark.parametrize(
+    'route, protocol, driver', WRITE_ROUTES,
+    ids=[route for route, _, _ in WRITE_ROUTES])
+async def test_every_write_route_classifies_one_fault_identically(
+    monkeypatch: pytest.MonkeyPatch,
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+    route: str,
+    protocol: str,
+    driver: str,
+    fault: str,
+    expected: str,
+) -> None:
+    """One local write fault, one code, down **every** route to a disk.
+
+    The third axis, and the one whose absence is the nineteenth
+    instance of this release's recurring class: a behaviour differing
+    between two paths for no argued reason, invisible because no guard
+    named that axis. The ``LOCAL_IO`` row above is indexed by
+    *protocol*, so it proves four protocols agree -- while exercising,
+    for each, only the **one** route its `local_io_call` happens to
+    configure. It passed throughout, because the routes it does not
+    take are not routes it can see.
+
+    They were not equivalent. The single-file transfer arm hands
+    ``resolve_within`` the containment base as its own candidate -- an
+    empty tail no other route produces -- and that case took the
+    ``..`` arm, whose whole-path ``resolve()`` canonicalises the
+    **final** component. The leaf is the file about to be opened, so a
+    symbolic link at it was resolved away *before* the open and
+    ``O_NOFOLLOW`` was handed the link's target with nothing left to
+    refuse. Measured against the real ``aioftp`` recursion: a
+    ``client_path`` that was a symlink to another file wrote straight
+    through it, answered ``ok=True``, and left the victim at mode 0644
+    -- where the identical HTTP download answered ``PATH``/400.
+
+    Args:
+        monkeypatch: The pytest patcher.
+        http_server: The loopback server, for the HTTP-family routes.
+        tmp_path: The test's temporary directory.
+        route: The route id, for the failure message.
+        protocol: The protocol the route belongs to.
+        driver: Which driver arm drives it.
+        fault: The staged local write fault.
+        expected: The one code every route must answer for it.
+
+    Returns:
+        None.
+    """
+    if (route, fault) in ROUTE_FAULT_INEXPRESSIBLE:
+        pytest.skip(ROUTE_FAULT_INEXPRESSIBLE[(route, fault)])
+
+    destination, victim = _write_fault_target(fault, tmp_path)
+
+    answered = await _drive_write_route(
+        driver, protocol, destination,
+        monkeypatch=monkeypatch, http_server=http_server)
+
+    assert answered == expected, (
+        f'route {route!r} answered {answered} for a {fault} '
+        f'destination, where every other route to a local disk answers '
+        f'{expected}. One fault must not depend on which write path '
+        f'reached it: the routes are enumerated in WRITE_ROUTES '
+        f'precisely because the per-protocol LOCAL_IO row exercises '
+        f'only one of them per protocol and passed while two disagreed.')
+    if fault == 'symlinked-target':
+        assert victim.read_bytes() == VICTIM_CONTENT, (
+            f'route {route!r} wrote *through* a symbolic link at the '
+            f'destination and into a file the caller never named. The '
+            f'refusal alone is not the property -- a route that wrote '
+            f'first and complained afterwards would satisfy a '
+            f'code-only assertion, and that is exactly what the '
+            f'single-file transfer arm did at mode 0644.')
+
+
+@pytest.mark.parametrize(
+    'route, protocol, driver', WRITE_ROUTES,
+    ids=[route for route, _, _ in WRITE_ROUTES])
+async def test_every_write_route_lands_on_the_canonical_location(
+    monkeypatch: pytest.MonkeyPatch,
+    http_server: RecordingHTTPServer,
+    tmp_path: Path,
+    route: str,
+    protocol: str,
+    driver: str,
+) -> None:
+    """A symlinked *parent* resolves, on every route, to one location.
+
+    The control this axis needs, and not a duplicate of the refusal
+    rows above. Those assert that a bad destination is refused
+    identically; refusing *everything* would satisfy them. This asserts
+    the other half -- that a legitimate destination still succeeds, and
+    lands where canonicalisation says rather than where the caller
+    spelled it.
+
+    It is a real shape rather than a contrived one: macOS ``/tmp`` is a
+    symbolic link to ``/private/tmp``, and the README's own documented
+    example writes there. So "the parent is canonicalised, the leaf is
+    not" is a property a caller feels on every ordinary call, and the
+    two halves are separable -- a mutation dropping the parent's
+    ``resolve()`` leaves every refusal row green while silently
+    returning the uncanonicalised path.
+
+    Args:
+        monkeypatch: The pytest patcher.
+        http_server: The loopback server, for the HTTP-family routes.
+        tmp_path: The test's temporary directory.
+        route: The route id, for the failure message.
+        protocol: The protocol the route belongs to.
+        driver: Which driver arm drives it.
+
+    Returns:
+        None.
+    """
+    real = tmp_path / 'real'
+    real.mkdir()
+    (tmp_path / 'via').symlink_to(real)
+
+    answered = await _drive_write_route(
+        driver, protocol, tmp_path / 'via' / 'out.bin',
+        monkeypatch=monkeypatch, http_server=http_server)
+
+    assert answered == 'ok=True', (
+        f'route {route!r} answered {answered} for a destination whose '
+        f'only unusual feature is a symlinked parent directory -- the '
+        f'shape macOS /tmp has, and the README documents. A guard made '
+        f'only of refusal rows is satisfied by a route that refuses '
+        f'everything; this is the row that is not.')
+    written = sorted(p.name for p in real.iterdir())
+    assert written, (
+        f'route {route!r} reported success but wrote nothing under the '
+        f'canonical parent {str(real)!r}. The parent must be resolved '
+        f'-- a route that writes through the *uncanonicalised* '
+        f'spelling passes every refusal row above while quietly '
+        f'defeating the canonicalisation half of resolve_within.')
+
+
+def test_the_write_route_enumeration_reaches_every_guarded_open() -> None:
+    """The enumeration itself, so a ninth route cannot opt out silently.
+
+    The row above holds each *listed* route to the shared answer;
+    nothing in it notices a route that was never listed -- which is the
+    same shape as the two-of-four gap ``LOCAL_IO`` had, one level up.
+    So the list is checked against the package rather than against
+    itself: every module that opens a local file for writing, through
+    ``safe_writer`` or through the guarded opener directly, must be
+    represented by at least one enumerated route.
+
+    Returns:
+        None.
+    """
+    writing_modules = set(files_containing(
+        r'safe_writer\(|guarded_opener\('))
+    covered = {
+        'helpers/internal/request_helper.py',
+        'utils/http_file_config.py',
+        'utils/contained_io.py',
+        'utils/paths.py',
+    }
+
+    assert writing_modules <= covered, (
+        f'{sorted(writing_modules - covered)} opens a local file for '
+        'writing and is claimed by no route in WRITE_ROUTES. Add the '
+        'route (and its driver arm) rather than widening this set: an '
+        'unenumerated write path is a path no guard watches, which is '
+        'how the single-file transfer arm came to write through a '
+        'symlink for the life of the release.')
 
 
 @pytest.mark.parametrize('protocol', ['FTP', 'SFTP'])

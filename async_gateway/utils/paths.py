@@ -438,7 +438,11 @@ def resolve_within(base: PathLike, candidate: PathLike) -> Path:
         The path to write to: the canonicalised parent directory joined
         with the final component **exactly as given**, so a symbolic
         link at that final component survives to be refused by
-        ``O_NOFOLLOW`` rather than being silently resolved here.
+        ``O_NOFOLLOW`` rather than being silently resolved here. That
+        holds for an **empty** candidate too -- the base as its own
+        candidate, which is what a single-file transfer produces -- and
+        it did not before: that case fell into the ``..`` arm, whose
+        whole-path ``resolve()`` canonicalised the leaf away.
 
     Raises:
         PathContainmentError: If ``candidate`` is absolute, contains a
@@ -459,6 +463,31 @@ def resolve_within(base: PathLike, candidate: PathLike) -> Path:
 
     canonical_base = Path(base).resolve()
     combined = Path(base) / relative
+
+    if not relative.parts:
+        # The candidate is the base *itself* -- an empty tail, or `.`.
+        # It reaches here from `under()` on a single-file transfer,
+        # where the caller's `client_path`/`local_path` is both the
+        # confinement base and the one file to write, so
+        # `relative_to` leaves nothing over.
+        #
+        # It must NOT take the `..` arm below. That arm answers
+        # `combined.resolve()`, which canonicalises the **final**
+        # component too -- and the final component here is the file
+        # about to be opened. A symbolic link at it was therefore
+        # resolved away before the open, so `O_NOFOLLOW` was handed the
+        # link's *target* and had nothing left to refuse: measured
+        # against the real `aioftp` recursion, a `client_path` that was
+        # a symlink to someone else's file wrote straight through it at
+        # mode 0644 and answered ok=True, where the identical HTTP
+        # download answered PATH/400 (R22/M18).
+        #
+        # Containment is trivially satisfied -- the base is at the base
+        # -- so what is owed is the *other* half of this function's
+        # contract: canonicalise the parent, hand the final component
+        # back verbatim, exactly as the leaf arm does.
+        whole = Path(base).absolute()
+        return whole.parent.resolve() / whole.name
 
     if _names_a_directory(relative):
         whole = combined.resolve()

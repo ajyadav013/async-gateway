@@ -819,6 +819,61 @@ LOCAL_IO_LEAF: str = 'no-such-dir/out.bin'
 #: protocol that writes locally.
 LOCAL_IO_CODE: str = 'PATH'
 
+# ---------------------------------------------------------------------
+# The write-path enumeration.
+#
+# `LOCAL_IO` above is indexed by *protocol*, and that is the axis it was
+# built for -- four protocols answering one disk fault four ways. What
+# it never asked is whether one protocol answers the same fault the same
+# way down **every route it can reach a disk by**. HTTP alone has three:
+# the explicit `http_file_download_config`, the `multipart/*` response
+# that writes `response.txt` on default config with no knob set at all,
+# and the standalone `download_file_from_url` helper the README
+# documents as public API. FTP and SFTP each have two -- the single-file
+# transfer and the recursive one -- and those two turned out to differ:
+# the single-file arm hands `resolve_within` the base as its own
+# candidate, an empty tail nothing else produces, and that case
+# canonicalised the leaf away so `O_NOFOLLOW` had nothing left to refuse
+# (a symlinked `client_path` was written straight through, ok=True, at
+# mode 0644, where the identical HTTP download answered PATH/400).
+#
+# So the axis below is the *route*, not the protocol: seven routes, one
+# question each, and the answers must agree. Enumerating them is the
+# deliverable -- a route absent from this tuple is a route no guard
+# watches, which is exactly how the last one stayed invisible.
+
+#: Every route by which this library writes a local file, as
+#: ``(id, protocol, driver)``. ``driver`` names the helper in
+#: ``tests/test_envelope.py`` that drives that route to a refusal; the
+#: guard asserts every route classifies one fault identically, and a
+#: separate row asserts this tuple still covers every `safe_writer` /
+#: guarded-open call site in the package.
+WRITE_ROUTES: tuple[tuple[str, str, str], ...] = (
+    ('http-download-config', 'HTTP', 'explicit_download'),
+    ('http-multipart-default', 'HTTP', 'multipart_default'),
+    ('http-multipart-config', 'HTTP', 'multipart_configured'),
+    ('download-file-from-url', 'HTTP', 'download_helper'),
+    ('ftp-single-file', 'FTP', 'transfer_single'),
+    ('ftp-recursive', 'FTP', 'transfer_recursive'),
+    ('sftp-single-file', 'SFTP', 'transfer_single'),
+    ('sftp-recursive', 'SFTP', 'transfer_recursive'),
+)
+
+#: The local write faults every route is asked about. Each is a fault of
+#: the *destination*, reachable on every route without privileges, and
+#: each has one settled answer.
+#:
+#: ``symlinked-target`` is the row that found the defect this
+#: enumeration was written for, and it is the one worth keeping honest:
+#: it asserts the refusal **and** that the victim behind the link still
+#: holds its own bytes, because a route that wrote through the link and
+#: complained afterwards would satisfy a code-only assertion.
+WRITE_FAULTS: tuple[tuple[str, str], ...] = (
+    ('missing-parent', 'PATH'),
+    ('unwritable-parent', 'PATH'),
+    ('symlinked-target', 'PATH'),
+)
+
 
 #: What a writing double sends. Overridden per row so an ``OVER_CAP``
 #: row can hand down a body larger than the ceiling while a ``LOCAL_IO``
