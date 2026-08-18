@@ -291,6 +291,25 @@ _SEPARATOR_RUN: Final[str] = '(?:[{}]|(?i:{}))*'.format(
 _SCHEME_PREFIX: Final[re.Pattern[str]] = re.compile(
     r'([A-Za-z][A-Za-z0-9+.\-]{0,31}:)(' + _SEPARATOR_RUN + ')')
 
+# The schemes `urllib.parse` itself reads an authority after, taken from
+# its own `uses_netloc` rather than guessed at here.
+#
+# This is the fix for the *bare-token* half of the userinfo rule, and it
+# is the same lesson as `_URL_IGNORED` one level up: the question "does
+# an authority follow this scheme?" already has an answer inside the
+# parser, and every time this module has answered it independently the
+# two have eventually disagreed. The guard that stood here asked whether
+# a *separator run* was present, which is a proxy for the real question
+# and fails on `http:TOKEN@h/p` -- no `//`, so the guard skipped it, and
+# the same test that was meant to exempt `mailto:bob@corp.example`
+# exempted `http:` too and published the token whole.
+#
+# A public name, unlike `_URL_IGNORED`, so it is read directly. It is a
+# list libraries may append to, which is the fail-closed direction: a
+# scheme added to it can only ever cause more masking.
+_NETLOC_SCHEMES: Final[frozenset[str]] = frozenset(
+    name.casefold() for name in _parse.uses_netloc)
+
 # The three characters that end an authority in RFC 3986 -- the start of
 # the path, the query, or the fragment. Userinfo cannot reach past one.
 _AUTHORITY_END: Final[frozenset[str]] = frozenset('/?#')
@@ -384,6 +403,56 @@ def _parser_view(text: str) -> tuple[str, Optional[list[int]]]:
     return view, origin
 
 
+def _bears_an_authority(scheme: 're.Match[str]', *, bare: bool) -> bool:
+    """Say whether a userinfo may be masked after this scheme match.
+
+    The one question :func:`_mask_userinfo` asks about a candidate, and
+    the half of it that is new is answered from ``urllib.parse``'s own
+    ``uses_netloc`` rather than from a pattern -- for the reason
+    :func:`_parser_view` deletes what ``urllib.parse`` deletes. A
+    hand-rolled answer to a question the parser has already answered is
+    how every round of findings against this module has begun.
+
+    A **separator run** introduces an authority under any scheme:
+    ``urlsplit`` reads a full netloc out of ``a://u:PW@h/p``, password
+    and all, whatever it makes of the scheme.
+
+    Without a separator run it depends on what the userinfo looks like,
+    and that asymmetry is the point:
+
+    * a ``user:password`` shape is masked under any scheme, which is
+      what this rule has always done -- ``a:u:PW@h/p`` and
+      ``mailto:bob:PW@corp.example`` both carry something no diagnostic
+      needs, whatever a parser makes of the string around it.
+    * a **bare token** is masked only under a scheme
+      ``urllib.parse`` reads a netloc after. Nothing distinguishes a
+      bare token from a username by inspection, so the scheme is what
+      decides: ``http:SUPERSECRET123@h/p`` is masked and
+      ``mailto:bob@corp.example`` keeps its address.
+
+    That second rule replaced "was a separator run present?", which was
+    a proxy for it and answered wrong in the dangerous direction. The
+    guard was written to exempt ``mailto:``; with no ``//`` to see it
+    exempted ``http:`` just as readily, and a bare-token userinfo -- the
+    common shape for an API token in a URL -- reached the envelope
+    ``url`` and the log record's ``extra['url']`` whole (F1).
+
+    Args:
+        scheme: A :data:`_SCHEME_PREFIX` match -- group 1 the
+            ``scheme:`` and group 2 the separator run that followed.
+        bare: True when the userinfo found after it carries no ``:``,
+            and so cannot be told from a username by its shape.
+
+    Returns:
+        True when a userinfo may be masked between this match's end and
+        the authority's.
+    """
+    prefix, separators = scheme.group(1), scheme.group(2)
+    if separators or not bare:
+        return True
+    return prefix[:-1].casefold() in _NETLOC_SCHEMES
+
+
 def _mask_userinfo(text: str) -> str:
     r"""Mask the credential in every ``scheme:...userinfo@`` in ``text``.
 
@@ -444,13 +513,39 @@ def _mask_userinfo(text: str) -> str:
     spelling; this one has to be right about where an authority ends,
     which RFC 3986 already decided.
 
-    Two bounds keep it off prose. A scheme is required, so a bare
-    ``user:PASS@host`` and an email address in a sentence are untouched.
-    And a *bare* userinfo -- one with no ``:`` -- is masked only when a
-    separator run was present, so ``mailto:bob@corp.example`` keeps its
-    address while ``https://TOKEN@host`` is masked whole: that is how
-    several APIs pass a token, nothing distinguishes it from a username,
-    and guessing wrong in the other direction publishes the token.
+    Two bounds keep it off prose, and both now come from the parser
+    rather than from a proxy for it.
+
+    An **authority** is required, which is either a scheme
+    ``urllib.parse`` reads a netloc after -- :data:`_NETLOC_SCHEMES`,
+    its own ``uses_netloc`` -- or a separator run at the very start of
+    the string, which is RFC 3986's protocol-relative reference and what
+    ``urlsplit`` reads a full netloc out of. So a bare
+    ``user:PASS@host`` and an email address in a sentence are untouched,
+    ``mailto:bob@corp.example`` keeps its address, and both
+    ``https://TOKEN@host`` and ``//u:PW@h/p`` are masked.
+
+    That replaced the two guards this rule used to carry, and each was a
+    proxy question standing in for the parser's own:
+
+    * "was a separator run present?" stood in for "is there an
+      authority?", and answered wrong on ``http:SUPERSECRET123@h/p`` --
+      no ``//``, so a *bare-token* userinfo was skipped entirely and the
+      token reached the envelope ``url`` and ``extra['url']`` whole. The
+      guard was written to exempt ``mailto:``; it exempted ``http:``
+      just as readily, because a separator run is not what distinguishes
+      them (F1).
+    * "is there a scheme?" stood in for the same question one step
+      earlier, and answered wrong on ``//u:S3CRET@h/p``: this rule
+      skipped it while :func:`redact_url` masked it through the parsed
+      netloc, so the two maskers published different strings and the
+      prose surfaces -- ``error['message']``, ``extra['traceback']`` --
+      got the password in the clear (F2).
+
+    A *bare* userinfo is masked wherever an authority is found, rather
+    than only where a separator run was: that is how several APIs pass a
+    token, nothing distinguishes it from a username, and guessing wrong
+    in the other direction publishes the token.
 
     A ``user:password`` keeps the user and masks the password -- the same
     bargain :func:`redact_headers` strikes, that a name is diagnostic and
@@ -481,7 +576,6 @@ def _mask_userinfo(text: str) -> str:
         if scheme.start() < read:
             continue
         start = scheme.end()
-        separators = scheme.group(2)
 
         after = bisect_left(ends, start)
         stop = ends[after] if after < len(ends) else len(view)
@@ -496,9 +590,9 @@ def _mask_userinfo(text: str) -> str:
 
         userinfo = view[start:credential]
         colon = userinfo.find(':')
-        keep_to = start if colon < 0 else start + colon + 1
-        if colon < 0 and not separators:
+        if not _bears_an_authority(scheme, bare=colon < 0):
             continue
+        keep_to = start if colon < 0 else start + colon + 1
         # Offsets decided in the view, sliced from the original: the
         # caller reads back the string they passed, minus the secret.
         masked.append(text[_at(origin, read):_at(origin, keep_to)])

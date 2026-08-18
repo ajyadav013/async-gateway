@@ -1380,6 +1380,8 @@ def test_redact_text_masks_hostile_userinfo_spellings(
     [
         pytest.param('mailto:bob@corp.example', id='an-email-uri'),
         pytest.param(
+            'news:bob@corp.example', id='another-non-netloc-scheme'),
+        pytest.param(
             'contact user@corp.example for access', id='an-address-in-prose'),
         pytest.param(
             'no scheme here user:PASS@host', id='no-scheme-at-all'),
@@ -1404,6 +1406,14 @@ def test_redact_text_leaves_a_non_credential_at_sign_alone(
     scheme requirement stops the first three; the authority-end rule
     stops the last three, because an ``@`` after the path begins is not
     in the authority at all.
+
+    The two non-netloc-scheme rows are the bound F1's fix had to keep.
+    A *bare* userinfo carries no ``:``, so nothing about its shape says
+    whether it is a token or an address, and the scheme is what
+    decides: ``http:`` is in ``urllib.parse``'s ``uses_netloc`` and
+    ``mailto:`` and ``news:`` are not. The guard that stood here before
+    asked whether a separator run was present instead, which exempted
+    ``mailto:`` correctly and ``http:`` by accident (F1).
     """
     assert redact_text(text) == text
 
@@ -1525,6 +1535,15 @@ FUZZ_USERINFO = [
     f'u:PART@SS{FUZZ_SECRET}',
     f':{FUZZ_SECRET}',
     f'us\ter:{FUZZ_SECRET}',
+    # A **bare token** -- no colon, so no `password` for a parser to
+    # report. This row was generable before and never *evaluated*,
+    # because the oracle read `.password` alone and a bare userinfo
+    # parses as a `username`: the corpus contained the shape and the
+    # differential silently skipped every spelling of it. That is the
+    # more dangerous half of a fuzz blind spot, since the row looks
+    # present. It is the common way an API token is passed in a URL,
+    # and it leaked through both maskers (F1).
+    FUZZ_SECRET,
 ]
 FUZZ_HOSTS = ['127.0.0.1', '[::1', '[::1]', 'host:1', 'ho\tst']
 FUZZ_TAILS = ['/p', '?a=1', '#f', '']
@@ -1561,8 +1580,8 @@ def fuzz_spellings() -> set[str]:
     return spellings
 
 
-def a_reader_sees_the_password(url: str) -> bool:
-    """Report whether either URL reader finds a live password here.
+def a_reader_sees_a_credential(url: str) -> bool:
+    """Report whether either URL reader finds a live credential here.
 
     Two oracles, because two readers decide what a *server* acts on and
     either can be the one that matters. ``urlsplit`` is what this package
@@ -1571,24 +1590,49 @@ def a_reader_sees_the_password(url: str) -> bool:
     ``http:<TAB>//u:PW@h/p`` where ``urlsplit`` sees a path. Asking only
     one would license publishing the credential the other reads.
 
+    **Both userinfo fields are read, not only the password**, and that
+    is F1's lesson rather than a widening for its own sake. A *bare*
+    userinfo -- ``http:TOKEN@h/p``, which is how a great many APIs pass
+    an API token -- has no colon, so every parser reports it as the
+    ``username`` and ``password`` is None. An oracle reading
+    ``.password`` alone therefore called that spelling clean no matter
+    what the maskers did with it: the corpus generated the shape and the
+    differential skipped every instance, which is worse than not
+    generating it, because the row looks covered. It leaked through both
+    maskers for a release.
+
+    So the question this asks is "does either reader find
+    :data:`FUZZ_SECRET` anywhere a credential can live?" rather than
+    "does either reader populate one specific attribute?" A username
+    that is a username is not a secret, but the sentinel only ever
+    appears here as one -- :data:`FUZZ_USERINFO` never spells a
+    plausible *name* with it -- so a hit is a credential by
+    construction.
+
     Args:
         url: The spelling to read.
 
     Returns:
-        True when either reader reports a password containing
+        True when either reader reports a userinfo field containing
         :data:`FUZZ_SECRET`.
     """
     for read in (urlsplit, yarl.URL):
         try:
-            password = read(url).password
+            parsed = read(url)
         except (ValueError, UnicodeError):
             continue
-        if password is not None and FUZZ_SECRET in password:
+        # `urlsplit` spells it `username` and `yarl` spells it `user`;
+        # asking for both by name rather than branching on the reader
+        # keeps a third reader one entry away.
+        fields = (parsed.password,
+                  getattr(parsed, 'username', None),
+                  getattr(parsed, 'user', None))
+        if any(field and FUZZ_SECRET in field for field in fields):
             return True
     return False
 
 
-def test_no_url_spelling_leaks_a_password_a_reader_can_see() -> None:
+def test_no_url_spelling_leaks_a_credential_a_reader_can_see() -> None:
     r"""The fourth bypass, and the check that a fifth cannot ship.
 
     Four rounds of findings against this module were one root cause: a
@@ -1600,7 +1644,7 @@ def test_no_url_spelling_leaks_a_password_a_reader_can_see() -> None:
 
     This is the property those four rows were each an instance of, and
     it is stated as a *differential*: for every spelling generated, if
-    either real reader reports a live password, then no published
+    either real reader reports a live credential, then no published
     surface may still carry it. It is deliberately not a list of
     remembered inputs. A list grows by one after each incident; this
     fails on a shape nobody has thought of yet, which is the only kind
@@ -1615,14 +1659,21 @@ def test_no_url_spelling_leaks_a_password_a_reader_can_see() -> None:
     parseable" message is the exact path that published a password in
     the clear (M1/AGW-34).
 
-    Measured before the fix: 1280 of these spellings had a live password
-    on at least one published surface. The assertion is zero, not
-    fewer.
+    **A differential is only as good as its oracle, and this one had a
+    hole with a live leak behind it.** It is closed above rather than
+    here, which is the right place, but it is worth naming at the
+    assertion it was silently weakening: the oracle read ``.password``
+    alone, and a *bare* userinfo token parses as a ``username`` with no
+    password. So ``http:TOKEN@h/p`` was generated and never evaluated
+    -- the most dangerous shape of fuzz gap, because the corpus looks
+    like it covers the case and the row is there to read (F1).
+
+    The assertion is zero, not fewer.
     """
     leaks: list[tuple[str, list[str]]] = []
     checked = 0
     for url in sorted(fuzz_spellings()):
-        if not a_reader_sees_the_password(url):
+        if not a_reader_sees_a_credential(url):
             continue
         checked += 1
         surfaces = {
@@ -1639,11 +1690,11 @@ def test_no_url_spelling_leaks_a_password_a_reader_can_see() -> None:
             leaks.append((url, published))
 
     assert checked > 1000, (
-        f'only {checked} spellings carried a password either reader '
+        f'only {checked} spellings carried a credential either reader '
         f'could see, so this row is close to vacuous -- the generators '
         f'above have stopped producing authorities')
     assert leaks == [], (
-        f'{len(leaks)} spellings publish a password a URL reader can '
+        f'{len(leaks)} spellings publish a credential a URL reader can '
         f'see; first five: {leaks[:5]}')
 
 
@@ -1708,6 +1759,32 @@ def test_masking_reports_the_string_the_caller_actually_passed() -> None:
         pytest.param(
             'http:%0A//u:PCTLFPW@h/p', 'PCTLFPW',
             id='a-percent-encoded-newline'),
+        # F1, and the reason it needs a row of its own rather than a
+        # corpus entry. A bare token with **no separator run** is the
+        # one authority shape no reader reports *at all*:
+        # `urlsplit('http:TOKEN@h/p')` yields an empty netloc and
+        # `yarl` yields no user, so even the widened oracle above --
+        # which now reads `username` as well as `password` -- has
+        # nothing to evaluate. The differential structurally cannot
+        # cover this, which is exactly what this parametrisation is
+        # for. Masked because `http` is a scheme `urllib.parse` reads a
+        # netloc after, and a bare userinfo token is how a great many
+        # APIs pass an API key.
+        pytest.param(
+            'http:BARETOKENPW@h.invalid/p', 'BARETOKENPW',
+            id='a-bare-token-with-no-separator-run'),
+        pytest.param(
+            'https:BARETOKENTLS@h/p', 'BARETOKENTLS',
+            id='the-same-under-https'),
+        pytest.param(
+            'ftp:BARETOKENFTP@h/f', 'BARETOKENFTP',
+            id='the-same-under-a-non-http-netloc-scheme'),
+        # A colon makes it a `user:password`, which is a credential
+        # under *any* scheme -- no netloc table consulted, because
+        # nothing about `a:u:PW@h/p` is diagnostic enough to keep.
+        pytest.param(
+            'a:u:NONNETLOCPW@h/p', 'NONNETLOCPW',
+            id='a-password-under-a-scheme-outside-the-netloc-table'),
     ],
 )
 def test_whitespace_in_the_separator_run_is_masked(
