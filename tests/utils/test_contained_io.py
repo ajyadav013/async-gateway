@@ -9,7 +9,7 @@ its own: the individual delegating methods.
 
 That matters because of how each wrapper is built. Both delegate
 *method by method*, and every method has to route its path through
-:func:`~async_gateway.utils.paths.under` for itself. A recursive
+:func:`~asyncio_gateway.utils.paths.under` for itself. A recursive
 download exercises perhaps half of them, so the other half could be
 missing their containment call and the end-to-end rows would still pass
 -- until a library version, an option, or a tree shape reached one of
@@ -30,7 +30,7 @@ import asyncssh
 
 import pytest
 
-from async_gateway.utils.contained_io import (
+from asyncio_gateway.utils.contained_io import (
     ClassifyingLocalFile,
     ContainedLocalFS,
     ContainedPathIO,
@@ -40,13 +40,13 @@ from async_gateway.utils.contained_io import (
     local_base,
     local_operand,
 )
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     LocalWriteError,
     PathContainmentError,
     ResponseTooLargeError,
 )
-from async_gateway.utils.paths import under
+from asyncio_gateway.utils.paths import under
 
 
 class _FullDisk:
@@ -1465,7 +1465,7 @@ def test_a_relative_operand_is_contained_rather_than_refused(
     to: ``local_base`` was never the broken half. The break was that
     the **operand** handed to the transfer library stayed the caller's
     original relative spelling while the base went absolute, so
-    :func:`~async_gateway.utils.paths.under` -- which splits by
+    :func:`~asyncio_gateway.utils.paths.under` -- which splits by
     *textual* ``relative_to`` -- compared ``'dest'`` against
     ``'/abs/dest'``, found no shared prefix, and refused every path the
     transfer touched with ``PATH``/400. An absolute base and a relative

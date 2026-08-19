@@ -1,4 +1,4 @@
-"""Test doubles for the async-gateway suite, one module per double.
+"""Test doubles for the asyncio-gateway suite, one module per double.
 
 Convention C-2 of the v1.0.0 release: every test double lives in its own
 ``tests/fixtures/<name>.py`` module owned by exactly one story, and

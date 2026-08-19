@@ -105,8 +105,8 @@ from typing import Any, Final
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.utils.exceptions import AsyncGatewayError
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.utils.exceptions import AsyncGatewayError
 
 from tests.fixtures.http_server import RecordingHTTPServer
 from tests.fixtures.protocol_transports import (

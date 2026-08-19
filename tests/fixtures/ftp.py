@@ -629,7 +629,7 @@ def certificate_pair() -> Iterator[tuple[Text, Text]]:
     """
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, 'async-gateway-test')])
+        [x509.NameAttribute(NameOID.COMMON_NAME, 'asyncio-gateway-test')])
     now = datetime.datetime.now(datetime.timezone.utc)
     certificate = (
         x509.CertificateBuilder()

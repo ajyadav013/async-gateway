@@ -29,10 +29,10 @@ import orjson
 
 import pytest
 
-from async_gateway.helpers.internal.response_helper import (
+from asyncio_gateway.helpers.internal.response_helper import (
     application_json_response,
 )
-from async_gateway.utils.exceptions import SerializationError
+from asyncio_gateway.utils.exceptions import SerializationError
 
 
 async def test_a_text_body_decodes() -> None:
