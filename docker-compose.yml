@@ -23,7 +23,7 @@
 # TLS server, so the client verifies a real chain instead of having
 # verification switched off to make the test pass.
 
-name: async-gateway-integration
+name: asyncio-gateway-integration
 
 services:
 

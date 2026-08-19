@@ -1,9 +1,9 @@
-# Publish async-gateway to PyPI via Trusted Publishing (OIDC) -- no API token.
+# Publish asyncio-gateway to PyPI via Trusted Publishing (OIDC) -- no API token.
 #
 # ---------------------------------------------------------------------------
 # FIRST-RUN PREREQUISITE: configure a PyPI *pending publisher* before merging.
 # ---------------------------------------------------------------------------
-# `async-gateway` has never been uploaded to PyPI (that is the whole point of
+# `asyncio-gateway` has never been uploaded to PyPI (that is the whole point of
 # the rename away from `asyncio-requests`), so there is no project for a
 # trusted publisher to attach to yet. Trusted Publishing solves this with a
 # *pending* publisher, which must be created by hand, once, before the first
@@ -12,11 +12,18 @@
 #   https://pypi.org/manage/account/publishing/  ->  "Add a new pending
 #   publisher", with exactly:
 #
-#       PyPI Project Name : async-gateway
+#       PyPI Project Name : asyncio-gateway
 #       Owner             : ajyadav013
 #       Repository name   : async-gateway
 #       Workflow name     : publish.yml
 #       Environment name  : pypi
+#
+# Note the two names differ on purpose. The *distribution* was renamed to
+# `asyncio-gateway` because PyPI rejected `async-gateway` -- it compares
+# PEP 503 normalised names, and `asyncgateway` already holds that one. The
+# GitHub *repository* was not renamed and is still `async-gateway`, so the
+# "Repository name" field above must say `async-gateway` or the OIDC claim
+# will not match and the upload fails with "invalid-publisher".
 #
 # The `environment: pypi` on the publish job below must match that last field
 # character for character, and a GitHub environment of that name must exist on

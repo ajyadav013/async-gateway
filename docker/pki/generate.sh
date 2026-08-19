@@ -32,7 +32,7 @@ cd "$PKI"
 echo 'pki: minting CA'
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days "$DAYS" \
     -keyout ca-key.pem -out ca.pem \
-    -subj '/CN=async-gateway integration test CA' \
+    -subj '/CN=asyncio-gateway integration test CA' \
     -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
     -addext 'keyUsage=critical,keyCertSign,cRLSign' 2>/dev/null
 

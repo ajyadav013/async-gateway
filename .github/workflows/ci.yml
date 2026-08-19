@@ -1,7 +1,7 @@
-# Continuous integration for async-gateway (release spec R1 / Step 3, R28-AC7).
+# Continuous integration for asyncio-gateway (release spec R1 / Step 3, R28-AC7).
 #
 # The defect class this release exists to close is the one a CI that never
-# installs the built package cannot see: `async_gateway` imported an
+# installs the built package cannot see: `asyncio_gateway` imported an
 # undeclared dependency, so every check passed in a tree that already had it
 # and the published artifact was unusable. Every job below therefore gates the
 # *real artifact* or the *real interpreter set*, not a convenient stand-in:
@@ -11,7 +11,7 @@
 #   build-and-install   build, then import the submodule out of a clean venv
 #                       from the wheel and again from the sdist.
 #   changelog           on a pull request, require CHANGELOG.md alongside any
-#                       async_gateway/ change (escape: a `skip-changelog`
+#                       asyncio_gateway/ change (escape: a `skip-changelog`
 #                       label).
 #   shuffled-order      the suite under five committed pytest-randomly seeds.
 #   coverage-ratchet    head's `fail_under` may never drop below base's.
@@ -107,7 +107,7 @@ jobs:
         # Green with no `ignore_errors` anywhere as of R27/Step 24 (story
         # AGW-26), and `ignore_missing_imports` only per-module, each
         # override naming the package that ships no stubs.
-        run: mypy async_gateway
+        run: mypy asyncio_gateway
 
       - name: no global type suppression (R27-AC5)
         # The gate this pair of settings is *for* is the one they can
@@ -150,7 +150,7 @@ jobs:
         # add and easiest to forget.
         run: |
           offenders=$(grep -rn 'pragma:[[:space:]]*no[[:space:]]*cover' \
-            async_gateway tests examples \
+            asyncio_gateway tests examples \
             | grep -v -- '--' || true)
           if [ -n "$offenders" ]; then
             echo '::error::a `# pragma: no cover` carries no `--`' \
@@ -174,7 +174,7 @@ jobs:
         # having a number rather than a convention.
         run: |
           count=$(grep -rc 'pragma:[[:space:]]*no[[:space:]]*cover' \
-            async_gateway tests examples \
+            asyncio_gateway tests examples \
             | awk -F: '{total += $2} END {print total + 0}')
           echo "pragma count: $count (ceiling 10)"
           if [ "$count" -gt 10 ]; then
@@ -208,7 +208,7 @@ jobs:
         # `-c pyproject.toml` is load-bearing: bandit reads only `.bandit`
         # files or an explicit `-c`, so without it `[tool.bandit]` is ignored
         # and the scanner runs unconfigured.
-        run: bandit -c pyproject.toml -r async_gateway -ll
+        run: bandit -c pyproject.toml -r asyncio_gateway -ll
 
       - name: compile the examples (R35-AC2)
         # A second, independent check alongside the suite's own import test.
@@ -237,7 +237,7 @@ jobs:
         run: |
           test -z "$(git status --porcelain)"
           test ! -e dist
-          test ! -e async_gateway.egg-info
+          test ! -e asyncio_gateway.egg-info
 
       - name: Build the wheel and the sdist
         # Deliberately an *isolated* build. `--no-isolation` would reuse the
@@ -251,7 +251,7 @@ jobs:
       - name: Install the wheel into a clean venv and import the submodule
         # `cd /tmp` first: with the repo as the working directory the source
         # tree shadows the installed package on sys.path and the import proves
-        # nothing. Importing bare `async_gateway` also proves nothing --
+        # nothing. Importing bare `asyncio_gateway` also proves nothing --
         # `__init__.py` is empty, so it succeeds even when every submodule is
         # broken. The documented entry point is the submodule.
         run: |
@@ -259,7 +259,7 @@ jobs:
           /tmp/wheel-venv/bin/pip install --no-cache-dir dist/*.whl
           cd /tmp
           /tmp/wheel-venv/bin/python -c \
-            'from async_gateway.async_gateway import request; print(request)'
+            'from asyncio_gateway.asyncio_gateway import request; print(request)'
 
       - name: Install the sdist into a clean venv and import the submodule
         run: |
@@ -268,7 +268,7 @@ jobs:
             dist/*.tar.gz
           cd /tmp
           /tmp/sdist-venv/bin/python -c \
-            'from async_gateway.async_gateway import request; print(request)'
+            'from asyncio_gateway.asyncio_gateway import request; print(request)'
 
       - name: twine check
         run: twine check dist/*
@@ -300,7 +300,7 @@ jobs:
           PY
 
   changelog:
-    name: changelog touched alongside async_gateway/
+    name: changelog touched alongside asyncio_gateway/
     # Pull requests only. A changelog entry is a statement about a *change
     # under review*; on a bare push there is no base to diff against and no
     # label to grant the escape, so the job would either be meaningless or
@@ -312,7 +312,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require a CHANGELOG.md change when async_gateway/ changes
+      - name: Require a CHANGELOG.md change when asyncio_gateway/ changes
         # The escape (R33-AC6): label the pull request `skip-changelog`.
         # It exists for the genuinely entry-less change -- a typo in a
         # docstring, a comment, a pure refactor with no consumer-visible
@@ -332,15 +332,15 @@ jobs:
               ;;
           esac
           changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
-          if ! grep -q '^async_gateway/' <<<"$changed"; then
-            echo 'no async_gateway/ change; no entry required.'
+          if ! grep -q '^asyncio_gateway/' <<<"$changed"; then
+            echo 'no asyncio_gateway/ change; no entry required.'
             exit 0
           fi
           if grep -qx 'CHANGELOG.md' <<<"$changed"; then
-            echo 'async_gateway/ changed and CHANGELOG.md was updated.'
+            echo 'asyncio_gateway/ changed and CHANGELOG.md was updated.'
             exit 0
           fi
-          echo 'This pull request changes async_gateway/ but not' >&2
+          echo 'This pull request changes asyncio_gateway/ but not' >&2
           echo 'CHANGELOG.md. Add an entry under [Unreleased], or apply' >&2
           echo 'the `skip-changelog` label if the change is genuinely' >&2
           echo 'not worth one.' >&2

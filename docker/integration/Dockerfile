@@ -9,7 +9,7 @@ FROM python:3.12-slim AS build
 WORKDIR /src
 RUN python -m pip install --no-cache-dir --upgrade pip build
 COPY pyproject.toml MANIFEST.in README.md LICENSE CHANGELOG.md ./
-COPY async_gateway/ ./async_gateway/
+COPY asyncio_gateway/ ./asyncio_gateway/
 RUN python -m build --wheel --outdir /dist
 
 FROM python:3.12-slim AS runtime

@@ -93,7 +93,7 @@ gate 'format check' \
 # --------------------------------------------------------------- types
 
 # covers: lint-type-test/mypy
-gate 'mypy' "$PYTHON" -m mypy async_gateway
+gate 'mypy' "$PYTHON" -m mypy asyncio_gateway
 
 # covers: lint-type-test/no global type suppression (R27-AC5)
 no_global_type_suppression() {
@@ -120,7 +120,7 @@ gate 'pytest' "$PYTHON" -m pytest
 no_unjustified_pragma() {
   local offenders
   offenders=$(grep -rn 'pragma:[[:space:]]*no[[:space:]]*cover' \
-    async_gateway tests examples | grep -v -- '--' || true)
+    asyncio_gateway tests examples | grep -v -- '--' || true)
   if [ -n "$offenders" ]; then
     echo 'error: a `# pragma: no cover` carries no `--` justification;' \
          'the permitted categories are `if TYPE_CHECKING:`, an' \
@@ -136,7 +136,7 @@ gate 'no unjustified coverage pragma' no_unjustified_pragma
 pragma_ceiling() {
   local count
   count=$(grep -rc 'pragma:[[:space:]]*no[[:space:]]*cover' \
-    async_gateway tests examples | awk -F: '{total += $2} END {print total + 0}')
+    asyncio_gateway tests examples | awk -F: '{total += $2} END {print total + 0}')
   echo "pragma count: $count (ceiling 10)"
   if [ "$count" -gt 10 ]; then
     echo "error: $count coverage pragmas exceeds the ceiling of 10" >&2
@@ -158,7 +158,7 @@ gate 'R7 fitness behaviours 1-6' \
 # ------------------------------------------------------------ security
 
 # covers: lint-type-test/bandit
-gate 'bandit' "$PYTHON" -m bandit -c pyproject.toml -r async_gateway -ll
+gate 'bandit' "$PYTHON" -m bandit -c pyproject.toml -r asyncio_gateway -ll
 
 # ------------------------------------------------------------ examples
 
@@ -294,7 +294,7 @@ build_and_install() {
     # source tree shadows the installed package and the import proves
     # nothing.
     (cd /tmp && "$venv/bin/python" -c \
-      'from async_gateway.async_gateway import request; print(request)') \
+      'from asyncio_gateway.asyncio_gateway import request; print(request)') \
       || return 1
   done
 
@@ -327,7 +327,7 @@ fi
 
 # ------------------------------------------------- inherently CI-only
 
-# ci-only: changelog/Require a CHANGELOG.md change when async_gateway/ changes
+# ci-only: changelog/Require a CHANGELOG.md change when asyncio_gateway/ changes
 #   Needs the pull request's base sha and its label set. On a local
 #   branch there is no PR, so there is no base to diff and no
 #   `skip-changelog` label to honour.

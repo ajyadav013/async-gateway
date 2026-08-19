@@ -51,19 +51,19 @@ import conftest as cfg
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.utils.constants import MAX_MULTIPART_DEPTH
-from async_gateway.utils.contained_io import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.utils.constants import MAX_MULTIPART_DEPTH
+from asyncio_gateway.utils.contained_io import (
     _open_guarded,
     contained_path_io_factory,
     local_base,
 )
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     PathContainmentError,
     ProcessorError,
 )
-from async_gateway.utils.paths import FILE_MODE
+from asyncio_gateway.utils.paths import FILE_MODE
 
 BASE_HTTP = cfg.BASE_HTTP
 BASE_HTTPS = cfg.BASE_HTTPS
@@ -514,7 +514,7 @@ async def test_userinfo_is_masked_on_a_real_request(
     secret = 'sup3rs3cr3t-pw'
     url = f'{prefix}user:{secret}@{authority}'
 
-    with caplog.at_level(logging.WARNING, logger='async_gateway'):
+    with caplog.at_level(logging.WARNING, logger='asyncio_gateway'):
         result = await request(
             url,
             protocol='HTTP',
@@ -531,7 +531,7 @@ async def test_userinfo_is_masked_on_a_real_request(
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
         and hasattr(record, 'traceback')
     ]
     assert records, 'the failure logged no record to inspect'
@@ -649,7 +649,7 @@ async def test_a_secret_outside_the_query_is_masked_on_a_real_request(
 
     # 2. The failure path: the envelope, the error prose that names the
     #    URL, and the two log surfaces.
-    with caplog.at_level(logging.WARNING, logger='async_gateway'):
+    with caplog.at_level(logging.WARNING, logger='asyncio_gateway'):
         result = await request(
             f'{BASE_HTTP}{fail_path}{secret}',
             protocol='HTTP',
@@ -664,7 +664,7 @@ async def test_a_secret_outside_the_query_is_masked_on_a_real_request(
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
         and hasattr(record, 'traceback')
     ]
     assert records, 'the failure logged no record to inspect'
