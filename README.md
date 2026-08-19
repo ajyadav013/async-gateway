@@ -215,12 +215,11 @@ unhashable value such as a list — is refused with a `ConfigurationError`
 (`code='CONFIG'`, status `400`) before the call is dispatched. Omit the key to
 take the port from the URL, or from the protocol family's default.
 
-**FTP and SFTP need only `.login` and `.password`.** Any object carrying those
-two attributes works — the example uses `types.SimpleNamespace` from the
-standard library. `aiohttp.BasicAuth` also has them and is still accepted, but
-constructing one now emits a `DeprecationWarning` (see
-[HTTP credentials](#http-basic-auth) above), so it is no longer what this
-README recommends.
+**FTP accepts any object carrying string `.login` and `.password`
+attributes.** The example uses `types.SimpleNamespace` from the standard
+library. SFTP has a protocol-specific `SFTPAuth` model because SSH accepts a
+password, an explicit client key, or both. Legacy SFTP auth objects remain
+supported.
 
 > **⚠️ FTP names its paths differently from SFTP.** FTP uses
 > **`server_path`/`client_path`**; SFTP uses **`remote_path`/`local_path`**.
@@ -229,6 +228,7 @@ README recommends.
 > underneath (`aioftp` for FTP, `asyncssh` for SFTP). **The pairs are not
 > interchangeable**, but mixing them fails loudly rather than silently: an FTP
 > call given `remote_path` is refused with
+> a `DeprecationWarning` for the unknown `remote_path`, followed by
 > `error['code'] == 'CONFIG'` and the message
 > `protocol_info['server_path'] must be a non-empty string naming the path on
 > the server, got None` — the unexpected key is ignored and the missing one is
@@ -246,12 +246,12 @@ SFTP verifies the server's SSH host key. By default that is asyncssh's own
 `~/.ssh/known_hosts` resolution; here the trusted set is pinned explicitly.
 
 ```python
-from types import SimpleNamespace
+from asyncio_gateway import SFTPAuth
 from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='sftp.example.com',
-    auth=SimpleNamespace(login='deploy', password='not-a-real-password'),
+    auth=SFTPAuth(username='deploy', password='not-a-real-password'),
     protocol='SFTP',
     protocol_info={
         'port': 22,
@@ -409,11 +409,12 @@ async def request(
 |---|---|
 | `url` | An absolute URL for HTTP/HTTPS/SOAP; a **bare host name** for FTP/SFTP. |
 | `data` | The request payload. For SOAP it is the XML body (`str` or `Element`). Defaults to `{}`. |
-| `auth` | **Required for FTP and SFTP** — any object carrying `.login` and `.password`, e.g. `SimpleNamespace(login=..., password=...)`; omitted there, the call raises `ConfigurationError`, because those two protocols cannot connect without credentials. **Optional for HTTP/HTTPS/SOAP**, where `None` sends no credentials; put credentials in an `Authorization` header instead (see [HTTP credentials](#http-basic-auth)). `auth` is still forwarded to aiohttp untouched, but `aiohttp.BasicAuth` is deprecated in aiohttp 3.14. |
+| `auth` | **Required for FTP and SFTP.** FTP accepts string `.login` and `.password` attributes. SFTP accepts `SFTPAuth(username=..., password=..., client_keys=..., key_passphrase=..., use_ssh_agent=False)` and retains legacy auth objects. **Optional for HTTP/HTTPS/SOAP**, where `None` sends no credentials; put credentials in an `Authorization` header instead (see [HTTP credentials](#http-basic-auth)). |
 | `protocol` | One of `'HTTP'`, `'HTTPS'`, `'FTP'`, `'SFTP'`, `'SOAP'`. Matched with surrounding whitespace stripped and without regard to case, so `'http'`, `' HTTP '` and `'Http'` are one protocol. |
 | `protocol_info` | Per-protocol configuration; see the tables below. `None` is a valid call for every protocol that requires no key. |
 | `pre_processor_config` | `{'function': async_callable, 'params': {...}}`. Awaited before dispatch with `response=<envelope>` plus `params`; its return value lands in `pre_processor_response`. See [Processor hooks](#processor-hooks). |
 | `post_processor_config` | The same shape, awaited after the call; its return value lands in `post_processor_response`. |
+| `**kwargs` | No additional top-level names are accepted. A misspelling raises `ConfigurationError` before processors or transport code. Put transport options in `protocol_info` and callback arguments in a processor config's `params`. |
 
 ### Processor hooks
 
@@ -430,25 +431,27 @@ your callable two values for one argument.
 A *valid* config whose callable then fails raises `ProcessorError`
 (`PROCESSOR`/500), with the original chained as `__cause__`. That covers your
 function raising, refusing the `response` keyword, returning something that
-cannot be awaited, or removing a key from the envelope it was handed. The two
+cannot be awaited, removing a required key, or changing pre-dispatch `url` or
+`protocol`. The two
 errors are deliberately distinct: the first says the hook was configured
 wrongly, the second says the hook that was configured is itself broken.
 
-Your callable is handed the **live** envelope and may change what it holds —
-rewriting `response['url']` from a pre-processor is a supported use — but it
-may not *remove* a key, because the protocol clients read them and
-`result['ok']` is the documented success predicate.
+Your callable is handed the **live** envelope and may change non-routing values
+such as `payload`, `headers`, cookies and caller metadata. A pre-processor may
+not rewrite `url` or `protocol`: the validated arguments to `request()` are the
+single authority for dispatch. URL edits were previously accepted and silently
+discarded, which made a callback appear to retarget a request that still went
+to the original destination. Either edit now raises `ProcessorError` before a
+protocol client is constructed, and the error names fields without echoing URL
+values. A **post-processor** may rewrite report fields, including `url` and
+`protocol`, because dispatch has already completed. Both hook types must
+preserve the required envelope key set.
 
-**A pre-processor may not rewrite `response['protocol']`.** It is the one field
-this library reads back off the envelope and *routes on*: the protocol object
-uses it to key its per-destination circuit breaker. Rewriting it to a non-string
-crashed inside the protocol client, and rewriting it to a *valid* protocol name
-silently pointed the call at another caller's breaker. Doing so now raises a
-`ProcessorError` naming the field. Every other key stays writable, including
-`url`, `payload`, `headers` and any state of your own you stash on the envelope
-— none of them decide where the call goes. A **post-processor** may rewrite
-anything at all, `protocol` included: by then the call has been made and there
-is nothing left to route.
+`protocol_info` also has an accepted key set per protocol, matching the tables
+below. An unknown key resembling a security control (for example
+`verify_sll`) raises `ConfigurationError` immediately. Other unknown keys emit
+`DeprecationWarning` during the 1.x compatibility window and will become errors
+in 2.0. The warning and error list the accepted keys.
 
 A post-processor that raises therefore forfeits the envelope, response body
 included. That is the cost of the guarantee that nothing but an
@@ -562,7 +565,7 @@ removes is the hang — a socket that goes silent forever.
 | `known_hosts` | anything asyncssh accepts | *omitted* | Trusted host keys. Omitting it takes asyncssh's `~/.ssh/known_hosts` resolution. |
 | `host_key` | one key | `None` | Pin exactly one trusted server key. |
 | `insecure_skip_host_key_check` | `bool` | `False` | Disable host-key verification. Only literal `True` reaches it. |
-| `client_keys` | anything asyncssh accepts | `None` | Client identities for key-based authentication. |
+| `client_keys` | anything asyncssh accepts | `None` | Legacy location for explicit client identities. Prefer `SFTPAuth.client_keys`; do not set both. |
 | `additional_arguments` | `dict` | `{}` | Forwarded to the asyncssh operation. Never mutated. |
 | `overwrite` | `bool` | `False` | Whether a download may replace an existing local file. |
 | `timeout` | number | `15` | Bounds the connect and the login. |
@@ -846,11 +849,12 @@ except ConfigurationError as exc:
 ```
 
 The errors that escape this way are: a `protocol` that is not a registered name;
-a `protocol_info` that is not a mapping or that omits a required key; a URL whose
+a `protocol_info` that is not a mapping or that omits a required key; an
+unknown top-level keyword or security-sensitive protocol option; a URL whose
 scheme the protocol will not dispatch on; an HTTP `request_type` outside the
 allowlist; an `http_file_upload_config` combined with a GET; an `auth` carrying
-no `login` and `password` on **FTP or SFTP**, which cannot connect without them
-(`auth` is optional in the signature, but not for those two protocols); and
+no `login` and `password` on **FTP**; invalid SFTP auth with no username or no
+explicit password/client key; and
 every other malformed value the HTTP and SOAP constructors check.
 
 **Everything else is an `ok=False` envelope** — every remote failure, every
@@ -1155,32 +1159,35 @@ With verification off, any host that answers can impersonate the endpoint,
 collect the credentials offered to it, and read or alter every byte transferred.
 
 **No ambient identity is ever offered.** By default this library passes
-`client_keys=None`, which is the only value that offers nothing: an empty list
-falls through to asyncssh's default-key branch and would hand over the host
-process's `~/.ssh/id_*` files *and* every identity its ssh-agent holds. Do
-key-based authentication by naming your keys:
+`client_keys=None` and `agent_path=None`, so asyncssh reads neither the host's
+default private keys nor `SSH_AUTH_SOCK`. Do key-based authentication with
+`SFTPAuth`; agent use remains off unless `use_ssh_agent=True`:
 
 ```python
-from types import SimpleNamespace
+from asyncio_gateway import SFTPAuth
 from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='sftp.example.com',
-    auth=SimpleNamespace(login='deploy', password='not-a-real-password'),
+    auth=SFTPAuth(
+        username='deploy',
+        client_keys=[CLIENT_SSH_KEY_PATH],
+        key_passphrase='not-a-real-key-passphrase',
+    ),
     protocol='SFTP',
     protocol_info={
         'mode': 'get',
         'remote_path': '/exports/report.csv',
         'local_path': LOCAL_DOWNLOAD_PATH,
         'known_hosts': KNOWN_HOSTS_PATH,
-        'client_keys': [CLIENT_SSH_KEY_PATH],
     },
 )
 assert result['ok'] is True
 ```
 
-A password and `client_keys` supplied together are both offered, in asyncssh's
-own order — public key first, password as the fallback.
+Set both `password` and `client_keys` when the server supports either method.
+Legacy `.login`/`.password` objects and `protocol_info['client_keys']` remain
+supported for 1.x callers, but two client-key sources in one call are rejected.
 
 ### Response size
 

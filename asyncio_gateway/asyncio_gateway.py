@@ -282,17 +282,56 @@ async def run_processor(
 #: The envelope keys this library **reads back and routes on**, and
 #: therefore the ones a processor may not rewrite (NEW-3).
 #:
-#: Membership is decided by one question -- does any code path read this
-#: value off the envelope after a processor could have touched it, and
-#: act on it? -- and today exactly one key answers yes:
-#: ``BaseRequestClass.__init__`` reads ``response['protocol']`` to build
-#: the breaker registry's key.
+#: Membership is decided by one question: can changing this value make the
+#: hook appear to control a transport decision? ``protocol`` is read back for
+#: the breaker key. ``url`` is the network destination even though dispatch
+#: deliberately reads the original argument; accepting and discarding a URL
+#: edit would falsely tell the callback that it retargeted the request.
 #:
 #: A frozenset rather than a literal at the check, so the set is one
 #: named thing a future story can extend when it makes another key
 #: routing-relevant, and so the docstring above and the code below
 #: cannot disagree about what is frozen.
-DISPATCH_CONTROLLING_KEYS: Final[frozenset[str]] = frozenset({'protocol'})
+DISPATCH_CONTROLLING_KEYS: Final[frozenset[str]] = frozenset({
+    'protocol',
+    'url',
+})
+
+#: The named locations accepted by :func:`request`. Kept beside the residual
+#: ``**kwargs`` check so its diagnostic cannot advertise an invented option.
+REQUEST_ARGUMENT_LOCATIONS: Final[Tuple[str, ...]] = (
+    'url',
+    'data',
+    'auth',
+    'protocol',
+    'protocol_info',
+    'pre_processor_config',
+    'post_processor_config',
+)
+
+
+def reject_unknown_request_kwargs(kwargs: Mapping[str, Any]) -> None:
+    """Reject residual top-level keywords before any caller code runs.
+
+    Args:
+        kwargs: Keywords not bound by the public signature.
+
+    Returns:
+        None when there are no residual keywords.
+
+    Raises:
+        ConfigurationError: If one or more keywords are unknown. The message
+            names keys but never values, which may contain credentials.
+    """
+    if not kwargs:
+        return
+    unknown = sorted(kwargs)
+    raise ConfigurationError(
+        f'request() received unknown keyword argument(s) {unknown}; '
+        f'accepted top-level arguments are '
+        f'{list(REQUEST_ARGUMENT_LOCATIONS)}. Put transport options in '
+        f'protocol_info and callback keyword arguments in the processor '
+        f'config "params" mapping')
 
 
 def checked_envelope(
@@ -303,12 +342,11 @@ def checked_envelope(
 ) -> GatewayResponse:
     """Return ``response`` once a processor has left it whole.
 
-    A processor is handed the *live* envelope, which is the documented
-    design -- FI-14 depends on a pre-processor being able to rewrite
-    ``response['url']``, and a caller stashing their own state on it is a
-    supported use. Handing over a live mutable object does mean a callback
-    can also *remove* from it, and a pre-processor that did was the ninth
-    escape found while extending the invariant matrix: ``response.clear()``
+    A processor is handed the *live* envelope so it can reshape payload and
+    add caller-owned metadata. Handing over a live mutable object does mean a
+    callback can also *remove* from it, and a pre-processor that did was
+    the ninth escape found while extending the invariant matrix:
+    ``response.clear()``
     or ``del response['payload']`` left ``http_client`` reading
     ``self.response['payload']`` and ``soap_client`` reading it two lines
     into building the SOAP body, both as a bare ``KeyError('payload')``
@@ -328,8 +366,8 @@ def checked_envelope(
     own business, and deliberately so.
 
     The line between them is not "what looks dangerous" -- it is whether
-    this library *reads the value back and acts on it*. Exactly one key
-    does that: :data:`DISPATCH_CONTROLLING_KEYS`.
+    the field describes or controls transport dispatch. Two keys do:
+    :data:`DISPATCH_CONTROLLING_KEYS` contains ``protocol`` and ``url``.
     ``BaseRequestClass.__init__`` reads ``response['protocol']`` to build
     the breaker registry's ``(family, host, port)`` key, so a
     pre-processor rewriting it did two things (NEW-3). A non-``str``
@@ -350,18 +388,11 @@ def checked_envelope(
     protocol client -- ``resolve_protocol`` running once is what makes
     the value checked and the value dispatched the same value.
 
-    ``url`` stays **writable**, and the asymmetry is FI-14's, not a new
-    judgement. A processor rewriting ``url`` is the documented point of
-    the hook, and it is safe for a specific reason worth stating: this
-    module *overwrites* ``response['url']`` from ``target_url`` a few
-    lines after the processor runs, so the rewrite reaches no dispatch
-    decision at all -- it cannot downgrade an HTTPS call to plaintext,
-    which is exactly what FI-14 established by moving the scheme check
-    after the processor and checking the URL actually dispatched. The
-    key is reportorial by the time anything reads it. If a later story
-    makes ``url`` decide where the call goes, it becomes
-    dispatch-controlling and moves into the frozen set with the scheme
-    check that guards it.
+    ``url`` is frozen because the old behavior accepted the edit and then
+    overwrote it from the original argument. It did not retarget dispatch;
+    it only made the callback appear to have done so. Refusing the edit keeps
+    one authoritative destination and prevents a future refactor from turning
+    the same write into an unvalidated network capability.
 
     Payload-shaping keys -- ``payload``, ``headers``, ``cookies``, and
     the caller's own stashed state -- stay writable for the same reason:
@@ -613,10 +644,9 @@ async def request(
     :param auth: aiohttp.BasicAuth(username, password), or any auth
         object aiohttp accepts. Optional for the HTTP family and SOAP,
         where None means "send no credentials" and is the common case.
-        **Required for FTP and SFTP**, which read ``.login`` and
-        ``.password`` off it to build their connect: omitted there, the
-        call raises ``ConfigurationError`` before anything is dispatched
-        rather than crashing on ``None.login`` as it once did (H5)
+        **Required for FTP**, which reads ``.login`` and ``.password``.
+        SFTP accepts ``SFTPAuth`` (password, explicit client key, or both)
+        and retains legacy ``.login``/``.password`` objects.
     :param protocol_info: {
         "request_type": "GET", #required
         "timeout": int, #Optional
@@ -681,16 +711,14 @@ async def request(
         malformed post-processor config is refused before the call is
         dispatched rather than after the remote side has been contacted.
         The callable is awaited with ``response=<the live envelope>``; it
-        may change what the envelope holds -- rewriting
-        ``response['url']`` from a pre-processor is a supported use -- but
-        it may not *remove* a key, because the protocol clients read them
+        may change non-routing values and add caller metadata, but it may
+        not rewrite ``url`` or ``protocol`` or remove a required key
     :param post_processor_config: Expects Dict
     {"function": function_address, "params": {"param1": value1}} Optional,
     same shape and same rules
-    :param kwargs: Accepted and ignored. Present so a caller passing a
-        keyword this version does not read gets the call it asked for
-        rather than a ``TypeError``; every option this library acts on is
-        named above or lives inside ``protocol_info``.
+    :param kwargs: Residual keywords are rejected as ``ConfigurationError``
+        before processors or transport code. Transport options belong in
+        ``protocol_info`` and processor arguments in the config's ``params``.
     :returns GatewayResponse: the same key set for every protocol, on both
         the success and the failure path. Check ``result['ok']`` -- it is
         the only success predicate, and it is False for every failure.
@@ -761,10 +789,11 @@ async def request(
         either runs and before anything is dispatched.
     :raises ProcessorError: If a *valid* processor config's callable
         fails -- it raised, it refused the ``response`` keyword, it
-        returned something that cannot be awaited, or it removed a key
-        from the envelope it was handed. Deliberately distinct from
-        ``ConfigurationError``: the configuration was accepted and this
-        library called exactly what the caller asked for, so the fault is
+        returned something that cannot be awaited, removed a required key,
+        or rewrote pre-dispatch ``url`` or ``protocol``. Deliberately
+        distinct from ``ConfigurationError``: the configuration was
+        accepted and this library called exactly what the caller asked for,
+        so the fault is
         in the caller's own function rather than in how they configured
         it. Reports ``PROCESSOR``/500 and chains the original as
         ``__cause__``.
@@ -780,6 +809,8 @@ async def request(
         through untouched, since it has already said what it wants
         reported.
     """
+    reject_unknown_request_kwargs(kwargs)
+
     # `protocol` and `protocol_info` -- including the keys the chosen
     # protocol requires -- are validated here, at the boundary, before an
     # envelope exists and before the caller's own pre-processor is given
@@ -801,7 +832,11 @@ async def request(
 
     protocol_name, protocol_class = resolve_protocol(protocol)
     info: Dict[str, Any] = validated_protocol_info(
-        protocol_info, required=protocol_class.REQUIRED_INFO_KEYS)
+        protocol_info,
+        required=protocol_class.REQUIRED_INFO_KEYS,
+        accepted=protocol_class.ACCEPTED_INFO_KEYS,
+        protocol=protocol_name,
+    )
 
     # `port` is checked here, at the boundary, with the rest of the
     # `validated_*` family and *outside* the one conversion `try` -- the
@@ -868,18 +903,14 @@ async def request(
         # off it directly. A pre-processor that removed one is refused
         # here, at the boundary, rather than surfacing as a bare
         # `KeyError` from inside the conversion `try` where nothing
-        # catches it -- and so is one that rewrote `protocol`, which the
-        # protocol object reads back to key its circuit breaker (NEW-3).
+        # catches it. URL and protocol edits are also refused because both
+        # describe routing, even though the old URL edit was discarded.
         response = checked_envelope(
             response, setting='pre_processor_config', dispatch=dispatch)
 
-    # FI-14. The scheme check runs *after* the pre-processor and against
-    # the value that is then handed to the protocol object -- one variable,
-    # so the URL checked and the URL dispatched cannot differ. A
-    # pre-processor mutating `response['url']` therefore cannot downgrade
-    # an HTTPS call to plaintext. If a later story lets a pre-processor
-    # rewrite the dispatched URL, this check moves with it: it has to stay
-    # the last thing that touches the URL before dispatch.
+    # The scheme check produces the one URL handed to the protocol object.
+    # Pre-processors cannot rewrite the destination, so the validated
+    # function argument remains the sole authority for transport dispatch.
     target_url = dispatch_url_for(
         protocol_name, url, redact_params=redact_query_params)
 

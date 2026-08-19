@@ -19,6 +19,10 @@ can drift out of step with it.
 import logging
 from importlib.metadata import version
 
+from asyncio_gateway.auth import SFTPAuth
+
+__all__ = ['SFTPAuth', '__version__']
+
 #: The installed distribution's version, read from packaging metadata.
 #:
 #: This deliberately carries no ``PackageNotFoundError`` fallback. A fallback

@@ -34,7 +34,7 @@ import socket
 import ssl
 from collections.abc import Collection, Mapping
 from types import MappingProxyType
-from typing import Any, Final, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Final, Optional, Sequence, Tuple, Union
 
 import aioftp
 
@@ -408,6 +408,18 @@ def transport_error_for(
 
 class FTPRequest(BaseRequestClass):
     """Implements Aioftp to make ftp calls."""
+
+    #: Every FTP option recognised at the public boundary.
+    ACCEPTED_INFO_KEYS: ClassVar[frozenset[str]] = (
+        BaseRequestClass.ACCEPTED_INFO_KEYS | frozenset({
+            'client_path',
+            'command',
+            'max_response_bytes',
+            'overwrite',
+            'server_path',
+            'verify_ssl',
+        })
+    )
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Build an FTP request from a validated ``protocol_info``.

@@ -34,18 +34,12 @@ that, and they are what this module owns:
   keys; and not a caller-supplied ``known_hosts`` of ``None``, which is
   asyncssh's spelling of the same thing and is rejected rather than
   quietly honoured.
-* **No ambient identity is ever offered.** ``client_keys=None`` is
-  passed by default -- ``None``, and not the empty list that reads like
-  "offer nothing". asyncssh's ``prepare`` tests ``client_keys`` for
-  truthiness, so ``[]`` falls through to the same
-  ``load_default_keypairs()`` branch an omitted argument takes and
-  additionally points ``agent_path`` at ``SSH_AUTH_SOCK``: it offers the
-  host process's ``~/.ssh/id_*`` files *and* every identity its
-  ssh-agent holds. Only ``None`` reaches the branch that offers neither.
-  A caller doing key-based authentication supplies
-  ``protocol_info['client_keys']`` and the value is forwarded unchanged;
-  supplied together with a password, both are offered in asyncssh's own
-  order -- public key first, password as the fallback.
+* **No ambient identity is ever offered.** ``client_keys=None`` and
+  ``agent_path=None`` are passed by default. Explicit keys come from
+  :class:`asyncio_gateway.auth.SFTPAuth` or the legacy
+  ``protocol_info['client_keys']`` location. The agent remains disabled even
+  with keys unless ``SFTPAuth.use_ssh_agent`` is true. A password and key may
+  be supplied together; asyncssh chooses their authentication order.
 
 **What the session reports.** Three defects sat between a completed
 operation and the caller, and they compounded: ``remote_files`` was bound
@@ -115,6 +109,7 @@ from collections.abc import Collection
 from types import MappingProxyType
 from typing import (
     Any,
+    ClassVar,
     Dict,
     Final,
     Mapping,
@@ -127,9 +122,9 @@ import asyncssh
 
 from failsafe import CircuitOpen, FailsafeError
 
+from asyncio_gateway.auth import SFTPAuth
 from asyncio_gateway.helpers.internal.base import (
     BaseRequestClass,
-    credentials_of,
 )
 from asyncio_gateway.logic.http_client import validated_max_response_bytes
 from asyncio_gateway.utils.constants import MAX_RESPONSE_BYTES
@@ -154,6 +149,96 @@ from asyncio_gateway.utils.http_file_config import validated_verb
 from asyncio_gateway.utils.redaction import redact_url, redact_value
 
 logger = logging.getLogger(__name__)
+
+
+def _explicit_client_keys(client_keys: Any) -> Any:
+    """Normalise an empty key declaration to no explicit client key.
+
+    Args:
+        client_keys: A value accepted by asyncssh's ``client_keys`` option.
+
+    Returns:
+        None for empty strings and empty collections, otherwise the original
+        value unchanged.
+    """
+    if client_keys is None:
+        return None
+    if isinstance(client_keys, (str, bytes)):
+        return client_keys or None
+    if isinstance(client_keys, Collection) and not client_keys:
+        return None
+    return client_keys
+
+
+def sftp_credentials_of(
+    auth: Any,
+    *,
+    legacy_client_keys: Any,
+) -> Tuple[str, Optional[str], Any, Optional[str], bool]:
+    """Resolve typed or legacy SFTP credentials without ambient fallback.
+
+    Args:
+        auth: A public :class:`SFTPAuth` or a legacy object carrying
+            ``.login`` and optionally ``.password``.
+        legacy_client_keys: The backwards-compatible
+            ``protocol_info['client_keys']`` value.
+
+    Returns:
+        Username, optional password, explicit keys, optional passphrase, and
+        whether ssh-agent use was explicitly enabled.
+
+    Raises:
+        ConfigurationError: If the username is missing, no password or key is
+            supplied, a typed field has the wrong runtime type, or both the
+            typed model and ``protocol_info`` provide client keys.
+    """
+    username: Any
+    password: Any
+    client_keys: Any
+    passphrase: Optional[str]
+    use_ssh_agent: bool
+    info_keys = _explicit_client_keys(legacy_client_keys)
+    if isinstance(auth, SFTPAuth):
+        model_keys = _explicit_client_keys(auth.client_keys)
+        if model_keys is not None and info_keys is not None:
+            raise ConfigurationError(
+                'SFTP client_keys were supplied in both SFTPAuth and '
+                'protocol_info; choose one explicit source')
+        username = auth.username
+        password = auth.password
+        client_keys = model_keys if model_keys is not None else info_keys
+        passphrase = auth.key_passphrase
+        if passphrase is not None and not isinstance(passphrase, str):
+            raise ConfigurationError(
+                'SFTPAuth.key_passphrase must be a str or None')
+        if not isinstance(auth.use_ssh_agent, bool):
+            raise ConfigurationError(
+                'SFTPAuth.use_ssh_agent must be a bool')
+        use_ssh_agent = auth.use_ssh_agent
+    else:
+        username = getattr(auth, 'login', None)
+        password = getattr(auth, 'password', None)
+        client_keys = info_keys
+        passphrase = None
+        use_ssh_agent = False
+
+    if not isinstance(username, str) or not username:
+        raise ConfigurationError(
+            'SFTP requires credentials: provide a non-empty username in '
+            'SFTPAuth.username or legacy auth.login, plus a password or '
+            'explicit client_keys')
+    if password is not None and not isinstance(password, str):
+        raise ConfigurationError(
+            'SFTP password must be a str or None')
+    if passphrase is not None and client_keys is None:
+        raise ConfigurationError(
+            'SFTPAuth.key_passphrase requires explicit client_keys')
+    if password is None and client_keys is None:
+        raise ConfigurationError(
+            'SFTP requires at least one explicit credential: a password '
+            'or client_keys')
+    return username, password, client_keys, passphrase, use_ssh_agent
+
 
 # asyncssh's SFTP operations report success by returning None -- there is
 # no protocol status on the success path to report -- so a completed
@@ -395,6 +480,22 @@ def transport_error_for(
 class SFTPRequest(BaseRequestClass):
     """Implements asyncssh to make sftp calls."""
 
+    #: Every SFTP option recognised at the public boundary.
+    ACCEPTED_INFO_KEYS: ClassVar[frozenset[str]] = (
+        BaseRequestClass.ACCEPTED_INFO_KEYS | frozenset({
+            'additional_arguments',
+            'client_keys',
+            'host_key',
+            'insecure_skip_host_key_check',
+            'known_hosts',
+            'local_path',
+            'max_response_bytes',
+            'mode',
+            'overwrite',
+            'remote_path',
+        })
+    )
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Build an SFTP request from a validated ``protocol_info``.
 
@@ -414,9 +515,9 @@ class SFTPRequest(BaseRequestClass):
             ConfigurationError: From the base, if ``info`` is neither
                 None nor a mapping, or omits a key this protocol
                 requires; from
-                :func:`~asyncio_gateway.helpers.internal.base.credentials_of`
-                if ``auth`` carries no credentials, which SFTP cannot
-                connect without; and from :meth:`_connect_options` if the
+                :func:`sftp_credentials_of` if ``auth`` carries no username
+                or no explicit password/key credential; and from
+                :meth:`_connect_options` if the
                 host-key configuration is self-contradictory. All escape
                 synchronously, because the entry point constructs this
                 object outside its one conversion ``try``. SFTP's own
@@ -433,9 +534,20 @@ class SFTPRequest(BaseRequestClass):
         # unconditional here is the documented default call crashing with
         # an `AttributeError` that escapes the envelope entirely (H5).
         self.user: str
-        self.password: str
-        self.user, self.password = credentials_of(
-            self.auth, protocol='SFTP')
+        self.password: Optional[str]
+        self.client_keys: Any
+        self.key_passphrase: Optional[str]
+        self.use_ssh_agent: bool
+        (
+            self.user,
+            self.password,
+            self.client_keys,
+            self.key_passphrase,
+            self.use_ssh_agent,
+        ) = sftp_credentials_of(
+            self.auth,
+            legacy_client_keys=self.info.get('client_keys'),
+        )
         # Optional, and genuinely so: `protocol_info` is optional for this
         # protocol (R11-AC3), so an `SFTPRequest` stays constructible with
         # no `mode` in it -- which is exactly why `_validate_mode` runs at
@@ -471,7 +583,6 @@ class SFTPRequest(BaseRequestClass):
         # forwarded, never interpreted.
         self.known_hosts: Any = self.info.get('known_hosts')
         self.host_key: Any = self.info.get('host_key')
-        self.client_keys: Any = self.info.get('client_keys') or None
         # `is True`, not `bool()`: a config file's string `'false'` is
         # truthy, and a bypass that a caller believes they turned off is
         # the one failure mode this keyword exists to make impossible.
@@ -622,6 +733,14 @@ class SFTPRequest(BaseRequestClass):
             # exactly as an omitted argument does.
             'client_keys': self.client_keys,
         }
+
+        # Asyncssh enables SSH_AUTH_SOCK whenever explicit client keys are
+        # present unless ``agent_path`` is disabled. That implicit second
+        # credential source is exactly what the typed model avoids.
+        if not self.use_ssh_agent:
+            options['agent_path'] = None
+        if self.key_passphrase is not None:
+            options['passphrase'] = self.key_passphrase
 
         if self.insecure_skip_host_key_check:
             logger.warning(

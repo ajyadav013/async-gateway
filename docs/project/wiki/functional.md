@@ -14,6 +14,7 @@ are no endpoints, no environment variables, no health check.
 |---|---|
 | [`docs/specs/v1_release_spec.md`](../../specs/v1_release_spec.md) — **Part A** | The functional specification: R1–R35, 258 acceptance criteria, 89 audit findings, the open questions (OQ1–OQ12) and the fix-interaction constraints (FI-1–FI-16). |
 | [`docs/specs/v1_release_stories.md`](../../specs/v1_release_stories.md) | The story breakdown: 32 stories, the coverage gate result, and §10's criterion → story traceability table. |
+| [`docs/specs/p0_contract_corrections_spec.md`](../../specs/p0_contract_corrections_spec.md) | The 1.x compatibility contract for immutable dispatch fields, explicit SFTP authentication, and unknown-option handling. |
 
 ## Requirement groups (Part A)
 
