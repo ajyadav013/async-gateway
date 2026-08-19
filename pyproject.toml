@@ -111,7 +111,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ajyadav013/async-gateway"
+Homepage = "https://github.com/ajyadav013/asyncio-gateway"
 
 [tool.setuptools.packages.find]
 include = ["asyncio_gateway*"]

@@ -419,5 +419,5 @@ release: anything under `asyncio_gateway.helpers.internal`, and the exact wordin
 of `error['message']`. Branch on `error['code']`, which is stable, and never on
 message text.
 
-[Unreleased]: https://github.com/ajyadav013/async-gateway/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/ajyadav013/async-gateway/releases/tag/v1.0.0
+[Unreleased]: https://github.com/ajyadav013/asyncio-gateway/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ajyadav013/asyncio-gateway/releases/tag/v1.0.0
