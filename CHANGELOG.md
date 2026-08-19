@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
-## [1.0.0] — unreleased
+## [1.0.0] — 2026-08-19
 
 The first release **under this name**, and a near-total rewrite of the code it
 inherited. Read the three notes below before the change list: they are what
