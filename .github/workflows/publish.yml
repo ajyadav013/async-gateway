@@ -14,16 +14,19 @@
 #
 #       PyPI Project Name : asyncio-gateway
 #       Owner             : ajyadav013
-#       Repository name   : async-gateway
+#       Repository name   : asyncio-gateway
 #       Workflow name     : publish.yml
 #       Environment name  : pypi
 #
-# Note the two names differ on purpose. The *distribution* was renamed to
-# `asyncio-gateway` because PyPI rejected `async-gateway` -- it compares
-# PEP 503 normalised names, and `asyncgateway` already holds that one. The
-# GitHub *repository* was not renamed and is still `async-gateway`, so the
-# "Repository name" field above must say `async-gateway` or the OIDC claim
-# will not match and the upload fails with "invalid-publisher".
+# "Repository name" is the GitHub repository, not the distribution. They
+# happen to match today because the repository was renamed to follow the
+# distribution -- the distribution became `asyncio-gateway` when PyPI
+# rejected `async-gateway` (it compares PEP 503 normalised names, and
+# `asyncgateway` already holds that one). Do not assume they must agree: the
+# OIDC claim carries the *repository*, so if the repository is ever renamed
+# again this field has to be updated on PyPI or the upload fails with
+# "invalid-publisher" -- an error whose message points at the workflow
+# rather than at the stale field.
 #
 # The `environment: pypi` on the publish job below must match that last field
 # character for character, and a GitHub environment of that name must exist on

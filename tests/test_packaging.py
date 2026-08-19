@@ -47,7 +47,23 @@ CI_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'ci.yml'
 PUBLISH_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'publish.yml'
 PYPROJECT = REPO_ROOT / 'pyproject.toml'
 PACKAGE_ROOT = REPO_ROOT / 'asyncio_gateway'
-REPOSITORY_URL = 'https://github.com/ajyadav013/async-gateway'
+
+#: Where this project lives on GitHub, split into the three parts that can
+#: each be renamed independently of the code. Two of them already have been:
+#: the repository ``async-gateway`` -> ``asyncio-gateway`` (following the
+#: distribution, which PyPI forced -- see ``_TAKEN_NORMALISED_NAMES``), and
+#: the default branch ``main`` -> ``master``. Neither rename touches a single
+#: line of Python, so nothing failed and both left stale URLs behind in the
+#: documentation, found by eye afterwards.
+#:
+#: These three names are therefore the *only* place any of them is spelled.
+#: ``test_documented_github_urls_track_the_current_repository`` holds every
+#: documented GitHub URL to them, so the next rename is one edit here and a
+#: red suite until the documents follow.
+REPOSITORY_OWNER: Final[str] = 'ajyadav013'
+REPOSITORY_NAME: Final[str] = 'asyncio-gateway'
+DEFAULT_BRANCH: Final[str] = 'master'
+REPOSITORY_URL = f'https://github.com/{REPOSITORY_OWNER}/{REPOSITORY_NAME}'
 
 _DISTRIBUTION_METADATA = metadata('asyncio-gateway')
 EXAMPLES = REPO_ROOT / 'examples'
@@ -673,6 +689,121 @@ def test_every_project_url_resolves_to_this_repository() -> None:
     )
 
 
+#: The documents whose GitHub links a reader will actually follow. The two
+#: Markdown files ship -- ``README.md`` is the distribution's long
+#: description, so a stale link in it is republished in every sdist -- and
+#: the workflow header is what someone debugging an `invalid-publisher`
+#: upload reads. ``docs/specs/`` is deliberately absent: it quotes the
+#: pre-rename metadata as a record of what the audit found, and correcting
+#: a quotation would falsify it.
+_LINK_BEARING_DOCUMENTS: Final[Tuple[str, ...]] = (
+    'README.md',
+    'CHANGELOG.md',
+    '.github/workflows/publish.yml',
+    '.github/workflows/ci.yml',
+)
+
+#: Any URL under this project's GitHub owner, with the repository slug and
+#: the remaining path captured separately.
+_OWNED_GITHUB_URL = re.compile(
+    r'https://github\.com/' + re.escape(REPOSITORY_OWNER)
+    + r'/(?P<slug>[\w.-]+)(?P<path>[^\s)>\]`"\']*)')
+
+#: The GitHub path forms that address a repository at a *git ref* -- the
+#: ones a default-branch rename breaks. ``compare`` and ``releases/tag``
+#: are absent on purpose: they name tags, which renaming a branch does not
+#: move.
+_REF_BEARING_PATH = re.compile(
+    r'^/(?:tree|blob|raw|blame|commits|edit)/(?P<ref>[^/\s]+)')
+
+#: Refs that are legitimately not the default branch: an annotated release
+#: tag or a pinned commit. Anything else in a ref-bearing URL is a branch
+#: name, and the only branch this project documents is the default one.
+_PINNED_REF = re.compile(r'^(?:v\d+\.\d+\.\d+|[0-9a-f]{7,40})$')
+
+
+def test_documented_github_urls_track_the_current_repository() -> None:
+    """Every documented GitHub URL names the live repo and branch.
+
+    Two renames landed after the code was written -- the repository
+    ``async-gateway`` -> ``asyncio-gateway``, and the default branch
+    ``main`` -> ``master`` -- and neither touched a line of Python. The
+    suite stayed green while ``README.md`` went on pointing a reader at
+    ``/async-gateway/tree/main/examples``, which 404s twice over. That is
+    the failure mode this test exists for: a fact about the project that
+    lives *only* in prose, changed outside the tree, caught by eye or not
+    at all.
+
+    ``REPOSITORY_NAME`` and ``DEFAULT_BRANCH`` are the single place either
+    name is spelled, so the next rename is one edit at the top of this
+    file -- and a red suite naming every document that has not followed.
+
+    Both constants are pinned literals rather than probed from ``git`` or
+    the network: a value derived from the checkout would agree with
+    whatever the checkout happens to be, which asserts nothing, and CI
+    builds this project from a detached head where there is no branch to
+    read.
+    """
+    findings: List[str] = []
+
+    for relative_path in _LINK_BEARING_DOCUMENTS:
+        document = REPO_ROOT / relative_path
+        assert document.is_file(), (
+            f'{relative_path} is listed as a link-bearing document but is '
+            f'not in the tree; drop it from _LINK_BEARING_DOCUMENTS or '
+            f'restore the file')
+        text = document.read_text(encoding='utf-8')
+
+        for match in _OWNED_GITHUB_URL.finditer(text):
+            line = text.count('\n', 0, match.start()) + 1
+            location = f'{relative_path}:{line}'
+            slug = match.group('slug')
+
+            if slug != REPOSITORY_NAME:
+                findings.append(
+                    f'{location} points at repository {slug!r}, but this '
+                    f'project lives at {REPOSITORY_NAME!r}')
+                continue
+
+            ref_match = _REF_BEARING_PATH.match(match.group('path'))
+            if ref_match is None:
+                continue
+            ref = ref_match.group('ref')
+            if ref != DEFAULT_BRANCH and not _PINNED_REF.match(ref):
+                findings.append(
+                    f'{location} addresses branch {ref!r}, but the default '
+                    f'branch is {DEFAULT_BRANCH!r}')
+
+    assert not findings, (
+        f'{len(findings)} stale GitHub reference(s):\n'
+        + '\n'.join(f'  {finding}' for finding in findings))
+
+
+def test_the_pending_publisher_block_names_the_current_repository() -> None:
+    """The workflow's ``Repository name`` field matches the real repo.
+
+    This one field is not decoration: PyPI matches the OIDC claim's
+    repository against it, so a value left behind by a rename fails the
+    upload with ``invalid-publisher`` -- an error whose text points at the
+    workflow rather than at the stale registration, which is exactly why
+    it is worth a mechanical check instead of a careful reading.
+    """
+    header = PUBLISH_WORKFLOW.read_text(encoding='utf-8')
+    declared = re.search(
+        r'^#\s+Repository name\s*:\s*(?P<name>\S+)\s*$',
+        header, re.MULTILINE)
+    assert declared is not None, (
+        'the publish workflow no longer states a `Repository name` for the '
+        'PyPI pending publisher; that field is what the OIDC claim is '
+        'matched against, so losing it loses the only record of what must '
+        'be registered')
+    assert declared.group('name') == REPOSITORY_NAME, (
+        f'the pending-publisher block names repository '
+        f'{declared.group("name")!r}, but the repository is '
+        f'{REPOSITORY_NAME!r}; PyPI will reject the upload with '
+        f'invalid-publisher until the two agree')
+
+
 # --- Sphinx retirement (R31-AC1, M24) ---------------------------------------
 
 
@@ -1122,8 +1253,11 @@ def test_the_readme_states_where_the_examples_live() -> None:
         'who cannot find the scripts in their install has nothing to '
         'read; see test_examples_ship_in_neither_artifact')
 
-    linked = 'github.com/ajyadav013/async-gateway' in readme and (
-        'tree/main/examples' in readme)
+    # Derived from the three rename-sensitive names rather than spelled
+    # out, because this assertion was itself a casualty of the repository
+    # and default-branch renames: it went on passing against the old slug
+    # and the old branch while the link it was guarding 404'd.
+    linked = f'{REPOSITORY_URL}/tree/{DEFAULT_BRANCH}/examples' in readme
     assert linked, (
         'the README names examples/ but does not link it in the '
         'repository, which is the only place a consumer can now read it')

@@ -130,7 +130,7 @@ test suite (`tests/test_docs.py`), so an example that stops working fails CI.
 <a id="runnable-example-scripts"></a>
 **Complete runnable scripts live in the repository, not in the package.** The
 five end-to-end programs under
-[`examples/`](https://github.com/ajyadav013/async-gateway/tree/main/examples) —
+[`examples/`](https://github.com/ajyadav013/asyncio-gateway/tree/master/examples) —
 `http_example.py`, `ftp_example.py`, `sftp_example.py`, `soap_example.py` and
 `error_handling_example.py` — are deliberately **not** shipped in the wheel or
 the sdist, so `pip install asyncio-gateway` does not place them on your disk.
@@ -1584,8 +1584,10 @@ Two consequences worth knowing:
 uploaded, so Trusted Publishing needs a
 [pending publisher](https://pypi.org/manage/account/publishing/) registered by
 hand first: project `asyncio-gateway`, owner `ajyadav013`, repository
-`async-gateway` (the **repository** keeps its original name; only the
-distribution was renamed), workflow `publish.yml`, environment `pypi` — and a
+`asyncio-gateway` (the distribution was renamed first, because PyPI rejected
+`async-gateway` under PEP 503 normalisation against the existing
+`asyncgateway`; the **repository** was renamed afterwards to match, so the two
+names agree today), workflow `publish.yml`, environment `pypi` — and a
 GitHub
 environment named `pypi` on the repository. Without it the first upload fails
 with `invalid-publisher`. The header comment in the workflow says the same
@@ -1605,8 +1607,8 @@ twine check dist/*
 ## Contributing
 
 ```text
-git clone https://github.com/ajyadav013/async-gateway
-cd async-gateway
+git clone https://github.com/ajyadav013/asyncio-gateway
+cd asyncio-gateway
 python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 ```
@@ -1704,7 +1706,7 @@ House rules worth knowing before you open a pull request:
   a default or an envelope key, `tests/test_docs.py` will tell you which part of
   this document went stale — that is what it is for.
 
-Issues and pull requests: <https://github.com/ajyadav013/async-gateway>.
+Issues and pull requests: <https://github.com/ajyadav013/asyncio-gateway>.
 
 ---
 
