@@ -32,9 +32,9 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any, Final, Optional
 
-from async_gateway.helpers.internal.circuit_breaker_helper import (
+from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
     CircuitBreakerHelper, Clock, Sleep, validated_breaker_config)
-from async_gateway.utils.constants import BREAKER_REGISTRY_MAX
+from asyncio_gateway.utils.constants import BREAKER_REGISTRY_MAX
 
 #: What one destination is keyed by: the protocol family, the host, and
 #: the port -- which is why ``https://a`` and ``https://b`` cannot share
@@ -75,9 +75,9 @@ def get_breaker(
         family: The protocol family, lower-cased: ``http``, ``https``,
             ``ftp``, ``sftp``.
         host: The host name or address, lower-cased by
-            :func:`~async_gateway.helpers.internal.base.destination_of`.
+            :func:`~asyncio_gateway.helpers.internal.base.destination_of`.
         port: The port, or
-            :data:`~async_gateway.utils.constants.UNKNOWN_PORT` when the
+            :data:`~asyncio_gateway.utils.constants.UNKNOWN_PORT` when the
             scheme has no default.
         config: The caller's ``circuit_breaker_config``, or None for the
             documented "no configuration" call.

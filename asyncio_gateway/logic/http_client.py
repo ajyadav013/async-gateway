@@ -29,14 +29,14 @@ from failsafe import CircuitOpen, FailsafeError, RetriesExhausted
 
 import orjson
 
-from async_gateway.helpers.internal import is_json_media_type, media_type_of
-from async_gateway.helpers.internal.base import BaseRequestClass
-from async_gateway.helpers.internal.filters_helper import is_get
-from async_gateway.helpers.internal.request_helper import \
+from asyncio_gateway.helpers.internal import is_json_media_type, media_type_of
+from asyncio_gateway.helpers.internal.base import BaseRequestClass
+from asyncio_gateway.helpers.internal.filters_helper import is_get
+from asyncio_gateway.helpers.internal.request_helper import \
     HttpResult, handle_http_request
-from async_gateway.helpers.internal.response_helper import \
+from asyncio_gateway.helpers.internal.response_helper import \
     application_json_response
-from async_gateway.utils.constants import (
+from asyncio_gateway.utils.constants import (
     ALLOWED_SCHEMES,
     CREDENTIAL_HEADERS,
     CROSS_ORIGIN_SAFE_HEADERS,
@@ -47,8 +47,8 @@ from async_gateway.utils.constants import (
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
 )
-from async_gateway.utils.envelope import GatewayResponse, finalise_ok
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.envelope import GatewayResponse, finalise_ok
+from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     CircuitOpenError,
     ConfigurationError,
@@ -63,13 +63,13 @@ from async_gateway.utils.exceptions import (
     faults_of,
     unwrap_cause,
 )
-from async_gateway.utils.http_file_config import HTTP_VERBS
-from async_gateway.utils.redaction import (
+from asyncio_gateway.utils.http_file_config import HTTP_VERBS
+from asyncio_gateway.utils.redaction import (
     redact_cookies,
     redact_headers,
     redact_url,
 )
-from async_gateway.utils.request_tracer import (
+from asyncio_gateway.utils.request_tracer import (
     begin_trace_scope,
     request_tracer,
 )
@@ -176,7 +176,7 @@ TRANSPORT_ERRORS: Sequence[
 #: ``faults_of`` is the shared derivation rather than a local
 #: comprehension because the same guarantee is now owed to all four
 #: dispatch sites, not just the two that ride ``aiohttp`` -- see
-#: :func:`~async_gateway.utils.exceptions.faults_of` (NEW-R10-1).
+#: :func:`~asyncio_gateway.utils.exceptions.faults_of` (NEW-R10-1).
 TRANSPORT_FAULTS: Tuple[type[BaseException], ...] = faults_of(
     TRANSPORT_ERRORS)
 
@@ -277,7 +277,7 @@ def validated_request_type(request_type: Any) -> str:
 
     Raises:
         UnsupportedVerbError: If it names no verb in
-            :data:`~async_gateway.utils.http_file_config.HTTP_VERBS`.
+            :data:`~asyncio_gateway.utils.http_file_config.HTTP_VERBS`.
             ``request_type='close'`` is the documented case: it used to
             resolve to ``ClientSession.close(url, **filters)`` and raise
             a ``TypeError`` that belonged to no transport family and was
@@ -398,7 +398,7 @@ def validated_cross_origin_headers(
 
     The **escape hatch** on the cross-origin allowlist, and the reason
     the allowlist can afford to be short. Inverting to an allowlist
-    (:data:`~async_gateway.utils.constants.CROSS_ORIGIN_SAFE_HEADERS`)
+    (:data:`~asyncio_gateway.utils.constants.CROSS_ORIGIN_SAFE_HEADERS`)
     means the library now decides, on the caller's behalf, that a header
     it has not heard of is not worth the risk of forwarding. That is the
     right default and the wrong absolute: a caller propagating
@@ -412,7 +412,7 @@ def validated_cross_origin_headers(
       position is what a caller gets without asking. Naming a header is
       an explicit, reviewable statement about that one header.
     * **It widens into the unknown region only.** A name in
-      :data:`~async_gateway.utils.constants.CREDENTIAL_HEADERS` is
+      :data:`~asyncio_gateway.utils.constants.CREDENTIAL_HEADERS` is
       refused outright rather than honoured. The hatch lets a caller say
       "this header of mine is not a secret"; it does not let them
       say ``Authorization`` is not a secret, because that is not a
@@ -729,7 +729,7 @@ def validated_http_auth(auth: object, url: str) -> object:
     """Return the caller's ``auth`` once proven usable on this call.
 
     The HTTP family's counterpart to
-    :func:`~async_gateway.helpers.internal.base.credentials_of`, which
+    :func:`~asyncio_gateway.helpers.internal.base.credentials_of`, which
     FTP and SFTP already run for the same reason: ``auth`` is documented
     optional and typed ``object``, so whatever the caller passed reaches
     ``aiohttp`` unexamined. Two shapes crashed there, both bare, and
@@ -1090,7 +1090,7 @@ def validated_trace_config(
                 'with no results_collector mapping to write into; this '
                 'library reads that attribute to fill the envelope key '
                 '"request_tracer". Build tracers with '
-                'async_gateway.utils.request_tracer.request_tracer(), '
+                'asyncio_gateway.utils.request_tracer.request_tracer(), '
                 'which attaches one')
     return list(trace_config)
 

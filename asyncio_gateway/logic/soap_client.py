@@ -66,13 +66,13 @@ import aiohttp
 
 from failsafe import CircuitOpen, RetriesExhausted
 
-from async_gateway.helpers.internal import media_type_of
-from async_gateway.helpers.internal.base import BaseRequestClass
-from async_gateway.helpers.internal.request_helper import (
+from asyncio_gateway.helpers.internal import media_type_of
+from asyncio_gateway.helpers.internal.base import BaseRequestClass
+from asyncio_gateway.helpers.internal.request_helper import (
     HttpResult,
     handle_http_request,
 )
-from async_gateway.logic.http_client import (
+from asyncio_gateway.logic.http_client import (
     TRANSPORT_FAULTS,
     trace_collectors_for,
     transport_error_for,
@@ -88,15 +88,15 @@ from async_gateway.logic.http_client import (
     validated_timeout,
     validated_trace_config,
 )
-from async_gateway.utils.constants import (
+from asyncio_gateway.utils.constants import (
     ALLOWED_SCHEMES,
     HTTP_ERROR_STATUS,
     MAX_FAULT_DETAIL_DEPTH,
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
 )
-from async_gateway.utils.envelope import GatewayResponse, finalise_ok
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.envelope import GatewayResponse, finalise_ok
+from asyncio_gateway.utils.exceptions import (
     CircuitOpenError,
     ConfigurationError,
     HttpStatusError,
@@ -104,7 +104,7 @@ from async_gateway.utils.exceptions import (
     SoapFaultError,
     UnsafeXmlError,
 )
-from async_gateway.utils.redaction import (
+from asyncio_gateway.utils.redaction import (
     redact_cookies,
     redact_headers,
     redact_url,
@@ -190,7 +190,7 @@ class SoapFault(TypedDict):
             application XML whose schema this library knows nothing about,
             and a string preserves it exactly without pretending to.
             Also None when the detail nests deeper than
-            :data:`~async_gateway.utils.constants.MAX_FAULT_DETAIL_DEPTH`,
+            :data:`~asyncio_gateway.utils.constants.MAX_FAULT_DETAIL_DEPTH`,
             which is refused rather than serialised -- the rest of the
             Fault is still reported. See :func:`fault_detail_text`.
     """
@@ -339,7 +339,7 @@ def validated_soap_body(payload: Any) -> str:
     raise ConfigurationError(
         f'a SOAP request body must be an XML str or an '
         f'xml.etree.ElementTree.Element, got '
-        f'{type(payload).__name__}; async-gateway provides no '
+        f'{type(payload).__name__}; asyncio-gateway provides no '
         f'dict-to-XML mapping, because choosing element names, order and '
         f'namespaces for one needs the service schema and this library '
         f'does not read WSDL')
@@ -673,7 +673,7 @@ def fault_detail_text(detail: Optional[Element]) -> Optional[str]:
 
     Returns:
         The detail as XML text, or None when it is absent or nests deeper
-        than :data:`~async_gateway.utils.constants.MAX_FAULT_DETAIL_DEPTH`.
+        than :data:`~asyncio_gateway.utils.constants.MAX_FAULT_DETAIL_DEPTH`.
     """
     if detail is None:
         return None

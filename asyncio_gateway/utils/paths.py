@@ -128,7 +128,7 @@ import aiofiles
 import aiofiles.os
 from aiofiles.threadpool.binary import AsyncBufferedIOBase
 
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     ConfigurationError,
     LocalWriteError,

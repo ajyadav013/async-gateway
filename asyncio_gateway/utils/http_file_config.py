@@ -139,8 +139,8 @@ def resolve_verb(
 
     Normalisation matches the rest of the library: surrounding whitespace
     is stripped and the name is lower-cased, the same reading
-    :func:`~async_gateway.helpers.internal.filters_helper.is_get` and
-    :func:`~async_gateway.async_gateway.resolve_protocol` take, so
+    :func:`~asyncio_gateway.helpers.internal.filters_helper.is_get` and
+    :func:`~asyncio_gateway.asyncio_gateway.resolve_protocol` take, so
     ``' GET '`` and ``'get'`` are one verb here exactly as they are one
     verb there.
 
@@ -424,7 +424,7 @@ async def download_file_from_url(
     The status is judged *before* the body is touched. It was judged after,
     which meant the whole body of a 403 was read and then discarded.
 
-    The write goes through :func:`~async_gateway.utils.paths.safe_writer`
+    The write goes through :func:`~asyncio_gateway.utils.paths.safe_writer`
     (R22). Three things change. The path is canonicalised before it is
     opened, so ``..`` and a symlinked intermediate component resolve to
     where they actually point (M17). The open carries ``O_NOFOLLOW`` and

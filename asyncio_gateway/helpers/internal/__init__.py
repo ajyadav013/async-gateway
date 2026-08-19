@@ -27,7 +27,7 @@ envelope through a JSON encoder.
 
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
-from async_gateway.helpers.internal.filters_helper import (
+from asyncio_gateway.helpers.internal.filters_helper import (
     application_json_filters,
     form_x_www_form_urlencoded_filters,
     raw_body_filters,

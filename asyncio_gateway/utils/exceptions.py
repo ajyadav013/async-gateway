@@ -1,7 +1,7 @@
 """The typed exception hierarchy every module below the entry point raises.
 
 Protocol code raises; exactly one place converts. Everything under
-``async_gateway.py`` raises an :class:`AsyncGatewayError` subclass, and
+``asyncio_gateway.py`` raises an :class:`AsyncGatewayError` subclass, and
 ``request()`` is the single place that turns one into an ``ok=False``
 envelope. Anything that is *not* an ``AsyncGatewayError`` -- a ``KeyError``,
 a ``TypeError``, an ``asyncio.CancelledError`` -- propagates unchanged,
@@ -21,7 +21,7 @@ a caller as a blank error message that reads as success.
 invariant: **no foreign exception text leaves this module without passing
 through the redactor.** It holds by construction rather than by agreement
 between call sites -- redaction is unconditional and the built-in
-:data:`~async_gateway.utils.redaction.SENSITIVE_NAMES` need no argument, so
+:data:`~asyncio_gateway.utils.redaction.SENSITIVE_NAMES` need no argument, so
 a consumer that knows nothing about redaction still cannot leak through it.
 The optional ``redact_params`` only ever widens the set. This matters
 because ``aiohttp``'s ``InvalidUrlClientError``, ``NonHttpUrlClientError``
@@ -32,8 +32,8 @@ query string included.
 from collections.abc import Collection, Sequence
 from typing import ClassVar, Optional, Tuple
 
-from async_gateway.utils.redaction import redact_text
-from async_gateway.utils.status_map import status_for
+from asyncio_gateway.utils.redaction import redact_text
+from asyncio_gateway.utils.status_map import status_for
 
 CAUSE_CHAIN_MAX_DEPTH = 10
 
@@ -221,7 +221,7 @@ class LocalWriteError(AsyncGatewayError):
     drove the destination's breaker OPEN, so the next healthy call to a
     healthy server got ``CIRCUIT_OPEN`` for a full disk on this machine
     (NEW-R10-1). It is therefore also listed in
-    :data:`~async_gateway.helpers.internal.circuit_breaker_helper.DEFAULT_ABORTABLE_EXCEPTIONS`,
+    :data:`~asyncio_gateway.helpers.internal.circuit_breaker_helper.DEFAULT_ABORTABLE_EXCEPTIONS`,
     which is what makes those two properties hold rather than merely be
     documented here.
     """

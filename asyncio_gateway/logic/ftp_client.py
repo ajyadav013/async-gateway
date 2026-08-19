@@ -40,21 +40,21 @@ import aioftp
 
 from failsafe import CircuitOpen, FailsafeError
 
-from async_gateway.helpers.internal.base import (
+from asyncio_gateway.helpers.internal.base import (
     BaseRequestClass,
     credentials_of,
 )
-from async_gateway.helpers.internal.filters_helper import get_ssl_config
-from async_gateway.logic.http_client import validated_max_response_bytes
-from async_gateway.utils.constants import MAX_RESPONSE_BYTES
-from async_gateway.utils.contained_io import (
+from asyncio_gateway.helpers.internal.filters_helper import get_ssl_config
+from asyncio_gateway.logic.http_client import validated_max_response_bytes
+from asyncio_gateway.utils.constants import MAX_RESPONSE_BYTES
+from asyncio_gateway.utils.contained_io import (
     TransferBudget,
     contained_path_io_factory,
     local_base,
     local_operand,
 )
-from async_gateway.utils.envelope import GatewayResponse, finalise_ok
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.envelope import GatewayResponse, finalise_ok
+from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     CircuitOpenError,
     ConfigurationError,
@@ -68,8 +68,8 @@ from async_gateway.utils.exceptions import (
     faults_of,
     unwrap_cause,
 )
-from async_gateway.utils.http_file_config import validated_verb
-from async_gateway.utils.redaction import redact_url, redact_value
+from asyncio_gateway.utils.http_file_config import validated_verb
+from asyncio_gateway.utils.redaction import redact_url, redact_value
 
 logger = logging.getLogger(__name__)
 
@@ -427,7 +427,7 @@ class FTPRequest(BaseRequestClass):
             ConfigurationError: From the base, if ``info`` is neither
                 None nor a mapping, or omits a key this protocol
                 requires; and from
-                :func:`~async_gateway.helpers.internal.base.credentials_of`
+                :func:`~asyncio_gateway.helpers.internal.base.credentials_of`
                 if ``auth`` carries no credentials, which FTP cannot
                 connect without. Both escape synchronously, because the
                 entry point constructs this object outside its one
@@ -748,7 +748,7 @@ class FTPRequest(BaseRequestClass):
         ``command`` is checked here as well as at the ``getattr`` in
         :meth:`_run_command`, and the redundancy is the point: the
         allowlist reading is one function
-        (:func:`~async_gateway.utils.http_file_config.validated_verb`,
+        (:func:`~asyncio_gateway.utils.http_file_config.validated_verb`,
         which ``resolve_verb`` also calls), but deferring the *only*
         check to the attribute lookup meant an unreachable host reported
         a caller's typo as ``CONNECT``/502 -- a transport verdict, on a
@@ -777,7 +777,7 @@ class FTPRequest(BaseRequestClass):
                 the same reason and against the same shape: absent is the
                 documented "no local operand" call, but a present
                 non-string reached ``Path()`` inside
-                :func:`~async_gateway.utils.contained_io.local_base` and
+                :func:`~asyncio_gateway.utils.contained_io.local_base` and
                 raised a ``TypeError`` belonging to no transport family,
                 which escaped ``request()`` un-enveloped.
             UnsupportedVerbError: If ``command`` names nothing in
