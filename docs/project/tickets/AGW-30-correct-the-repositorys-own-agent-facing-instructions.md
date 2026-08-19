@@ -1,6 +1,6 @@
 # AGW-30: Correct the repository's own agent-facing instructions
 
-- **Status:** DONE (commit `7f87275`)
+- **Status:** DONE
 - **Story:** S30 — spec Step 29, size S (`docs/specs/v1_release_stories.md` §4, Phase 7). *Free-floating lane: fully file-disjoint from all 31 other stories (§7) — developable in any wave from W0 onward, merged at step-order position 29.*
 - **Spec:** `docs/specs/v1_release_spec.md` — R32 all (Group N — Documentation)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation
@@ -62,6 +62,17 @@ Closes findings: MG7 *(or records it "rejected by human" if OQ8 declines)*.
   is a leftover from the claude-kit template and is retained deliberately.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`7f87275`](https://github.com/ajyadav013/asyncio-gateway/commit/7f87275); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 **2026-08-16 — OQ8 approved by the human.** Scoped to the stack-specific sections of both
 project-wide files. This is the approval the Definition of Done requires *before* the edit; it

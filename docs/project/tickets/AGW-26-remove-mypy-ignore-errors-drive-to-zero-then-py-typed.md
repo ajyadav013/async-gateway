@@ -64,6 +64,17 @@ Closes findings: H18. Discharges FI-13.
 
 ## Work Log
 
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`dc70828`](https://github.com/ajyadav013/asyncio-gateway/commit/dc70828); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
+
 - **Measured before changing anything.** With `ignore_errors` removed, `mypy
   async_gateway` reported **24 errors in 9 files** — not the 40/44 the audit
   predicted, because AGW-24's annotation pass had already closed most of them.

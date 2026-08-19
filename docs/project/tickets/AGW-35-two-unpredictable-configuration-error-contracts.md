@@ -1,6 +1,6 @@
 # AGW-35: two unpredictable `ConfigurationError` contracts across protocols
 
-- **Status:** CLOSED
+- **Status:** DONE
 - **Severity: Medium.** Blocks the **acceptance gate**. Does not block any code-review gate — the
   two stories that exposed it are each internally correct and were each approved on their own
   boundary.
@@ -110,6 +110,17 @@ with the main fix.
 
 ## Work Log
 
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`3b81e9d`](https://github.com/ajyadav013/asyncio-gateway/commit/3b81e9d), [`363897a`](https://github.com/ajyadav013/asyncio-gateway/commit/363897a); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
+
 _Opened at the close of wave W10, when S12 and S13 first sat in one tree._
 
 ### Resolved on `fix/auth-none`, with H5 (AGW-35 + H5 are one lane)
@@ -161,4 +172,5 @@ on the **raise** side, in the constructor, matching the spec's edge-case mapping
 - [x] the README's error-handling section documents both paths and states the rule in one line
 - [x] the spec's failure table gains the two rows it was missing
 
-**Status: CLOSED.**
+**Historical resolution:** closed by the original implementation review. The
+primary ledger status is now normalized to **DONE**.

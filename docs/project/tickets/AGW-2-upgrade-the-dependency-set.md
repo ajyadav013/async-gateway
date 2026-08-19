@@ -1,6 +1,6 @@
 # AGW-2: Upgrade the dependency set — closes C7 in Phase 0
 
-- **Status:** IN REVIEW
+- **Status:** DONE
 - **Story:** S2 — spec Step 1.5, size S (`docs/specs/v1_release_stories.md` §4, Phase 0)
 - **Spec:** `docs/specs/v1_release_spec.md` — R6-AC1,3,4,5,6 (Group B — Dependency upgrades and the resilience-library decision), R3-AC2 (Group A)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; Dependencies §Runtime (target state)
@@ -51,6 +51,17 @@ Closes findings: C7, H23. Discharges FI-10, FI-11, FI-12.
 - `pyfailsafe==0.6.0` left as the sole exact pin — R7/Step 22 owns keep/replace/vendor.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`6cfc1aa`](https://github.com/ajyadav013/asyncio-gateway/commit/6cfc1aa); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 **2026-08-16 — implemented, validated, reviewed, committed.**
 

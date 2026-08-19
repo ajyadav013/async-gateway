@@ -1,6 +1,6 @@
 # AGW-18: Path containment and safe local file handling
 
-- **Status:** DONE — lane `lane/s18`, pending the main session's merge
+- **Status:** DONE
 - **Story:** S18 — spec Step 16, size M (`docs/specs/v1_release_stories.md` §4, Phase 3)
 - **Spec:** `docs/specs/v1_release_spec.md` — R22 all (Group J — The caller-controlled capability surface)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; safe local file handling
@@ -65,6 +65,17 @@ than at the process `umask`, and `delete_local_file_path` is now **idempotent** 
 raised `FileNotFoundError` on an already-absent file, M19).
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`1493fe3`](https://github.com/ajyadav013/asyncio-gateway/commit/1493fe3), [`8578972`](https://github.com/ajyadav013/asyncio-gateway/commit/8578972), [`925c784`](https://github.com/ajyadav013/asyncio-gateway/commit/925c784), [`c1c0a0b`](https://github.com/ajyadav013/asyncio-gateway/commit/c1c0a0b), [`f1ce83d`](https://github.com/ajyadav013/asyncio-gateway/commit/f1ce83d); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 - **Implementation.** `utils/paths.py` (new): `resolve_within` canonicalises the candidate's
   *parent* and returns the final component **verbatim**, so a symlink at the target survives to be

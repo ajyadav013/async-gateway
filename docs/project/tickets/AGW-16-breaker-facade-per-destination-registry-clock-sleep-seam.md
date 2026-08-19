@@ -1,6 +1,6 @@
 # AGW-16: Breaker facade + per-destination registry + clock/sleep seam
 
-- **Status:** IN REVIEW
+- **Status:** DONE
 - **Story:** S16 — spec Step 14, size **L** — 6 files, 12 criteria, cannot be split (`docs/specs/v1_release_stories.md` §4, Phase 3; sizing exception §12)
 - **Spec:** `docs/specs/v1_release_spec.md` — R24 all (Group K — Transport security and resilience) · R7-AC1, AC7 (Group B — Dependency upgrades and the resilience-library decision)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; `CircuitBreakerConfig` §seam, `get_breaker`; Orchestrator Ruling D
@@ -43,6 +43,17 @@ Closes findings: H8, M12, M13, M14, M15, M16, L9, L10. Discharges FI-4.
 _None recorded yet._
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`11eb432`](https://github.com/ajyadav013/asyncio-gateway/commit/11eb432), [`17cbab5`](https://github.com/ajyadav013/asyncio-gateway/commit/17cbab5), [`d1eef1c`](https://github.com/ajyadav013/asyncio-gateway/commit/d1eef1c), [`befac75`](https://github.com/ajyadav013/asyncio-gateway/commit/befac75); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 ### Implementation — lane `lane/s16`, commits `11eb432`, `17cbab5`, `d1eef1c`
 

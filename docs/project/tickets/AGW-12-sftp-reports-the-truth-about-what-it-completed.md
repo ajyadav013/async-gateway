@@ -1,6 +1,6 @@
 # AGW-12: SFTP reports the truth about what it completed
 
-- **Status:** OPEN
+- **Status:** DONE
 - **Story:** S12 — spec Step 10, size S (`docs/specs/v1_release_stories.md` §4, Phase 2)
 - **Spec:** `docs/specs/v1_release_spec.md` — R17-AC1…6,8,9 *(AC7 → AGW-19)* (Group G — SFTP protocol correctness)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; protocol clients
@@ -58,6 +58,17 @@ Closes findings: H2, M4, M28, L5, L6, H10-sftp.
   See the iteration-2 log below.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`b6e58ba`](https://github.com/ajyadav013/asyncio-gateway/commit/b6e58ba), [`f9ebeb8`](https://github.com/ajyadav013/asyncio-gateway/commit/f9ebeb8); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 ### Implementation (S12 / lane β, wave W10)
 

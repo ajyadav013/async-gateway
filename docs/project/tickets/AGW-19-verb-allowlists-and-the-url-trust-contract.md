@@ -1,6 +1,6 @@
 # AGW-19: Verb allowlists and the URL-trust contract
 
-- **Status:** OPEN
+- **Status:** DONE
 - **Story:** S19 — spec Step 17, size **L** *(serialization point — 5 `getattr` sites in 5 files)* (`docs/specs/v1_release_stories.md` §4, Phase 3; sizing exception §12 — irreducible)
 - **Spec:** `docs/specs/v1_release_spec.md` — R21-AC1,2,5 (Group J — The caller-controlled capability surface) · **R15-AC8** (Group F — FTP protocol correctness) · **R17-AC7** (Group G — SFTP protocol correctness)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; the capability surface
@@ -66,6 +66,17 @@ Closes findings: M25, H13-ptr, M21-partial.
   deletion is pending.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`1635116`](https://github.com/ajyadav013/asyncio-gateway/commit/1635116), [`8487cb0`](https://github.com/ajyadav013/asyncio-gateway/commit/8487cb0), [`363897a`](https://github.com/ajyadav013/asyncio-gateway/commit/363897a); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 - **Implementation** (`1635116`) — `resolve_verb` + `HTTP_VERBS` in `utils/http_file_config.py`;
   `BaseRequestClass.resolve_verb` in `helpers/internal/base.py`; `FTP_COMMANDS` and `SFTP_MODES`
