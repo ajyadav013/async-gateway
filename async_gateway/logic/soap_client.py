@@ -561,7 +561,15 @@ def parse_document(xml_text: str) -> Optional[Element]:
     if start < 0:
         return None
     try:
-        return fromstring(xml_text[start:])
+        # `scan_prolog` above refuses any DOCTYPE before this line is
+        # reached, and a DOCTYPE is the entry condition for every
+        # entity-expansion attack `xml.etree` is vulnerable to. All four
+        # payloads -- billion laughs, XXE file read, external parameter
+        # entity, and a DOCTYPE hidden behind prolog noise -- are
+        # asserted refused *pre-parse* in `tests/logic/test_soap_client
+        # .py`. Adding `defusedxml` would be a new runtime dependency
+        # for a class this module already closes in-tree.
+        return fromstring(xml_text[start:])  # nosec B314 - see above
     except ParseError as err:
         raise SerializationError(
             f'SOAP response is not well-formed XML: {err}') from err
