@@ -41,12 +41,12 @@ from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 
 import pytest
 
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     HttpStatusError,
     UnsupportedVerbError,
 )
-from async_gateway.utils.http_file_config import (
+from asyncio_gateway.utils.http_file_config import (
     HTTP_VERBS,
     download_file_from_s3,
     download_file_from_url,
@@ -58,7 +58,7 @@ from tests.fixtures.http_server import RecordingHTTPServer
 #: The module under test, as a path, for the two structural scans below.
 HTTP_FILE_CONFIG_SOURCE = (
     Path(__file__).resolve().parents[2]
-    / 'async_gateway' / 'utils' / 'http_file_config.py'
+    / 'asyncio_gateway' / 'utils' / 'http_file_config.py'
 )
 
 
@@ -199,7 +199,7 @@ def s3_session(monkeypatch: pytest.MonkeyPatch) -> RecordingSession:
     """
     session = RecordingSession(RecordingS3Client())
     monkeypatch.setattr(
-        'async_gateway.utils.http_file_config.aioboto3.Session', session)
+        'asyncio_gateway.utils.http_file_config.aioboto3.Session', session)
     return session
 
 
@@ -216,7 +216,7 @@ def test_the_duplicate_file_helper_module_no_longer_imports() -> None:
     being restored.
     """
     with pytest.raises(ModuleNotFoundError):
-        importlib.import_module('async_gateway.helpers.common.file_helper')
+        importlib.import_module('asyncio_gateway.helpers.common.file_helper')
 
 
 def test_the_dead_fetch_file_helper_is_gone() -> None:
@@ -226,7 +226,7 @@ def test_the_dead_fetch_file_helper_is_gone() -> None:
     duplicate removable at all.
     """
     request_helper = importlib.import_module(
-        'async_gateway.helpers.internal.request_helper')
+        'asyncio_gateway.helpers.internal.request_helper')
 
     assert not hasattr(request_helper, 'fetch_file')
 
@@ -237,7 +237,7 @@ def test_the_retired_status_constant_is_gone() -> None:
     A constant named after its own value, whose only consumer was the
     single-status check H16 replaces.
     """
-    constants = importlib.import_module('async_gateway.utils.constants')
+    constants = importlib.import_module('asyncio_gateway.utils.constants')
 
     assert not hasattr(constants, 'STATUS_CODE_403')
 
@@ -473,7 +473,7 @@ async def test_absent_s3_credentials_become_a_configuration_error(
     """
     session = RecordingSession(RecordingS3Client(raises=raised))
     monkeypatch.setattr(
-        'async_gateway.utils.http_file_config.aioboto3.Session', session)
+        'asyncio_gateway.utils.http_file_config.aioboto3.Session', session)
 
     with pytest.raises(ConfigurationError) as caught:
         await download_file_from_s3(
@@ -495,7 +495,7 @@ async def test_an_s3_failure_that_is_not_credentials_is_not_wrapped(
     raised = OSError('connection reset')
     session = RecordingSession(RecordingS3Client(raises=raised))
     monkeypatch.setattr(
-        'async_gateway.utils.http_file_config.aioboto3.Session', session)
+        'asyncio_gateway.utils.http_file_config.aioboto3.Session', session)
 
     with pytest.raises(OSError) as caught:
         await download_file_from_s3(

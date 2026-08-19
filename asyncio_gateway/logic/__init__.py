@@ -18,11 +18,11 @@ advertised (H3).
 
 from typing import Final
 
-from async_gateway.helpers.internal.base import BaseRequestClass
-from async_gateway.logic.ftp_client import FTPRequest
-from async_gateway.logic.http_client import HttpRequest
-from async_gateway.logic.sftp_client import SFTPRequest
-from async_gateway.logic.soap_client import SoapRequest
+from asyncio_gateway.helpers.internal.base import BaseRequestClass
+from asyncio_gateway.logic.ftp_client import FTPRequest
+from asyncio_gateway.logic.http_client import HttpRequest
+from asyncio_gateway.logic.sftp_client import SFTPRequest
+from asyncio_gateway.logic.soap_client import SoapRequest
 
 protocol_mapping: Final[dict[str, type[BaseRequestClass]]] = {
     'HTTP': HttpRequest,

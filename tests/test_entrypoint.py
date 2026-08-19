@@ -33,7 +33,7 @@ from aiohttp import BasicAuth
 
 import pytest
 
-from async_gateway.async_gateway import (
+from asyncio_gateway.asyncio_gateway import (
     DISPATCH_CONTROLLING_KEYS,
     HTTP_FAMILY_SCHEMES,
     URL_DISPATCHED_PROTOCOLS,
@@ -41,19 +41,19 @@ from async_gateway.async_gateway import (
     request,
     resolve_protocol,
 )
-from async_gateway.helpers.internal.base import (
+from asyncio_gateway.helpers.internal.base import (
     BaseRequestClass,
     validated_port,
     validated_protocol_info,
 )
-from async_gateway.logic import protocol_mapping
-from async_gateway.logic.ftp_client import FTPRequest
-from async_gateway.logic.http_client import HttpRequest
-from async_gateway.logic.sftp_client import SFTPRequest
-from async_gateway.logic.soap_client import SoapRequest
-from async_gateway.utils.constants import HTTP_TIMEOUT
-from async_gateway.utils.envelope import GatewayResponse, finalise_ok
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.logic import protocol_mapping
+from asyncio_gateway.logic.ftp_client import FTPRequest
+from asyncio_gateway.logic.http_client import HttpRequest
+from asyncio_gateway.logic.sftp_client import SFTPRequest
+from asyncio_gateway.logic.soap_client import SoapRequest
+from asyncio_gateway.utils.constants import HTTP_TIMEOUT
+from asyncio_gateway.utils.envelope import GatewayResponse, finalise_ok
+from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     ProcessorError,
 )
@@ -146,11 +146,11 @@ def gateway_records(
         caplog: The capture fixture, already set to DEBUG on the tree.
 
     Returns:
-        Every captured record from the ``async_gateway`` logger tree.
+        Every captured record from the ``asyncio_gateway`` logger tree.
     """
     return [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
 
 
@@ -233,7 +233,7 @@ async def test_r11_ac2_a_rejected_protocol_is_reported_once_and_not_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A pre-dispatch raise is the whole report; nothing logs it as well."""
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     with pytest.raises(ConfigurationError):
         await request('http://host/p', protocol='HTTPX')
@@ -311,7 +311,7 @@ async def test_h5_the_documented_default_call_is_configuration_not_a_crash(
     that decides (AGW-35), and the single-report principle gives a
     raising path no log line.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     with pytest.raises(ConfigurationError) as raised:
         await request('host', protocol=name, protocol_info=None)
@@ -420,7 +420,7 @@ def test_validated_port_passes_every_usable_port(port: Any) -> None:
     ``0`` is on this list rather than the reject list on purpose, and
     it is the one row worth arguing about: ``0`` is a legal port number,
     which is precisely why
-    :data:`~async_gateway.utils.constants.UNKNOWN_PORT` is ``-1`` and
+    :data:`~asyncio_gateway.utils.constants.UNKNOWN_PORT` is ``-1`` and
     not ``0``. Rejecting it here would contradict that choice one module
     away.
 
@@ -933,7 +933,7 @@ async def test_r10_ac3_a_programming_error_escapes_request(
     bug: type[Exception],
 ) -> None:
     """A bug in a handler reaches the caller as itself, not as an envelope."""
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     async def handle_request(self: BaseRequestClass) -> GatewayResponse:
         """Fail the way a library bug fails.
@@ -997,7 +997,7 @@ async def test_a_recursion_error_becomes_an_envelope_like_any_failure(
     Every protocol, because the conversion sits in the entry point and a
     guard placed in one protocol client would be three-quarters absent.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     async def handle_request(self: BaseRequestClass) -> GatewayResponse:
         """Fail the way an unbounded descent fails.
@@ -1068,7 +1068,7 @@ async def test_agw35_a_constructor_rejection_raises_and_does_not_log(
     single-report principle says a path never both raises and logs, and
     a check moved inside the ``try`` would start doing both.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     with pytest.raises(ConfigurationError):
         await request(
@@ -1114,7 +1114,7 @@ async def test_agw35_a_deferred_rejection_envelopes_at_config_400(
     against a host that does not answer, a transport verdict is exactly
     what a regression would produce.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     result = await request(
         'host', protocol=name, auth=AUTH, protocol_info=info)

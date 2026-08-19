@@ -3,11 +3,11 @@ paths:
   - "**/*.py"
 ---
 
-# async-gateway library patterns
+# asyncio-gateway library patterns
 
 Stack-specific conventions for this repository's Python code. It complements the generic rules —
 read `.claude/rules/code-organization.md`, `.claude/rules/design-patterns.md`, and
-`.claude/rules/testing.md` first; this file makes them concrete for **async-gateway**.
+`.claude/rules/testing.md` first; this file makes them concrete for **asyncio-gateway**.
 
 > **The filename is wrong and is kept deliberately.** claude-kit generated this overlay from a
 > FastAPI-service template and `CLAUDE.md` references it by path. Renaming it would break that
@@ -16,8 +16,8 @@ read `.claude/rules/code-organization.md`, `.claude/rules/design-patterns.md`, a
 
 ## What this project is
 
-`async-gateway` is a **distributable Python library** — a single public coroutine,
-`async_gateway.async_gateway.request()`, that dispatches a call over one of several protocols and
+`asyncio-gateway` is a **distributable Python library** — a single public coroutine,
+`asyncio_gateway.asyncio_gateway.request()`, that dispatches a call over one of several protocols and
 returns one uniform response envelope. It is **not a web service**: nothing here serves HTTP, there
 is no application object, and there is no dev server to run.
 
@@ -37,7 +37,7 @@ section of `CLAUDE.md`, which is the single source of truth for them.
 ## Architecture (the call path, top to bottom)
 
 ```
-async_gateway/async_gateway.py     request(): the one public entry point.
+asyncio_gateway/asyncio_gateway.py     request(): the one public entry point.
                                    Validates caller config, seeds the envelope,
                                    resolves the protocol, dispatches, and is the
                                    ONLY place an AsyncGatewayError becomes an
@@ -78,16 +78,16 @@ To add `<PROTO>` (SOAP is the next one, and is deliberately absent from the regi
 client module exists — an absent key is an unknown protocol, which `resolve_protocol()` rejects
 with a `ConfigurationError` naming what *is* supported):
 
-1. **Protocol class** — `async_gateway/logic/<proto>_client.py`. Subclass `BaseRequestClass`.
+1. **Protocol class** — `asyncio_gateway/logic/<proto>_client.py`. Subclass `BaseRequestClass`.
    Declare `REQUIRED_INFO_KEYS: ClassVar[frozenset[Text]]` for the `protocol_info` keys the
    protocol cannot run without (HTTP declares `{'request_type'}`; a protocol whose every key has a
    default inherits the empty default). Read config off `self.info` in `__init__`, never off the
    raw parameter. Implement `async def handle_request(self) -> GatewayResponse`.
 2. **Registry entry** — add `'<PROTO>': <Proto>Request` to `protocol_mapping` in
-   `async_gateway/logic/__init__.py`. The mapping is typed
+   `asyncio_gateway/logic/__init__.py`. The mapping is typed
    `Final[dict[str, type[BaseRequestClass]]]`, so a non-class entry is a mypy error rather than a
    `TypeError: 'NoneType' object is not callable` at the caller. If the protocol needs a URL-scheme
-   allowlist the way HTTPS does, add it to `HTTP_FAMILY_SCHEMES` in `async_gateway/async_gateway.py`
+   allowlist the way HTTPS does, add it to `HTTP_FAMILY_SCHEMES` in `asyncio_gateway/asyncio_gateway.py`
    — that table, not the registry, is what makes `'HTTP'` and `'HTTPS'` differ while both map to
    `HttpRequest`.
 3. **Envelope mapping** — fill `self.response` from the protocol's result and close it with
@@ -116,7 +116,7 @@ with a `ConfigurationError` naming what *is* supported):
 
 - **Type everything.** Full annotations on every public function, and a Google-style or
   reST-style docstring (args, returns, raises) — `flake8-docstrings` enforces the presence of one.
-  Note that `mypy async_gateway` is currently clean only because `ignore_errors = true` is still
+  Note that `mypy asyncio_gateway` is currently clean only because `ignore_errors = true` is still
   set in `pyproject.toml`; a later story removes it, so do not read a clean mypy run as proof your
   annotations are right.
 - **Single quotes.** `flake8-quotes` flags double quotes (`Q000`). Existing code is single-quoted
@@ -124,8 +124,8 @@ with a `ConfigurationError` naming what *is* supported):
 - **79 columns.** `max_doc_length = 79` in `.flake8`, and the default `E501` line limit applies to
   code.
 - **Import order** is checked by `flake8-import-order`. Be aware that
-  `application_import_names = async-gateway, tests` in `.flake8` is not a legal module name, so
-  first-party `async_gateway` imports are currently classified as third-party — which is why they
+  `application_import_names = asyncio-gateway, tests` in `.flake8` is not a legal module name, so
+  first-party `asyncio_gateway` imports are currently classified as third-party — which is why they
   sit in the same block as `aiohttp` with no blank line between. Match what the file does; fixing
   the setting is a separate story's job.
 - **Errors:** raise a typed `AsyncGatewayError` subclass. Never raise a bare `Exception`, never
@@ -161,13 +161,13 @@ Before deleting a symbol, sweep every surface:
 ```bash
 SYM=TheSymbolOrName           # e.g. FTPRequest  or  'SFTP'  or  RESPONSE_TOO_LARGE
 
-grep -rn "$SYM" async_gateway/                  # entry point, logic, helpers, utils
+grep -rn "$SYM" asyncio_gateway/                  # entry point, logic, helpers, utils
 grep -rn "$SYM" tests/                          # including fixtures/ and conftest.py
 grep -rn "$SYM" README.md docs/                 # user-facing docs and specs
 grep -rn "patch(.*$SYM\|monkeypatch.*$SYM" tests/   # the most-missed: patch targets
 ```
 
-A `unittest.mock.patch('async_gateway.logic.http_client.HttpRequest')` target that no longer
+A `unittest.mock.patch('asyncio_gateway.logic.http_client.HttpRequest')` target that no longer
 resolves **fails silently** — the patch hits nothing and the test passes against a non-existent
 symbol. Search tests explicitly, then remove one symbol at a time and run the suite.
 

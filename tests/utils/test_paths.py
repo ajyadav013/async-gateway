@@ -42,12 +42,12 @@ import aiofiles
 
 import pytest
 
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     LocalWriteError,
     PathContainmentError,
 )
-from async_gateway.utils.paths import (
+from asyncio_gateway.utils.paths import (
     FILE_MODE,
     _describe,
     _refuse_symlink_at,

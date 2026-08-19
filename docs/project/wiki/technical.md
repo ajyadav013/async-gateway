@@ -6,7 +6,7 @@ it and at the plan that sequences the work.
 ## Developer documentation
 
 [`docs/specs/v1_release_spec.md`](../../specs/v1_release_spec.md) — **Part B: Developer Documentation
-(async-gateway v1.0.0)**, beginning at the `# Developer Documentation` heading. It carries:
+(asyncio-gateway v1.0.0)**, beginning at the `# Developer Documentation` heading. It carries:
 
 - **Architecture overview** — `request()` as the only public entry point, the protocol-strategy layer,
   and the seams being fixed.

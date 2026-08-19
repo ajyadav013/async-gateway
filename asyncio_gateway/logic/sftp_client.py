@@ -127,16 +127,16 @@ import asyncssh
 
 from failsafe import CircuitOpen, FailsafeError
 
-from async_gateway.helpers.internal.base import (
+from asyncio_gateway.helpers.internal.base import (
     BaseRequestClass,
     credentials_of,
 )
-from async_gateway.logic.http_client import validated_max_response_bytes
-from async_gateway.utils.constants import MAX_RESPONSE_BYTES
-from async_gateway.utils.contained_io import (
+from asyncio_gateway.logic.http_client import validated_max_response_bytes
+from asyncio_gateway.utils.constants import MAX_RESPONSE_BYTES
+from asyncio_gateway.utils.contained_io import (
     TransferBudget, contained_download, local_base, local_operand)
-from async_gateway.utils.envelope import GatewayResponse, finalise_ok
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.envelope import GatewayResponse, finalise_ok
+from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     CircuitOpenError,
     ConfigurationError,
@@ -150,8 +150,8 @@ from async_gateway.utils.exceptions import (
     faults_of,
     unwrap_cause,
 )
-from async_gateway.utils.http_file_config import validated_verb
-from async_gateway.utils.redaction import redact_url, redact_value
+from asyncio_gateway.utils.http_file_config import validated_verb
+from asyncio_gateway.utils.redaction import redact_url, redact_value
 
 logger = logging.getLogger(__name__)
 
@@ -414,7 +414,7 @@ class SFTPRequest(BaseRequestClass):
             ConfigurationError: From the base, if ``info`` is neither
                 None nor a mapping, or omits a key this protocol
                 requires; from
-                :func:`~async_gateway.helpers.internal.base.credentials_of`
+                :func:`~asyncio_gateway.helpers.internal.base.credentials_of`
                 if ``auth`` carries no credentials, which SFTP cannot
                 connect without; and from :meth:`_connect_options` if the
                 host-key configuration is self-contradictory. All escape
@@ -504,7 +504,7 @@ class SFTPRequest(BaseRequestClass):
                 rejections beside it. Checked here as well as at the
                 ``getattr`` in :meth:`_run_session`, and the redundancy
                 is the point: the allowlist reading is one function
-                (:func:`~async_gateway.utils.http_file_config.validated_verb`,
+                (:func:`~asyncio_gateway.utils.http_file_config.validated_verb`,
                 which ``resolve_verb`` also calls), but deferring the
                 *only* check to the attribute lookup meant the connect
                 reported the caller's typo first -- a server whose host

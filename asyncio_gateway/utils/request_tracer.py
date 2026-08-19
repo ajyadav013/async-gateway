@@ -32,7 +32,7 @@ a relative delta like its thirteen siblings instead of overwriting the
 request-start baseline with an absolute timestamp -- which silently
 under-reported latency on every keep-alive connection (M11). And
 ``on_request_exception`` stores a redacted *string* built by
-:func:`~async_gateway.utils.exceptions.unwrap_cause` rather than the
+:func:`~asyncio_gateway.utils.exceptions.unwrap_cause` rather than the
 live exception object: an ``aiohttp.ClientResponseError`` carries
 ``.request_info.headers``, so the old value put the caller's
 ``Authorization`` on the envelope (M20).
@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 import aiohttp
 
-from async_gateway.utils.exceptions import unwrap_cause
+from asyncio_gateway.utils.exceptions import unwrap_cause
 
 #: The key every relative measurement below is taken against, and the one
 #: ``helpers/internal/request_helper.py`` reads to reproduce ``aiohttp``'s
@@ -237,7 +237,7 @@ def request_tracer(
         monotonic clock.
     """
     results_var: ContextVar[Optional[TraceResults]] = ContextVar(
-        'async_gateway_trace_results', default=None)
+        'asyncio_gateway_trace_results', default=None)
     collector = ResultsCollector(results_var)
 
     def trace_context(**kwargs: Any) -> SimpleNamespace:

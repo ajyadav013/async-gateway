@@ -20,7 +20,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from async_gateway.helpers.internal.breaker_registry import reset
+from asyncio_gateway.helpers.internal.breaker_registry import reset
 
 
 class FakeClock:

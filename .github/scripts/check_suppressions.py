@@ -51,7 +51,7 @@ from typing import Dict, Iterator, Sequence, Tuple
 #: Where library, test and example code lives. `.claude` is deliberately
 #: absent for the same reason `.flake8` excludes it: it is vendored agent
 #: tooling checked in beside the library, not part of it.
-DEFAULT_ROOTS: Tuple[str, ...] = ('async_gateway', 'tests', 'examples')
+DEFAULT_ROOTS: Tuple[str, ...] = ('asyncio_gateway', 'tests', 'examples')
 
 #: Any suppression comment, coded or not. Matched first so that a bare one
 #: is *found* and then rejected, rather than simply not matching and

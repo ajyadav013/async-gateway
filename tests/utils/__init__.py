@@ -1,1 +1,1 @@
-"""Tests for ``async_gateway.utils``."""
+"""Tests for ``asyncio_gateway.utils``."""

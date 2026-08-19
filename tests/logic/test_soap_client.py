@@ -46,10 +46,10 @@ import aiohttp
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.helpers.common.date_helper import monotonic_now
-from async_gateway.logic import soap_client
-from async_gateway.logic.soap_client import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.helpers.common.date_helper import monotonic_now
+from asyncio_gateway.logic import soap_client
+from asyncio_gateway.logic.soap_client import (
     ENVELOPE_NAMESPACE,
     SOAP_11,
     SOAP_12,
@@ -61,14 +61,14 @@ from async_gateway.logic.soap_client import (
     validated_soap_action,
     validated_soap_headers,
 )
-from async_gateway.utils.constants import (
+from asyncio_gateway.utils.constants import (
     HTTP_TIMEOUT,
     MAX_FAULT_DETAIL_DEPTH,
 )
-from async_gateway.utils.envelope import GatewayResponse, new_envelope
-from async_gateway.utils.exceptions import ConfigurationError
-from async_gateway.utils.redaction import REDACTED
-from async_gateway.utils.request_tracer import request_tracer
+from asyncio_gateway.utils.envelope import GatewayResponse, new_envelope
+from asyncio_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.utils.redaction import REDACTED
+from asyncio_gateway.utils.request_tracer import request_tracer
 
 from tests.fixtures.http_server import RecordingHTTPServer
 
@@ -1110,7 +1110,7 @@ async def test_n5_a_refused_fault_detail_says_so_in_the_log(
     the first person debugging a missing detail has nothing to search
     for.
     """
-    caplog.set_level(logging.WARNING, logger='async_gateway')
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
 
     result = await soap_call(
         http_server, body=fault_11(nested_detail(1000)), status=500)

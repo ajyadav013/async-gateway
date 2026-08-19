@@ -20,12 +20,12 @@ caller logs and stores.
 from collections.abc import Collection, MutableMapping
 from typing import Any, Optional, TypedDict
 
-from async_gateway.helpers.common.date_helper import (
+from asyncio_gateway.helpers.common.date_helper import (
     elapsed_since,
     utc_now_iso,
 )
-from async_gateway.utils.exceptions import AsyncGatewayError, unwrap_cause
-from async_gateway.utils.redaction import redact_payload, redact_url
+from asyncio_gateway.utils.exceptions import AsyncGatewayError, unwrap_cause
+from asyncio_gateway.utils.redaction import redact_payload, redact_url
 
 # Everything a valid JSON document can decode to. An empty body and a body
 # that was literally `{}` stay distinguishable, and so do the scalars:

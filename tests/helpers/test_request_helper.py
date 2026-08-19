@@ -43,8 +43,8 @@ from multidict import CIMultiDict
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.helpers.internal.request_helper import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.helpers.internal.request_helper import (
     DEFAULT_DOWNLOAD_FILEPATH,
     HttpResult,
     REQUEST_START_KEY,
@@ -61,7 +61,7 @@ from async_gateway.helpers.internal.request_helper import (
     redirect_target,
     same_origin,
 )
-from async_gateway.utils.constants import (
+from asyncio_gateway.utils.constants import (
     ALLOWED_SCHEMES,
     CHUNK_SIZE_CONSTANT,
     CREDENTIAL_HEADERS,
@@ -70,19 +70,19 @@ from async_gateway.utils.constants import (
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
 )
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     HttpStatusError,
     PathContainmentError,
     ResponseTooDeepError,
     ResponseTooLargeError,
 )
-from async_gateway.utils.http_file_config import (
+from asyncio_gateway.utils.http_file_config import (
     download_file_from_url,
     guard_declared_length,
     iter_capped,
 )
-from async_gateway.utils.redaction import SENSITIVE_HEADERS
+from asyncio_gateway.utils.redaction import SENSITIVE_HEADERS
 
 from tests.fixtures.http_server import RecordingHTTPServer, ResponseSpec
 
@@ -1186,7 +1186,7 @@ def test_no_mapping_lookup_is_called_immediately_anywhere() -> None:
     than fixed at its one site, because the next one would be written the
     same way.
     """
-    package = Path(__file__).resolve().parents[2] / 'async_gateway'
+    package = Path(__file__).resolve().parents[2] / 'asyncio_gateway'
 
     offenders = [
         f'{path}:{lineno}'
@@ -1783,7 +1783,7 @@ async def test_a_large_upload_is_not_buffered_whole_in_memory(
         yield_counts.append(yielded)
 
     monkeypatch.setattr(
-        'async_gateway.helpers.internal.request_helper.file_upload',
+        'asyncio_gateway.helpers.internal.request_helper.file_upload',
         counting_file_upload)
 
     await _upload(http_server, source, attempts=1)
@@ -3059,7 +3059,7 @@ def test_no_session_in_the_package_is_built_without_a_deadline() -> None:
     connect and leaves the transfer unbounded, so an endpoint that
     dribbled bytes pinned the calling task for as long as it liked.
     """
-    package = Path(__file__).resolve().parents[2] / 'async_gateway'
+    package = Path(__file__).resolve().parents[2] / 'asyncio_gateway'
     scanned = sorted(package.rglob('*.py'))
 
     offenders = [

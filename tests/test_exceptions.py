@@ -22,9 +22,9 @@ import orjson
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.utils import exceptions
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.utils import exceptions
+from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     CircuitOpenError,
     ConfigurationError,
@@ -49,8 +49,8 @@ from async_gateway.utils.exceptions import (
     UnsupportedVerbError,
     unwrap_cause,
 )
-from async_gateway.utils.redaction import REDACTED
-from async_gateway.utils.status_map import (
+from asyncio_gateway.utils.redaction import REDACTED
+from asyncio_gateway.utils.status_map import (
     DEFAULT_STATUS,
     STATUS_BY_CODE,
     WARNING_CODES,

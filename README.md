@@ -1,11 +1,11 @@
-# async-gateway
+# asyncio-gateway
 
 One `await` for HTTP, HTTPS, SOAP, FTP and SFTP. Every protocol returns the
 **same response envelope**, so a consuming service writes one success check and
 one error path instead of five.
 
 ```python
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='https://api.example.com/v1/items',
@@ -18,7 +18,7 @@ else:
     print(result['error']['code'], result['error']['message'])
 ```
 
-`async-gateway` is a **library**, not a service. There is nothing to start, no
+`asyncio-gateway` is a **library**, not a service. There is nothing to start, no
 endpoint it serves and no configuration file it reads: you import `request()`
 and call it.
 
@@ -49,7 +49,7 @@ and call it.
 ## Install
 
 ```text
-pip install async-gateway
+pip install asyncio-gateway
 ```
 
 From a checkout, for development:
@@ -82,23 +82,31 @@ name.** That distribution is retired at `2.7.3` and will receive no further
 releases; development continues here. If you install `asyncio-requests` today,
 this is where it went.
 
-The rename is why the version resets from `2.7.3` to `1.0.0`: `async-gateway`
+The rename is why the version resets from `2.7.3` to `1.0.0`: `asyncio-gateway`
 is a new distribution name with no release history, so the reset cannot move
 any installed package backwards or invalidate any pin. It also means `pip
 install --upgrade asyncio-requests` will **not** find this release — migrating
 is a deliberate step, not something a resolver does to you.
 
+**Why `asyncio-gateway` and not `async-gateway`.** `async-gateway` was the
+intended name and PyPI rejected it: it compares
+[PEP 503](https://peps.python.org/pep-0503/) *normalised* names
+(`re.sub(r'[-_.]+', '-', name).lower()`), under which `async-gateway`,
+`async_gateway` and the already-published `asyncgateway` are all one name.
+`asyncio-gateway` was checked free in both spellings before it was adopted.
+The full account is in [CHANGELOG.md](CHANGELOG.md).
+
 To migrate:
 
-1. Replace `asyncio-requests` with `async-gateway` in your dependencies.
-2. Change the import path — `asyncio_requests` becomes `async_gateway`. The
+1. Replace `asyncio-requests` with `asyncio-gateway` in your dependencies.
+2. Change the import path — `asyncio_requests` becomes `asyncio_gateway`. The
    entry point keeps its name:
 
 ```text
 # before
 from asyncio_requests.asyncio_request import request
 # after
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 ```
 
 3. Work through the breaking changes in [CHANGELOG.md](CHANGELOG.md): the
@@ -125,7 +133,7 @@ five end-to-end programs under
 [`examples/`](https://github.com/ajyadav013/async-gateway/tree/main/examples) —
 `http_example.py`, `ftp_example.py`, `sftp_example.py`, `soap_example.py` and
 `error_handling_example.py` — are deliberately **not** shipped in the wheel or
-the sdist, so `pip install async-gateway` does not place them on your disk.
+the sdist, so `pip install asyncio-gateway` does not place them on your disk.
 That is a decision rather than an oversight: a second copy of the API's
 documentation inside every install is a copy that drifts against this README.
 Read them on GitHub or in a clone; the snippets below are self-contained and
@@ -135,7 +143,7 @@ are what the test suite executes.
 
 ```python
 import aiohttp
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='https://api.example.com/v1/items',
@@ -179,7 +187,7 @@ downgrades to plaintext.
 
 ```python
 from types import SimpleNamespace
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='ftp.example.com',
@@ -239,7 +247,7 @@ SFTP verifies the server's SSH host key. By default that is asyncssh's own
 
 ```python
 from types import SimpleNamespace
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='sftp.example.com',
@@ -266,7 +274,7 @@ key-based authentication.
 ### SOAP
 
 ```python
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='https://api.example.com/soap',
@@ -307,7 +315,7 @@ Building the body with ElementTree instead of a string:
 
 ```python
 from xml.etree.ElementTree import Element, SubElement
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 call = Element('{urn:rates}GetRate')
 SubElement(call, '{urn:rates}Pair').text = 'EURUSD'
@@ -339,7 +347,7 @@ structured fault is in `protocol_details['soap_fault']`, flattened into one
 shape for both versions:
 
 ```python
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='https://api.example.com/soap',
@@ -600,11 +608,11 @@ a test failure, in both directions. In addition:
 
 ### File-transfer utilities
 
-These are exported from `async_gateway.utils.http_file_config`, and that is the
+These are exported from `asyncio_gateway.utils.http_file_config`, and that is the
 only place they live:
 
 ```python
-from async_gateway.utils.http_file_config import (
+from asyncio_gateway.utils.http_file_config import (
     delete_local_file_path,
     download_file_from_s3,
     download_file_from_url,
@@ -654,8 +662,8 @@ success, so it is safe to call from a `finally` or as a post-processor.
 They compose with `request()` through the processor hooks:
 
 ```python
-from async_gateway.async_gateway import request
-from async_gateway.utils.http_file_config import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.utils.http_file_config import (
     delete_local_file_path,
     download_file_from_url,
 )
@@ -704,7 +712,7 @@ assert result['post_processor_response'] == 'cleaned'
 ### Request tracing
 
 ```python
-from async_gateway.utils.request_tracer import request_tracer
+from asyncio_gateway.utils.request_tracer import request_tracer
 
 tracer = request_tracer()
 ```
@@ -725,7 +733,7 @@ for every protocol, on both the success and the failure path**. Import it for
 type checking:
 
 ```python
-from async_gateway.utils.envelope import GatewayError, GatewayResponse
+from asyncio_gateway.utils.envelope import GatewayError, GatewayResponse
 ```
 
 | Key | Type | Meaning |
@@ -766,7 +774,7 @@ re-shaped, so old code doing `if result['api_response']:` fails loudly with a
 `cookies`, `text` and `json` are populated exactly as on the success path:
 
 ```python
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='https://api.example.com/v1/items/missing',
@@ -824,8 +832,8 @@ These are programming errors on your side and are never retryable, so they
 escape rather than becoming an envelope a retry loop would re-attempt forever:
 
 ```python
-from async_gateway.async_gateway import request
-from async_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.utils.exceptions import ConfigurationError
 
 try:
     await request(
@@ -867,10 +875,10 @@ branches on `result['error']['code']`.
 
 ### The exception hierarchy
 
-Every class below is importable from `async_gateway.utils.exceptions`:
+Every class below is importable from `asyncio_gateway.utils.exceptions`:
 
 ```python
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     CircuitOpenError,
     ConfigurationError,
@@ -982,8 +990,8 @@ Retries are **off by default**. Ask for them with a `retry_config` inside
 `circuit_breaker_config`:
 
 ```python
-from async_gateway.async_gateway import request
-from async_gateway.utils.exceptions import GatewayTimeoutError, TransportError
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.utils.exceptions import GatewayTimeoutError, TransportError
 
 result = await request(
     url='https://api.example.com/v1/items',
@@ -1068,7 +1076,7 @@ trial call — its success closes the circuit, its failure re-opens it).
 `(certificate path, key path)` **pair**:
 
 ```python
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='https://api.example.com/v1/items',
@@ -1154,7 +1162,7 @@ key-based authentication by naming your keys:
 
 ```python
 from types import SimpleNamespace
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='sftp.example.com',
@@ -1241,7 +1249,7 @@ does not need to keep pace with the entire internet.
 header that is genuinely not a secret:
 
 ```python
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='https://api.example.com/v1/items',
@@ -1277,7 +1285,7 @@ status 302 and the redirect's own body.
 
 ## You own URL validation
 
-**`async-gateway` will fetch whatever URL you give it. That is its purpose, not
+**`asyncio-gateway` will fetch whatever URL you give it. That is its purpose, not
 a defect — and it means URL validation is yours.**
 
 This library does not, and will not, decide whether a destination is one your
@@ -1294,7 +1302,7 @@ databases bound to loopback.
 What the library *does* give you is one **minimum, opt-in guardrail**:
 
 ```python
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='https://api.example.com/v1/items',
@@ -1340,7 +1348,7 @@ Every local file this library writes goes through one guarded path.
 and SFTP `protocol_info`:
 
 ```python
-from async_gateway.utils.http_file_config import download_file_from_url
+from asyncio_gateway.utils.http_file_config import download_file_from_url
 
 await download_file_from_url(
     file_download_path=FILE_SOURCE_URL,
@@ -1444,7 +1452,7 @@ it will appear in `result['payload']`, and anything you log that envelope to
 will receive it.**
 
 ```python
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 result = await request(
     url='https://api.example.com/v1/items',
@@ -1470,7 +1478,7 @@ assert echo['w']['x']['y']['z']['token'] == 'ECHOED-VERBATIM-BELOW-DEPTH-4'
 ## Logging
 
 Every module logs through `logging.getLogger(__name__)`, so all records land
-under the `async_gateway` tree and your application configures or silences the
+under the `asyncio_gateway` tree and your application configures or silences the
 library with one call. A `NullHandler` is attached and nothing else: until you
 add a handler, the library's records go nowhere, which is the correct default
 for a library.
@@ -1493,7 +1501,7 @@ The cost: a handler reading `record.exc_info` finds nothing, so **APM tools that
 group exceptions natively — Sentry, Datadog and the like — will not group these
 failures**. If your deployment sends no credentials in URLs and you would rather
 have native grouping, the revert is one line in
-`async_gateway/async_gateway.py`'s `log_failure`: replace the `'traceback'`
+`asyncio_gateway/asyncio_gateway.py`'s `log_failure`: replace the `'traceback'`
 entry in `extra` with `exc_info=exc` on the `logger.log` call. Choose knowingly
 — it re-opens the leak the current form closes.
 
@@ -1511,7 +1519,7 @@ asyncio throughout — there is no synchronous entry point and none is planned.
 ## Versioning policy
 
 [Semantic versioning](https://semver.org/). `1.0.0` is the first release under
-the name `async-gateway`; it follows `asyncio-requests 2.7.3` under the old
+the name `asyncio-gateway`; it follows `asyncio-requests 2.7.3` under the old
 name, and the reset is explained in
 [Migrating from `asyncio-requests`](#migrating-from-asyncio-requests). Given
 `MAJOR.MINOR.PATCH`:
@@ -1526,12 +1534,12 @@ name, and the reset is explained in
 **`error['code']` values are wire-stable within a major version.** Messages are
 not: branch on the code, never on the message text.
 
-The public surface is `async_gateway.async_gateway.request()`, the envelope in
-`async_gateway.utils.envelope`, the exception hierarchy in
-`async_gateway.utils.exceptions`, the helpers in
-`async_gateway.utils.http_file_config`, and
-`async_gateway.utils.request_tracer`. Anything under
-`async_gateway.helpers.internal` is internal and may change in a patch release.
+The public surface is `asyncio_gateway.asyncio_gateway.request()`, the envelope in
+`asyncio_gateway.utils.envelope`, the exception hierarchy in
+`asyncio_gateway.utils.exceptions`, the helpers in
+`asyncio_gateway.utils.http_file_config`, and
+`asyncio_gateway.utils.request_tracer`. Anything under
+`asyncio_gateway.helpers.internal` is internal and may change in a patch release.
 
 ### Cutting a release
 
@@ -1572,11 +1580,13 @@ Two consequences worth knowing:
   incoherent and unfixable — a PyPI version cannot be re-uploaded once spent —
   so the workflow stops and tells you which heading to edit.
 
-**One-time setup before the first release.** `async-gateway` has never been
+**One-time setup before the first release.** `asyncio-gateway` has never been
 uploaded, so Trusted Publishing needs a
 [pending publisher](https://pypi.org/manage/account/publishing/) registered by
-hand first: project `async-gateway`, owner `ajyadav013`, repository
-`async-gateway`, workflow `publish.yml`, environment `pypi` — and a GitHub
+hand first: project `asyncio-gateway`, owner `ajyadav013`, repository
+`async-gateway` (the **repository** keeps its original name; only the
+distribution was renamed), workflow `publish.yml`, environment `pypi` — and a
+GitHub
 environment named `pypi` on the repository. Without it the first upload fails
 with `invalid-publisher`. The header comment in the workflow says the same
 thing, at the place where someone debugging that failure will look.
@@ -1605,8 +1615,8 @@ The three commands you will reach for while iterating:
 
 ```text
 pytest
-flake8 async_gateway tests
-mypy async_gateway
+flake8 asyncio_gateway tests
+mypy asyncio_gateway
 ```
 
 **Those three are not the full gate.** CI enforces about a dozen required
@@ -1654,14 +1664,14 @@ into a clean image, and runs the whole suite against the *installed
 distribution* rather than the source tree:
 
 ```text
-docker build -t async-gateway:test .
-docker run --rm async-gateway:test
+docker build -t asyncio-gateway:test .
+docker run --rm asyncio-gateway:test
 ```
 
 This is the check that catches a packaging defect an editable install hides —
 an undeclared dependency imports fine in a tree that already has it, and fails
 on the first `import` for everyone else. `docker/run-tests.sh` refuses to start
-unless `async_gateway` resolves out of `site-packages`, so a green run cannot
+unless `asyncio_gateway` resolves out of `site-packages`, so a green run cannot
 have quietly tested the checkout.
 
 **Do the protocols actually work?** `docker-compose.yml` stands up an HTTP/HTTPS
@@ -1716,6 +1726,6 @@ requires the original notice to travel with the code.
 That fork was published as
 [`asyncio-requests`](https://pypi.org/project/asyncio-requests/) (12 releases,
 2022-02-24 to 2023-01-02, last at `2.7.3`), authored by Arjunsingh Yadav,
-Manish Magnani and Devesh Ratthour at Fynd. `async-gateway` is its
+Manish Magnani and Devesh Ratthour at Fynd. `asyncio-gateway` is its
 continuation under a new name — see
 [Migrating from `asyncio-requests`](#migrating-from-asyncio-requests).

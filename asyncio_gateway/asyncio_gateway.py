@@ -14,30 +14,30 @@ from collections.abc import Callable, Collection, Mapping
 from typing import Any, Dict, Final, Optional, Tuple, Union
 from urllib.parse import urlsplit
 
-from async_gateway.helpers.internal.base import (
+from asyncio_gateway.helpers.internal.base import (
     BaseRequestClass,
     validated_port,
     validated_protocol_info,
 )
-from async_gateway.logic import protocol_mapping
-from async_gateway.utils.envelope import (
+from asyncio_gateway.logic import protocol_mapping
+from asyncio_gateway.utils.envelope import (
     GatewayResponse,
     finalise_error,
     new_envelope,
 )
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     ConfigurationError,
     ProcessorError,
     StackExhaustedError,
 )
-from async_gateway.utils.redaction import (
+from asyncio_gateway.utils.redaction import (
     normalise_param_names,
     redact_text,
     redact_url,
     redact_value,
 )
-from async_gateway.utils.status_map import WARNING_CODES
+from asyncio_gateway.utils.status_map import WARNING_CODES
 
 logger = logging.getLogger(__name__)
 
@@ -132,8 +132,8 @@ def validated_processor_config(
 
     Checked here, at the boundary, and called from ``request()`` *outside*
     its one conversion ``try`` -- the placement
-    :func:`~async_gateway.helpers.internal.base.validated_protocol_info`
-    and :func:`~async_gateway.helpers.internal.base.credentials_of`
+    :func:`~asyncio_gateway.helpers.internal.base.validated_protocol_info`
+    and :func:`~asyncio_gateway.helpers.internal.base.credentials_of`
     already use, and the settled contract of AGW-35: an unretryable
     caller-configuration mistake raises once, synchronously, rather than
     becoming an ``ok=False`` envelope a retry loop would re-attempt
@@ -149,7 +149,7 @@ def validated_processor_config(
     an awaitable, or whether its signature accepts ``response``. Both are
     knowable only by calling it, and a callback that refuses its argument
     or returns a plain value has *run* -- that is
-    :class:`~async_gateway.utils.exceptions.ProcessorError` territory, not
+    :class:`~asyncio_gateway.utils.exceptions.ProcessorError` territory, not
     configuration. What is checked is everything decidable without
     calling: the config's shape, the key's presence, the callable's
     callability, the params' mapping-ness, its keys' str-ness, and the
@@ -235,7 +235,7 @@ async def run_processor(
     argument``) and one that returns a non-awaitable (``TypeError: 'int'
     object can't be awaited``). Both mean the callback did not honour the
     documented contract, and both arrive as the same
-    :class:`~async_gateway.utils.exceptions.ProcessorError` as a callback
+    :class:`~asyncio_gateway.utils.exceptions.ProcessorError` as a callback
     that raised outright.
 
     ``BaseException`` is not caught. A ``KeyboardInterrupt`` or an
@@ -605,7 +605,7 @@ async def request(
     :param url: URL to call
     :param data: Data to be sent in calls
     :param protocol: one of the names registered in
-        ``async_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP,
+        ``asyncio_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP,
         SFTP. Matched with surrounding whitespace stripped and without
         regard to case, so 'http', ' HTTP ' and 'Http' are the same
         protocol. HTTPS additionally requires that the call go out over

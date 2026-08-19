@@ -35,29 +35,29 @@ import pytest
 
 import yarl
 
-from async_gateway import async_gateway as entrypoint
-from async_gateway.async_gateway import request
-from async_gateway.helpers.common import date_helper
-from async_gateway.helpers.common.date_helper import (
+from asyncio_gateway import asyncio_gateway as entrypoint
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.helpers.common import date_helper
+from asyncio_gateway.helpers.common.date_helper import (
     elapsed_since,
     monotonic_now,
     utc_now_iso,
 )
-from async_gateway.helpers.internal.request_helper import (
+from asyncio_gateway.helpers.internal.request_helper import (
     DEFAULT_DOWNLOAD_FILEPATH)
-from async_gateway.logic import (
+from asyncio_gateway.logic import (
     ftp_client, http_client, protocol_mapping, sftp_client, soap_client)
-from async_gateway.logic.http_client import (
+from asyncio_gateway.logic.http_client import (
     HttpRequest, transport_error_for)
-from async_gateway.utils import redaction
-from async_gateway.utils.contained_io import contained_path_io_factory
-from async_gateway.utils.envelope import (
+from asyncio_gateway.utils import redaction
+from asyncio_gateway.utils.contained_io import contained_path_io_factory
+from asyncio_gateway.utils.envelope import (
     GatewayResponse,
     finalise_error,
     finalise_ok,
     new_envelope,
 )
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     CircuitOpenError,
     ConnectError,
@@ -66,8 +66,8 @@ from async_gateway.utils.exceptions import (
     PathContainmentError,
     SerializationError,
 )
-from async_gateway.utils.http_file_config import download_file_from_url
-from async_gateway.utils.redaction import (
+from asyncio_gateway.utils.http_file_config import download_file_from_url
+from asyncio_gateway.utils.redaction import (
     PAYLOAD_REDACTION_DEPTH,
     REDACTED,
     normalise_param_names,
@@ -128,7 +128,7 @@ EXPECTED_KEYS = frozenset({
     'post_processor_response',
 })
 
-PACKAGE_ROOT = Path(__file__).resolve().parent.parent / 'async_gateway'
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent / 'asyncio_gateway'
 
 JSON_HEADERS = {'Content-Type': 'application/json'}
 
@@ -222,7 +222,7 @@ def _reads_only(call: ast.Call) -> bool:
     """Report whether ``call`` is an open whose mode cannot write.
 
     Only a *literal* read mode counts. A mode computed at runtime --
-    ``open(path, mode)`` in :func:`~async_gateway.utils.contained_io.
+    ``open(path, mode)`` in :func:`~asyncio_gateway.utils.contained_io.
     _open_guarded`, where ``mode`` is whatever ``aioftp`` or ``asyncssh``
     asked for -- is treated as a write, because it can be one.
 
@@ -2077,9 +2077,9 @@ def test_e7_the_fabricated_status_appears_nowhere_in_the_package() -> None:
 #:
 #: Pinned to the function rather than to a line number, so the allowance
 #: cannot drift: a second blanket catch anywhere -- including elsewhere in
-#: ``async_gateway.py`` -- still fails the ban.
+#: ``asyncio_gateway.py`` -- still fails the ban.
 BLANKET_EXCEPT_SITE: Final[tuple[str, str]] = (
-    'async_gateway.py', 'run_processor')
+    'asyncio_gateway.py', 'run_processor')
 
 
 def test_r10_ac2_the_only_blanket_except_wraps_the_callers_own_callback(
@@ -2087,7 +2087,7 @@ def test_r10_ac2_the_only_blanket_except_wraps_the_callers_own_callback(
     """The one justified blanket catch, held to being the only one.
 
     The ban below cannot simply exempt a file: doing so would let a
-    *second* blanket catch into ``async_gateway.py`` -- the entry point,
+    *second* blanket catch into ``asyncio_gateway.py`` -- the entry point,
     of all places -- with the suite still green. So the file is checked
     here instead, and the check is stricter than the ban it replaces: it
     requires exactly one occurrence, inside exactly the one function
@@ -4384,7 +4384,7 @@ def test_an_unfinalised_envelope_reads_as_a_failure() -> None:
 
 def test_r10_the_library_attaches_exactly_one_null_handler() -> None:
     """A library that adds a real handler duplicates its host's output."""
-    handlers = logging.getLogger('async_gateway').handlers
+    handlers = logging.getLogger('asyncio_gateway').handlers
 
     assert len(handlers) == 1
     assert isinstance(handlers[0], logging.NullHandler)
@@ -4400,13 +4400,13 @@ async def test_r10_a_remote_failure_logs_one_warning_with_the_exception(
     """
     http_server.respond('/missing', status=404, body=b'{}',
                         headers=JSON_HEADERS)
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     await http_call(http_server.url_for('/missing'))
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING
@@ -4419,13 +4419,13 @@ async def test_r10_a_transport_failure_logs_one_error_with_the_exception(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A transport or configuration failure is this library's problem."""
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     await http_call(f'http://127.0.0.1:{closed_port()}/x')
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
     assert len(records) == 1
     assert records[0].levelno == logging.ERROR
@@ -4439,13 +4439,13 @@ async def test_r10_a_successful_call_logs_nothing(
 ) -> None:
     """Nothing failed, so there is nothing for an operator to read."""
     http_server.respond('/ok', status=200, body=b'{}', headers=JSON_HEADERS)
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     await http_call(http_server.url_for('/ok'))
 
     assert [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ] == []
 
 
@@ -4460,7 +4460,7 @@ async def test_r10_the_logger_leaks_no_credential(
     """
     http_server.respond('/missing', status=404, body=b'{}',
                         headers=JSON_HEADERS)
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     await http_call(
         http_server.url_for('/missing') + '?api_key=LOGGEDSECRET',
@@ -4495,7 +4495,7 @@ async def test_r10_a_caller_supplied_parameter_name_is_masked_in_the_log(
     """
     http_server.respond('/missing', status=404, body=b'{}',
                         headers=JSON_HEADERS)
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     await request(
         http_server.url_for('/missing') + '?session_id=SESSIONSECRET',
@@ -4510,7 +4510,7 @@ async def test_r10_a_caller_supplied_parameter_name_is_masked_in_the_log(
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
     assert len(records) == 1
     assert 'SESSIONSECRET' not in render_record(records[0])
@@ -4534,7 +4534,7 @@ async def test_r10_a_caller_declared_secret_reaches_no_surface_on_a_404(
     """
     http_server.respond('/missing', status=404, body=b'{}',
                         headers=JSON_HEADERS)
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     result = await request(
         http_server.url_for('/missing') + '?session_id=SESSIONSECRET',
@@ -4549,7 +4549,7 @@ async def test_r10_a_caller_declared_secret_reaches_no_surface_on_a_404(
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
     assert len(records) == 1
     error = result['error']
@@ -4597,7 +4597,7 @@ async def test_r10_a_transport_failure_leaks_no_foreign_exception_text(
     chain is then rendered into the log -- so every surface has to be
     asserted against a *foreign* string.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     result = await request(
         NO_NETLOC_URL,
@@ -4611,7 +4611,7 @@ async def test_r10_a_transport_failure_leaks_no_foreign_exception_text(
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
     assert len(records) == 1
     error = result['error']
@@ -4643,7 +4643,7 @@ async def test_r10_a_default_secret_is_masked_with_no_redact_query_params(
     would not be the extension feature failing -- it would be E9 itself
     failing for every caller who never asked for anything.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     result = await request(
         NO_NETLOC_URL,
@@ -4654,7 +4654,7 @@ async def test_r10_a_default_secret_is_masked_with_no_redact_query_params(
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
     assert len(records) == 1
     error = result['error']
@@ -4696,7 +4696,7 @@ async def test_r10_a_scheme_less_url_reaches_the_log_url_field_masked(
     test as pinning the ``redact_value`` composition, not as a claim about
     the record as a whole.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     await request(
         'host/p?session_id=SESSIONSECRET&api_key=APIKEYSECRET',
@@ -4710,7 +4710,7 @@ async def test_r10_a_scheme_less_url_reaches_the_log_url_field_masked(
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
     assert len(records) == 1
     logged_url = records[0].url
@@ -4742,7 +4742,7 @@ async def test_r10_a_scheme_less_url_leaks_on_no_surface_at_all(
     sensitive set reach ``redact_text`` by different routes and only one
     of them is this library's own.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     result = await request(
         'host/p?api_key=APIKEYSECRET&session_id=SESSIONSECRET',
@@ -4756,7 +4756,7 @@ async def test_r10_a_scheme_less_url_leaks_on_no_surface_at_all(
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
     assert len(records) == 1
     error = result['error']
@@ -4827,13 +4827,13 @@ async def test_r10_a_percent_encoded_secret_leaks_on_no_surface_either(
         raise ConnectError('') from cause
 
     monkeypatch.setattr(HttpRequest, 'handle_request', leaky)
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     result = await http_call(http_server.url_for('/anything'))
 
     records = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ]
     assert len(records) == 1
     error = result['error']
@@ -4973,5 +4973,5 @@ async def test_the_conversion_point_is_the_only_place_that_converts(
     """
     converters = files_containing(r'except AsyncGatewayError')
 
-    assert converters == ['async_gateway.py']
+    assert converters == ['asyncio_gateway.py']
     assert hasattr(entrypoint, 'log_failure')

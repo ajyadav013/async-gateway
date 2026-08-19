@@ -1,7 +1,7 @@
 # Build the wheel, then prove it installs and passes its suite clean.
 #
 # The defect this image exists to catch is the one a development checkout
-# structurally cannot show you: `async_gateway` once imported a dependency
+# structurally cannot show you: `asyncio_gateway` once imported a dependency
 # it never declared, so every check passed in a tree that already had that
 # package installed and the *published artifact* was unusable
 # (`ModuleNotFoundError: ujson` on the first import). An editable install
@@ -17,11 +17,11 @@
 # `tests/test_docs.py` parses `README.md`, `tests/test_packaging.py` parses
 # `.github/workflows/ci.yml` and `LICENSE`, and both it and
 # `tests/test_no_blocking_io.py` AST-scan every file under
-# `async_gateway/`. Omitting the tree would not isolate the wheel, it would
+# `asyncio_gateway/`. Omitting the tree would not isolate the wheel, it would
 # just fail collection.
 #
 # So the isolation is *asserted* rather than inferred from a missing COPY:
-# `docker/run-tests.sh` refuses to start unless `async_gateway` imports out
+# `docker/run-tests.sh` refuses to start unless `asyncio_gateway` imports out
 # of `site-packages`. See the comment in that file for why the weaker
 # arrangement is the one that fails silently.
 #
@@ -52,7 +52,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip build
 # would put `.git`, the coverage database and every local artifact into the
 # build context's layer for no benefit.
 COPY pyproject.toml MANIFEST.in README.md LICENSE CHANGELOG.md ./
-COPY async_gateway/ ./async_gateway/
+COPY asyncio_gateway/ ./asyncio_gateway/
 
 RUN python -m build --wheel --sdist --outdir /dist
 
@@ -84,11 +84,11 @@ COPY examples/ ./examples/
 COPY tests/ ./tests/
 COPY docker/run-tests.sh /usr/local/bin/run-tests
 
-# `async_gateway/` is a SYMLINK to the installed package, not a copy of the
+# `asyncio_gateway/` is a SYMLINK to the installed package, not a copy of the
 # checkout -- and the difference is the whole point of this image.
 #
 # The suites that need it on disk need it at exactly `REPO_ROOT/
-# async_gateway` (they compute it as `Path(__file__).parents[1]`), and
+# asyncio_gateway` (they compute it as `Path(__file__).parents[1]`), and
 # pytest prepends the rootdir to `sys.path`, so a *copied* tree there would
 # shadow `site-packages` and the suite would silently go back to testing
 # the checkout. That is not hypothetical: it is what the first build of
@@ -97,11 +97,11 @@ COPY docker/run-tests.sh /usr/local/bin/run-tests
 # Symlinked, the two are the same bytes by construction. The AST scans in
 # `tests/test_no_blocking_io.py` and `tests/test_packaging.py` therefore
 # read the source that actually shipped in the wheel, which is a stronger
-# check than scanning the checkout, and `import async_gateway` resolves to
+# check than scanning the checkout, and `import asyncio_gateway` resolves to
 # that same installed package however `sys.path` happens to be ordered.
 RUN ln -s "$(python -c 'import sysconfig, pathlib; \
-        print(pathlib.Path(sysconfig.get_paths()["purelib"]) / "async_gateway")')" \
-        /app/async_gateway \
+        print(pathlib.Path(sysconfig.get_paths()["purelib"]) / "asyncio_gateway")')" \
+        /app/asyncio_gateway \
  && chmod +x /usr/local/bin/run-tests
 
 # Non-root. The suite writes only to temporary directories, so it needs no
@@ -113,8 +113,8 @@ USER gateway
 # Fail loudly at build time if the wheel does not import out of a clean
 # environment -- the original headline defect, asserted rather than hoped
 # for. `--import-mode=importlib` keeps the rootdir off `sys.path`, so
-# `import async_gateway` cannot silently resolve to a stray directory.
-RUN cd / && python -c "import async_gateway; print(async_gateway.__version__)"
+# `import asyncio_gateway` cannot silently resolve to a stray directory.
+RUN cd / && python -c "import asyncio_gateway; print(asyncio_gateway.__version__)"
 
 ENTRYPOINT ["run-tests"]
 CMD ["-q"]

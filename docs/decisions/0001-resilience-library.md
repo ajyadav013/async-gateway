@@ -22,7 +22,7 @@ bites at the ceiling and not at the floor. A fitness result obtained only on the
 to "keep" almost regardless, which is not a decision procedure.
 
 Since Ruling D was written the ground moved. **S16 (AGW-16) already landed the facade**
-(`async_gateway/helpers/internal/circuit_breaker_helper.py`, `breaker_registry.py`), so this
+(`asyncio_gateway/helpers/internal/circuit_breaker_helper.py`, `breaker_registry.py`), so this
 decision is being taken against code that exists rather than against a plan. That changes the
 question from a forecast into a measurement, and the measurement is below.
 
@@ -231,6 +231,6 @@ compatible with vendoring should the revisit trigger fire — attribution would 
 - Spec: `docs/specs/v1_release_spec.md` — R7, Ruling D, OQ12 (§Open questions), Step 22.
 - Story: `docs/specs/v1_release_stories.md` — S23. Ticket: `docs/project/tickets/AGW-23-*.md`.
 - Finding: MG1 (dormant dependency on the critical resilience path).
-- Facade: `async_gateway/helpers/internal/circuit_breaker_helper.py` (S16 / AGW-16).
+- Facade: `asyncio_gateway/helpers/internal/circuit_breaker_helper.py` (S16 / AGW-16).
 - Behaviour tests: `tests/helpers/test_circuit_breaker.py`.
 - To be linked from `CHANGELOG.md` when S31 creates it (R7-AC4, S31 records the R7 decision).

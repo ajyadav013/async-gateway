@@ -19,8 +19,8 @@ import asyncio
 import sys
 from typing import Any, Dict
 
-from async_gateway.async_gateway import request
-from async_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.utils.exceptions import ConfigurationError
 
 DEFAULT_URL = 'http://127.0.0.1:8080/missing'
 

@@ -34,11 +34,11 @@ from importlib.metadata import metadata
 from importlib.metadata import version as metadata_version
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Final, Iterator, List, Tuple
 
 import pytest
 
-import async_gateway
+import asyncio_gateway
 
 from tests.fixtures.http_server import RecordingHTTPServer
 
@@ -46,10 +46,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'ci.yml'
 PUBLISH_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'publish.yml'
 PYPROJECT = REPO_ROOT / 'pyproject.toml'
-PACKAGE_ROOT = REPO_ROOT / 'async_gateway'
+PACKAGE_ROOT = REPO_ROOT / 'asyncio_gateway'
 REPOSITORY_URL = 'https://github.com/ajyadav013/async-gateway'
 
-_DISTRIBUTION_METADATA = metadata('async-gateway')
+_DISTRIBUTION_METADATA = metadata('asyncio-gateway')
 EXAMPLES = REPO_ROOT / 'examples'
 
 #: The five scripts R35 requires, named rather than globbed. A glob would
@@ -384,12 +384,141 @@ def test_the_floor_scan_permits_what_3_10_already_accepts(
 # --- Version: one source of truth (R5) --------------------------------------
 #
 # Four mutually contradictory version claims (H22) are collapsed to one:
-# `pyproject.toml`'s `[project] version`. `async_gateway.__version__` reads
+# `pyproject.toml`'s `[project] version`. `asyncio_gateway.__version__` reads
 # the installed distribution's metadata rather than restating the string, so
 # the two cannot drift -- but "cannot drift" is a claim about code that has
 # to be asserted, because a future edit could reintroduce a literal.
 
-DISTRIBUTION = 'async-gateway'
+DISTRIBUTION = 'asyncio-gateway'
+
+#: The PEP 503 normalised form of :data:`DISTRIBUTION` -- the string PyPI
+#: actually compares names on, and therefore the only spelling worth
+#: checking a name's availability against.
+#:
+#: Pinned as a literal rather than computed from ``DISTRIBUTION`` so that
+#: the assertion below is a real comparison. Deriving both sides from the
+#: same expression would assert that a function equals itself.
+NORMALISED_DISTRIBUTION = 'asyncio-gateway'
+
+#: The normalised names this distribution must **not** collide with, and
+#: the reason each is here. `asyncgateway` is not hypothetical: it is a
+#: real project ("Itential Gateway Async Client", 0.1.0, 2026-03-09) and
+#: it is why the intended name `async-gateway` was rejected by PyPI.
+_TAKEN_NORMALISED_NAMES: Final[Dict[str, str]] = {
+    'async-gateway': (
+        'the name this project was originally written for; PyPI rejects '
+        'it as too similar to the existing `asyncgateway`, because all of '
+        '`async-gateway`, `async_gateway` and `asyncgateway` normalise to '
+        'the same string'
+    ),
+    'aio-gateway': (
+        'blocked the same way by the existing `aiogateway`; recorded so '
+        'it is not proposed as the fix next time'
+    ),
+}
+
+
+def _pep503_normalise(name: str) -> str:
+    """Normalise a distribution name the way PEP 503 defines it.
+
+    Args:
+        name: A distribution name in any spelling.
+
+    Returns:
+        The normalised form: runs of ``-``, ``_`` and ``.`` collapsed to a
+        single ``-``, lowercased.
+    """
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def test_the_distribution_name_normalises_as_checked() -> None:
+    """The distribution's PEP 503 normalised form is the pinned one.
+
+    **This test exists because a rename already failed for want of it.**
+    The project was built as ``async-gateway``, its availability was
+    "verified" with ``GET https://pypi.org/pypi/async-gateway/json`` ->
+    404, and PyPI then rejected the upload: *"This project name is too
+    similar to an existing project."*
+
+    The 404 was true and worthless. PyPI does not compare the spelling
+    you type -- it compares the `PEP 503 <https://peps.python.org/pep-0503/>`_
+    **normalised** name, ``re.sub(r'[-_.]+', '-', name).lower()``. Under
+    that rule ``async-gateway``, ``async_gateway`` and ``asyncgateway``
+    are one name, and ``asyncgateway`` was already taken. A check on one
+    spelling says nothing about the identity it belongs to.
+
+    So this pins the identity rather than the spelling. A future rename
+    that changes ``[project] name`` turns this test red, and the failure
+    message states the exact two URLs to check -- which is the step that
+    was skipped. A network call is deliberately **not** made here: a unit
+    test that reaches PyPI is flaky offline, slow, and would make the
+    suite's result depend on someone else's uptime. The manual check is
+    documented instead, and the string it must be run against is asserted.
+    """
+    declared = _read_declared_distribution_name()
+    assert declared == DISTRIBUTION, (
+        f'pyproject declares the distribution as {declared!r} but this '
+        f'suite pins {DISTRIBUTION!r}; if the rename is intended, update '
+        'DISTRIBUTION and NORMALISED_DISTRIBUTION together, then verify '
+        'BOTH spellings are free on PyPI before uploading'
+    )
+    actual = _pep503_normalise(declared)
+    assert actual == NORMALISED_DISTRIBUTION, (
+        f'{declared!r} normalises to {actual!r}, not the pinned '
+        f'{NORMALISED_DISTRIBUTION!r}. PyPI compares normalised names, so '
+        f'before publishing this name verify BOTH of:\n'
+        f'  https://pypi.org/pypi/{declared}/json\n'
+        f'  https://pypi.org/pypi/{actual.replace("-", "")}/json\n'
+        'return 404. Checking only the hyphenated spelling is what got '
+        '`async-gateway` rejected after it was declared available.'
+    )
+
+
+def test_the_distribution_name_avoids_the_names_already_taken() -> None:
+    """The name does not normalise onto a name PyPI already holds.
+
+    The companion to the test above: that one pins *what* the name
+    normalises to, this one pins *what it must not*. Both are needed --
+    a rename could satisfy the pinned-form check by updating both
+    constants together and still land straight back on a taken name.
+
+    The list is deliberately short and evidence-based: each entry is a
+    name this project actually tried or considered, with the collision
+    that ruled it out. It is a record of checks already paid for, not a
+    speculative denylist.
+    """
+    actual = _pep503_normalise(_read_declared_distribution_name())
+    assert actual not in _TAKEN_NORMALISED_NAMES, (
+        f'the distribution normalises to {actual!r}, which is taken: '
+        f'{_TAKEN_NORMALISED_NAMES[actual]}'
+    )
+
+
+_NAME_PATTERN = re.compile(
+    r'^name\s*=\s*[\'"](?P<name>[^\'"]+)[\'"]',
+    re.MULTILINE,
+)
+
+
+def _read_declared_distribution_name() -> str:
+    """Read ``[project] name`` from ``pyproject.toml`` as text.
+
+    Read as text rather than through ``tomllib`` for the reason
+    :func:`_read_declared_version` gives: this suite runs on the 3.10 leg
+    of the CI matrix and ``tomllib`` arrived in 3.11.
+
+    Returns:
+        The distribution name exactly as declared.
+
+    Raises:
+        AssertionError: If no top-level ``name = "..."`` line is found.
+    """
+    match = _NAME_PATTERN.search(PYPROJECT.read_text(encoding='utf-8'))
+    assert match is not None, (
+        f'no top-level `name = "..."` line found in {PYPROJECT}'
+    )
+    return match['name']
+
 
 _VERSION_PATTERN = re.compile(
     r'^version\s*=\s*[\'"](?P<version>[^\'"]+)[\'"]',
@@ -424,7 +553,7 @@ def test_dunder_version_matches_the_installed_distribution_metadata() -> None:
     today -- ``__init__`` *reads* the metadata -- and this test is what keeps
     it holding if someone later replaces that read with a literal.
     """
-    assert metadata_version(DISTRIBUTION) == async_gateway.__version__
+    assert metadata_version(DISTRIBUTION) == asyncio_gateway.__version__
 
 
 def test_the_declared_version_is_the_one_that_gets_installed() -> None:
@@ -445,7 +574,9 @@ def test_the_version_is_the_one_zero_zero_reset() -> None:
     """The version is ``1.0.0``, down from the fork-inherited 2.x version.
 
     The decrease is sound because nothing was ever published under **this
-    distribution name** (OQ4, re-verified 404 on 2026-08-17), so no pin or
+    distribution name** (OQ4, re-verified 404 on 2026-08-19 in both PEP 503
+    spellings -- see :func:`test_the_distribution_name_normalises_as_checked`),
+    so no pin or
     resolver can be broken by it. It is *not* sound on the stronger claim the
     release was originally written on -- "this code has never been published"
     -- which is false: it ships as ``asyncio-requests``, retired at ``2.7.3``.
@@ -453,7 +584,7 @@ def test_the_version_is_the_one_zero_zero_reset() -> None:
     exact string here means a careless bump cannot quietly undo the reset the
     release is named for.
     """
-    assert async_gateway.__version__ == '1.0.0'
+    assert asyncio_gateway.__version__ == '1.0.0'
 
 
 def test_the_version_is_declared_in_exactly_one_place() -> None:
@@ -694,7 +825,7 @@ def test_the_licence_metadata_agrees_with_the_licence_file() -> None:
 #
 #   * the files exist, are ≤ ~40 code lines, and parse;
 #   * each one *imports*, which is what catches a renamed symbol -- a
-#     compile check passes happily on `from async_gateway import gone`;
+#     compile check passes happily on `from asyncio_gateway import gone`;
 #   * the two examples that can be pointed at a local server are actually
 #     *run* against the loopback recording server, so a changed envelope
 #     key or error code fails here rather than in a consumer's code.
@@ -787,7 +918,7 @@ def test_every_example_imports_cleanly(name: str) -> None:
     """Every example's imports resolve against the real package.
 
     This is the test that bites when the library is refactored. Parsing
-    accepts ``from async_gateway.utils.exceptions import Gone``; importing
+    accepts ``from asyncio_gateway.utils.exceptions import Gone``; importing
     does not, so a renamed or deleted public symbol fails here.
     """
     assert _load_example(name) is not None
@@ -1026,12 +1157,12 @@ def test_py_typed_ships_in_both_artifacts(tmp_path: Path) -> None:
     ``[tool.setuptools.package-data]`` names it. Delete that one line and
     the wheel still installs, still imports and still runs; the *only*
     symptom is that every downstream type checker treats
-    ``async_gateway`` as untyped and silently ignores the annotations
+    ``asyncio_gateway`` as untyped and silently ignores the annotations
     this release exists to add. A failure with no runtime signal is
     exactly the kind that needs a test rather than a review.
 
     Asserted on the **built artifacts**, not on the source tree: the file
-    existing in ``async_gateway/`` is what a ``git status`` shows, and it
+    existing in ``asyncio_gateway/`` is what a ``git status`` shows, and it
     is not the property that matters. Both artifacts are checked because
     they are packed by different machinery -- ``package-data`` for the
     wheel, ``MANIFEST.in`` plus setuptools' defaults for the sdist -- and
@@ -1072,12 +1203,12 @@ def test_py_typed_ships_in_both_artifacts(tmp_path: Path) -> None:
     # expected path is derived from the declared version rather than
     # written out -- a literal here would fail the next release for the
     # wrong reason and teach whoever fixes it to loosen the assertion.
-    sdist_root = f'async_gateway-{_read_declared_version()}'
+    sdist_root = f'asyncio_gateway-{_read_declared_version()}'
 
-    assert in_wheel == ['async_gateway/py.typed'], (
+    assert in_wheel == ['asyncio_gateway/py.typed'], (
         f'py.typed is missing from the wheel (found {in_wheel!r}); '
         f'downstream type checkers will ignore this package entirely')
-    assert in_sdist == [f'{sdist_root}/async_gateway/py.typed'], (
+    assert in_sdist == [f'{sdist_root}/asyncio_gateway/py.typed'], (
         f'py.typed is missing from the sdist (found {in_sdist!r}); '
         f'an install from source would ship untyped')
 
@@ -1123,7 +1254,7 @@ def test_the_release_workflow_derives_the_distribution_name() -> None:
     republishes on every merge, and every run is green while it does.
 
     Asserted on the URL rather than on the whole file: the header comment
-    legitimately names ``async-gateway`` several times, because the PyPI
+    legitimately names ``asyncio-gateway`` several times, because the PyPI
     pending-publisher registration it walks through cannot be described
     without it.
     """

@@ -20,7 +20,7 @@ from typing import Final, FrozenSet
 # imports nothing from the package, so naming it here cannot cycle. It is
 # imported rather than duplicated because `CREDENTIAL_HEADERS` below is
 # *derived* from it -- see the reasoning there.
-from async_gateway.utils.redaction import SENSITIVE_HEADERS
+from asyncio_gateway.utils.redaction import SENSITIVE_HEADERS
 
 HTTP_TIMEOUT = 15
 
@@ -287,7 +287,7 @@ CROSS_ORIGIN_SAFE_HEADERS: Final[FrozenSet[str]] = frozenset({
 })
 
 #: Credential-bearing request headers this module names in its own right,
-#: beyond the ones :data:`~async_gateway.utils.redaction.SENSITIVE_HEADERS`
+#: beyond the ones :data:`~asyncio_gateway.utils.redaction.SENSITIVE_HEADERS`
 #: already classifies. Every entry is a header whose value is a bearer
 #: token in the plain sense: possessing it is sufficient to act as the
 #: caller, so a hostile ``Location`` receiving one is a full credential
