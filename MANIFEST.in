@@ -1,0 +1,15 @@
+# sdist file set (H26).
+#
+# The sdist must carry everything the build needs, because `pip install
+# --no-binary :all:` rebuilds from it. The three files below are named
+# explicitly rather than left to setuptools' defaults so the guarantee is
+# stated, not inherited. The prunes keep the wheel and the sdist free of the
+# directories the old `find_packages(exclude=...)` kept out.
+
+include README.md
+include LICENSE
+include pyproject.toml
+
+prune tests
+prune docs
+prune local_development

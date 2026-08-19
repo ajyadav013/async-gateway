@@ -1,0 +1,349 @@
+# Declarative build + project metadata for async-gateway (PEP 517 / PEP 621).
+#
+# Replaces the executable `setup.py` and the `setup.cfg` tool sections. Nothing
+# here is computed at build time: the previous build read `requirements.txt`
+# with `open()` while packaging, so an sdist that omitted that file failed to
+# install at all (H26) and the read carried no explicit `encoding=` (L16).
+#
+# Tool configuration lives here for every tool that reads pyproject.toml
+# (pytest, mypy, coverage, bandit). flake8 does not read pyproject.toml, so its
+# configuration lives in `.flake8` at the repo root.
+
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "async-gateway"
+# The single source of truth for the version (R5-AC1). `async_gateway.
+# __version__` reads it back off the installed distribution rather than
+# restating it, so a release edits exactly one line and the two cannot
+# disagree. The reset *down* from the fork-inherited 2.x version is a
+# one-way door, safe only because nothing has ever been published under
+# this name: `GET https://pypi.org/pypi/async-gateway/json` returned 404 on
+# 2026-08-17 (OQ4; the check is recorded in the AGW-28 work log). The old
+# number is deliberately not written here -- R5-AC3 requires it survive
+# only in the spec and the changelog history, and a packaging test asserts
+# that.
+version = "1.0.0"
+description = "Any microservice will be able to use the “async_gateway” can make an async request(HTTP/SOAP/XML/FTP/redis) with the given payload to given address"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Arjunsingh Yadav", email = "arjun.yadav013@gmail.com" },
+]
+classifiers = [
+    # Deliberate downgrade from `5 - Production/Stable` (L17): the inherited
+    # tree did not import from a clean install, and this rewrite has no field
+    # experience under this name yet.
+    # Re-examined and justified in the CHANGELOG at the release step.
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    # The version classifiers track `requires-python` and the CI interpreter
+    # matrix; they are metadata only — no resolver reads them (M23).
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "aiohttp>=3.14.3,<4",
+    "orjson>=3.12.0,<4",
+    "aioboto3>=15.5.0,<16",
+    "aiofiles>=25.1.0,<26",
+    # The one deliberate exact pin: 0.6.0 is the latest release of a dormant
+    # project, and R7 (Step 22) owns the keep / replace / vendor decision.
+    "pyfailsafe==0.6.0",
+    "aioftp>=0.28.0,<1",
+    "asyncssh>=2.24.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    # The `toml` extra, not bare `bandit`: reading `[tool.bandit]` out of this
+    # file needs a TOML parser, and bandit only has one via stdlib `tomllib`
+    # (3.11+) or the `tomli` backport the extra pulls in. `requires-python` is
+    # >=3.10, so on the 3.10 CI leg bare bandit would fail to load `-c
+    # pyproject.toml` — a silently unconfigured scanner.
+    "bandit[toml]",
+    # Mints the throwaway PKI `tests/fixtures/tls.py` runs R23's mutual-TLS
+    # handshake against, and the client certificates `tests/fixtures/ftp.py`
+    # already used. It was resolving here transitively via `asyncssh`, which
+    # is exactly why it has to be declared: a direct import resting on
+    # someone else's dependency breaks the day that dependency drops it, and
+    # the break surfaces as a collection error in an unrelated suite rather
+    # than as a missing requirement.
+    "cryptography",
+    "flake8==7.1.0",
+    "flake8-builtins==2.5.0",
+    "flake8-docstrings==1.7.0",
+    "flake8-import-order==0.18.2",
+    "flake8-quotes==3.4.0",
+    "lxml",
+    "mypy",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-randomly",
+    # flake8-import-order 0.18.2 still imports pkg_resources, so setuptools must
+    # keep providing it: setuptools 81 removed pkg_resources outright and flake8
+    # cannot start at all in a clean venv without a ceiling.
+    # The ceiling is 76, not the 81 that setuptools' own warning text implies,
+    # because 76+ still ships pkg_resources but warns on every import of it:
+    # five UserWarnings on each flake8 invocation. R27-AC2 requires `flake8 .`
+    # to produce *no output*, not merely exit 0, so <81 is unachievable by
+    # construction; <76 is a strict subset of it.
+    # `sphinx` and `sphinx-rtd-theme` were removed here with the three Sphinx
+    # files (R31-AC1, M24): the build had never succeeded -- no `.rst` root
+    # document existed, and `docs/source/Makefile` set `SOURCEDIR = source`
+    # from inside `docs/source/`, resolving to `docs/source/source`. Two dev
+    # dependencies for a build nobody could run.
+    "setuptools<76",
+]
+
+[project.urls]
+Homepage = "https://github.com/ajyadav013/async-gateway"
+
+[tool.setuptools.packages.find]
+include = ["async_gateway*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+# PEP 561. `py.typed` is not a `.py` file, so setuptools does not carry it
+# with the package on its own: a wheel built without this line ships the
+# annotations while telling every downstream type checker to ignore them.
+# `tests/test_packaging.py` asserts it is in both artifacts, because the
+# failure is silent by construction -- the wheel installs, imports and
+# runs perfectly, and the only symptom is a consumer's mypy reporting
+# `async_gateway` as untyped.
+#
+# Added at AGW-26 and deliberately not earlier (FI-13): the marker is a
+# promise that this package's own types check, so publishing it while
+# `ignore_errors = true` was still hiding two dozen real errors would
+# have exported them into every consumer's build.
+"async_gateway" = ["py.typed"]
+
+# --- Tool configuration migrated out of the deleted setup.cfg ---------------
+
+[tool.bandit]
+# Was `[bandit] exclude = ./env` in setup.cfg. bandit never auto-discovered
+# that section (it only reads `.bandit` files or an explicit `-c`), so this
+# must be passed as `bandit -c pyproject.toml` to take effect.
+exclude_dirs = ["./env"]
+
+[tool.mypy]
+
+# R30's annotation criterion. Every function in `async_gateway` carries a
+# full signature as of story S24, and these two keep it that way:
+# `disallow_untyped_defs` refuses a def with no annotations at all,
+# `disallow_incomplete_defs` refuses the more common regression -- a def
+# that annotates some of its parameters and forgets one.
+#
+# Both were INERT until AGW-26 removed `ignore_errors` from this section,
+# and that was measured rather than assumed: with both settings present,
+# `mypy async_gateway` reported "Success: no issues found in 27 source
+# files" while seven functions were missing annotations -- `ignore_errors`
+# suppressed the whole check, these two included. They were declared ahead
+# of time so that removing it turned the criterion on without anyone also
+# having to remember to add them, and `tests/test_docs.py` enforces the
+# same property independently, by AST. A gate that an unrelated setting in
+# the same file can switch off is not by itself a gate.
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+# Per-module, never global (R27-AC5). A blanket
+# `ignore_missing_imports = true` -- which is what this section carried
+# until AGW-26 -- silences the *next* untyped dependency too, including
+# one added by accident, so the setting that was meant to acknowledge
+# four known gaps quietly became a policy of not noticing any.
+#
+# Each entry below names a package that genuinely ships neither inline
+# annotations nor a stub distribution, verified against the installed
+# version rather than assumed. Adding a fifth is a deliberate act with a
+# comment attached, which is the whole point of listing them.
+
+[[tool.mypy.overrides]]
+# `pyfailsafe` 0.6.0: no `py.typed`, no `types-pyfailsafe` on PyPI. The
+# project is dormant, and ADR 0001 records the keep/replace/vendor
+# decision -- a replacement would take this entry with it.
+module = ["failsafe.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# `aioboto3` and its transitive `botocore`: neither ships `py.typed`.
+# Stubs exist for boto3 (`boto3-stubs`) but not for the async fork, and
+# `botocore.exceptions` is imported directly for two exception classes.
+module = ["aioboto3.*", "botocore.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# `aiofiles`: no inline annotations. `types-aiofiles` exists on PyPI and
+# would remove this entry, but adding a dev dependency is a change this
+# story's boundary does not cover -- recorded so the upgrade path is
+# named rather than forgotten.
+# shortcut: per-module ignore -- add `types-aiofiles` to the dev set.
+module = ["aiofiles.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=async_gateway --cov-branch"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+junit_family = "legacy"
+
+[tool.coverage.run]
+# The measurement backend, pinned because the default one mismeasures this
+# package on the interpreter the matrix tops out at.
+#
+# coverage.py 7.15.4 defaults to the `sysmon` core on CPython 3.12+. On 3.14.7
+# that core reports a *false* missing arc out of an `async with` body nested
+# three deep whose context managers await in `__aenter__` -- it claims the
+# body's successor arc was never taken on a line that provably executed.
+# `utils/http_file_config.py`'s `download_file_from_url` is exactly that shape
+# (`ClientSession` -> `response` -> `safe_writer`), which is why `429->431`
+# was the last "uncovered" branch in the package.
+#
+# Reduced to 24 lines with no project code involved, and the reproduction is
+# the evidence for this line rather than an assertion about it:
+#
+#     async def depth3_fallthrough():
+#         async with Ctx():
+#             async with Ctx():
+#                 async with Ctx():
+#                     marker = 'ran'      # sysmon: arc missing
+#         return marker                   # ...yet the assert on `marker` passes
+#
+# `coverage run --branch` reports `17->18, 17->19` missing at 92% while the
+# runner prints that all three bodies ran; under `ctrace` the same file is
+# 100%. Depth 2 is unaffected, and a `return` instead of a fall-through is
+# unaffected -- so this is not a shape the tests can be rewritten around.
+#
+# `ctrace` is coverage.py's own C tracer, not a third-party plugin or a
+# relaxation: it measures *more* strictly here, not less. Twelve input shapes
+# were driven through the real function (empty body, chunked, capped,
+# overwrite, `chunk_size=1`, 300 KB, HEAD) and `sysmon` reports the arc
+# missing on every one, including those that provably enter the loop body.
+# Pinning the core is therefore the fix; a `# pragma: no cover` here would
+# have bought the number by hiding a working test behind a tool defect.
+#
+# Revisit trigger: drop this line when coverage.py fixes the `sysmon` arc bug
+# and the floor of the supported range ships the fixed version. Owner: the
+# maintainer.
+core = "ctrace"
+
+[tool.coverage.report]
+# Coverage ratchet floor (R28): the value measured at this step, and it may
+# only ever be raised, never lowered. Every later step re-measures and raises
+# it; a CI job fails any commit whose value is below the base branch.
+#
+# Measured at Step 6 / story S8 (`coverage report --precision=6`): 76.442308%
+# line+branch. This raises the floor 72.90 -> 76.44 against the committed
+# baseline at af16cf6, the only value in history; the 76.69 seen mid-story was
+# never committed. It fell to 76.44 when the final `redact_value` security fix
+# deleted 7 covered statements and 2 covered branches: missed statements stayed
+# at 159, so no line lost coverage -- a smaller denominator lowered the ratio.
+# The floor is truncated to two decimals rather than rounded, because rounding
+# up would put it above the value it was measured from and fail the very run
+# that set it.
+#
+# Re-measured after wave W9 / stories S10 (FTP) and S11 (SFTP)
+# (`coverage report --precision=6`): 82.896118%, stable across three
+# randomised orders, and unchanged under all five seeds the shuffled-order CI
+# job commits (1, 20250816, 424242, 99991, 2147483647).
+# Both stories grew production code *and* brought their own tests, and it is
+# the tests that carry the rise, not the new code: deselect the two suites W9
+# added (`tests/logic/`, 60 tests) and this same tree measures 78.069255% --
+# below the 79.35 floor S9 set. Their effect is concentrated in the three
+# modules W9 touched: `logic/ftp_client` 67.889908% -> 94.495413%,
+# `logic/sftp_client` 66.250000% -> 82.500000%, and
+# `helpers/internal/filters_helper` 85.106383% -> 93.617021%.
+# Raised 79.35 -> 82.89, truncated for the reason above.
+#
+# Re-measured after wave W10 / stories S12 (SFTP operations) and S13 (HTTP
+# request construction and response handling)
+# (`coverage report --precision=6`): 89.892665%, stable across three
+# randomised orders.
+# Both stories brought substantial suites of their own -- S12 took
+# `logic/sftp_client` to 100.000000%, and S13 added the first real coverage of
+# the four `helpers/internal` modules, which were the least-tested part of the
+# package. The rise is concentrated there rather than spread thin, which is why
+# it is the largest single-wave jump of the run so far.
+# Raised 82.89 -> 89.88, truncated for the reason above.
+#
+# Re-measured after story S15 (HTTP transport resilience and the owned
+# redirect loop) (`coverage report --precision=6`): 95.223179%, identical
+# across all five seeds the shuffled-order CI job commits (1, 20250816,
+# 424242, 99991, 2147483647).
+# The rise is concentrated in the three modules the story rewrote:
+# `helpers/internal/request_helper` 81.481481% -> 91.176471%,
+# `utils/http_file_config` 33.333333% -> 93.939394%, and
+# `logic/http_client` 99.074074% -> 99.300000%. What is left uncovered in
+# the first two is dead code story S20 deletes -- `fetch_file` and the
+# duplicate `download_file_from_s3` -- plus two partial branches.
+# Raised 92.37 -> 95.22, truncated for the reason above.
+#
+# Re-measured after story S15's review round (the four blockers: a supplied
+# session's credential headers, the redirected upload's consumed body, the
+# three unvalidated redirect keys, the after_redirect table)
+# (`coverage report --precision=6`): 95.427286%, identical across the same
+# five seeds. The rise is in `logic/http_client` 99.300000% -> 99.492958%
+# (three new validators, all exercised) with `helpers/internal/request_helper`
+# at 91.256831%; what is left uncovered there is unchanged -- the dead
+# `fetch_file` story S20 deletes, plus the `CircuitOpen` arm of `_exchange`.
+# Raised 95.22 -> 95.42, truncated for the reason above.
+#
+# Re-measured after story S15's second review round (the chain-wide deadline,
+# the refused `trace_config` + `session` pair, and the redirect trace event
+# the owned loop has to write itself) (`coverage report --precision=6`):
+# 95.557174%, identical across the same five seeds. The rise is in
+# `helpers/internal/request_helper` 91.256831% -> 92.307692% (`hop_deadline`
+# and `record_redirect`, both exercised on every branch) with
+# `logic/http_client` at 99.516908%. What is left uncovered is unchanged --
+# the dead `fetch_file` story S20 deletes, plus the `CircuitOpen` arm of
+# `_exchange`, which no HTTP test drives (story S16 owns that seam).
+# Raised 95.42 -> 95.55, truncated for the reason above.
+#
+# Re-measured after story S15's third review round (the redirect trace event
+# written from a `finally` so an error-terminated chain still reports the hops
+# it followed; the collectors derived from a caller-supplied session; and
+# `trace_config` validated at construction) (`coverage report --precision=6`):
+# 95.661451%, identical across the same five seeds. The rise is in
+# `logic/http_client` 99.516908% -> 99.581590% (the new `trace_config`
+# validator and `trace_collectors_for`, both exercised on every branch) with
+# `helpers/internal/request_helper` at 92.340426%. What is left uncovered is
+# unchanged -- the dead `fetch_file` story S20 deletes, plus the `CircuitOpen`
+# arm of `_exchange`, which no HTTP test drives (story S16 owns that seam).
+# Raised 95.55 -> 95.66, truncated for the reason above.
+# Terminal value (R28-AC3, Step 26). Re-measured after story S27 closed the
+# last eighteen gaps -- thirteen statements and five partial branches across
+# eight modules -- with tests only: no source file was edited, which is the
+# boundary this story is held to.
+#
+# `coverage report --precision=6`: 100.000000% line+branch, 1899 statements
+# and 562 branches, 0 missed and 0 partial, identical across all five seeds
+# the shuffled-order CI job commits (1, 20250816, 424242, 99991, 2147483647).
+#
+# This is the end of the ratchet, not another step on it: the number can no
+# longer rise, so from here `fail_under` only has to be defended. There is
+# no truncation to apply -- earlier floors were truncated because a rounded
+# value could exceed the run that measured it, and 100 has no such headroom.
+#
+# The pragma count is **zero**, against a ceiling of 10. Nothing here was
+# bought with a suppression: the two categories the spec pre-authorised went
+# unused because both turned out to be testable -- the `@abstractmethod`
+# body on `handle_request` is driven by a subclass that calls `super()`, and
+# the one arc that genuinely could not be covered was a coverage.py `sysmon`
+# defect, fixed by pinning the measurement core above rather than by hiding
+# the line from the measurement.
+fail_under = 100
+# `fail_under` is compared against the total *rounded to `precision`*, so a
+# two-decimal ratchet needs two-decimal precision or the comparison silently
+# degrades to whole percents. Latent until now: earlier floors happened to round
+# favourably, so the integer comparison agreed with the intended one by luck.
+precision = 2

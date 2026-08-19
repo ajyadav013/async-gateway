@@ -1,0 +1,24 @@
+# sshd restricted to SFTP, for the integration lane.
+
+Port 22
+ListenAddress 0.0.0.0
+
+# One host key, at a path the entrypoint generates into and the test
+# harness reads the public half of. Ed25519 because it is the one
+# asyncssh, OpenSSH and every test client agree on without negotiation
+# surprises.
+HostKey /etc/ssh/keys/ssh_host_ed25519_key
+
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+AuthorizedKeysFile /home/gateway/.ssh/authorized_keys
+ChallengeResponseAuthentication no
+UsePAM no
+
+# SFTP only -- no shell. This is what the library actually talks to, and
+# it keeps the container from being a general-purpose remote shell.
+Subsystem sftp internal-sftp
+ForceCommand internal-sftp
+
+LogLevel INFO

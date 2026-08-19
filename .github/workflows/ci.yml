@@ -1,0 +1,498 @@
+# Continuous integration for async-gateway (release spec R1 / Step 3, R28-AC7).
+#
+# The defect class this release exists to close is the one a CI that never
+# installs the built package cannot see: `async_gateway` imported an
+# undeclared dependency, so every check passed in a tree that already had it
+# and the published artifact was unusable. Every job below therefore gates the
+# *real artifact* or the *real interpreter set*, not a convenient stand-in:
+#
+#   lint-type-test      flake8 / mypy / pytest / bandit on the committed
+#                       interpreter matrix (3.10 - 3.14).
+#   build-and-install   build, then import the submodule out of a clean venv
+#                       from the wheel and again from the sdist.
+#   changelog           on a pull request, require CHANGELOG.md alongside any
+#                       async_gateway/ change (escape: a `skip-changelog`
+#                       label).
+#   shuffled-order      the suite under five committed pytest-randomly seeds.
+#   coverage-ratchet    head's `fail_under` may never drop below base's.
+#   newer-python-minor  monthly: fails once CPython ships a minor newer than
+#                       the highest committed matrix entry.
+#
+# No step carries `continue-on-error`: every one of them is a required check.
+#
+# `flake8 .` is green as of R27/Step 24 (story AGW-25): the violation
+# baseline is gone, there is no baseline-suppression file, and the two
+# settings that made the command mean something -- a legal
+# `application_import_names` and the `.claude` exclusion -- are documented
+# in `.flake8`.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # 03:17 UTC on the 1st of every month -- for `newer-python-minor`.
+    - cron: '17 3 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # A pip wheel cached from an earlier run must never be able to satisfy the
+  # clean-venv installs below; that would hide exactly the packaging defect
+  # these jobs exist to catch.
+  PIP_NO_CACHE_DIR: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+
+  lint-type-test:
+    name: lint + types + tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # THE COMMITTED INTERPRETER MATRIX. This is a literal list, never
+        # derived from an interpreter probe or a metadata query: a derived
+        # matrix silently shrinks when a runner image changes, and the shrink
+        # is invisible in review. `tests/test_packaging.py` parses this exact
+        # line and asserts every entry is at or above `requires-python` and
+        # that the minors are contiguous, so an edit here that skips or
+        # deletes a version fails the suite.
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the project and its dev extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: flake8
+        run: flake8 .
+
+      - name: no unjustified suppression (R27-AC7)
+        # A lint or type suppression is allowed; an *unaccountable* one is
+        # not. Every `# noqa` must name the code it silences, and every
+        # `# type: ignore` must name the error category -- so a suppression
+        # added for one reason cannot silently start hiding a second,
+        # unrelated finding. `.claude` is not scanned for the same reason
+        # flake8 excludes it: it is vendored agent tooling, not this
+        # library.
+        #
+        # The `--` justification is enforced too, but on the *contiguous
+        # comment block above the line* rather than on the line itself:
+        # at 79 columns a real explanation does not fit beside the code,
+        # and a trailing-comment-only rule buys a one-word alibi instead
+        # of a reason.
+        run: python .github/scripts/check_suppressions.py
+
+      - name: format check (R27-AC8)
+        # This project configures no autoformatter -- deliberately, and
+        # `CLAUDE.md` says so. `flake8` is the formatting judge instead,
+        # and this step is its check-mode run narrowed to the codes that
+        # *are* formatting: layout (E1/E2/E3/W2/W3), line length (E501,
+        # W505), and the committed quote style (Q). Separated from the
+        # `flake8` step above so a formatting regression is named as one
+        # in the job list rather than buried in a general lint failure.
+        run: flake8 --select=E1,E2,E3,E501,W2,W3,W505,Q .
+
+      - name: mypy
+        # Green with no `ignore_errors` anywhere as of R27/Step 24 (story
+        # AGW-26), and `ignore_missing_imports` only per-module, each
+        # override naming the package that ships no stubs.
+        run: mypy async_gateway
+
+      - name: no global type suppression (R27-AC5)
+        # The gate this pair of settings is *for* is the one they can
+        # silently switch off: `ignore_errors` turns the whole check into
+        # "Success: no issues found", and a global
+        # `ignore_missing_imports` silences the next untyped dependency
+        # as well as the four known ones. Both are cheap to reintroduce
+        # under deadline and invisible in a green run -- the spec's own
+        # premortem names "`ignore_errors = True` restored within a week"
+        # as the likely failure -- so the config is asserted here rather
+        # than trusted.
+        run: |
+          if grep -qE '^\s*ignore_errors' pyproject.toml; then
+            echo '::error::ignore_errors is back in pyproject.toml' >&2
+            exit 1
+          fi
+          if awk '/^\[tool\.mypy\]/{f=1;next} /^\[/{f=0} f' pyproject.toml \
+             | grep -qE '^\s*ignore_missing_imports'; then
+            echo '::error::ignore_missing_imports is set globally in' \
+                 '[tool.mypy]; it belongs in a per-module override that' \
+                 'names the package' >&2
+            exit 1
+          fi
+
+      - name: pytest
+        run: pytest
+
+      - name: no unjustified coverage pragma (R28-AC7)
+        # `fail_under = 100` is only worth what the pragmas cost. A
+        # `# pragma: no cover` does not fail a build, it *removes lines
+        # from the denominator* -- so the one way to hold 100 while
+        # quietly shipping untested code is to pragma the code away, and
+        # the number would stay green the whole time. This step and the
+        # one below are what make that visible.
+        #
+        # Same shape as the suppression check above: every pragma names
+        # its reason after a `--`. The tree currently has zero pragmas,
+        # so this is a check against reintroduction rather than a check
+        # on anything present -- which is exactly when it is cheapest to
+        # add and easiest to forget.
+        run: |
+          offenders=$(grep -rn 'pragma:[[:space:]]*no[[:space:]]*cover' \
+            async_gateway tests examples \
+            | grep -v -- '--' || true)
+          if [ -n "$offenders" ]; then
+            echo '::error::a `# pragma: no cover` carries no `--`' \
+                 'justification; the permitted categories are' \
+                 '`if TYPE_CHECKING:`, an `@abstractmethod` body, and a' \
+                 'platform-guarded fallback (R28-AC7)' >&2
+            echo "$offenders" >&2
+            exit 1
+          fi
+
+      - name: coverage pragma ceiling of 10 (R28-AC7)
+        # The count, not just the justification. A justified pragma is
+        # still a line nobody tests, and a policy with no ceiling can be
+        # applied one well-argued line at a time until 100% means
+        # nothing. Ten is the spec's number: ~4 `if TYPE_CHECKING:`
+        # blocks, the one `@abstractmethod` body, the `O_NOFOLLOW`
+        # platform fallback (~2), and a slot of headroom.
+        #
+        # Raising the ceiling requires editing this line in a reviewed
+        # PR with a written justification, which is the entire point of
+        # having a number rather than a convention.
+        run: |
+          count=$(grep -rc 'pragma:[[:space:]]*no[[:space:]]*cover' \
+            async_gateway tests examples \
+            | awk -F: '{total += $2} END {print total + 0}')
+          echo "pragma count: $count (ceiling 10)"
+          if [ "$count" -gt 10 ]; then
+            echo "::error::$count coverage pragmas exceeds the ceiling" \
+                 'of 10; the ceiling is what stops 100% coverage being' \
+                 'bought a line at a time (R28-AC7)' >&2
+            exit 1
+          fi
+
+      - name: R7 fitness behaviours 1-6 (the resilience-library evidence)
+        # R7-AC1's run-in-CI half, and R7-AC2's "on every interpreter in the
+        # declared range". These behaviours already run inside `pytest` above;
+        # this step exists so the evidence ADR 0001 rests on is a *named,
+        # required check per interpreter* rather than a line buried in a
+        # 1000-test summary. When one regresses, the job name says which
+        # interpreter -- which is the ADR's recorded revisit trigger, so the
+        # trigger has to be mechanically visible to be a trigger at all.
+        #
+        # Behaviour 7 is deliberately excluded: it is known-failed against
+        # `pyfailsafe` by execution (no injectable clock or sleep --
+        # `circuit_breaker.py:139,142`, `failsafe.py:103`) and is asserted
+        # against this library's own facade instead. It runs in `pytest`
+        # above; it is not a fitness input for the dependency.
+        run: >-
+          pytest tests/helpers/test_circuit_breaker.py
+          -k "behaviour_1 or behaviour_2 or behaviour_3 or behaviour_4
+          or behaviour_5 or behaviour_6"
+          --no-cov -p no:randomly -v
+
+      - name: bandit
+        # `-c pyproject.toml` is load-bearing: bandit reads only `.bandit`
+        # files or an explicit `-c`, so without it `[tool.bandit]` is ignored
+        # and the scanner runs unconfigured.
+        run: bandit -c pyproject.toml -r async_gateway -ll
+
+      - name: compile the examples (R35-AC2)
+        # A second, independent check alongside the suite's own import test.
+        # It runs on every interpreter in the matrix and needs nothing
+        # importable, so an example using syntax valid on 3.12 but not on
+        # 3.10 fails here. Cheap, and it discharges R35-AC2 by a step that
+        # names it rather than by a side effect of the test run.
+        run: python -m compileall -q examples/
+
+  build-and-install:
+    name: build + clean-venv install of the real artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the build front-end
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Assert the checkout is clean before building
+        run: |
+          test -z "$(git status --porcelain)"
+          test ! -e dist
+          test ! -e async_gateway.egg-info
+
+      - name: Build the wheel and the sdist
+        # Deliberately an *isolated* build. `--no-isolation` would reuse the
+        # ambient environment, and the dev extra pins `setuptools<76` (so that
+        # flake8-import-order's pkg_resources import stays warning-free) while
+        # `build` requires `setuptools>=77.0.3` -- the two cannot coexist in
+        # one interpreter. Isolation gives the build its own pinned setuptools
+        # and the conflict never arises.
+        run: python -m build
+
+      - name: Install the wheel into a clean venv and import the submodule
+        # `cd /tmp` first: with the repo as the working directory the source
+        # tree shadows the installed package on sys.path and the import proves
+        # nothing. Importing bare `async_gateway` also proves nothing --
+        # `__init__.py` is empty, so it succeeds even when every submodule is
+        # broken. The documented entry point is the submodule.
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install --no-cache-dir dist/*.whl
+          cd /tmp
+          /tmp/wheel-venv/bin/python -c \
+            'from async_gateway.async_gateway import request; print(request)'
+
+      - name: Install the sdist into a clean venv and import the submodule
+        run: |
+          python -m venv /tmp/sdist-venv
+          /tmp/sdist-venv/bin/pip install --no-cache-dir --no-binary :all: \
+            dist/*.tar.gz
+          cd /tmp
+          /tmp/sdist-venv/bin/python -c \
+            'from async_gateway.async_gateway import request; print(request)'
+
+      - name: twine check
+        run: twine check dist/*
+
+      - name: Assert examples/ ships in neither artifact (R35-AC4)
+        # The decision is that `examples/` is repository-only. The suite
+        # asserts the same thing, but skips where `build` is absent -- it is
+        # not in the dev extra -- so this job, which has already built both
+        # artifacts, carries the assertion unconditionally.
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import tarfile
+          import zipfile
+
+          leaked = []
+          for wheel in glob.glob('dist/*.whl'):
+              with zipfile.ZipFile(wheel) as archive:
+                  leaked += [n for n in archive.namelist()
+                             if 'example' in n.lower()]
+          for sdist in glob.glob('dist/*.tar.gz'):
+              with tarfile.open(sdist) as archive:
+                  leaked += [n for n in archive.getnames()
+                             if 'example' in n.lower()]
+          if leaked:
+              sys.exit(f'examples/ leaked into the artifacts: {leaked}')
+          print('examples/ ships in neither artifact.')
+          PY
+
+  changelog:
+    name: changelog touched alongside async_gateway/
+    # Pull requests only. A changelog entry is a statement about a *change
+    # under review*; on a bare push there is no base to diff against and no
+    # label to grant the escape, so the job would either be meaningless or
+    # unskippable.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a CHANGELOG.md change when async_gateway/ changes
+        # The escape (R33-AC6): label the pull request `skip-changelog`.
+        # It exists for the genuinely entry-less change -- a typo in a
+        # docstring, a comment, a pure refactor with no consumer-visible
+        # effect -- and it is deliberately a *label*, so taking it is
+        # visible on the pull request and in its history rather than
+        # buried in a commit message.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          case ",$LABELS," in
+            *,skip-changelog,*)
+              echo 'skip-changelog label present; not requiring an entry.'
+              exit 0
+              ;;
+          esac
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          if ! grep -q '^async_gateway/' <<<"$changed"; then
+            echo 'no async_gateway/ change; no entry required.'
+            exit 0
+          fi
+          if grep -qx 'CHANGELOG.md' <<<"$changed"; then
+            echo 'async_gateway/ changed and CHANGELOG.md was updated.'
+            exit 0
+          fi
+          echo 'This pull request changes async_gateway/ but not' >&2
+          echo 'CHANGELOG.md. Add an entry under [Unreleased], or apply' >&2
+          echo 'the `skip-changelog` label if the change is genuinely' >&2
+          echo 'not worth one.' >&2
+          exit 1
+
+  shuffled-order:
+    name: shuffled test order (seed ${{ matrix.seed }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Five committed seeds. Committed rather than random so a failure is
+        # reproducible: the seed that broke the suite is in the job name and
+        # `pytest -p randomly --randomly-seed=<n>` replays it exactly.
+        seed: [1, 20250816, 424242, 99991, 2147483647]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the project and its dev extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: pytest in shuffled order
+        run: pytest -p randomly --randomly-seed=${{ matrix.seed }}
+
+  coverage-ratchet:
+    name: coverage ratchet (head fail_under >= base fail_under)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch the base branch's pyproject.toml
+        env:
+          BASE_REF: >-
+            ${{ github.event_name == 'pull_request'
+                && github.event.pull_request.base.ref
+                || github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          # A base branch predating declarative packaging has no
+          # pyproject.toml; an absent file means an absent floor, which the
+          # comparison below reads as 0.
+          git show "origin/$BASE_REF:pyproject.toml" \
+            > /tmp/base-pyproject.toml || : > /tmp/base-pyproject.toml
+
+      - name: Compare head's fail_under against the base branch's
+        env:
+          BASE_PYPROJECT: /tmp/base-pyproject.toml
+          HEAD_PYPROJECT: pyproject.toml
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          def fail_under(path: str) -> float:
+              """Read `tool.coverage.report.fail_under`, 0.0 when absent."""
+              try:
+                  with open(path, 'rb') as handle:
+                      data = tomllib.load(handle)
+              except (FileNotFoundError, tomllib.TOMLDecodeError):
+                  return 0.0
+              report = data.get('tool', {}).get('coverage', {}).get('report', {})
+              return float(report.get('fail_under', 0))
+
+          base = fail_under(os.environ['BASE_PYPROJECT'])
+          head = fail_under(os.environ['HEAD_PYPROJECT'])
+          print(f'base fail_under = {base}')
+          print(f'head fail_under = {head}')
+          if head < base:
+              sys.exit(
+                  f'coverage ratchet broken: head {head} < base {base}. '
+                  'fail_under may only ever be raised.'
+              )
+          print('coverage ratchet holds.')
+          PY
+
+  newer-python-minor:
+    name: fail when a newer stable CPython minor exists
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compare python.org's stable releases against the matrix
+        env:
+          CI_WORKFLOW: .github/workflows/ci.yml
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          RELEASES = (
+              'https://www.python.org/api/v2/downloads/release/'
+              '?is_published=true'
+          )
+          MATRIX = re.compile(
+              r"^\s*python-version:\s*\[(?P<entries>[^\]]+)\]\s*$",
+              re.MULTILINE,
+          )
+          NAMED = re.compile(r'Python\s+(?P<major>\d+)\.(?P<minor>\d+)')
+
+          source = open(os.environ['CI_WORKFLOW'], encoding='utf-8').read()
+          found = MATRIX.findall(source)
+          if len(found) != 1:
+              sys.exit(f'expected exactly one matrix, found {len(found)}')
+          committed = max(
+              tuple(int(part) for part in entry.strip().strip('\'"').split('.'))
+              for entry in found[0].split(',')
+          )
+
+          with urllib.request.urlopen(RELEASES, timeout=60) as response:
+              payload = json.load(response)
+
+          released = set()
+          for release in payload:
+              if release.get('pre_release'):
+                  continue
+              match = NAMED.match(release.get('name', ''))
+              if match:
+                  released.add(
+                      (int(match['major']), int(match['minor'])),
+                  )
+          if not released:
+              sys.exit('python.org returned no stable releases; check the API')
+
+          newest = max(released)
+          print(f'highest committed matrix entry = {committed}')
+          print(f'highest stable CPython minor   = {newest}')
+          if newest > committed:
+              sys.exit(
+                  f'CPython {newest[0]}.{newest[1]} is stable but the CI '
+                  f'matrix stops at {committed[0]}.{committed[1]}. Add it to '
+                  'the matrix and to the pyproject classifiers.'
+              )
+          print('the matrix covers every stable CPython minor.')
+          PY

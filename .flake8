@@ -1,0 +1,95 @@
+# flake8 configuration. flake8 does not read pyproject.toml, so this is the
+# only place its settings can live.
+#
+# `flake8 .` must exit 0 with no output (R27-AC2). Two settings below are
+# what make that command mean what it says, and both replaced a defect:
+# `application_import_names` named something that is not a legal Python
+# identifier, and a bare `.` walked into ~745 files of agent tooling that
+# are not this library.
+
+[flake8]
+# `docs`, `env` and `src` are carried over from the deleted setup.cfg.
+#
+# `.claude` is the addition, and it is deliberate (OQ15): the directory
+# holds the agent harness -- rules, skills, hooks and their bundled Python
+# scripts -- which is development tooling checked in beside the library
+# rather than part of it. Nothing under it is imported by `async_gateway`,
+# shipped in the sdist or the wheel, or executed by the test suite, and it
+# follows its own upstream conventions. `flake8 .` is the command CLAUDE.md
+# documents and CI runs, so without this the documented command reports on
+# files no story in this release owns.
+#
+# `build`/`dist`/`*.egg-info` hold copies of files already linted at their
+# source; without them every finding in a working tree that has run
+# `python -m build` is reported twice.
+exclude =
+    .claude,
+    .eggs,
+    .git,
+    __pycache__,
+    build,
+    dist,
+    docs,
+    env,
+    src,
+    *.egg-info
+
+max_doc_length = 79
+
+# The quote style, stated rather than inherited. `flake8-quotes` happens to
+# default to single inline quotes, which is what this tree uses, but a
+# default is not a decision: written down here, Q000 is the mechanical
+# enforcement of the one style, and the ~938 quote findings the audit
+# counted (against the double-quote reading) cannot come back by a plugin
+# default changing under us. `avoid-escape` keeps `"it's"` legal rather
+# than forcing `'it\'s'`.
+inline-quotes = single
+multiline-quotes = double
+docstring-quotes = double
+avoid-escape = True
+
+# The distribution is `async-gateway`; the importable package is
+# `async_gateway`. This setting takes the *module* name, so the hyphenated
+# spelling that was here named something no import can ever match: every
+# first-party import was classified third-party, and import-order checking
+# had been checking a fiction (H19).
+application_import_names = async_gateway, tests
+
+# A003 flags a class attribute that shadows a builtin. Four files are
+# excluded for that code alone, and in every one the attribute's name is
+# chosen by a third party rather than by this project -- renaming it does
+# not rename the call site inside the dependency, so the override stops
+# overriding and the behaviour it exists to enforce silently disappears.
+#
+#   async_gateway/utils/contained_io.py
+#     `ContainedPathIO.list` and `ContainedLocalFS.open` are the path-
+#     containment wrappers. Verified against the installed libraries, not
+#     assumed: `aioftp.client` calls `self.path_io.list(src)` and
+#     `self.path_io.open(..., mode=...)`, and `asyncssh.sftp` calls
+#     `self._srcfs.open(...)` / `self._dstfs.open(...)`. Rename either and
+#     the dependency dispatches to the *unwrapped* base-class method --
+#     that is the containment check being disabled, a security regression
+#     traded for a lint code.
+#
+#   async_gateway/utils/envelope.py
+#     `GatewayError.type` is a wire-stable envelope key (R8): consumers
+#     branch on `envelope['error']['type']`. It is a TypedDict field, so
+#     no code resolves the name as a builtin, and renaming it is a
+#     breaking change to the published response shape.
+#
+#   tests/fixtures/ftp.py, tests/fixtures/sftp.py
+#     The doubles for the two servers above. They have to present the same
+#     attribute names the real clients dispatch on, or they are not
+#     doubles of them.
+#
+# Scoped per file *and* per code rather than disabled globally, so a new
+# `list`/`open`/`type` class attribute anywhere else in the tree is still
+# a finding. Deliberately not `# noqa`: R27-AC7 requires every in-code
+# suppression to carry a rule code and a written justification, and five
+# comments each restating one shared reason is worse than the single
+# place that states it -- which is this block.
+per-file-ignores =
+    async_gateway/utils/contained_io.py:A003
+    async_gateway/utils/envelope.py:A003
+    tests/fixtures/ftp.py:A003
+    tests/fixtures/sftp.py:A003

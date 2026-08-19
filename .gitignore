@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+.DS_Store
+.idea/
+*.pyc
+env/
 # C extensions
 *.so
 
@@ -160,3 +164,7 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# claude-kit local working state (CONTINUITY.template.md and the rest of .claude/ stay tracked)
+.claude/CONTINUITY.md
+.claude/state/

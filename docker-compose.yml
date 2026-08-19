@@ -1,0 +1,189 @@
+# The integration stack: the library, and the four protocols it speaks,
+# talking to real servers.
+#
+# What this exists for. The unit suite is thorough -- 1475 tests at 100%
+# line and branch -- but it necessarily proves the library against
+# doubles. Four things it cannot show you, and this stack can:
+#
+#   1. that the FTPS session really is FTPS, refused by a server that
+#      will not accept plaintext, rather than a flag set on a mock;
+#   2. that SSH host-key verification really refuses an unknown key, and
+#      really succeeds once that key is pinned;
+#   3. that an upload puts the LOCAL file's bytes at the REMOTE path --
+#      AGW-33 reversed those operands and shipped for years, and the fix
+#      had never met a live server; and
+#   4. that a cross-origin redirect does not carry credentials, observed
+#      at the second server rather than asserted in-process.
+#
+# Usage:
+#     docker compose up --build --abort-on-container-exit integration
+#     docker compose down -v
+#
+# The `pki` service runs first and mints a throwaway CA plus one leaf per
+# TLS server, so the client verifies a real chain instead of having
+# verification switched off to make the test pass.
+
+name: async-gateway-integration
+
+services:
+
+  # Mints the CA and the server certificates into a shared volume, then
+  # exits. Everything with TLS waits for it to complete successfully.
+  pki:
+    build:
+      context: .
+      dockerfile: docker/pki/Dockerfile
+    volumes:
+      - pki:/pki
+    environment:
+      PKI_DIR: /pki
+
+  http-server:
+    build:
+      context: .
+      dockerfile: docker/http/Dockerfile
+    environment:
+      PORT: '8080'
+      TLS_PORT: '8443'
+      TLS_CERT: /pki/http-server.pem
+      TLS_KEY: /pki/http-server-key.pem
+      # Same CA, wrong host name -- see docker/http/server.py.
+      WRONG_TLS_PORT: '9443'
+      WRONG_TLS_CERT: /pki/wrong-host.pem
+      WRONG_TLS_KEY: /pki/wrong-host-key.pem
+    volumes:
+      - pki:/pki:ro
+    depends_on:
+      pki:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'python', '-c',
+             'import urllib.request,sys; sys.exit(0)
+              if urllib.request.urlopen("http://127.0.0.1:8080/health")
+              .status == 200 else sys.exit(1)']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # A SECOND HTTP origin, from the same image. The cross-origin redirect
+  # test needs a genuinely different origin to redirect *to* -- one that
+  # reports the headers it received, so "the Authorization header was
+  # dropped" is something observed at the far end rather than inferred.
+  http-other:
+    build:
+      context: .
+      dockerfile: docker/http/Dockerfile
+    environment:
+      PORT: '8080'
+    healthcheck:
+      test: ['CMD', 'python', '-c',
+             'import urllib.request,sys; sys.exit(0)
+              if urllib.request.urlopen("http://127.0.0.1:8080/health")
+              .status == 200 else sys.exit(1)']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  ftp-server:
+    build:
+      context: .
+      dockerfile: docker/ftp/Dockerfile
+    environment:
+      FTP_PORT: '990'
+      FTP_USER: gateway
+      FTP_PASSWORD: gateway-test-pw
+      TLS_CERT: /pki/ftp-server.pem
+      TLS_KEY: /pki/ftp-server-key.pem
+    volumes:
+      - pki:/pki:ro
+    depends_on:
+      pki:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'python', '-c',
+             'import socket,sys; s=socket.create_connection(("127.0.0.1",990),3);
+              s.close(); sys.exit(0)']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  sftp-server:
+    build:
+      context: .
+      dockerfile: docker/sftp/Dockerfile
+    volumes:
+      # The host key's public half, so the client can pin it. Writable
+      # here and read-only for the client.
+      - hostkeys:/hostkeys
+    healthcheck:
+      test: ['CMD', 'sh', '-c',
+             'test -f /hostkeys/known_hosts && netstat -ltn | grep -q ":22 "']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  soap-server:
+    build:
+      context: .
+      dockerfile: docker/soap/Dockerfile
+    environment:
+      PORT: '8080'
+    healthcheck:
+      test: ['CMD', 'python', '-c',
+             'import urllib.request,sys; sys.exit(0)
+              if urllib.request.urlopen("http://127.0.0.1:8080/health")
+              .status == 200 else sys.exit(1)']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # The client. Runs the integration suite and exits with its status, so
+  # `--abort-on-container-exit` makes the whole stack's exit code the
+  # suite's exit code.
+  integration:
+    build:
+      context: .
+      dockerfile: docker/integration/Dockerfile
+    volumes:
+      - pki:/pki:ro
+      - hostkeys:/hostkeys:ro
+      # A writable volume, so the local-filesystem tests land somewhere
+      # that is NOT the container's own overlayfs. File mode, ownership
+      # and link counting are exactly where macOS/APFS and Linux
+      # diverge, and a download into the image's writable layer would
+      # only ever exercise overlayfs. Mounted, the same assertions run
+      # against the volume driver the host actually provides.
+      - scratch:/scratch
+    environment:
+      SCRATCH_DIR: /scratch
+      HTTP_HOST: http-server
+      HTTP_PORT: '8080'
+      HTTPS_PORT: '8443'
+      OTHER_HOST: http-other
+      OTHER_PORT: '8080'
+      FTP_HOST: ftp-server
+      FTP_PORT: '990'
+      FTP_USER: gateway
+      FTP_PASSWORD: gateway-test-pw
+      SFTP_HOST: sftp-server
+      SFTP_PORT: '22'
+      SFTP_USER: gateway
+      SFTP_PASSWORD: gateway-test-pw
+      SOAP_HOST: soap-server
+      SOAP_PORT: '8080'
+    depends_on:
+      http-server:
+        condition: service_healthy
+      http-other:
+        condition: service_healthy
+      ftp-server:
+        condition: service_healthy
+      sftp-server:
+        condition: service_healthy
+      soap-server:
+        condition: service_healthy
+
+volumes:
+  pki:
+  hostkeys:
+  scratch:
