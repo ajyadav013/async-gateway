@@ -22,6 +22,16 @@ cannot launder a suppression, and one block can legitimately justify a
 run of identical suppressions -- which is the shape they actually take
 (a monkeypatch and its ``finally`` restore, two arms of one ``if``).
 
+**Only real comments are scanned.** The scan is over ``tokenize``'s
+``COMMENT`` tokens rather than over raw lines, because a raw-line regex
+cannot tell a suppression from *prose about* one. The docstrings that
+explain why an ignore was removed necessarily quote the ignore they
+removed, and a line-based scan reported all three of them as bare
+suppressions -- a false positive that failed every CI leg while the
+tree contained no such suppression at all. Scanning tokens also stops
+the mirror-image failure, which is the one that matters: a real
+suppression can no longer hide inside a string literal.
+
 Run with no arguments to scan the default roots; pass paths to narrow it.
 
 Exit status:
@@ -31,10 +41,12 @@ Exit status:
 
 from __future__ import annotations
 
+import io
 import re
 import sys
+import tokenize
 from pathlib import Path
-from typing import Iterator, List, Sequence, Tuple
+from typing import Dict, Iterator, Sequence, Tuple
 
 #: Where library, test and example code lives. `.claude` is deliberately
 #: absent for the same reason `.flake8` excludes it: it is vendored agent
@@ -64,33 +76,58 @@ JUSTIFIED = re.compile(r'--\s*\S')
 JUSTIFICATION_WINDOW = 12
 
 
+def comments_by_line(source: str) -> Dict[int, str]:
+    """Map each one-based line number to the comment it carries.
+
+    Tokenizing is what separates a suppression from *prose about* one.
+    A ``# type: ignore`` quoted inside a docstring is a ``STRING``
+    token, never a ``COMMENT``, so it does not appear here at all --
+    and a real suppression cannot hide inside a string literal either.
+
+    Args:
+        source: The file's full text.
+
+    Returns:
+        ``{line number: comment text}`` for every comment in the file.
+        A line carries at most one comment, so the mapping is total.
+
+    Raises:
+        tokenize.TokenError: If the source is not tokenizable, which is
+            a real failure and is deliberately not caught here.
+    """
+    readline = io.StringIO(source).readline
+    return {
+        token.start[0]: token.string
+        for token in tokenize.generate_tokens(readline)
+        if token.type == tokenize.COMMENT
+    }
+
+
 def justified_nearby(
-    lines: Sequence[str],
-    index: int,
+    comments: Dict[int, str],
+    number: int,
     code: str,
 ) -> bool:
     """Report whether a justifying comment for ``code`` sits above.
 
     Args:
-        lines: The file's lines, without terminators.
-        index: Zero-based index of the suppressed line.
+        comments: The file's comments, keyed by one-based line number.
+        number: One-based line number of the suppressed line.
         code: The suppression exactly as written -- ``noqa: E501`` or
             ``type: ignore[assignment]``. A candidate comment must
             contain this text, so a nearby comment about something else
             cannot satisfy the check.
 
     Returns:
-        True when some comment line within :data:`JUSTIFICATION_WINDOW`
-        above ``index`` names ``code`` and carries a ``--``
+        True when some comment within :data:`JUSTIFICATION_WINDOW`
+        lines above ``number`` names ``code`` and carries a ``--``
         justification.
     """
-    window: List[str] = []
-    cursor = index - 1
-    while cursor >= 0 and index - cursor <= JUSTIFICATION_WINDOW:
-        stripped = lines[cursor].lstrip()
-        if stripped.startswith('#'):
-            window.append(stripped)
-        cursor -= 1
+    window = [
+        comments[cursor]
+        for cursor in range(number - JUSTIFICATION_WINDOW, number)
+        if cursor >= 1 and cursor in comments
+    ]
     normalised = code.replace(' ', '')
     return any(
         normalised in line.replace(' ', '') and JUSTIFIED.search(line)
@@ -106,9 +143,9 @@ def check_file(path: Path) -> Iterator[Tuple[int, str]]:
     Yields:
         ``(line number, reason)`` for each finding, one-based.
     """
-    lines = path.read_text(encoding='utf-8').splitlines()
-    for number, line in enumerate(lines, start=1):
-        match = SUPPRESSION.search(line)
+    comments = comments_by_line(path.read_text(encoding='utf-8'))
+    for number in sorted(comments):
+        match = SUPPRESSION.search(comments[number])
         if match is None:
             continue
         kind, rest = match.group(1), match.group('rest')
@@ -122,7 +159,7 @@ def check_file(path: Path) -> Iterator[Tuple[int, str]]:
         code = f'{kind}{coded.group(0)}'
         if JUSTIFIED.search(rest):
             continue
-        if justified_nearby(lines, number - 1, code):
+        if justified_nearby(comments, number, code):
             continue
         yield number, (
             f'`{code}` carries no `-- <why>` justification, on the line '
