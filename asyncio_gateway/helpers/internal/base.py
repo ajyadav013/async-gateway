@@ -17,18 +17,18 @@ from collections.abc import Collection, Mapping
 from typing import Any, ClassVar, Optional, Tuple
 from urllib.parse import urlsplit
 
-from async_gateway.helpers.common.date_helper import monotonic_now
-from async_gateway.helpers.internal.breaker_registry import get_breaker
-from async_gateway.helpers.internal.circuit_breaker_helper import (
+from asyncio_gateway.helpers.common.date_helper import monotonic_now
+from asyncio_gateway.helpers.internal.breaker_registry import get_breaker
+from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
     CircuitBreakerHelper,
 )
-from async_gateway.utils.constants import (DEFAULT_PORTS, HTTP_TIMEOUT,
-                                           PORT_RANGE_HIGH, PORT_RANGE_LOW,
-                                           UNKNOWN_PORT)
-from async_gateway.utils.envelope import GatewayResponse
-from async_gateway.utils.exceptions import ConfigurationError
-from async_gateway.utils.http_file_config import resolve_verb
-from async_gateway.utils.redaction import redact_url
+from asyncio_gateway.utils.constants import (DEFAULT_PORTS, HTTP_TIMEOUT,
+                                             PORT_RANGE_HIGH, PORT_RANGE_LOW,
+                                             UNKNOWN_PORT)
+from asyncio_gateway.utils.envelope import GatewayResponse
+from asyncio_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.utils.http_file_config import resolve_verb
+from asyncio_gateway.utils.redaction import redact_url
 
 
 def validated_protocol_info(
@@ -130,7 +130,7 @@ def validated_port(port: Any) -> Optional[int]:
             integer in ``0..65535``. A port outside that range cannot
             reach any socket -- ``aioftp`` and ``asyncssh`` both raise
             an ``OverflowError`` from deep inside the transport for one
-            -- and :data:`~async_gateway.utils.constants.UNKNOWN_PORT`
+            -- and :data:`~asyncio_gateway.utils.constants.UNKNOWN_PORT`
             is ``-1``, so accepting a negative port would let a caller
             collide with the registry's own "no port known" sentinel.
     """
@@ -224,7 +224,7 @@ def destination_of(
     Returns:
         The family lower-cased, the host lower-cased, and the port. A
         scheme with no known default and no port in the URL reports
-        :data:`~async_gateway.utils.constants.UNKNOWN_PORT`, which is
+        :data:`~asyncio_gateway.utils.constants.UNKNOWN_PORT`, which is
         ``-1`` and deliberately not ``0``: ``0`` is a legal port number,
         so using it as "unknown" would collapse every unknown-scheme
         destination onto a single key and re-create M16 for exactly the

@@ -28,14 +28,14 @@ import aiohttp
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.utils.constants import HTTP_TIMEOUT
-from async_gateway.utils.envelope import GatewayResponse
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.utils.constants import HTTP_TIMEOUT
+from asyncio_gateway.utils.envelope import GatewayResponse
+from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     UnsupportedVerbError,
 )
-from async_gateway.utils.request_tracer import request_tracer
+from asyncio_gateway.utils.request_tracer import request_tracer
 
 from tests.fixtures.http_server import RecordingHTTPServer
 
@@ -468,7 +468,7 @@ async def test_a_session_the_library_created_is_closed_on_the_way_out(
             created.append(self)
 
     monkeypatch.setattr(
-        'async_gateway.logic.http_client.aiohttp.ClientSession',
+        'asyncio_gateway.logic.http_client.aiohttp.ClientSession',
         _RecordingSession)
 
     await _get_with(http_server)

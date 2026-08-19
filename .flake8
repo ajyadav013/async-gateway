@@ -13,7 +13,7 @@
 # `.claude` is the addition, and it is deliberate (OQ15): the directory
 # holds the agent harness -- rules, skills, hooks and their bundled Python
 # scripts -- which is development tooling checked in beside the library
-# rather than part of it. Nothing under it is imported by `async_gateway`,
+# rather than part of it. Nothing under it is imported by `asyncio_gateway`,
 # shipped in the sdist or the wheel, or executed by the test suite, and it
 # follows its own upstream conventions. `flake8 .` is the command CLAUDE.md
 # documents and CI runs, so without this the documented command reports on
@@ -48,12 +48,12 @@ multiline-quotes = double
 docstring-quotes = double
 avoid-escape = True
 
-# The distribution is `async-gateway`; the importable package is
-# `async_gateway`. This setting takes the *module* name, so the hyphenated
+# The distribution is `asyncio-gateway`; the importable package is
+# `asyncio_gateway`. This setting takes the *module* name, so the hyphenated
 # spelling that was here named something no import can ever match: every
 # first-party import was classified third-party, and import-order checking
 # had been checking a fiction (H19).
-application_import_names = async_gateway, tests
+application_import_names = asyncio_gateway, tests
 
 # A003 flags a class attribute that shadows a builtin. Four files are
 # excluded for that code alone, and in every one the attribute's name is
@@ -61,7 +61,7 @@ application_import_names = async_gateway, tests
 # not rename the call site inside the dependency, so the override stops
 # overriding and the behaviour it exists to enforce silently disappears.
 #
-#   async_gateway/utils/contained_io.py
+#   asyncio_gateway/utils/contained_io.py
 #     `ContainedPathIO.list` and `ContainedLocalFS.open` are the path-
 #     containment wrappers. Verified against the installed libraries, not
 #     assumed: `aioftp.client` calls `self.path_io.list(src)` and
@@ -71,7 +71,7 @@ application_import_names = async_gateway, tests
 #     that is the containment check being disabled, a security regression
 #     traded for a lint code.
 #
-#   async_gateway/utils/envelope.py
+#   asyncio_gateway/utils/envelope.py
 #     `GatewayError.type` is a wire-stable envelope key (R8): consumers
 #     branch on `envelope['error']['type']`. It is a TypedDict field, so
 #     no code resolves the name as a builtin, and renaming it is a
@@ -89,7 +89,7 @@ application_import_names = async_gateway, tests
 # comments each restating one shared reason is worse than the single
 # place that states it -- which is this block.
 per-file-ignores =
-    async_gateway/utils/contained_io.py:A003
-    async_gateway/utils/envelope.py:A003
+    asyncio_gateway/utils/contained_io.py:A003
+    asyncio_gateway/utils/envelope.py:A003
     tests/fixtures/ftp.py:A003
     tests/fixtures/sftp.py:A003

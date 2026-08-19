@@ -32,20 +32,20 @@ from failsafe import CircuitOpen, RetriesExhausted
 
 import pytest
 
-from async_gateway.helpers.internal.base import destination_of
-from async_gateway.helpers.internal.breaker_registry import (
+from asyncio_gateway.helpers.internal.base import destination_of
+from asyncio_gateway.helpers.internal.breaker_registry import (
     get_breaker, registry_size, reset)
-from async_gateway.helpers.internal.circuit_breaker_helper import (
+from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
     BACKOFF_NAMES, BreakerState, CircuitBreakerHelper,
     DEFAULT_ABORTABLE_EXCEPTIONS, RETRIABLE_FAILURES, get_retry_policy,
     validated_breaker_config)
-from async_gateway.utils.constants import (BREAKER_REGISTRY_MAX,
-                                           CIRCUIT_BREAKER_DELAY,
-                                           CIRCUIT_BREAKER_JITTER,
-                                           CIRCUIT_BREAKER_MAX_DELAY,
-                                           UNKNOWN_PORT)
-from async_gateway.utils.exceptions import (ConfigurationError,
-                                            ResponseTooLargeError)
+from asyncio_gateway.utils.constants import (BREAKER_REGISTRY_MAX,
+                                             CIRCUIT_BREAKER_DELAY,
+                                             CIRCUIT_BREAKER_JITTER,
+                                             CIRCUIT_BREAKER_MAX_DELAY,
+                                             UNKNOWN_PORT)
+from asyncio_gateway.utils.exceptions import (ConfigurationError,
+                                              ResponseTooLargeError)
 
 from tests.fixtures.clock import FakeClock, RecordingSleep
 

@@ -29,7 +29,7 @@ makes this facade's interface identical whether R7 later keeps, replaces
 or vendors what sits underneath.
 
 Callers never construct a breaker here. They look one up per destination
-through :mod:`async_gateway.helpers.internal.breaker_registry`, which is
+through :mod:`asyncio_gateway.helpers.internal.breaker_registry`, which is
 what lets failures accumulate across ``request()`` calls (H8) without one
 flaky host opening the circuit for every other (M16).
 """
@@ -50,17 +50,17 @@ import asyncssh
 from failsafe import (Backoff, CircuitOpen, Delay, RetriesExhausted,
                       RetryPolicy)
 
-from async_gateway.utils.constants import (CIRCUIT_BREAKER_BACKOFF,
-                                           CIRCUIT_BREAKER_DELAY,
-                                           CIRCUIT_BREAKER_JITTER,
-                                           CIRCUIT_BREAKER_MAX_DELAY,
-                                           CIRCUIT_BREAKER_RETRY,
-                                           CIRCUIT_BREAKER_TIMEOUT)
-from async_gateway.utils.exceptions import (AsyncGatewayError,
-                                            ConfigurationError,
-                                            LocalWriteError,
-                                            PathContainmentError,
-                                            ResponseTooLargeError)
+from asyncio_gateway.utils.constants import (CIRCUIT_BREAKER_BACKOFF,
+                                             CIRCUIT_BREAKER_DELAY,
+                                             CIRCUIT_BREAKER_JITTER,
+                                             CIRCUIT_BREAKER_MAX_DELAY,
+                                             CIRCUIT_BREAKER_RETRY,
+                                             CIRCUIT_BREAKER_TIMEOUT)
+from asyncio_gateway.utils.exceptions import (AsyncGatewayError,
+                                              ConfigurationError,
+                                              LocalWriteError,
+                                              PathContainmentError,
+                                              ResponseTooLargeError)
 
 #: A reading of the injected clock, in seconds. Monotonic by contract:
 #: the facade only ever subtracts one reading from another.
@@ -576,7 +576,7 @@ class CircuitBreakerHelper:
     """One destination's breaker: its state machine and its retry loop.
 
     Constructed once per destination by
-    :func:`async_gateway.helpers.internal.breaker_registry.get_breaker`
+    :func:`asyncio_gateway.helpers.internal.breaker_registry.get_breaker`
     and reused for the life of the process, which is what lets failures
     accumulate at all (H8). Never constructed per request.
 
@@ -803,7 +803,7 @@ class CircuitBreakerHelper:
                 recent failure when this loop has seen one.
             RetriesExhausted: When every allowed attempt failed. Chained
                 from the last failure, whose message
-                :func:`~async_gateway.utils.exceptions.unwrap_cause`
+                :func:`~asyncio_gateway.utils.exceptions.unwrap_cause`
                 recovers -- ``str(RetriesExhausted())`` is ``''``.
             BaseException: An abortable exception, and anything outside
                 :data:`RETRIABLE_FAILURES`, propagate as themselves. A

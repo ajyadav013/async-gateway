@@ -1,6 +1,6 @@
 """R20: the mechanical ban on blocking filesystem calls in ``async def``.
 
-Every ``.py`` file under ``async_gateway/`` is parsed and every
+Every ``.py`` file under ``asyncio_gateway/`` is parsed and every
 ``async def`` in it is searched for a synchronous filesystem call
 *written in one of the forms below*. A hit fails this test, so those
 forms cannot be reintroduced -- not in the four sites Step 12 converted,
@@ -120,8 +120,8 @@ from typing import NamedTuple
 
 import pytest
 
-from async_gateway.helpers.internal import request_helper
-from async_gateway.utils.http_file_config import delete_local_file_path
+from asyncio_gateway.helpers.internal import request_helper
+from asyncio_gateway.utils.http_file_config import delete_local_file_path
 
 #: Builtins that open a file synchronously when called bare.
 BANNED_BUILTINS = frozenset({'open'})
@@ -383,7 +383,7 @@ def test_no_blocking_filesystem_call_sits_inside_any_async_def() -> None:
     first. Pointed at a directory that does not exist, the assertion on
     ``offenders`` alone reported the package clean.
     """
-    package = Path(__file__).resolve().parents[1] / 'async_gateway'
+    package = Path(__file__).resolve().parents[1] / 'asyncio_gateway'
     scanned = sorted(package.rglob('*.py'))
 
     offenders = [

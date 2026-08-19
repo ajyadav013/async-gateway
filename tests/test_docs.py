@@ -29,9 +29,9 @@ check rather than five variations of one:
 1. **Every ``python`` block compiles.** A syntax error in an example fails the
    suite. Blocks that are illustrative rather than runnable are fenced
    ``text``, so this test never has to guess.
-2. **Every documented import resolves.** A ``from async_gateway... import ...``
-   line naming a module or a symbol that does not exist fails here rather than
-   in a reader's editor.
+2. **Every documented import resolves.** A ``from asyncio_gateway...
+   import ...`` line naming a module or a symbol that does not exist fails
+   here rather than in a reader's editor.
 3. **Every documented signature and call matches the real one.** A signature
    listing in the README is executed into a real function object and compared
    against ``inspect.signature`` parameter by parameter; a documented call is
@@ -63,7 +63,7 @@ Part B -- source-tree documentation standard (R30)
 
 R30: the documentation and annotation standard, enforced mechanically.
 
-Every ``.py`` file under ``async_gateway/`` is parsed and checked against
+Every ``.py`` file under ``asyncio_gateway/`` is parsed and checked against
 the project's documentation rule: a module docstring that says what the
 module does and why, a docstring on every public class and function that
 documents its arguments, its return value and what it raises, and a full
@@ -84,7 +84,7 @@ properties cannot be delegated:
   -- and was **inert there** for most of this release, because
   ``ignore_errors = true`` in the same section suppressed it along with
   everything else. That was measured rather than assumed: with both
-  settings on, ``mypy async_gateway`` reported ``Success: no issues
+  settings on, ``mypy asyncio_gateway`` reported ``Success: no issues
   found`` while seven functions were missing annotations. Story AGW-26
   removed ``ignore_errors``, so the flag now has something behind it.
   :func:`test_every_signature_is_fully_annotated` held the line while it
@@ -148,22 +148,22 @@ from typing import (  # noqa: F401 -- re-exported into example namespaces
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.helpers.internal.circuit_breaker_helper import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
     BREAKER_CONFIG_KEYS,
     RETRY_CONFIG_KEYS,
 )
-from async_gateway.logic.ftp_client import FTP_COMMANDS
-from async_gateway.logic.sftp_client import SFTP_MODES
-from async_gateway.utils.envelope import GatewayError, GatewayResponse
-from async_gateway.utils.http_file_config import (
+from asyncio_gateway.logic.ftp_client import FTP_COMMANDS
+from asyncio_gateway.logic.sftp_client import SFTP_MODES
+from asyncio_gateway.utils.envelope import GatewayError, GatewayResponse
+from asyncio_gateway.utils.http_file_config import (
     HTTP_VERBS,
     delete_local_file_path,
     download_file_from_s3,
     download_file_from_url,
 )
-from async_gateway.utils.redaction import PAYLOAD_REDACTION_DEPTH
-from async_gateway.utils.status_map import STATUS_BY_CODE
+from asyncio_gateway.utils.redaction import PAYLOAD_REDACTION_DEPTH
+from asyncio_gateway.utils.status_map import STATUS_BY_CODE
 
 from tests.fixtures.ftp import (
     TransferringFTPClient,
@@ -194,8 +194,8 @@ _FENCE = re.compile(r'^```(?P<language>[a-z]*)\n(?P<body>.*?)^```',
 
 #: A documented import of this package, however it is spelled.
 _IMPORT = re.compile(
-    r'^\s*(?:from\s+(?P<module>async_gateway[\w.]*)\s+import\s+'
-    r'(?P<names>\([^)]*\)|[^\n]+)|import\s+(?P<plain>async_gateway[\w.]*))',
+    r'^\s*(?:from\s+(?P<module>asyncio_gateway[\w.]*)\s+import\s+'
+    r'(?P<names>\([^)]*\)|[^\n]+)|import\s+(?P<plain>asyncio_gateway[\w.]*))',
     re.MULTILINE)
 
 #: One Markdown table row's cells.
@@ -371,7 +371,7 @@ def source_protocol_info_keys() -> set[str]:
             it looks for have changed and this test has stopped checking.
     """
     keys: set[str] = set()
-    for path in sorted((REPO_ROOT / 'async_gateway').rglob('*.py')):
+    for path in sorted((REPO_ROOT / 'asyncio_gateway').rglob('*.py')):
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
             keys.update(_info_keys_in(node))
     assert keys, 'no protocol_info key reads found; the AST shapes changed'
@@ -540,15 +540,15 @@ def test_every_documented_import_resolves() -> None:
                 assert hasattr(module, name), (
                     f'README imports {name!r} from '
                     f'{match.group("module")}, which does not export it')
-    assert found, 'no async_gateway import found in the README'
+    assert found, 'no asyncio_gateway import found in the README'
 
 
 def test_documented_module_paths_exist() -> None:
-    """Check every ``async_gateway`` module path named in prose is real."""
+    """Check every ``asyncio_gateway`` module path named in prose is real."""
     checked = 0
     for span in documented_code_spans():
         candidate = span.strip('` ').removesuffix('()')
-        if not candidate.startswith('async_gateway.') or ' ' in candidate:
+        if not candidate.startswith('asyncio_gateway.') or ' ' in candidate:
             continue
         checked += 1
         module, _, tail = candidate.rpartition('.')
@@ -558,7 +558,7 @@ def test_documented_module_paths_exist() -> None:
             imported = __import__(module, fromlist=['__name__'])
             assert hasattr(imported, tail), (
                 f'README names {candidate!r}, which does not exist')
-    assert checked, 'the README names no async_gateway module path'
+    assert checked, 'the README names no asyncio_gateway module path'
 
 
 # --------------------------------------------------------------------------
@@ -926,7 +926,7 @@ def test_retry_and_breaker_config_keys_are_documented_both_ways() -> None:
 
 def test_exception_hierarchy_names_every_class() -> None:
     """Check every exception the library defines appears in the README."""
-    from async_gateway.utils import exceptions
+    from asyncio_gateway.utils import exceptions
 
     documented = documented_code_spans() | set(README_TEXT.split())
     for name, value in vars(exceptions).items():
@@ -1185,7 +1185,7 @@ def test_the_readme_tells_predecessor_users_how_to_migrate() -> None:
     """
     section = prose_after('## Migrating from `asyncio-requests`')
     assert PREDECESSOR in section
-    assert 'asyncio_requests' in section and 'async_gateway' in section, (
+    assert 'asyncio_requests' in section and 'asyncio_gateway' in section, (
         'the README does not state the import-path change')
     assert '2.7.3' in section, (
         'the README does not name the version the predecessor is retired at')
@@ -1228,13 +1228,13 @@ def test_the_readme_links_the_changelog_advisory() -> None:
 
 # ==========================================================================
 # Part B (R30) -- the source-tree documentation and annotation
-# standard. Everything below polices ``async_gateway/`` itself and is
+# standard. Everything below polices ``asyncio_gateway/`` itself and is
 # independent of the README checks above.
 # ==========================================================================
 
 
 #: The package this module polices. Everything under it, recursively.
-PACKAGE_ROOT = Path(__file__).resolve().parents[1] / 'async_gateway'
+PACKAGE_ROOT = Path(__file__).resolve().parents[1] / 'asyncio_gateway'
 
 #: Minimum length of a module docstring, in characters, after stripping.
 #: R30's number. See the module docstring for why a floor on effort is

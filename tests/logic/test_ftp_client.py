@@ -34,14 +34,14 @@ from failsafe import FailsafeError, RetriesExhausted
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.helpers.internal.filters_helper import get_ssl_config
-from async_gateway.logic import ftp_client
-from async_gateway.logic.ftp_client import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.helpers.internal.filters_helper import get_ssl_config
+from asyncio_gateway.logic import ftp_client
+from asyncio_gateway.logic.ftp_client import (
     FTPRequest, _being_cancelled, reply_status, tls_context_for,
     transport_error_for)
-from async_gateway.utils.envelope import GatewayResponse, new_envelope
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.envelope import GatewayResponse, new_envelope
+from asyncio_gateway.utils.exceptions import (
     ConfigurationError, FtpStatusError, TlsError, TransportError)
 
 from tests.fixtures.ftp import (
@@ -205,7 +205,7 @@ async def test_r15_ac2_a_broken_system_ca_store_becomes_a_tls_envelope(
 
     install_ftp_double(monkeypatch)
     monkeypatch.setattr(
-        'async_gateway.helpers.internal.filters_helper.'
+        'asyncio_gateway.helpers.internal.filters_helper.'
         'ssl.create_default_context',
         unreadable_trust_store)
 
@@ -373,7 +373,7 @@ async def test_tls_context_for_keeps_the_callers_own_certificate_context(
     certificate branch off the deprecated ``ssl_context=`` key that this
     test used to read, so pinning the new one is the point rather than
     incidental. Accepting either would prove nothing:
-    :data:`~async_gateway.logic.ftp_client.TLS_CONFIG_KEYS` still reads
+    :data:`~asyncio_gateway.logic.ftp_client.TLS_CONFIG_KEYS` still reads
     both, so a test that tolerated the old key would keep passing if the
     migration were reverted -- which is exactly the regression it is here
     to catch.
@@ -457,7 +457,7 @@ async def test_agw37_the_default_context_is_built_off_the_event_loop(
         return real_resolver(ssl_config)
 
     monkeypatch.setattr(
-        'async_gateway.logic.ftp_client.tls_context_for', record_thread)
+        'asyncio_gateway.logic.ftp_client.tls_context_for', record_thread)
     client, _ = ftp_request()
 
     context = await client._tls_value()
@@ -603,7 +603,7 @@ async def test_r15_ac5_an_explicit_false_is_honoured_and_warns(
     ``warning`` naming the risk -- an operator reading the log is the
     only person who can notice it.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
     double = install_ftp_double(monkeypatch)
 
     result = await ftp_call(verify_ssl=False)
@@ -613,7 +613,7 @@ async def test_r15_ac5_an_explicit_false_is_honoured_and_warns(
 
     warnings = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
         and record.levelno == logging.WARNING
     ]
     assert len(warnings) == 1
@@ -974,7 +974,7 @@ def test_r28_a_failure_of_no_family_is_re_raised_by_the_classifier() -> None:
     A direct call, because reaching this arm through ``handle_request``
     now requires a failure the dispatch clause catches and the
     classifier does not name -- and the two are derived from one table
-    (:data:`~async_gateway.logic.ftp_client.TRANSPORT_FAULTS`), which is
+    (:data:`~asyncio_gateway.logic.ftp_client.TRANSPORT_FAULTS`), which is
     the property that makes the pair impossible to write by accident.
     Before NEW-R10-1 this arm was reached incidentally, by a
     ``PathContainmentError`` that ``aioftp`` had wrapped; that failure

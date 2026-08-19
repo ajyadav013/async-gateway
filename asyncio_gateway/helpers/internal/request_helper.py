@@ -53,16 +53,16 @@ import aiofiles
 
 import aiohttp
 
-from async_gateway.helpers.internal import (
+from asyncio_gateway.helpers.internal import (
     MULTIPART_MEDIA_PREFIX,
     filter_for_media_type,
     media_type_of,
 )
-from async_gateway.helpers.internal.circuit_breaker_helper import (
+from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
     CircuitBreakerHelper,
 )
-from async_gateway.helpers.internal.filters_helper import get_ssl_config
-from async_gateway.utils.constants import (
+from asyncio_gateway.helpers.internal.filters_helper import get_ssl_config
+from asyncio_gateway.utils.constants import (
     CHUNK_SIZE_CONSTANT,
     CROSS_ORIGIN_SAFE_HEADERS,
     MAX_MULTIPART_DEPTH,
@@ -71,11 +71,11 @@ from async_gateway.utils.constants import (
     REDIRECT_STATUSES,
     SEE_OTHER_STATUS,
 )
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     TransportError,
 )
-from async_gateway.utils.http_file_config import (
+from asyncio_gateway.utils.http_file_config import (
     HTTP_VERBS,
     guard_declared_length,
     iter_capped,
@@ -83,12 +83,12 @@ from async_gateway.utils.http_file_config import (
     response_too_deep,
     response_too_large,
 )
-from async_gateway.utils.paths import (
+from asyncio_gateway.utils.paths import (
     PathLike,
     resolve_caller_path,
     safe_writer,
 )
-from async_gateway.utils.redaction import redact_url
+from asyncio_gateway.utils.redaction import redact_url
 
 #: Where a download lands when the caller names no path. The README
 #: documents ``download_filepath`` as part of an *optional* config block, so
@@ -148,7 +148,7 @@ RedirectEvent = List[Tuple[Dict[str, Any], Optional[float]]]
 # Import is where synchronous I/O is legitimate, on the expectation that
 # the consuming process imports this package while starting up rather than
 # from inside a coroutine -- an expectation about the consumer, not a
-# guarantee this module can make: a lazy `import async_gateway` inside a
+# guarantee this module can make: a lazy `import asyncio_gateway` inside a
 # running coroutine pays this read on the loop, once. Afterwards
 # `guess_type` is an in-memory dict lookup either way.
 mimetypes.init()
@@ -209,7 +209,7 @@ async def file_upload(
             ``aiofiles.open``; ``None`` is accepted by the signature but
             reaches ``open`` and raises, so callers pass a real path.
         file_upload_chunk_size: Bytes per read, defaulting to
-            :data:`~async_gateway.utils.constants.CHUNK_SIZE_CONSTANT`.
+            :data:`~asyncio_gateway.utils.constants.CHUNK_SIZE_CONSTANT`.
 
     Yields:
         Successive chunks of the file's bytes, ending when the file is
@@ -251,7 +251,7 @@ async def handle_multipart_response(
     the whole event loop (R20).
 
     It is opened through
-    :func:`~async_gateway.utils.paths.safe_writer` (R22). This is a
+    :func:`~asyncio_gateway.utils.paths.safe_writer` (R22). This is a
     caller-supplied path reached from a *response*, and the caller does
     not choose when a multipart body arrives -- so the same guarantees
     the streamed download gets apply here: the path is canonicalised
@@ -273,7 +273,7 @@ async def handle_multipart_response(
     :func:`_drain_multipart` owns that descent and records why.
 
     How *far* down it descends is bounded by
-    :data:`~async_gateway.utils.constants.MAX_MULTIPART_DEPTH`, and that
+    :data:`~asyncio_gateway.utils.constants.MAX_MULTIPART_DEPTH`, and that
     bound is independent of the byte cap because the two resources are:
     2000 levels of empty nesting is 221 KB, far under any realistic byte
     ceiling, and it exhausted the interpreter's stack (NEW-H2).
@@ -295,7 +295,7 @@ async def handle_multipart_response(
         ResponseTooLargeError: Once the parts read exceed
             ``max_response_bytes``. The remainder of the body is not read.
         ResponseTooDeepError: Once the parts nest past
-            :data:`~async_gateway.utils.constants.MAX_MULTIPART_DEPTH`.
+            :data:`~asyncio_gateway.utils.constants.MAX_MULTIPART_DEPTH`.
             The remainder of the body is not read either.
         PathContainmentError: If ``download_filepath`` is a symbolic
             link, or names a directory rather than a file.
@@ -537,7 +537,7 @@ def cross_origin_headers(
     """Return only the headers that are safe to hand a different origin.
 
     An **allowlist**: a header survives by being in
-    :data:`~async_gateway.utils.constants.CROSS_ORIGIN_SAFE_HEADERS` or
+    :data:`~asyncio_gateway.utils.constants.CROSS_ORIGIN_SAFE_HEADERS` or
     in the caller's ``also_forward``, and everything else is dropped.
     Applied to a hop that crosses an origin boundary, which is what
     ``aiohttp`` did for itself while it owned the redirect loop.
@@ -559,7 +559,7 @@ def cross_origin_headers(
             safe to forward, from
             ``protocol_info['cross_origin_headers']``. Validated at the
             boundary to exclude anything in
-            :data:`~async_gateway.utils.constants.CREDENTIAL_HEADERS`.
+            :data:`~asyncio_gateway.utils.constants.CREDENTIAL_HEADERS`.
 
     Returns:
         A new mapping holding only the allowed headers, or None when
@@ -829,7 +829,7 @@ async def read_response(
                 f'{redact_url(url, extra_params=redact_params)} is '
                 f'{media_type_of(headers)!r}, which this protocol does '
                 f'not support: SOAP with attachments (MTOM, '
-                f'multipart/related) is out of scope for async-gateway. '
+                f'multipart/related) is out of scope for asyncio-gateway. '
                 f'The body is refused rather than mis-parsed, and no '
                 f'part of it is written to disk')
         result['text'] = await handle_multipart_response(

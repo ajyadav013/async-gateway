@@ -28,7 +28,7 @@ takes a ``path_io_factory``, and ``asyncssh``'s ``_begin_copy`` takes a
 destination filesystem object satisfying a small structural protocol.
 Each wrapper delegates to the library's own implementation and adds one
 thing -- every path is routed through
-:func:`~async_gateway.utils.paths.under` before it is touched -- so the
+:func:`~asyncio_gateway.utils.paths.under` before it is touched -- so the
 transfer semantics are the library's and only the containment is ours.
 
 Every write additionally goes through the same guarded open the HTTP
@@ -59,14 +59,14 @@ import aioftp
 import asyncssh
 from asyncssh.sftp import LocalFile, local_fs
 
-from async_gateway.utils.exceptions import (
+from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     ConfigurationError,
     LocalWriteError,
     PathContainmentError,
 )
-from async_gateway.utils.http_file_config import response_too_large
-from async_gateway.utils.paths import (
+from asyncio_gateway.utils.http_file_config import response_too_large
+from asyncio_gateway.utils.paths import (
     BytesOrPathLike,
     PathLike,
     classify_refusal,
@@ -148,7 +148,7 @@ async def _unlink(path: Path) -> None:
     """Remove ``path``, succeeding when it is already gone.
 
     The transfer wrappers' equivalent of
-    :func:`~async_gateway.utils.paths.safe_unlink`, in a thread because
+    :func:`~asyncio_gateway.utils.paths.safe_unlink`, in a thread because
     R20 bans a blocking filesystem call on the event loop and these
     wrappers -- unlike ``safe_writer`` -- are not already inside one.
 
@@ -287,7 +287,7 @@ class _AsGivenLister(aioftp.AsyncListerMixin[Path]):
 def classify_mkdir_refusal(path: Path, err: OSError) -> AsyncGatewayError:
     """Return the typed error a refused ``mkdir`` should raise.
 
-    :func:`~async_gateway.utils.paths.classify_refusal` with the one arm
+    :func:`~asyncio_gateway.utils.paths.classify_refusal` with the one arm
     that cannot apply to a directory replaced. That function is written
     for the *open* of a file, so its ``EEXIST`` answer is
     ``ConfigurationError``: "already exists and overwrite is False; pass
@@ -299,7 +299,7 @@ def classify_mkdir_refusal(path: Path, err: OSError) -> AsyncGatewayError:
     arm of ``classify_refusal`` already refuses to make.
 
     So a ``mkdir`` refused because something is already in the way is a
-    :class:`~async_gateway.utils.exceptions.LocalWriteError` -- code
+    :class:`~asyncio_gateway.utils.exceptions.LocalWriteError` -- code
     ``PATH``, which is what **every other** ``mkdir`` refusal on both
     protocols already reports: a missing ancestor
     (``LocalWriteError``), and an escaping path
@@ -387,7 +387,7 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
     seam ``aioftp`` offers between its recursion and the disk. Every
     path the client hands down -- the ones it composed out of the
     server's entry names included -- is routed through
-    :func:`~async_gateway.utils.paths.under` first, so a name that
+    :func:`~asyncio_gateway.utils.paths.under` first, so a name that
     escapes the base is refused before any filesystem call is made with
     it.
 
@@ -675,7 +675,7 @@ class ContainedPathIO(aioftp.pathio.AsyncPathIO):
 
         The one override that does more than contain. A download's open
         is the write M18 is about, so it goes through
-        :func:`~async_gateway.utils.paths.guarded_opener` -- refusing a
+        :func:`~asyncio_gateway.utils.paths.guarded_opener` -- refusing a
         symlink at the target and, by default, refusing to overwrite --
         at mode 0600 rather than at whatever ``umask`` allows. An
         upload's open is a *read* of the caller's own file and is left
@@ -991,7 +991,7 @@ class ContainedLocalFS:
     Handed to ``SFTPClient._begin_copy`` in place of the module-level
     ``local_fs`` for a download. Every method delegates to that real
     object after routing its path through
-    :func:`~async_gateway.utils.paths.under`, so the transfer behaviour
+    :func:`~asyncio_gateway.utils.paths.under`, so the transfer behaviour
     is asyncssh's and only the containment is this library's.
 
     The surface is the structural protocol ``_begin_copy`` and ``_copy``
@@ -1129,7 +1129,7 @@ class ContainedLocalFS:
 
         **The ownership and permission bits are dropped.** Every local
         file this library creates is opened at
-        :data:`~async_gateway.utils.paths.FILE_MODE` -- 0600, owner-only
+        :data:`~asyncio_gateway.utils.paths.FILE_MODE` -- 0600, owner-only
         -- and that is a security property of this release rather than
         an accident of ``umask`` (M18). ``asyncssh``'s ``_setstat``
         ends with an ``os.chmod`` to whatever ``attrs.permissions``
@@ -1515,7 +1515,7 @@ def local_base(path: PathLike) -> Path:
 
     **The transfer must be handed this same value as its local
     operand**, not the caller's original spelling, and that is AGW-N3.
-    :func:`~async_gateway.utils.paths.under` splits a composed path into
+    :func:`~asyncio_gateway.utils.paths.under` splits a composed path into
     a trusted prefix and an untrusted tail by *textual*
     ``relative_to`` -- so the prefix it is given has to be the one the
     client actually composed against. Handed an absolute base while the
@@ -1536,7 +1536,7 @@ def local_base(path: PathLike) -> Path:
 
     Returns:
         The absolute path, uncanonicalised. Canonicalisation happens
-        inside :func:`~async_gateway.utils.paths.resolve_within`, which
+        inside :func:`~asyncio_gateway.utils.paths.resolve_within`, which
         is where the base and the candidate are compared as locations.
     """
     return Path(path).absolute()
@@ -1548,7 +1548,7 @@ def local_operand(path: PathLike) -> str:
     The companion of :func:`local_base`, and deliberately the *same*
     computation: the base a write is judged against and the operand the
     client composes onto must be one value, or the textual prefix split
-    in :func:`~async_gateway.utils.paths.under` compares two spellings
+    in :func:`~asyncio_gateway.utils.paths.under` compares two spellings
     of one location and refuses everything (AGW-N3).
 
     A relative path is therefore resolved against the process working

@@ -52,7 +52,7 @@ import aiohttp
 
 import orjson
 
-from async_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.utils.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +213,7 @@ def build_client_ssl_context(
     except _PassphraseProtectedKey as err:
         raise ConfigurationError(
             f'client key {key_path!r} is passphrase-protected, which '
-            'async-gateway does not support: supply a decrypted PEM key'
+            'asyncio-gateway does not support: supply a decrypted PEM key'
         ) from err
     except OSError as err:
         raise ConfigurationError(

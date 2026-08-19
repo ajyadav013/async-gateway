@@ -34,9 +34,9 @@ import aiohttp
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.utils.envelope import GatewayResponse
-from async_gateway.utils.request_tracer import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.utils.envelope import GatewayResponse
+from asyncio_gateway.utils.request_tracer import (
     REQUEST_START_KEY,
     ResultsCollector,
     begin_trace_scope,

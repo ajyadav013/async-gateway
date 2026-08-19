@@ -28,18 +28,43 @@ packaging metadata.
 
 So this release is **a rename with a discontinued predecessor**, not a first
 release of new code. `asyncio-requests` is retired at `2.7.3`; development
-continues here as `async-gateway`.
+continues here as `asyncio-gateway`.
 
 The version reset is safe, but not for the reason a first release would be
 safe. It is safe because **the new distribution name has no history**:
-`async-gateway` has never been uploaded to PyPI, so no resolver can be
+`asyncio-gateway` has never been uploaded to PyPI, so no resolver can be
 confused, no pin can be invalidated, and no `>=2.0` constraint can exist —
 nobody can hold a requirement on a name that has never existed. Publishing
-`async-gateway 1.0.0` cannot move any installed package backwards, because no
+`asyncio-gateway 1.0.0` cannot move any installed package backwards, because no
 installed package answers to that name.
 
 What is *not* true is that this code has no users. It has them, on the old
 name, and they are the subject of the next two notes.
+
+### Why the name is `asyncio-gateway` and not `async-gateway`
+
+The name intended throughout this rewrite was `async-gateway`, and it is the
+name most of this repository's planning documents argue for. **PyPI rejected
+it** — "This project name is too similar to an existing project" — and the
+reason is worth recording, because the check that was run to clear the name
+could never have caught it.
+
+PyPI does not compare the *spelling* you type; it compares the
+[PEP 503](https://peps.python.org/pep-0503/) **normalised** form,
+`re.sub(r'[-_.]+', '-', name).lower()`. Under that rule `async-gateway`,
+`async_gateway` and `asyncgateway` are all **one name**, and
+[`asyncgateway`](https://pypi.org/project/asyncgateway/) — an unrelated
+"Itential Gateway Async Client", `0.1.0`, uploaded 2026-03-09 — already
+holds it. The `GET https://pypi.org/pypi/async-gateway/json` → 404 recorded
+during planning was true and useless: a 404 on one spelling says nothing
+about the normalised name it belongs to. (`aio-gateway` is blocked the same
+way, by an existing `aiogateway`.)
+
+`asyncio-gateway` was verified free in **both** forms before it was adopted:
+`pypi.org/pypi/asyncio-gateway/json` and `pypi.org/pypi/asynciogateway/json`
+each returned 404. The lesson is now mechanical rather than remembered —
+`tests/test_packaging.py` pins the distribution's normalised form, so the
+name that must be checked against PyPI is the one the test states.
 
 ### For existing `asyncio-requests` users
 
@@ -50,9 +75,9 @@ package's import path and behaviour underneath a working program.
 
 To migrate:
 
-1. Replace the dependency: drop `asyncio-requests`, add `async-gateway`.
-2. Change the import path: `asyncio_requests` becomes `async_gateway`. The
-   entry point keeps its name — `async_gateway.async_gateway.request()`.
+1. Replace the dependency: drop `asyncio-requests`, add `asyncio-gateway`.
+2. Change the import path: `asyncio_requests` becomes `asyncio_gateway`. The
+   entry point keeps its name — `asyncio_gateway.asyncio_gateway.request()`.
 3. Work through the breaking changes listed below. They are real, and against
    `2.7.3` they are the changes you will actually feel: the single response
    envelope, the removal of `api_response`, `tat` becoming `latency`, the FTP
@@ -92,7 +117,7 @@ in particular hold those packages at 2020–2021 releases, so an install
 inherits whatever vulnerabilities have been reported against them since. This
 release ships current, patched versions.
 
-**Remedy:** migrate to `async-gateway 1.0.0` as described above. If you cannot
+**Remedy:** migrate to `asyncio-gateway 1.0.0` as described above. If you cannot
 migrate yet, treat SFTP through `asyncio-requests` as unauthenticated at the
 host level and do not use it over an untrusted network; the FTP and SOAP paths
 are non-functional and nothing depends on them.
@@ -133,7 +158,7 @@ discovering it at runtime.
 - **Runnable examples** under `examples/`, imported and executed by the test
   suite so they cannot rot. They ship in neither the wheel nor the sdist.
 - **This changelog**, plus a CI step that fails a pull request touching
-  `async_gateway/` without touching `CHANGELOG.md`.
+  `asyncio_gateway/` without touching `CHANGELOG.md`.
 - **A lint gate that is on and at zero.** `flake8 .` exits 0 with no output
   from a fresh `pip install -e '.[dev]'`. Two configuration defects were
   what previously made the command meaningless rather than merely noisy:
@@ -147,7 +172,7 @@ discovering it at runtime.
   in check mode over the formatting codes alone, since this project
   configures no autoformatter and `flake8` is the formatting judge.
 - **A type gate that reports.** `ignore_errors = true` is gone from
-  `pyproject.toml` and `mypy async_gateway` exits 0 on the 24 real errors it
+  `pyproject.toml` and `mypy asyncio_gateway` exits 0 on the 24 real errors it
   had been turning into `Success: no issues found` — including a `"None" not
   callable` on the HTTP filter-method dispatch, four `Optional` attributes
   annotated as though they could not be None, and an envelope `json` type too
@@ -390,7 +415,7 @@ Given `MAJOR.MINOR.PATCH`, this project increments:
 - **PATCH** for a backwards-compatible fix.
 
 Two things are explicitly **not** part of the public API and may change in any
-release: anything under `async_gateway.helpers.internal`, and the exact wording
+release: anything under `asyncio_gateway.helpers.internal`, and the exact wording
 of `error['message']`. Branch on `error['code']`, which is stable, and never on
 message text.
 

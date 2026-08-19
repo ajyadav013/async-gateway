@@ -17,7 +17,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Dict
 
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 DEFAULT_HOST = '127.0.0.1'
 

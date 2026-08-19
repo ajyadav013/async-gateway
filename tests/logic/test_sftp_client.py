@@ -52,11 +52,11 @@ import asyncssh
 
 import pytest
 
-from async_gateway.async_gateway import request
-from async_gateway.logic.sftp_client import (
+from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.logic.sftp_client import (
     SFTPRequest, transport_error_for)
-from async_gateway.utils.envelope import GatewayResponse, new_envelope
-from async_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.utils.envelope import GatewayResponse, new_envelope
+from asyncio_gateway.utils.exceptions import ConfigurationError
 
 from tests.fixtures.sftp import (
     ACCEPTED_KEY_ALGORITHMS,
@@ -91,9 +91,9 @@ RETRYING_BREAKER: dict[Text, Any] = {
     'retry_config': {'name': 'delay', 'allowed_retries': 2, 'delay': 0},
 }
 
-SFTP_LOGGER = 'async_gateway.logic.sftp_client'
+SFTP_LOGGER = 'asyncio_gateway.logic.sftp_client'
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[2] / 'async_gateway'
+PACKAGE_ROOT = Path(__file__).resolve().parents[2] / 'asyncio_gateway'
 
 
 def package_sources() -> Iterator[tuple[str, str]]:
@@ -161,7 +161,7 @@ def sftp_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
 
     Returns:
         Every captured ``WARNING`` record from
-        ``async_gateway.logic.sftp_client``, so the entry point's own
+        ``asyncio_gateway.logic.sftp_client``, so the entry point's own
         failure log cannot be mistaken for the bypass warning.
     """
     return [
@@ -384,7 +384,7 @@ async def test_r16_ac4_the_bypass_disables_verification_and_warns(
     warning is the only artefact that reaches an operator, so it is
     asserted to actually name the risk rather than merely to exist.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
     double = SSHTransportDouble()
     double.install(monkeypatch)
 
@@ -408,7 +408,7 @@ async def test_r16_ac4_the_bypass_warns_on_every_single_use(
     The count is what pins that, and a one-shot guard would pass a test
     that only asserted the warning exists.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
     double = SSHTransportDouble()
     double.install(monkeypatch)
 
@@ -470,7 +470,7 @@ async def test_r16_ac4_nothing_but_the_named_keyword_enables_the_bypass(
     """
     double = SSHTransportDouble(host_key=SERVER_HOST_KEY)
     double.install(monkeypatch)
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     await sftp_call(**info)
 
@@ -1263,7 +1263,7 @@ def test_r28_a_failure_of_no_family_is_re_raised_by_the_classifier() -> None:
     Called directly, because reaching the arm through ``handle_request``
     now requires a failure the dispatch clause catches and the
     classifier does not name -- and both derive from
-    :data:`~async_gateway.logic.sftp_client.TRANSPORT_FAULTS`, so the
+    :data:`~asyncio_gateway.logic.sftp_client.TRANSPORT_FAULTS`, so the
     pair cannot drift apart. Before NEW-R10-1 the arm was reached only
     incidentally, by a ``PathContainmentError`` on its way out; that one
     now aborts the retry loop and propagates as itself.

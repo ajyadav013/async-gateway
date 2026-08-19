@@ -52,15 +52,15 @@ import orjson
 
 import pytest
 
-from async_gateway import async_gateway as entrypoint
-from async_gateway.helpers.internal import (
+from asyncio_gateway import asyncio_gateway as entrypoint
+from asyncio_gateway.helpers.internal import (
     RequestFilter,
     filter_for_media_type,
     is_json_media_type,
     media_type_of,
     normalise_media_type,
 )
-from async_gateway.helpers.internal.filters_helper import (
+from asyncio_gateway.helpers.internal.filters_helper import (
     application_json_filters,
     build_client_ssl_context,
     build_query_params,
@@ -71,11 +71,11 @@ from async_gateway.helpers.internal.filters_helper import (
     normalised_certificate,
     raw_body_filters,
 )
-from async_gateway.logic.http_client import (
+from asyncio_gateway.logic.http_client import (
     HttpRequest,
     default_json_serialize,
 )
-from async_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.utils.exceptions import ConfigurationError
 
 from tests.fixtures.http_server import RecordingHTTPServer
 from tests.fixtures.tls import (
@@ -970,7 +970,7 @@ async def test_a_get_with_a_file_upload_config_escapes_the_entry_point(
     upload = tmp_path / 'payload.bin'
     upload.write_bytes(b'data')
     http_server.respond('/upload', body=b'{}')
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     with pytest.raises(ConfigurationError) as raised:
         await entrypoint.request(
@@ -987,7 +987,7 @@ async def test_a_get_with_a_file_upload_config_escapes_the_entry_point(
     assert not http_server.requests
     assert [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ] == []
 
 
@@ -1217,7 +1217,7 @@ def test_r23_ac2_a_weakened_context_is_refused_before_it_is_returned(
         return context
 
     monkeypatch.setattr(
-        'async_gateway.helpers.internal.filters_helper.'
+        'asyncio_gateway.helpers.internal.filters_helper.'
         'ssl.create_default_context',
         unverifying_context)
 
@@ -1240,9 +1240,9 @@ GUARD_PROBE = """
 import ssl
 import sys
 
-from async_gateway.helpers.internal.filters_helper import (
+from asyncio_gateway.helpers.internal.filters_helper import (
     build_client_ssl_context)
-from async_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.utils.exceptions import ConfigurationError
 
 asserts_live = False
 try:
@@ -1423,13 +1423,13 @@ async def test_r23_ac4_an_absent_flag_verifies(
     to speak *plaintext*. A test that only covered ``True`` and ``False``
     would have waved that through.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     assert await get_ssl_config() == {'ssl': True}
     assert await get_ssl_config(None, None) == {'ssl': True}
     assert [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
     ] == []
 
 
@@ -1450,13 +1450,13 @@ async def test_r23_ac4_verify_ssl_false_disables_and_warns(
     open to an intercepting peer, so it is logged at ``warning``: an
     operator reading the log is the only person who can notice it.
     """
-    caplog.set_level(logging.DEBUG, logger='async_gateway')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
     assert await get_ssl_config(None, False) == {'ssl': False}
 
     warnings = [
         record for record in caplog.records
-        if record.name.startswith('async_gateway')
+        if record.name.startswith('asyncio_gateway')
         and record.levelno == logging.WARNING
     ]
     assert len(warnings) == 1
@@ -1921,7 +1921,7 @@ async def test_agw36_the_certificate_is_loaded_off_the_event_loop(
         return real_build(certificate_path, key_path)
 
     monkeypatch.setattr(
-        'async_gateway.helpers.internal.filters_helper.'
+        'asyncio_gateway.helpers.internal.filters_helper.'
         'build_client_ssl_context',
         record_thread)
 
@@ -2012,7 +2012,7 @@ async def test_agw36_the_system_ca_failure_is_not_reclassified(
         raise OSError(2, 'No such file or directory')
 
     monkeypatch.setattr(
-        'async_gateway.helpers.internal.filters_helper.'
+        'asyncio_gateway.helpers.internal.filters_helper.'
         'ssl.create_default_context',
         broken_trust_store)
 
@@ -2034,7 +2034,7 @@ def test_the_server_purpose_appears_in_no_executable_code() -> None:
     executable statement in the package may name it. Parsing rather than
     grepping is what distinguishes the two.
     """
-    package = Path(__file__).resolve().parents[2] / 'async_gateway'
+    package = Path(__file__).resolve().parents[2] / 'asyncio_gateway'
     scanned = sorted(package.rglob('*.py'))
     offenders = [
         f'{path.relative_to(package).as_posix()}:{node.lineno}'
@@ -2060,7 +2060,7 @@ def test_no_expression_in_the_package_is_or_ed_with_a_literal_true() -> None:
     bug wherever it is written and never a legitimate construct. The AST
     sees only executable code, so the prose survives.
     """
-    package = Path(__file__).resolve().parents[2] / 'async_gateway'
+    package = Path(__file__).resolve().parents[2] / 'asyncio_gateway'
     scanned = sorted(package.rglob('*.py'))
     offenders = [
         f'{path.relative_to(package).as_posix()}:{node.lineno}'

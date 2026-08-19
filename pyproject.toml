@@ -1,4 +1,4 @@
-# Declarative build + project metadata for async-gateway (PEP 517 / PEP 621).
+# Declarative build + project metadata for asyncio-gateway (PEP 517 / PEP 621).
 #
 # Replaces the executable `setup.py` and the `setup.cfg` tool sections. Nothing
 # here is computed at build time: the previous build read `requirements.txt`
@@ -14,19 +14,23 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "async-gateway"
-# The single source of truth for the version (R5-AC1). `async_gateway.
+name = "asyncio-gateway"
+# The single source of truth for the version (R5-AC1). `asyncio_gateway.
 # __version__` reads it back off the installed distribution rather than
 # restating it, so a release edits exactly one line and the two cannot
 # disagree. The reset *down* from the fork-inherited 2.x version is a
 # one-way door, safe only because nothing has ever been published under
-# this name: `GET https://pypi.org/pypi/async-gateway/json` returned 404 on
-# 2026-08-17 (OQ4; the check is recorded in the AGW-28 work log). The old
+# this name. Checked on 2026-08-19 in BOTH PEP 503 spellings, which is the
+# check that matters -- PyPI compares normalised names, and the earlier
+# `async-gateway` 404 was worthless because `asyncgateway` already held
+# that normalised name: `GET https://pypi.org/pypi/asyncio-gateway/json`
+# and `.../asynciogateway/json` each returned 404 (OQ4; the normalisation
+# itself is pinned by `tests/test_packaging.py`). The old
 # number is deliberately not written here -- R5-AC3 requires it survive
 # only in the spec and the changelog history, and a packaging test asserts
 # that.
 version = "1.0.0"
-description = "Any microservice will be able to use the “async_gateway” can make an async request(HTTP/SOAP/XML/FTP/redis) with the given payload to given address"
+description = "Any microservice will be able to use the “asyncio_gateway” can make an async request(HTTP/SOAP/XML/FTP/redis) with the given payload to given address"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -110,7 +114,7 @@ dev = [
 Homepage = "https://github.com/ajyadav013/async-gateway"
 
 [tool.setuptools.packages.find]
-include = ["async_gateway*"]
+include = ["asyncio_gateway*"]
 namespaces = false
 
 [tool.setuptools.package-data]
@@ -120,13 +124,13 @@ namespaces = false
 # `tests/test_packaging.py` asserts it is in both artifacts, because the
 # failure is silent by construction -- the wheel installs, imports and
 # runs perfectly, and the only symptom is a consumer's mypy reporting
-# `async_gateway` as untyped.
+# `asyncio_gateway` as untyped.
 #
 # Added at AGW-26 and deliberately not earlier (FI-13): the marker is a
 # promise that this package's own types check, so publishing it while
 # `ignore_errors = true` was still hiding two dozen real errors would
 # have exported them into every consumer's build.
-"async_gateway" = ["py.typed"]
+"asyncio_gateway" = ["py.typed"]
 
 # --- Tool configuration migrated out of the deleted setup.cfg ---------------
 
@@ -138,7 +142,7 @@ exclude_dirs = ["./env"]
 
 [tool.mypy]
 
-# R30's annotation criterion. Every function in `async_gateway` carries a
+# R30's annotation criterion. Every function in `asyncio_gateway` carries a
 # full signature as of story S24, and these two keep it that way:
 # `disallow_untyped_defs` refuses a def with no annotations at all,
 # `disallow_incomplete_defs` refuses the more common regression -- a def
@@ -146,7 +150,7 @@ exclude_dirs = ["./env"]
 #
 # Both were INERT until AGW-26 removed `ignore_errors` from this section,
 # and that was measured rather than assumed: with both settings present,
-# `mypy async_gateway` reported "Success: no issues found in 27 source
+# `mypy asyncio_gateway` reported "Success: no issues found in 27 source
 # files" while seven functions were missing annotations -- `ignore_errors`
 # suppressed the whole check, these two included. They were declared ahead
 # of time so that removing it turned the criterion on without anyone also
@@ -192,7 +196,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=async_gateway --cov-branch"
+addopts = "--cov=asyncio_gateway --cov-branch"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 junit_family = "legacy"

@@ -13,8 +13,8 @@ from typing import Union
 
 import orjson
 
-from async_gateway.utils.envelope import JsonBody
-from async_gateway.utils.exceptions import SerializationError
+from asyncio_gateway.utils.envelope import JsonBody
+from asyncio_gateway.utils.exceptions import SerializationError
 
 #: Everything a valid JSON document can decode to -- and now literally
 #: ``utils.envelope.JsonBody``, because that is the same set.

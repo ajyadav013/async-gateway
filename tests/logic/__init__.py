@@ -1,4 +1,4 @@
-"""Tests for the protocol clients in ``async_gateway/logic``.
+"""Tests for the protocol clients in ``asyncio_gateway/logic``.
 
 One module per client, mirroring the source layout. The package exists
 because the clients' tests are about a single protocol's own behaviour --
