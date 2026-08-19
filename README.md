@@ -1601,13 +1601,44 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 ```
 
-The full gate, all of which CI runs as required checks:
+The three commands you will reach for while iterating:
 
 ```text
 pytest
 flake8 async_gateway tests
 mypy async_gateway
 ```
+
+**Those three are not the full gate.** CI enforces about a dozen required
+checks, and several exist only as inline steps in
+`.github/workflows/ci.yml` — the unjustified-suppression check, the two
+coverage-pragma checks, the assertion that `ignore_errors` has not come
+back, `bandit`, and the clean-venv install of the built wheel and sdist.
+None of them is part of `pytest`, `flake8` or `mypy`, so a green run of
+the three above can sit on a branch that CI fails. That is not
+hypothetical: it is what happened, and it is why the script below exists.
+
+Before pushing, run every gate CI runs, in one command:
+
+```text
+scripts/ci-local.sh              # every locally-runnable gate
+scripts/ci-local.sh --fast       # skip the slow ones (build, 5 seeds)
+PYTHON=.venv/bin/python scripts/ci-local.sh
+```
+
+It runs each gate, keeps going after a failure, and prints a
+pass/skip/fail summary, so one local pass tells you everything CI would.
+Exit status is 0 only when every gate it ran passed.
+
+Two things it deliberately does **not** do. It never installs into your
+venv — the artifact gates need `build` and `twine`, which cannot coexist
+with the dev extra's `setuptools<76` pin, so it uses them when present
+and says so plainly when they are absent. And it runs on one interpreter:
+the **3.10–3.14 matrix, the pull-request changelog check, and the monthly
+newer-CPython check remain CI-only**, each annotated in the script with
+the reason. `tests/test_ci_local.py` parses the script and the workflow
+together and fails if a CI step is in neither the covered nor the
+CI-only list, so the two cannot drift apart silently.
 
 There is **no autoformatter** configured. Match the surrounding file by hand;
 `flake8` judges the result.
