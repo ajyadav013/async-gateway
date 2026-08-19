@@ -18,7 +18,7 @@ import asyncio
 import sys
 from typing import Any, Dict
 
-from async_gateway.async_gateway import request
+from asyncio_gateway.asyncio_gateway import request
 
 DEFAULT_URL = 'http://127.0.0.1:8080/rates'
 BODY = '<GetRate xmlns="urn:rates"><Pair>EURUSD</Pair></GetRate>'

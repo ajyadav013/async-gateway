@@ -4,7 +4,7 @@ An **index**, not a copy. Every statement of behaviour lives in the spec; this p
 
 ## The product
 
-`async-gateway` is a Python library with **one public entry point** — `async_gateway.async_gateway.request()` —
+`asyncio-gateway` is a Python library with **one public entry point** — `asyncio_gateway.asyncio_gateway.request()` —
 and a protocol-strategy layer behind it (HTTP, FTP, SFTP, SOAP). It is a library, not a service: there
 are no endpoints, no environment variables, no health check.
 

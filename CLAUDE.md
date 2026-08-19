@@ -263,13 +263,13 @@ concrete for this stack.
 
 ### Stack & conventions
 
-**`async-gateway` is a distributable Python library, not a web service.** It exposes one public
-coroutine — `async_gateway.async_gateway.request()` — that dispatches a call over HTTP, HTTPS, FTP
+**`asyncio-gateway` is a distributable Python library, not a web service.** It exposes one public
+coroutine — `asyncio_gateway.asyncio_gateway.request()` — that dispatches a call over HTTP, HTTPS, FTP
 or SFTP (SOAP is planned and deliberately not yet registered) and returns one uniform response
 envelope. There is no application object, nothing serves HTTP, and there is no dev server.
 
 - **Python ≥ 3.10**, asyncio throughout. Transports: `aiohttp`, `aioftp`, `asyncssh`.
-- Package source is `async_gateway/`; tests are under `tests/`. Conventions:
+- Package source is `asyncio_gateway/`; tests are under `tests/`. Conventions:
   `.claude/rules/fastapi-patterns.md` — the filename is a leftover from the claude-kit template and
   is retained deliberately because this file references it by path; its contents describe this
   library.
@@ -282,7 +282,7 @@ envelope. There is no application object, nothing serves HTTP, and there is no d
   to check a health endpoint as inapplicable here.
 - Test: `pytest`
 - Lint: `flake8 .`
-- Types: `mypy async_gateway`
+- Types: `mypy asyncio_gateway`
 - Format: **there is no format command — this project configures no autoformatter at all.** Match
   the surrounding file by hand; `flake8` is what judges the result.
 - Build the distribution: `python -m build`. Note that `build` is **not** in
@@ -290,9 +290,9 @@ envelope. There is no application object, nothing serves HTTP, and there is no d
   install it separately with `pip install build`.
 
 Two things to expect from those commands at present, so that a green run is not mistaken for a
-clean one. `flake8 .` exits non-zero on pre-existing findings in `async_gateway/` and `tests/` that
-a later remediation story owns; scope to `flake8 async_gateway tests` to see only those, since a
-bare `.` also walks `.claude/` and its bundled scripts. And `mypy async_gateway` reports clean only
+clean one. `flake8 .` exits non-zero on pre-existing findings in `asyncio_gateway/` and `tests/` that
+a later remediation story owns; scope to `flake8 asyncio_gateway tests` to see only those, since a
+bare `.` also walks `.claude/` and its bundled scripts. And `mypy asyncio_gateway` reports clean only
 because `ignore_errors = true` is still set in `pyproject.toml`, which a later story removes.
 
 ### Adding a protocol
