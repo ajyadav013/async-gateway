@@ -1721,3 +1721,151 @@ def test_every_dispatch_controlling_key_is_a_real_envelope_key() -> None:
         GatewayResponse.__annotations__)
     # And it is non-empty, or the guard is silently inert.
     assert DISPATCH_CONTROLLING_KEYS
+
+
+class _SemanticBoundaryRequest(BaseRequestClass):
+    """Minimal strategy used to exercise the new public-boundary contract."""
+
+    ALLOWED_INFO_KEYS = frozenset({'known'})
+
+    async def handle_request(self) -> GatewayResponse:
+        """Return the envelope without opening a transport."""
+        return finalise_ok(
+            self.response, status_code=200, started=self.start_time)
+
+
+def test_protocol_info_can_opt_into_an_exact_key_allowlist() -> None:
+    """New selectors reject a typo instead of silently ignoring it."""
+    with pytest.raises(ConfigurationError, match='unknown key'):
+        validated_protocol_info(
+            {'known': 1, 'typo': 2},
+            allowed=frozenset({'known'}),
+        )
+
+
+def test_protocol_info_without_an_allowlist_remains_permissive() -> None:
+    """Legacy selectors retain their existing unknown-key behavior."""
+    assert validated_protocol_info({'legacy_extension': 1}) == {
+        'legacy_extension': 1}
+
+
+def test_protocol_info_allowlist_rejects_non_string_keys_as_configuration(
+) -> None:
+    """A non-string key is rejected without being rendered or sorted."""
+    with pytest.raises(
+        ConfigurationError,
+        match='protocol_info keys must be strings',
+    ):
+        validated_protocol_info(
+            {'typo': 1, 2: 'also unknown'},
+            allowed=frozenset({'known'}),
+        )
+
+
+def test_protocol_info_allowlist_never_renders_a_hostile_key() -> None:
+    """Caller-controlled repr cannot escape or disclose a key's contents."""
+    class HostileKey:
+        """Hashable mapping key whose representation must never be invoked."""
+
+        def __repr__(self) -> str:
+            """Fail if validation tries to render the key."""
+            raise RuntimeError('secret repr was invoked')
+
+    with pytest.raises(
+        ConfigurationError,
+        match='protocol_info keys must be strings',
+    ):
+        validated_protocol_info(
+            {HostileKey(): 'secret'},
+            allowed=frozenset({'known'}),
+        )
+
+
+def test_protocol_info_checks_key_types_before_required_key_comparison(
+) -> None:
+    """A hash collision cannot invoke hostile equality before refusal."""
+    class CollidingKey:
+        """Non-string key colliding with a selector's required key."""
+
+        def __hash__(self) -> int:
+            """Collide deliberately with the required string."""
+            return hash('method')
+
+        def __eq__(self, other: object) -> bool:
+            """Fail if validation compares this caller-controlled key."""
+            raise RuntimeError('hostile equality was invoked')
+
+    with pytest.raises(
+        ConfigurationError,
+        match='protocol_info keys must be strings',
+    ):
+        validated_protocol_info(
+            {CollidingKey(): 'secret'},
+            required=frozenset({'method'}),
+            allowed=frozenset({'method'}),
+        )
+
+
+async def test_new_selector_allowlist_is_enforced_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The class-declared inventory is applied at the public boundary."""
+    monkeypatch.setitem(
+        protocol_mapping, 'JSONRPC', _SemanticBoundaryRequest)
+
+    with pytest.raises(ConfigurationError, match='unknown key'):
+        await request(
+            'https://host/rpc',
+            protocol='JSONRPC',
+            protocol_info={'typo': True},
+        )
+
+
+async def test_none_is_preserved_only_for_semantic_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON-RPC can omit params while legacy HTTP still receives an object."""
+    monkeypatch.setitem(
+        protocol_mapping, 'JSONRPC', _SemanticBoundaryRequest)
+    semantic = await request(
+        'https://host/rpc', protocol='JSONRPC', data=None,
+        protocol_info={})
+
+    dispatched = capture_dispatch(monkeypatch)
+    legacy = await request(
+        'https://host/p', protocol='HTTPS', data=None,
+        protocol_info={'request_type': 'GET'})
+
+    assert semantic['payload'] is None
+    assert legacy['payload'] == {}
+    assert dispatched[0].response['payload'] == {}
+
+
+@pytest.mark.parametrize(
+    'protocol, accepted, rejected',
+    [
+        pytest.param(
+            'JSONRPC', 'https://host/rpc', 'ftp://host/rpc', id='jsonrpc'),
+        pytest.param(
+            'GRAPHQL', 'http://host/graphql', 'file:///tmp/q', id='graphql'),
+        pytest.param('S3', 's3://bucket/key', 'https://bucket/key', id='s3'),
+        pytest.param(
+            'GRPC', 'grpcs://host:443', 'https://host:443', id='grpc'),
+    ],
+)
+def test_new_url_selectors_have_closed_scheme_allowlists(
+    protocol: str,
+    accepted: str,
+    rejected: str,
+) -> None:
+    """Every URL-backed selector fails closed on a foreign scheme."""
+    assert dispatch_url_for(protocol, accepted) == accepted
+    with pytest.raises(ConfigurationError, match='dispatches only'):
+        dispatch_url_for(protocol, rejected)
+
+
+@pytest.mark.parametrize('protocol', ['JSONRPC', 'GRAPHQL', 'S3', 'GRPC'])
+def test_new_url_selectors_reject_schemeless_targets(protocol: str) -> None:
+    """New URL contracts never guess a transport scheme for the caller."""
+    with pytest.raises(ConfigurationError, match='requires an explicit'):
+        dispatch_url_for(protocol, 'host/path')

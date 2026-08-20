@@ -35,6 +35,7 @@ def validated_protocol_info(
     info: Optional[Mapping[str, Any]],
     *,
     required: Collection[str] = (),
+    allowed: Optional[Collection[str]] = None,
 ) -> dict[str, Any]:
     """Return ``protocol_info`` as a dict once its shape is known good.
 
@@ -57,15 +58,18 @@ def validated_protocol_info(
         info: ``protocol_info`` exactly as the caller supplied it, or None.
         required: Key names this protocol cannot run without, from the
             protocol class's own :attr:`BaseRequestClass.REQUIRED_INFO_KEYS`.
+        allowed: The exact accepted keys for a closed new-selector contract,
+            or None to retain the legacy permissive behavior.
 
     Returns:
         A new dict of the caller's configuration, empty when they supplied
         nothing.
 
     Raises:
-        ConfigurationError: If ``info`` is neither None nor a mapping, or if
-            any required key is absent. Both are the caller's own
-            configuration failing to form a valid call, so both are reported
+        ConfigurationError: If ``info`` is neither None nor a mapping, any
+            required key is absent, or an opt-in allowlist excludes a supplied
+            key. All are the caller's own
+            configuration failing to form a valid call, so all are reported
             as configuration rather than as an ``AttributeError`` or a
             ``KeyError`` from somewhere further in.
     """
@@ -75,10 +79,21 @@ def validated_protocol_info(
         raise ConfigurationError(
             f'protocol_info must be a mapping or None, got '
             f'{type(info).__name__}')
+    if allowed is not None and any(
+        not isinstance(key, str) for key in info
+    ):
+        raise ConfigurationError(
+            'protocol_info keys must be strings for this protocol')
     missing = sorted(set(required) - set(info))
     if missing:
         raise ConfigurationError(
             f'protocol_info is missing required key(s) {missing}')
+    if allowed is not None:
+        unknown = sorted(set(info) - set(allowed))
+        if unknown:
+            raise ConfigurationError(
+                f'protocol_info has unknown key(s) {unknown}; accepted keys '
+                f'are {sorted(allowed)}')
     return dict(info)
 
 
@@ -282,6 +297,11 @@ class BaseRequestClass(abc.ABC):
     #: Keys this protocol cannot run without. The default requires nothing,
     #: so a protocol whose every key has a default inherits it untouched.
     REQUIRED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset()
+
+    #: Exact keys a new selector accepts, or None for legacy permissiveness.
+    #: Opt-in keeps additive validation from rejecting extension keys existing
+    #: callers may already pass to the original protocol strategies.
+    ALLOWED_INFO_KEYS: ClassVar[Optional[frozenset[str]]] = None
 
     def __init__(
         self, url: str,

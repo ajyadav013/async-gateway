@@ -886,13 +886,19 @@ from asyncio_gateway.utils.exceptions import (
     DnsError,
     FtpStatusError,
     GatewayTimeoutError,
+    GraphqlError,
+    GraphqlProtocolError,
+    GrpcStatusError,
     HostKeyError,
     HttpStatusError,
+    JsonRpcError,
+    JsonRpcProtocolError,
     LocalWriteError,
     PathContainmentError,
     ProtocolError,
     ResponseTooLargeError,
     SerializationError,
+    S3StatusError,
     SftpStatusError,
     SoapFaultError,
     TlsError,
@@ -923,6 +929,12 @@ AsyncGatewayError                 GATEWAY              502
 ├── StackExhaustedError           STACK_EXHAUSTED      502
 └── ProtocolError                 PROTOCOL             502
     ├── HttpStatusError           HTTP_STATUS          the real status
+    ├── JsonRpcError              JSONRPC_ERROR        the real HTTP status
+    ├── JsonRpcProtocolError      JSONRPC_PROTOCOL     502
+    ├── GraphqlError              GRAPHQL_ERROR        the real HTTP status
+    ├── GraphqlProtocolError      GRAPHQL_PROTOCOL     502
+    ├── S3StatusError             S3_STATUS            the real AWS status
+    ├── GrpcStatusError           GRPC_STATUS          mapped canonical status
     ├── FtpStatusError            FTP_STATUS           the reply code
     ├── SftpStatusError           SFTP_STATUS          404 / 403 / 500
     └── SoapFaultError            SOAP_FAULT           the real status
@@ -955,6 +967,12 @@ message text.
 | `STACK_EXHAUSTED` | Dispatching the call exhausted the interpreter stack | No |
 | `CIRCUIT_OPEN` | The breaker for this destination is open | Later |
 | `HTTP_STATUS` | An HTTP 4xx or 5xx | Depends |
+| `JSONRPC_ERROR` | A valid JSON-RPC 2.0 error object | No |
+| `JSONRPC_PROTOCOL` | A malformed JSON-RPC 2.0 peer envelope | No |
+| `GRAPHQL_ERROR` | A GraphQL response contains errors | No |
+| `GRAPHQL_PROTOCOL` | A malformed GraphQL peer envelope | No |
+| `S3_STATUS` | AWS S3 returned a service error | Depends |
+| `GRPC_STATUS` | gRPC returned a non-OK canonical status | Depends |
 | `FTP_STATUS` | An FTP 4xx or 5xx reply | Depends |
 | `SFTP_STATUS` | An SFTP `SSH_FX_*` failure | Depends |
 | `SOAP_FAULT` | A SOAP Fault, at any status | Depends |

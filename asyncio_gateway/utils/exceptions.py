@@ -333,6 +333,42 @@ class HttpStatusError(ProtocolError):
     code: ClassVar[str] = 'HTTP_STATUS'
 
 
+class JsonRpcError(ProtocolError):
+    """Raised for a valid JSON-RPC 2.0 error object."""
+
+    code: ClassVar[str] = 'JSONRPC_ERROR'
+
+
+class JsonRpcProtocolError(ProtocolError):
+    """Raised when a peer's JSON-RPC 2.0 envelope is malformed."""
+
+    code: ClassVar[str] = 'JSONRPC_PROTOCOL'
+
+
+class GraphqlError(ProtocolError):
+    """Raised for a valid GraphQL response containing errors."""
+
+    code: ClassVar[str] = 'GRAPHQL_ERROR'
+
+
+class GraphqlProtocolError(ProtocolError):
+    """Raised when a peer's GraphQL response envelope is malformed."""
+
+    code: ClassVar[str] = 'GRAPHQL_PROTOCOL'
+
+
+class S3StatusError(ProtocolError):
+    """Raised for a normalized AWS S3 service error response."""
+
+    code: ClassVar[str] = 'S3_STATUS'
+
+
+class GrpcStatusError(ProtocolError):
+    """Raised for a non-OK canonical gRPC status."""
+
+    code: ClassVar[str] = 'GRPC_STATUS'
+
+
 class FtpStatusError(ProtocolError):
     """Raised for an FTP 4xx or 5xx reply, carrying the reply code."""
 

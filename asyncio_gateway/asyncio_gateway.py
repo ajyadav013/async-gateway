@@ -53,6 +53,18 @@ HTTP_FAMILY_SCHEMES: Final[dict[str, frozenset[str]]] = {
     'HTTPS': frozenset({'https'}),
 }
 
+# Closed scheme allowlists for every selector whose target is a URL. The
+# original public constant above is retained because callers and contract
+# tests import it; these additive rows extend dispatch without relabelling the
+# HTTP family.
+PROTOCOL_SCHEME_ALLOWLISTS: Final[dict[str, frozenset[str]]] = {
+    **HTTP_FAMILY_SCHEMES,
+    'JSONRPC': frozenset({'http', 'https'}),
+    'GRAPHQL': frozenset({'http', 'https'}),
+    'S3': frozenset({'s3'}),
+    'GRPC': frozenset({'grpc', 'grpcs'}),
+}
+
 # Every protocol whose `url` is dispatched as a URL, rather than read as
 # a bare host name the way FTP's and SFTP's are.
 #
@@ -476,18 +488,18 @@ def dispatch_url_for(
 
     Returns:
         The URL to dispatch, upgraded to ``https://`` where that was the
-        only reading. Protocols outside the HTTP family get theirs back
-        unchanged.
+        only legacy HTTP-family reading. Protocols outside the URL-backed
+        selector table get theirs back unchanged.
 
     Raises:
         ConfigurationError: If the URL's scheme is one this protocol will
-            not dispatch on, if it is a protocol-relative reference
-            carrying an authority but no scheme, or if the URL cannot be
-            parsed at all. The URL's *type* is checked earlier, in
-            ``request()``, because the envelope is built from it before
-            this function is reached.
+            not dispatch on, if a new selector's explicit scheme is absent,
+            if it is a protocol-relative reference carrying an authority but
+            no scheme, or if the URL cannot be parsed at all. The URL's
+            *type* is checked earlier, in ``request()``, because the envelope
+            is built from it before this function is reached.
     """
-    allowed = HTTP_FAMILY_SCHEMES.get(protocol)
+    allowed = PROTOCOL_SCHEME_ALLOWLISTS.get(protocol)
     if allowed is None and protocol not in URL_DISPATCHED_PROTOCOLS:
         return url
 
@@ -514,6 +526,11 @@ def dispatch_url_for(
         return url
 
     if not scheme:
+        if protocol not in HTTP_FAMILY_SCHEMES:
+            raise ConfigurationError(
+                f'protocol {protocol!r} requires an explicit scheme from '
+                f'{sorted(allowed)}: '
+                f'{redact_url(url, extra_params=redact_params)}')
         return f'https://{url}' if protocol == 'HTTPS' else url
     if scheme not in allowed:
         raise ConfigurationError(
@@ -801,7 +818,10 @@ async def request(
 
     protocol_name, protocol_class = resolve_protocol(protocol)
     info: Dict[str, Any] = validated_protocol_info(
-        protocol_info, required=protocol_class.REQUIRED_INFO_KEYS)
+        protocol_info,
+        required=protocol_class.REQUIRED_INFO_KEYS,
+        allowed=protocol_class.ALLOWED_INFO_KEYS,
+    )
 
     # `port` is checked here, at the boundary, with the rest of the
     # `validated_*` family and *outside* the one conversion `try` -- the
@@ -838,7 +858,7 @@ async def request(
             post_processor_config, setting='post_processor_config')
         if post_processor_config else None)
 
-    if data is None:
+    if data is None and protocol_name not in {'JSONRPC', 'GRAPHQL'}:
         data = {}
 
     # The one place caller-supplied redaction config is read, so the one

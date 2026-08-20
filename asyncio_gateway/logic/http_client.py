@@ -1460,17 +1460,40 @@ class HttpRequest(BaseRequestClass):
         body_error = await self._copy_into_envelope(result)
 
         status: int = result['status_code']
+        response_error = self._response_error(status, body_error)
+        if response_error is not None:
+            raise response_error
+
+        return finalise_ok(
+            self.response, status_code=status, started=self.start_time)
+
+    def _response_error(
+        self,
+        status: int,
+        body_error: Optional[SerializationError],
+    ) -> Optional[AsyncGatewayError]:
+        """Choose the error after the common transport populated the envelope.
+
+        The base ordering is the existing HTTP contract: a remote status wins
+        over a malformed body. Semantic HTTP adapters override this one
+        decision point to recognize their application error envelope without
+        copying the session, retry, redirect, cap, trace, or response-copy
+        machinery.
+
+        Args:
+            status: The HTTP status returned by the peer.
+            body_error: A response decoding failure, or None.
+
+        Returns:
+            The error to raise, or None for a successful response.
+        """
         if status >= HTTP_ERROR_STATUS:
-            raise HttpStatusError(
+            return HttpStatusError(
                 f'{self.request_type.upper()} '
                 f'{redact_url(self.url, extra_params=self.redact_params)}'
                 f' returned HTTP {status}',
                 status)
-        if body_error is not None:
-            raise body_error
-
-        return finalise_ok(
-            self.response, status_code=status, started=self.start_time)
+        return body_error
 
     async def _copy_into_envelope(
         self,

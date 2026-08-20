@@ -419,3 +419,30 @@ async def test_an_unknown_protocol_escapes_request_synchronously() -> None:
         await request('http://127.0.0.1/unused', protocol='CARRIER_PIGEON')
 
     assert 'CARRIER_PIGEON' in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    'name, code, warning',
+    [
+        pytest.param('JsonRpcError', 'JSONRPC_ERROR', True),
+        pytest.param('JsonRpcProtocolError', 'JSONRPC_PROTOCOL', False),
+        pytest.param('GraphqlError', 'GRAPHQL_ERROR', True),
+        pytest.param('GraphqlProtocolError', 'GRAPHQL_PROTOCOL', False),
+        pytest.param('S3StatusError', 'S3_STATUS', True),
+        pytest.param('GrpcStatusError', 'GRPC_STATUS', True),
+    ],
+)
+def test_new_protocol_errors_have_stable_registered_contracts(
+    name: str,
+    code: str,
+    warning: bool,
+) -> None:
+    """Every new remote/protocol failure is typed and wire-stable."""
+    error_class = getattr(exceptions, name)
+    raised = error_class('peer refused')
+
+    assert issubclass(error_class, ProtocolError)
+    assert raised.code == code
+    assert raised.status_code == 502
+    assert STATUS_BY_CODE[code] == 502
+    assert (code in WARNING_CODES) is warning

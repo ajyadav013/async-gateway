@@ -29,10 +29,14 @@ import aiohttp
 import pytest
 
 from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.logic import protocol_mapping
+from asyncio_gateway.logic.http_client import HttpRequest
 from asyncio_gateway.utils.constants import HTTP_TIMEOUT
 from asyncio_gateway.utils.envelope import GatewayResponse
 from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
+    HttpStatusError,
+    SerializationError,
     UnsupportedVerbError,
 )
 from asyncio_gateway.utils.request_tracer import request_tracer
@@ -2038,3 +2042,76 @@ async def test_local_write_failures_do_not_open_the_destinations_breaker(
         f'a healthy call was refused with {refused_code} after six '
         'local disk failures: the breaker for a healthy destination is '
         'being opened by faults on this machine.')
+
+
+def test_http_response_error_hook_preserves_status_before_body_ordering(
+) -> None:
+    """The default hook keeps the long-standing HTTP precedence exactly."""
+    body_error = SerializationError('malformed response')
+    client = object.__new__(HttpRequest)
+    client.request_type = 'get'
+    client.url = 'https://host/p'
+    client.redact_params = frozenset()
+
+    status_error = client._response_error(503, body_error)
+
+    assert isinstance(status_error, HttpStatusError)
+    assert status_error.status_code == 503
+    assert client._response_error(200, body_error) is body_error
+    assert client._response_error(204, None) is None
+
+
+async def test_response_error_override_runs_after_copy_and_controls_result(
+    http_server: RecordingHTTPServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A semantic adapter sees the copied peer response before deciding."""
+    observed: list[dict[str, Any]] = []
+
+    class SemanticHttpRequest(HttpRequest):
+        """HTTP test strategy that rejects an otherwise successful answer."""
+
+        def _response_error(
+            self,
+            status: int,
+            body_error: SerializationError | None,
+        ) -> SerializationError:
+            """Record post-copy state and return the semantic decision."""
+            observed.append({
+                'argument_status': status,
+                'body_error': body_error,
+                'status_code': self.response['status_code'],
+                'headers': self.response['headers'],
+                'text': self.response['text'],
+                'json': self.response['json'],
+            })
+            return SerializationError('semantic adapter rejected response')
+
+    monkeypatch.setitem(protocol_mapping, 'HTTP', SemanticHttpRequest)
+    http_server.respond(
+        '/semantic',
+        status=207,
+        body=b'{"answer": 42}',
+        headers={**JSON, 'X-Semantic': 'visible'},
+    )
+
+    envelope = await request(
+        http_server.url_for('/semantic'),
+        protocol='HTTP',
+        protocol_info={'request_type': 'GET'},
+    )
+
+    assert observed == [{
+        'argument_status': 207,
+        'body_error': None,
+        'status_code': 207,
+        'headers': envelope['headers'],
+        'text': '{"answer": 42}',
+        'json': {'answer': 42},
+    }]
+    assert envelope['headers']['X-Semantic'] == 'visible'
+    assert envelope['text'] == '{"answer": 42}'
+    assert envelope['json'] == {'answer': 42}
+    assert envelope['ok'] is False
+    assert envelope['error'] is not None
+    assert envelope['error']['code'] == 'SERIALIZATION'
