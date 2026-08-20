@@ -89,6 +89,26 @@ class AbortableServiceError(AsyncGatewayError):
     """
 
 
+class _GrpcAbortableStatusFailure(AsyncGatewayError):
+    """Private gRPC status snapshot that must not retry or count.
+
+    The shared breaker owns exception classification, while the gRPC adapter
+    owns normalization and public conversion.  Retaining the already-safe
+    snapshot here keeps that boundary explicit without importing the protocol
+    implementation into this helper.
+    """
+
+    def __init__(self, status: object) -> None:
+        """Store one normalized status snapshot for the adapter.
+
+        Args:
+            status: Private, normalized status data.  It is never stringified
+                or exposed by this marker.
+        """
+        super().__init__('abortable gRPC status')
+        self.status = status
+
+
 #: The failures a retry is *for*: a transport that did not answer, or
 #: answered with something the next attempt might not see.
 #:
@@ -148,6 +168,7 @@ RETRIABLE_FAILURES: Final[tuple[type[BaseException], ...]] = (
 #: the whole of what a breaker exists to measure.
 DEFAULT_ABORTABLE_EXCEPTIONS: Final[tuple[type[BaseException], ...]] = (
     AbortableServiceError,
+    _GrpcAbortableStatusFailure,
     ConfigurationError,
     ResponseTooLargeError,
     LocalWriteError,
