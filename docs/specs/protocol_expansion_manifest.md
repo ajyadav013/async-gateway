@@ -62,6 +62,7 @@ protobuf and `grpcio-tools` remain application/tooling concerns.
 ### Change: FTPS lane
 
 - `asyncio_gateway/logic/ftp_client.py`
+- `tests/fixtures/ftp.py`
 - `tests/logic/test_ftp_client.py`
 
 ### Change: shared protocol contract
@@ -77,6 +78,8 @@ protobuf and `grpcio-tools` remain application/tooling concerns.
   botocore transport classification and the gRPC retryable/abortable status
   split
 - `asyncio_gateway/utils/constants.py`
+- `asyncio_gateway/utils/envelope.py`, for the nine-protocol envelope contract
+  documentation
 - `asyncio_gateway/utils/exceptions.py`
 - `asyncio_gateway/utils/status_map.py`
 - `asyncio_gateway/utils/http_file_config.py`
@@ -90,6 +93,8 @@ protobuf and `grpcio-tools` remain application/tooling concerns.
 - `tests/test_entrypoint.py`
 - `tests/test_entrypoint_invariant.py`
 - `tests/test_envelope.py`
+- `tests/test_exceptions.py`
+- `tests/helpers/test_circuit_breaker.py`
 - `tests/test_docs.py`
 - `tests/test_packaging.py`
 - `tests/test_no_blocking_io.py`, only if its inventory requires an explicit
