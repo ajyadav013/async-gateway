@@ -8,7 +8,7 @@ enforces TLS), AC6 (a typed registry with no ``None`` in it) and AC7
 error inside a protocol handler escapes ``request()`` instead of being
 reported as a failed network call.
 
-Nothing here reaches the network. The four registered protocols are
+Nothing here reaches the network. The nine registered protocols are
 exercised through ``request()`` with their ``handle_request`` replaced by a
 recorder, because what is under test is everything ``request()`` does
 *around* the dispatch -- which protocol object it built, and with which
@@ -49,7 +49,11 @@ from asyncio_gateway.helpers.internal.base import (
 )
 from asyncio_gateway.logic import protocol_mapping
 from asyncio_gateway.logic.ftp_client import FTPRequest
+from asyncio_gateway.logic.graphql_client import GraphqlRequest
+from asyncio_gateway.logic.grpc_client import GrpcRequest
 from asyncio_gateway.logic.http_client import HttpRequest
+from asyncio_gateway.logic.jsonrpc_client import JsonRpcRequest
+from asyncio_gateway.logic.s3_client import S3Request
 from asyncio_gateway.logic.sftp_client import SFTPRequest
 from asyncio_gateway.logic.soap_client import SoapRequest
 from asyncio_gateway.utils.constants import HTTP_TIMEOUT
@@ -59,7 +63,23 @@ from asyncio_gateway.utils.exceptions import (
     ProcessorError,
 )
 
+from tests.fixtures.protocol_transports import CONTRACT_CALL, contract_call
+
 AUTH: Final[BasicAuth] = BasicAuth('user', 'password')
+
+EXPECTED_PROTOCOL_MAPPING: Final[dict[
+    str, type[BaseRequestClass]
+]] = {
+    'HTTP': HttpRequest,
+    'HTTPS': HttpRequest,
+    'FTP': FTPRequest,
+    'SFTP': SFTPRequest,
+    'SOAP': SoapRequest,
+    'JSONRPC': JsonRpcRequest,
+    'GRAPHQL': GraphqlRequest,
+    'S3': S3Request,
+    'GRPC': GrpcRequest,
+}
 
 
 async def _valid_processor(response: GatewayResponse, **params: Any) -> str:
@@ -76,20 +96,6 @@ async def _valid_processor(response: GatewayResponse, **params: Any) -> str:
         A sentinel.
     """
     return 'processed'
-
-# One call per registered protocol that is valid for that protocol and for
-# no other reason: FTP and SFTP address a bare host and require no
-# `protocol_info` at all, the HTTP family addresses a schemed URL and
-# requires a verb.
-VALID_CALL: Final[dict[str, dict[str, Any]]] = {
-    'HTTP': {'url': 'http://host/p', 'protocol_info': {'request_type': 'GET'}},
-    'HTTPS': {
-        'url': 'https://host/p',
-        'protocol_info': {'request_type': 'GET'},
-    },
-    'FTP': {'url': 'host', 'protocol_info': None},
-    'SFTP': {'url': 'host', 'protocol_info': None},
-}
 
 # Every way of writing a protocol name that R11-AC1 requires to work. They
 # are applied to each registered name rather than to a fixed list, so a
@@ -158,7 +164,7 @@ def gateway_records(
 # --- R11-AC1: normalised once, for the guard and for the lookup (H4) -------
 
 
-@pytest.mark.parametrize('name', sorted(VALID_CALL))
+@pytest.mark.parametrize('name', tuple(CONTRACT_CALL))
 @pytest.mark.parametrize(
     'spelling', list(SPELLINGS.values()), ids=list(SPELLINGS))
 async def test_r11_ac1_protocol_spelling_dispatches_the_same_class(
@@ -169,15 +175,16 @@ async def test_r11_ac1_protocol_spelling_dispatches_the_same_class(
     """Case and whitespace do not change which protocol is dispatched (H4)."""
     dispatched = capture_dispatch(monkeypatch)
 
-    result = await request(
-        protocol=spelling(name), auth=AUTH, **VALID_CALL[name])
+    call = contract_call(name)
+    call['protocol'] = spelling(name)
+    result = await request(**call)
 
     assert result['ok'] is True
     assert [type(obj) for obj in dispatched] == [protocol_mapping[name]]
     assert result['protocol'] == name
 
 
-@pytest.mark.parametrize('name', sorted(VALID_CALL))
+@pytest.mark.parametrize('name', tuple(CONTRACT_CALL))
 @pytest.mark.parametrize(
     'spelling', list(SPELLINGS.values()), ids=list(SPELLINGS))
 def test_r11_ac1_resolve_protocol_normalises_before_it_looks_up(
@@ -230,6 +237,14 @@ def test_h3_soap_maps_to_a_real_class_and_never_to_none() -> None:
         for strategy in protocol_mapping.values())
 
 
+def test_pe80_registry_is_the_exact_nine_protocol_contract() -> None:
+    """The production selector registry contains every first-class client."""
+    assert protocol_mapping == EXPECTED_PROTOCOL_MAPPING
+    assert set(CONTRACT_CALL) == set(protocol_mapping)
+    for protocol, row in CONTRACT_CALL.items():
+        assert {'url', 'data', 'auth', 'info'} <= set(row), protocol
+
+
 async def test_r11_ac2_a_rejected_protocol_is_reported_once_and_not_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -273,9 +288,34 @@ async def test_r11_ac3_a_missing_required_key_names_it(
     """HTTP requires a verb, and names the key when it does not get one."""
     with pytest.raises(ConfigurationError) as raised:
         await request(
-            VALID_CALL[name]['url'], protocol=name, protocol_info=info)
+            CONTRACT_CALL[name]['url'], protocol=name, protocol_info=info)
 
     assert 'request_type' in str(raised.value)
+
+
+@pytest.mark.parametrize('name', tuple(CONTRACT_CALL))
+async def test_each_selector_owns_its_public_required_key_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    """Every selector's declared requirements are enforced at the boundary."""
+    protocol_class = EXPECTED_PROTOCOL_MAPPING[name]
+    required = protocol_class.REQUIRED_INFO_KEYS
+    if not required:
+        dispatched = capture_dispatch(monkeypatch)
+        call = contract_call(name)
+        call['protocol_info'] = None
+        result = await request(**call)
+        assert result['ok'] is True
+        assert len(dispatched) == 1
+        return
+
+    for missing in required:
+        call = contract_call(name)
+        del call['protocol_info'][missing]
+        with pytest.raises(ConfigurationError) as raised:
+            await request(**call)
+        assert missing in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -374,7 +414,9 @@ async def test_h5_the_http_family_still_accepts_no_auth(
     """
     dispatched = capture_dispatch(monkeypatch)
 
-    result = await request(**VALID_CALL[name], protocol=name)
+    call = contract_call(name)
+    call['auth'] = None
+    result = await request(**call)
 
     assert result['ok'] is True
     assert dispatched[0].auth is None
@@ -921,16 +963,14 @@ async def test_r28_a_subclass_that_defers_to_the_base_gets_a_named_error(
 # --- R10-AC3: a library bug escapes; it is not reported as a failed call ---
 
 
-@pytest.mark.parametrize(
-    'protocol_class', [HttpRequest, FTPRequest, SFTPRequest],
-    ids=['http', 'ftp', 'sftp'])
+@pytest.mark.parametrize('name', tuple(CONTRACT_CALL))
 @pytest.mark.parametrize(
     'bug', [KeyError, TypeError, UnboundLocalError],
     ids=['key-error', 'type-error', 'unbound-local-error'])
 async def test_r10_ac3_a_programming_error_escapes_request(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    protocol_class: type[BaseRequestClass],
+    name: str,
     bug: type[Exception],
 ) -> None:
     """A bug in a handler reaches the caller as itself, not as an envelope."""
@@ -950,14 +990,11 @@ async def test_r10_ac3_a_programming_error_escapes_request(
         """
         raise bug('injected')
 
-    monkeypatch.setattr(protocol_class, 'handle_request', handle_request)
-    name = next(
-        key for key, value in protocol_mapping.items()
-        if value is protocol_class
-    )
+    monkeypatch.setattr(
+        protocol_mapping[name], 'handle_request', handle_request)
 
     with pytest.raises(bug):
-        await request(protocol=name, auth=AUTH, **VALID_CALL[name])
+        await request(**contract_call(name))
 
     # Not caught means not converted *and* not logged: the caller's own
     # traceback is the report.
@@ -967,13 +1004,11 @@ async def test_r10_ac3_a_programming_error_escapes_request(
 # --- NEW-H2: a RecursionError is a failure, not a library bug --------------
 
 
-@pytest.mark.parametrize(
-    'protocol_class', [HttpRequest, FTPRequest, SFTPRequest],
-    ids=['http', 'ftp', 'sftp'])
+@pytest.mark.parametrize('name', tuple(CONTRACT_CALL))
 async def test_a_recursion_error_becomes_an_envelope_like_any_failure(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    protocol_class: type[BaseRequestClass],
+    name: str,
 ) -> None:
     """The one exception to the row above, and it is not an inconsistency.
 
@@ -1014,13 +1049,10 @@ async def test_a_recursion_error_becomes_an_envelope_like_any_failure(
         """
         raise RecursionError('maximum recursion depth exceeded')
 
-    monkeypatch.setattr(protocol_class, 'handle_request', handle_request)
-    name = next(
-        key for key, value in protocol_mapping.items()
-        if value is protocol_class
-    )
+    monkeypatch.setattr(
+        protocol_mapping[name], 'handle_request', handle_request)
 
-    result = await request(protocol=name, auth=AUTH, **VALID_CALL[name])
+    result = await request(**contract_call(name))
 
     assert result['ok'] is False
     assert result['error'] is not None
@@ -1073,7 +1105,7 @@ async def test_agw35_a_constructor_rejection_raises_and_does_not_log(
 
     with pytest.raises(ConfigurationError):
         await request(
-            VALID_CALL[name]['url'], protocol=name, protocol_info=info)
+            CONTRACT_CALL[name]['url'], protocol=name, protocol_info=info)
 
     assert gateway_records(caplog) == []
 
@@ -1865,24 +1897,32 @@ async def test_new_selector_allowlist_is_enforced_before_dispatch(
         )
 
 
-async def test_none_is_preserved_only_for_semantic_selectors(
+@pytest.mark.parametrize(
+    ('protocol', 'expected'),
+    [
+        pytest.param(
+            protocol,
+            None if protocol in {'JSONRPC', 'GRAPHQL'} else {},
+            id=protocol,
+        )
+        for protocol in CONTRACT_CALL
+    ],
+)
+async def test_none_payload_compatibility_is_explicit_for_every_selector(
     monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+    expected: object,
 ) -> None:
-    """JSON-RPC can omit params while legacy HTTP still receives an object."""
+    """Only semantic JSON selectors preserve None; all others get ``{}``."""
     monkeypatch.setitem(
-        protocol_mapping, 'JSONRPC', _SemanticBoundaryRequest)
-    semantic = await request(
-        'https://host/rpc', protocol='JSONRPC', data=None,
-        protocol_info={})
+        protocol_mapping, protocol, _SemanticBoundaryRequest)
+    call = contract_call(protocol)
+    call['data'] = None
+    call['protocol_info'] = {}
 
-    dispatched = capture_dispatch(monkeypatch)
-    legacy = await request(
-        'https://host/p', protocol='HTTPS', data=None,
-        protocol_info={'request_type': 'GET'})
+    result = await request(**call)
 
-    assert semantic['payload'] is None
-    assert legacy['payload'] == {}
-    assert dispatched[0].response['payload'] == {}
+    assert result['payload'] == expected
 
 
 @pytest.mark.parametrize(

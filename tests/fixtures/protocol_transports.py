@@ -1,4 +1,4 @@
-"""Transport doubles for the five-protocol envelope contract (S9).
+"""Transport doubles for the nine-protocol envelope contract.
 
 R8-AC2 asserts that ``request()`` returns one key set for every protocol on
 both the success and the failure path. Proving that needs each protocol to
@@ -32,6 +32,7 @@ correct them rather than to find them already right.
 """
 
 import asyncio
+import copy
 import os
 import pathlib
 import socket
@@ -48,16 +49,29 @@ from aiohttp.client_reqrep import ConnectionKey
 
 import asyncssh
 
+from botocore.exceptions import BotoCoreError, ClientError
+
+import grpc
+
 import pytest
 
 from asyncio_gateway.helpers.internal.request_helper import HttpResult
-from asyncio_gateway.logic import http_client, soap_client
+from asyncio_gateway.logic import (
+    grpc_client,
+    http_client,
+    s3_client,
+    soap_client,
+)
 
 # What a doubled transport says when it refuses. One string, so a test that
 # needs to recognise the double's own failure has something to match on.
 REFUSED = 'the transport double refused the connection'
 
 JSON_BODY = b'{"value": 1}'
+
+JSONRPC_BODY = b'{"jsonrpc":"2.0","id":"contract-1","result":1}'
+
+GRAPHQL_BODY = b'{"data":{"value":1}}'
 
 #: What the SOAP double answers with: a minimal, well-formed 1.1 envelope.
 #: The SOAP row cannot be served :data:`JSON_BODY` like the HTTP rows are
@@ -74,32 +88,76 @@ SOAP_BODY = (
 
 AUTH = BasicAuth('user', 'password')
 
-# One `request()` call per protocol that is valid for that protocol and for
-# no other reason. FTP and SFTP address a bare host and name the operation
-# they want in `protocol_info`; the HTTP family addresses a schemed URL and
-# names a verb. `'SOAP'` addresses a schemed URL and needs no
-# `protocol_info` at all: the version defaults to 1.1 and the verb is not
-# the caller's to choose.
+# The sole selector inventory used by the integration contract. Every row
+# owns all four public call inputs whose shapes differ between strategies;
+# in particular gRPC owns bytes and no auth, rather than inheriting the
+# BasicAuth/object payload that happened to suit the original five rows.
+# ``operation_key`` is test metadata, not a request option. It lets hostile
+# operation matrices mutate the selector's real key instead of spraying
+# HTTP/FTP/SFTP keys into strategies which correctly reject those keys.
 CONTRACT_CALL: dict[str, dict[str, Any]] = {
     'HTTP': {
         'url': 'http://host/p',
-        'protocol_info': {'request_type': 'GET'},
+        'data': {},
+        'auth': AUTH,
+        'info': {'request_type': 'GET'},
+        'operation_key': 'request_type',
     },
     'HTTPS': {
         'url': 'https://host/p',
-        'protocol_info': {'request_type': 'GET'},
+        'data': {},
+        'auth': AUTH,
+        'info': {'request_type': 'GET'},
+        'operation_key': 'request_type',
     },
     'FTP': {
         'url': 'host',
-        'protocol_info': {'command': 'download', 'server_path': '/f'},
+        'data': {},
+        'auth': AUTH,
+        'info': {'command': 'download', 'server_path': '/f'},
+        'operation_key': 'command',
     },
     'SFTP': {
         'url': 'host',
-        'protocol_info': {'mode': 'get', 'remote_path': '/f'},
+        'data': {},
+        'auth': AUTH,
+        'info': {'mode': 'get', 'remote_path': '/f'},
+        'operation_key': 'mode',
     },
     'SOAP': {
         'url': 'http://host/p',
-        'protocol_info': {},
+        'data': {},
+        'auth': AUTH,
+        'info': {},
+        'operation_key': None,
+    },
+    'JSONRPC': {
+        'url': 'http://host/rpc',
+        'data': {'value': 1},
+        'auth': None,
+        'info': {'method': 'contract.echo', 'request_id': 'contract-1'},
+        'operation_key': 'method',
+    },
+    'GRAPHQL': {
+        'url': 'http://host/graphql',
+        'data': {'value': 1},
+        'auth': None,
+        'info': {'query': 'query Contract { value }'},
+        'operation_key': 'query',
+    },
+    'S3': {
+        'url': 's3://contract-bucket/path/to/object',
+        'data': {},
+        'auth': None,
+        'info': {'command': 'head'},
+        'operation_key': 'command',
+    },
+    'GRPC': {
+        'url': 'grpc://host:50051',
+        'data': b'contract request',
+        'auth': None,
+        'info': {'method': '/contract.Service/Call'},
+        'operation_key': 'method',
     },
 }
 
@@ -112,16 +170,17 @@ def contract_call(protocol: str) -> dict[str, Any]:
 
     Returns:
         Keyword arguments for ``request()``: the URL, the protocol name,
-        an auth object and a fresh copy of the protocol configuration, so
-        a client that mutates what it was handed cannot reach the next
-        row.
+        the row's own auth and payload, and fresh copies of mutable data and
+        protocol configuration, so a client that mutates what it was handed
+        cannot reach the next row.
     """
     call = CONTRACT_CALL[protocol]
     return {
         'url': call['url'],
         'protocol': protocol,
-        'auth': AUTH,
-        'protocol_info': dict(call['protocol_info']),
+        'data': copy.deepcopy(call['data']),
+        'auth': call['auth'],
+        'protocol_info': copy.deepcopy(call['info']),
     }
 
 
@@ -365,6 +424,202 @@ def _sftp_transport(*, succeeds: bool) -> Callable[..., Any]:
     return connect
 
 
+class StubS3Body:
+    """One async streaming body used by the S3 local-write rows."""
+
+    def __init__(self, body: bytes) -> None:
+        """Retain the bytes yielded by the SDK-style chunk iterator."""
+        self.body = body
+        self.closed = False
+
+    async def iter_chunks(self, *, chunk_size: int) -> AsyncIterator[bytes]:
+        """Yield the body once, as botocore's streaming facade does.
+
+        Args:
+            chunk_size: Requested chunk ceiling, unused by this one-chunk
+                deterministic body.
+
+        Yields:
+            The configured response body.
+        """
+        del chunk_size
+        yield self.body
+
+    async def close(self) -> None:
+        """Record body cleanup without performing external I/O."""
+        self.closed = True
+
+
+class StubS3Client:
+    """The head/download slice of an S3 client used by integration rows."""
+
+    def __init__(
+        self,
+        *,
+        head: Any = None,
+        download_body: Optional[bytes] = None,
+    ) -> None:
+        """Choose a head outcome and optional streamed download body."""
+        self.head = {} if head is None else head
+        self.download_body = download_body
+
+    async def head_object(self, **kwargs: Any) -> Any:
+        """Return or raise the configured head outcome."""
+        del kwargs
+        if isinstance(self.head, BaseException):
+            raise self.head
+        return self.head
+
+    async def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        """Return one valid SDK streaming response for a download."""
+        del kwargs
+        if self.download_body is None:
+            raise AssertionError('the S3 double has no download body')
+        return {
+            'Body': StubS3Body(self.download_body),
+            'ContentLength': len(self.download_body),
+            'ETag': 'contract-etag',
+            'ResponseMetadata': {'HTTPStatusCode': 200},
+        }
+
+
+class StubS3ClientContext:
+    """Non-suppressing async context for one deterministic S3 client."""
+
+    def __init__(self, client: StubS3Client) -> None:
+        """Retain the client yielded on entry."""
+        self.client = client
+
+    async def __aenter__(self) -> StubS3Client:
+        """Yield the configured S3 client."""
+        return self.client
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        """Suppress no body failure."""
+        del exc_info
+        return False
+
+
+class StubS3Session:
+    """Session facade returning one deterministic client context."""
+
+    def __init__(self, client: StubS3Client) -> None:
+        """Retain the sole S3 client."""
+        self.client_instance = client
+
+    def client(self, service_name: str, **kwargs: Any) -> StubS3ClientContext:
+        """Return the S3 context and reject any other service name."""
+        del kwargs
+        if service_name != 's3':
+            raise AssertionError(f'unexpected SDK service {service_name!r}')
+        return StubS3ClientContext(self.client_instance)
+
+
+def _install_s3_client(
+    monkeypatch: pytest.MonkeyPatch,
+    client: StubS3Client,
+) -> None:
+    """Patch the aioboto3 Session seam with ``client``."""
+    monkeypatch.setattr(
+        s3_client.aioboto3,
+        'Session',
+        lambda **kwargs: StubS3Session(client),
+    )
+
+
+class StubGrpcCall:
+    """Awaitable unary gRPC call with deterministic peer metadata."""
+
+    def __init__(self, outcome: Any) -> None:
+        """Retain bytes or the native status failure to raise."""
+        self.outcome = outcome
+
+    def __await__(self) -> Any:
+        """Delegate awaiting to the response coroutine."""
+        return self._response().__await__()
+
+    async def _response(self) -> Any:
+        """Return or raise the configured RPC outcome."""
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+    async def initial_metadata(self) -> tuple[()]:
+        """Return no initial metadata."""
+        return ()
+
+    async def trailing_metadata(self) -> tuple[()]:
+        """Return no trailing metadata."""
+        return ()
+
+    def cancel(self) -> bool:
+        """Accept cancellation, though integration rows do not need it."""
+        return True
+
+
+class StubGrpcChannel:
+    """One raw unary-only channel for the gRPC contract rows."""
+
+    def __init__(self, outcome: Any) -> None:
+        """Retain the response or status failure for the next call."""
+        self.outcome = outcome
+
+    def unary_unary(
+        self,
+        method: str,
+        request_serializer: Any = None,
+        response_deserializer: Any = None,
+    ) -> Callable[..., StubGrpcCall]:
+        """Return a raw call factory and reject generated-code codecs."""
+        if request_serializer is not None or response_deserializer is not None:
+            raise AssertionError('the gRPC contract must stay at raw bytes')
+        if method != '/contract.Service/Call':
+            raise AssertionError(f'unexpected gRPC method {method!r}')
+
+        def invoke(*args: Any, **kwargs: Any) -> StubGrpcCall:
+            """Create the deterministic awaitable call."""
+            del args, kwargs
+            return StubGrpcCall(self.outcome)
+
+        return invoke
+
+    async def close(self, grace: Optional[float] = None) -> None:
+        """Close without external work."""
+        del grace
+
+
+def _grpc_status_failure() -> grpc.aio.AioRpcError:
+    """Build one genuine non-retryable gRPC peer status."""
+    return grpc.aio.AioRpcError(
+        grpc.StatusCode.PERMISSION_DENIED,
+        None,
+        None,
+        REFUSED,
+        'private debug string',
+    )
+
+
+def _install_grpc_channel(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: Any,
+) -> None:
+    """Patch both channel factories with deterministic raw-byte channels."""
+    def channel(*args: Any, **kwargs: Any) -> StubGrpcChannel:
+        """Return a fresh channel for one public gateway call."""
+        del args, kwargs
+        return StubGrpcChannel(outcome)
+
+    monkeypatch.setattr(
+        grpc_client.grpc.aio, 'insecure_channel', channel)
+    monkeypatch.setattr(
+        grpc_client.grpc.aio, 'secure_channel', channel)
+    monkeypatch.setattr(
+        grpc_client.grpc,
+        'ssl_channel_credentials',
+        lambda *args, **kwargs: object(),
+    )
+
+
 def install_transport(
     monkeypatch: pytest.MonkeyPatch,
     protocol: str,
@@ -394,6 +649,22 @@ def install_transport(
         monkeypatch.setattr(
             http_client, 'handle_http_request',
             _http_transport(succeeds=succeeds))
+    elif protocol == 'JSONRPC':
+        monkeypatch.setattr(
+            http_client,
+            'handle_http_request',
+            _http_transport(succeeds=succeeds, body=JSONRPC_BODY),
+        )
+    elif protocol == 'GRAPHQL':
+        monkeypatch.setattr(
+            http_client,
+            'handle_http_request',
+            _http_transport(
+                succeeds=succeeds,
+                media_type='application/graphql-response+json',
+                body=GRAPHQL_BODY,
+            ),
+        )
     elif protocol == 'SOAP':
         # Patched on `soap_client`, not on `http_client`: both modules
         # bound `handle_http_request` into their own namespace at import,
@@ -411,6 +682,29 @@ def install_transport(
     elif protocol == 'SFTP':
         monkeypatch.setattr(
             asyncssh, 'connect', _sftp_transport(succeeds=succeeds))
+    elif protocol == 'S3':
+        outcome: Any = {}
+        if not succeeds:
+            outcome = ClientError(
+                {
+                    'Error': {
+                        'Code': 'AccessDenied',
+                        'Message': REFUSED,
+                    },
+                    'ResponseMetadata': {
+                        'HTTPStatusCode': 403,
+                        'RequestId': 'contract-request',
+                    },
+                },
+                'HeadObject',
+            )
+        _install_s3_client(
+            monkeypatch, StubS3Client(head=outcome))
+    elif protocol == 'GRPC':
+        _install_grpc_channel(
+            monkeypatch,
+            b'contract response' if succeeds else _grpc_status_failure(),
+        )
     else:
         raise ValueError(
             f'{protocol!r} owns no transport seam. Returning quietly here'
@@ -518,6 +812,18 @@ CATEGORY_EXEMPT: dict[str, dict[str, str]] = {
             'it writes no local file at all: the same reason it is '
             'exempt from LOCAL_IO, asserted by the same row.'
         ),
+        'JSONRPC': (
+            'JSON-RPC is a semantic HTTP call and exposes no local-file '
+            'download option in its closed protocol_info allowlist.'
+        ),
+        'GRAPHQL': (
+            'GraphQL is a semantic HTTP call and exposes no local-file '
+            'download option in its closed protocol_info allowlist.'
+        ),
+        'GRPC': (
+            'Unary gRPC returns bounded bytes in the envelope and exposes '
+            'no local-file destination.'
+        ),
     },
     'LOCAL_IO': {
         'SOAP': (
@@ -529,6 +835,18 @@ CATEGORY_EXEMPT: dict[str, dict[str, str]] = {
             'row below, which asserts the key is absent from the '
             'protocol rather than trusting this note.'
         ),
+        'JSONRPC': (
+            'JSON-RPC has no local destination key in its closed option '
+            'inventory.'
+        ),
+        'GRAPHQL': (
+            'GraphQL has no local destination key in its closed option '
+            'inventory.'
+        ),
+        'GRPC': (
+            'Unary gRPC has no local destination key in its closed option '
+            'inventory.'
+        ),
     },
     'TLS': {
         'SFTP': (
@@ -536,6 +854,41 @@ CATEGORY_EXEMPT: dict[str, dict[str, str]] = {
             'ssl.SSLError can arise from its transport. Its table maps '
             'the OSError family instead, which subsumes ssl.SSLError '
             'anyway -- an SSLError reaching it reports CONNECT, not TLS.'
+        ),
+        'GRPC': (
+            'grpcio reports transport conditions through canonical RPC '
+            'statuses, not Python TLS exceptions; its status mapping is '
+            'covered by a dedicated SDK-status contract row.'
+        ),
+    },
+    'TIMEOUT': {
+        'GRPC': (
+            'grpcio reports deadline expiry as DEADLINE_EXCEEDED; the '
+            'canonical status row owns that vocabulary.'
+        ),
+    },
+    'TIMEOUT_BUILTIN': {
+        'GRPC': (
+            'grpcio reports deadline expiry as DEADLINE_EXCEEDED; it does '
+            'not expose the Python timeout-class distinction to callers.'
+        ),
+    },
+    'CONNECT': {
+        'GRPC': (
+            'grpcio reports connection failures as canonical statuses '
+            '(normally UNAVAILABLE), covered by the status matrix.'
+        ),
+    },
+    'DNS': {
+        'GRPC': (
+            'grpcio reports resolver failures as canonical statuses rather '
+            'than socket.gaierror, covered by the status matrix.'
+        ),
+    },
+    'PROTOCOL': {
+        'GRPC': (
+            'grpcio exposes protocol failures as canonical statuses rather '
+            'than a Python wire-parser exception.'
         ),
     },
 }
@@ -585,6 +938,8 @@ PROTOCOL_FAULTS: dict[str, dict[str, Callable[[], BaseException]]] = {
     'HTTP': _AIOHTTP_FAULTS,
     'HTTPS': _AIOHTTP_FAULTS,
     'SOAP': _AIOHTTP_FAULTS,
+    'JSONRPC': _AIOHTTP_FAULTS,
+    'GRAPHQL': _AIOHTTP_FAULTS,
     'FTP': {
         'TLS': lambda: ssl.SSLError('handshake failed'),
         'TIMEOUT': lambda: asyncio.TimeoutError(),
@@ -600,6 +955,19 @@ PROTOCOL_FAULTS: dict[str, dict[str, Callable[[], BaseException]]] = {
         'DNS': lambda: socket.gaierror('name not resolved'),
         'PROTOCOL': lambda: asyncssh.ProtocolError('bad packet'),
     },
+    'S3': {
+        'TLS': lambda: ssl.SSLError('handshake failed'),
+        'TIMEOUT': lambda: asyncio.TimeoutError(),
+        'TIMEOUT_BUILTIN': lambda: TimeoutError('timed out'),
+        'CONNECT': lambda: ConnectionRefusedError('connection refused'),
+        'DNS': lambda: socket.gaierror('name not resolved'),
+        'PROTOCOL': BotoCoreError,
+    },
+    # grpcio's public transport vocabulary is StatusCode, not native Python
+    # wire exceptions. Every generic category is explicitly exempt above;
+    # retaining the empty row makes omission and exemption mechanically
+    # distinguishable in the table-completeness guard.
+    'GRPC': {},
 }
 
 #: The ``error['code']`` each category must produce. ``PROTOCOL`` is the
@@ -668,7 +1036,7 @@ def install_failing_transport(
         """
         return FaultingTransport(fault)
 
-    if protocol in {'HTTP', 'HTTPS'}:
+    if protocol in {'HTTP', 'HTTPS', 'JSONRPC', 'GRAPHQL'}:
         monkeypatch.setattr(http_client, 'handle_http_request', failing)
     elif protocol == 'SOAP':
         monkeypatch.setattr(soap_client, 'handle_http_request', failing)
@@ -676,6 +1044,9 @@ def install_failing_transport(
         monkeypatch.setattr(aioftp.Client, 'context', opening)
     elif protocol == 'SFTP':
         monkeypatch.setattr(asyncssh, 'connect', opening)
+    elif protocol == 'S3':
+        _install_s3_client(
+            monkeypatch, StubS3Client(head=fault()))
     else:
         raise ValueError(
             f'{protocol!r} owns no transport seam. Returning quietly here'
@@ -857,6 +1228,7 @@ WRITE_ROUTES: tuple[tuple[str, str, str], ...] = (
     ('ftp-recursive', 'FTP', 'transfer_recursive'),
     ('sftp-single-file', 'SFTP', 'transfer_single'),
     ('sftp-recursive', 'SFTP', 'transfer_recursive'),
+    ('s3-download', 'S3', 's3_download'),
 )
 
 #: The local write faults every route is asked about. Each is a fault of
@@ -1273,6 +1645,10 @@ def install_writing_transport(
             asyncssh, 'connect',
             lambda *a, **k: entered(StubSSHConnection(client)))
         return client
+    if protocol == 'S3':
+        client = StubS3Client(download_body=body)
+        _install_s3_client(monkeypatch, client)
+        return client
     raise ValueError(
         f'{protocol!r} has no doubled local-write seam. HTTP and '
         'HTTPS write below the seam this doubles and must dial the '
@@ -1306,5 +1682,6 @@ def local_io_call(protocol: str, destination: str) -> dict[str, Any]:
             'download_filepath': destination}},
         'FTP': {'client_path': destination},
         'SFTP': {'local_path': destination},
+        'S3': {'command': 'download', 'local_path': destination},
     }[protocol])
     return call

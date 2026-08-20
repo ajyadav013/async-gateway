@@ -108,7 +108,7 @@ LOCAL_IO_PATH: str = '/local-io'
 
 # The envelope's public key set. Named here so that adding a key is a
 # deliberate edit to this list rather than something a test silently
-# accepts. S9 parametrises the same set across all five protocols.
+# accepts. S9 parametrises the same set across all nine protocols.
 EXPECTED_KEYS = frozenset({
     'ok',
     'status_code',
@@ -163,6 +163,66 @@ def files_containing(pattern: str) -> list[str]:
     ]
 
 
+def async_gateway_error_handlers_in(
+    source: str,
+) -> list[tuple[int, str, bool, bool]]:
+    """Describe each ``except AsyncGatewayError`` structurally.
+
+    Args:
+        source: One package module's Python source.
+
+    Returns:
+        ``(line, enclosing, converts, rethrows)`` rows. ``converts`` means
+        the handler calls ``finalise_error``; ``rethrows`` means it ends in a
+        bare raise and contains no envelope builder or return statement.
+    """
+    found: list[tuple[int, str, bool, bool]] = []
+
+    def walk(node: ast.AST, enclosing: str) -> None:
+        """Walk definitions while retaining their qualified source name."""
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.AsyncFunctionDef,
+                                  ast.ClassDef,
+                                  ast.FunctionDef)):
+                walk(
+                    child,
+                    f'{enclosing}.{child.name}' if enclosing else child.name,
+                )
+                continue
+            if isinstance(child, ast.ExceptHandler):
+                caught = {
+                    part.id if isinstance(part, ast.Name) else part.attr
+                    for part in ast.walk(child.type)
+                    if isinstance(part, (ast.Attribute, ast.Name))
+                } if child.type is not None else set()
+                if 'AsyncGatewayError' in caught:
+                    calls = {
+                        dotted_name(part.func).rsplit('.', 1)[-1]
+                        for part in ast.walk(child)
+                        if isinstance(part, ast.Call)
+                    }
+                    converts = 'finalise_error' in calls
+                    terminal_raise = (
+                        bool(child.body)
+                        and isinstance(child.body[-1], ast.Raise)
+                        and child.body[-1].exc is None
+                    )
+                    forbidden = {'finalise_error', 'new_envelope'} & calls
+                    returns = any(
+                        isinstance(part, (ast.Return, ast.Yield,
+                                          ast.YieldFrom))
+                        for part in ast.walk(child)
+                    )
+                    rethrows = (
+                        terminal_raise and not forbidden and not returns)
+                    found.append((
+                        child.lineno, enclosing, converts, rethrows))
+            walk(child, enclosing)
+
+    walk(ast.parse(source), '')
+    return found
+
+
 #: Every call by which Python can create, truncate or otherwise write a
 #: local file. Matched on the *final* attribute, so ``open``,
 #: ``aiofiles.open``, ``os.open`` and ``pathlib.Path(...).write_bytes``
@@ -193,6 +253,46 @@ WRITE_SEAMS: frozenset[str] = frozenset({
     'touch',
     'write_bytes',
     'write_text',
+})
+
+# Descriptor-level mutations must be matched by their complete dotted name.
+# Matching only the final ``write``/``replace`` attribute would mistake every
+# stream write and ``str.replace`` for filesystem I/O and turn the census into
+# a broad allowlist exercise instead of a guard on concrete syscalls.
+DESCRIPTOR_WRITE_SEAMS: frozenset[str] = frozenset({
+    'os.replace',
+    'os.write',
+})
+
+#: Descriptor flags whose spelling proves they cannot enable a mutation.
+#: The allowlist is intentionally narrow: an unknown name or expression is
+#: a possible caller-supplied write bit and must stay visible to the census.
+NONMUTATING_DESCRIPTOR_FLAGS: Final[frozenset[str]] = frozenset({
+    'DIRECTORY_FLAGS',
+    'O_CLOEXEC',
+    'O_DIRECTORY',
+    'O_NOFOLLOW',
+    'O_NONBLOCK',
+    'O_RDONLY',
+    'os.O_CLOEXEC',
+    'os.O_DIRECTORY',
+    'os.O_NOFOLLOW',
+    'os.O_NONBLOCK',
+    'os.O_RDONLY',
+})
+
+#: Flag spellings that explicitly select descriptor read access.
+READ_ONLY_DESCRIPTOR_FLAGS: Final[frozenset[str]] = frozenset({
+    '<zero>',
+    'O_RDONLY',
+    'os.O_RDONLY',
+})
+
+#: Flag spellings that prove an ``os.open`` targets a directory.
+DIRECTORY_DESCRIPTOR_FLAGS: Final[frozenset[str]] = frozenset({
+    'DIRECTORY_FLAGS',
+    'O_DIRECTORY',
+    'os.O_DIRECTORY',
 })
 
 
@@ -239,7 +339,66 @@ def _reads_only(call: ast.Call) -> bool:
     for keyword in call.keywords:
         if keyword.arg == 'mode' and isinstance(keyword.value, ast.Constant):
             mode = keyword.value.value
-    return isinstance(mode, str) and not set(mode) & set('wxa+')
+    if isinstance(mode, str):
+        return not set(mode) & set('wxa+')
+    return _os_open_reads_only(call)
+
+
+def _known_nonmutating_descriptor_flags(
+    expression: ast.expr,
+) -> frozenset[str] | None:
+    """Return the proven non-mutating atoms in a descriptor expression.
+
+    A bitwise OR is safe only when both sides are safe. Zero is the sole
+    accepted numeric literal because every non-zero bit can select a
+    platform-specific write or create mode. All other operations and names
+    are deliberately unknown rather than guessed safe.
+
+    Args:
+        expression: The second argument supplied to ``os.open``.
+
+    Returns:
+        The known flag spellings, ``{'<zero>'}`` for literal zero, or None
+        when any part of the expression could enable a mutation.
+    """
+    if isinstance(expression, ast.Constant):
+        if type(expression.value) is int and expression.value == 0:
+            return frozenset({'<zero>'})
+        return None
+    if isinstance(expression, (ast.Attribute, ast.Name)):
+        name = dotted_name(expression)
+        if name in NONMUTATING_DESCRIPTOR_FLAGS:
+            return frozenset({name})
+        return None
+    if isinstance(expression, ast.BinOp) and isinstance(
+        expression.op,
+        ast.BitOr,
+    ):
+        left = _known_nonmutating_descriptor_flags(expression.left)
+        right = _known_nonmutating_descriptor_flags(expression.right)
+        if left is not None and right is not None:
+            return left | right
+    return None
+
+
+def _os_open_reads_only(call: ast.Call) -> bool:
+    """Recognize an explicit descriptor read with no mutating flag.
+
+    The check is structural and deliberately strict: the flags expression
+    must explicitly select read access and contain only allowlisted,
+    non-mutating atoms. A computed flag, non-zero integer or unrecognised
+    operation remains a possible write.
+
+    Args:
+        call: Candidate ``os.open`` call.
+
+    Returns:
+        True only for an explicit read-only descriptor open.
+    """
+    if dotted_name(call.func) != 'os.open' or len(call.args) < 2:
+        return False
+    flags = _known_nonmutating_descriptor_flags(call.args[1])
+    return flags is not None and bool(flags & READ_ONLY_DESCRIPTOR_FLAGS)
 
 
 def write_seams_in(source: str) -> list[tuple[int, str, str]]:
@@ -284,7 +443,11 @@ def write_seams_in(source: str) -> list[tuple[int, str, str]]:
                 name = dotted_name(child.func)
                 writes = (not _reads_only(child)
                           and not _opens_a_directory(child))
-                if name.rsplit('.', 1)[-1] in WRITE_SEAMS and writes:
+                is_write_seam = (
+                    name.rsplit('.', 1)[-1] in WRITE_SEAMS
+                    or name in DESCRIPTOR_WRITE_SEAMS
+                )
+                if is_write_seam and writes:
                     found.append((child.lineno, name, enclosing))
             walk(child, enclosing)
 
@@ -298,24 +461,99 @@ def _opens_a_directory(call: ast.Call) -> bool:
     ``open_within`` walks the destination's ancestors a component at a
     time, opening each as a directory descriptor. Those opens create
     nothing -- ``O_DIRECTORY`` refuses anything that is not already a
-    directory, and no ``O_CREAT`` is in the flags -- so they are not
-    write seams. Recognised by the flag constant appearing anywhere in
-    the flags expression rather than by line number, so the exemption
-    follows the code if it moves.
+    directory -- so an exact expression made only of known non-mutating
+    flags is not a write seam. Unknown or computed terms keep the call in
+    the census even when the expression also mentions a directory flag.
 
     Args:
         call: The call node to inspect.
 
     Returns:
-        True when the call names ``os.open`` and its flags mention a
-        directory-open constant.
+        True only when a proven non-mutating ``os.open`` expression names
+        a directory-open constant.
     """
     if dotted_name(call.func) != 'os.open' or len(call.args) < 2:
         return False
-    return any(
-        isinstance(node, ast.Name) and node.id in {'DIRECTORY_FLAGS'}
-        for node in ast.walk(call.args[1])
-    )
+    flags = _known_nonmutating_descriptor_flags(call.args[1])
+    return flags is not None and bool(flags & DIRECTORY_DESCRIPTOR_FLAGS)
+
+
+@pytest.mark.parametrize(
+    'flags',
+    [
+        pytest.param(
+            'os.O_RDONLY | 1',
+            id='nonzero-numeric-write-flag',
+        ),
+        pytest.param(
+            'os.O_RDONLY | caller_flags',
+            id='read-plus-computed-flags',
+        ),
+        pytest.param(
+            'os.O_RDONLY | os.O_CREAT',
+            id='read-plus-create',
+        ),
+        pytest.param(
+            'os.O_RDONLY | os.O_WRONLY',
+            id='read-plus-write',
+        ),
+        pytest.param(
+            'os.O_RDONLY | os.O_TRUNC',
+            id='read-plus-truncate',
+        ),
+        pytest.param(
+            'DIRECTORY_FLAGS | os.O_CREAT',
+            id='directory-plus-create',
+        ),
+        pytest.param(
+            'DIRECTORY_FLAGS | caller_flags',
+            id='directory-plus-computed-flags',
+        ),
+        pytest.param(
+            'DIRECTORY_FLAGS | 1',
+            id='directory-plus-nonzero-numeric-flag',
+        ),
+        pytest.param(
+            'DIRECTORY_FLAGS | os.O_WRONLY',
+            id='directory-plus-write',
+        ),
+        pytest.param(
+            'DIRECTORY_FLAGS | os.O_TRUNC',
+            id='directory-plus-truncate',
+        ),
+    ],
+)
+def test_descriptor_flag_census_reports_every_not_proven_read(
+    flags: str,
+) -> None:
+    """Unknown or mutating descriptor flags remain write-census findings."""
+    source = f'os.open(path, {flags})'
+
+    assert write_seams_in(source) == [(1, 'os.open', '')]
+
+
+@pytest.mark.parametrize(
+    'flags',
+    [
+        pytest.param('os.O_RDONLY', id='exact-read-only'),
+        pytest.param(
+            'os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC',
+            id='read-with-known-safe-modifiers',
+        ),
+        pytest.param('DIRECTORY_FLAGS', id='exact-directory-only'),
+        pytest.param(
+            'DIRECTORY_FLAGS | O_CLOEXEC',
+            id='directory-with-known-safe-modifier',
+        ),
+    ],
+)
+def test_descriptor_flag_census_exempts_proven_nonmutating_opens(
+    flags: str,
+) -> None:
+    """Exact known read and directory expressions are not write seams."""
+    source = f'os.open(path, {flags})'
+
+    assert write_seams_in(source) == []
 
 
 def closed_port() -> int:
@@ -451,7 +689,7 @@ async def test_e1_success_and_failure_return_the_same_key_set(
 ) -> None:
     """One shape for both paths, so a caller writes one handler (E1).
 
-    S9 widens the same assertion to five protocols; HTTP is the protocol
+    S9 widens the same assertion to nine protocols; HTTP is the protocol
     Step 5 rewrites, so it is the one that can be asserted here.
     """
     assert set(ok_envelope) == EXPECTED_KEYS
@@ -467,7 +705,7 @@ async def test_e1_a_transport_failure_returns_the_same_key_set() -> None:
     assert envelope['cookies'] == {}
 
 
-# --- R8-AC2: one key set, five protocols, both paths -----------------------
+# --- R8-AC2: one key set, nine protocols, both paths -----------------------
 
 # The five contract rows, shared by the success and the failure test below
 # so that a protocol's marker was one line to remove rather than two.
@@ -480,14 +718,24 @@ async def test_e1_a_transport_failure_returns_the_same_key_set() -> None:
 # both of that protocol's rows passed unexpectedly, the suite failed, and
 # the marker had to come off in the story that earned it. S10 took FTP,
 # S11 took SFTP, and S22 -- writing `logic/soap_client.py` from nothing --
-# took the last one. All five protocols satisfy E1 and E11 here.
-CONTRACT_ROWS = [
-    pytest.param('HTTP', id='HTTP'),
-    pytest.param('HTTPS', id='HTTPS'),
-    pytest.param('FTP', id='FTP'),
-    pytest.param('SFTP', id='SFTP'),
-    pytest.param('SOAP', id='SOAP'),
-]
+# took the last legacy one. All nine protocols satisfy E1 and E11 here.
+CONTRACT_ROWS = tuple(
+    pytest.param(protocol, id=protocol)
+    for protocol in CONTRACT_CALL
+)
+
+
+def test_contract_rows_are_derived_from_the_exact_registry() -> None:
+    """No selector can be registered without joining every envelope matrix."""
+    assert set(CONTRACT_CALL) == set(protocol_mapping)
+
+
+def test_unknown_transport_installer_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing deterministic seam can never fall through to the network."""
+    with pytest.raises(ValueError, match='owns no transport seam'):
+        install_transport(monkeypatch, 'UNKNOWN', succeeds=True)
 
 
 @pytest.mark.parametrize('protocol', CONTRACT_ROWS)
@@ -561,7 +809,30 @@ async def test_r8_ac2_every_protocol_returns_one_key_set_on_failure(
     assert result['error'] is not None
 
 
-# --- The tracing half of the same contract, on the same five rows ----------
+@pytest.mark.parametrize(
+    ('protocol', 'code'),
+    [
+        pytest.param('S3', 'S3_STATUS', id='botocore-service-status'),
+        pytest.param('GRPC', 'GRPC_STATUS', id='grpc-peer-status'),
+    ],
+)
+async def test_sdk_protocol_failures_keep_their_public_status_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+    code: str,
+) -> None:
+    """SDK-native failures cross the breaker once and normalize by protocol."""
+    install_transport(monkeypatch, protocol, succeeds=False)
+
+    result = await request(**contract_call(protocol))
+
+    assert set(result) == EXPECTED_KEYS
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == code
+
+
+# --- The tracing half of the same contract, on the same nine rows ----------
 #
 # Three findings in as many review rounds have been the *same* defect: a fix
 # landed on one protocol client and its siblings were left behind. M20 (the
@@ -614,12 +885,15 @@ def attached_tracer_count(protocol: str) -> int:
         The number of ``aiohttp.TraceConfig`` objects the client attaches,
         which is the number of collector mappings a call must report.
     """
-    call = CONTRACT_CALL[protocol]
-    built = protocol_mapping[protocol](
+    call = contract_call(protocol)
+    protocol_class = protocol_mapping[protocol]
+    info = protocol_class.validate_protocol_info(call['protocol_info'])
+    built = protocol_class(
         call['url'],
-        BasicAuth('user', 'password'),
-        new_envelope(url=call['url'], protocol=protocol, payload={}),
-        info=dict(call['protocol_info']),
+        call['auth'],
+        new_envelope(
+            url=call['url'], protocol=protocol, payload=call['data']),
+        info=info,
         redact_params=frozenset(),
     )
     return len(getattr(built, 'trace_config', []))
@@ -701,12 +975,15 @@ def test_h17_no_protocol_binds_trace_state_at_construction(
     Returns:
         None.
     """
-    call = CONTRACT_CALL[protocol]
-    built = protocol_mapping[protocol](
+    call = contract_call(protocol)
+    protocol_class = protocol_mapping[protocol]
+    info = protocol_class.validate_protocol_info(call['protocol_info'])
+    built = protocol_class(
         call['url'],
-        BasicAuth('user', 'password'),
-        new_envelope(url=call['url'], protocol=protocol, payload={}),
-        info=dict(call['protocol_info']),
+        call['auth'],
+        new_envelope(
+            url=call['url'], protocol=protocol, payload=call['data']),
+        info=info,
         redact_params=frozenset(),
     )
 
@@ -717,7 +994,7 @@ def test_h17_no_protocol_binds_trace_state_at_construction(
             'collide in (H17); bind it inside handle_request.')
 
 
-# --- The exception half of the same contract, on the same five rows --------
+# --- The exception half of the same contract, on the same nine rows --------
 #
 # The trace rows above closed the *tracing* class of cross-protocol
 # divergence. They did not close the class itself: AGW-R9-1 was a fourth
@@ -1132,14 +1409,23 @@ def test_the_derivation_reaches_every_dispatch_site() -> None:
     checked against it rather than against itself.
     """
     covered = {module for module, _, _ in DISPATCH_SITES}
+    strategy_modules = {
+        importlib.import_module(strategy.__module__)
+        for strategy in protocol_mapping.values()
+    }
     expected = {
-        f'{protocol.lower()}_client' for protocol in protocol_mapping
-    } - {'https_client'}
+        module.__name__.rsplit('.', 1)[-1]
+        for module in strategy_modules
+        if hasattr(module, 'TRANSPORT_FAULTS')
+    }
 
-    assert expected <= covered, (
+    assert expected == covered, (
         f'{sorted(expected - covered)} dispatch(es) over a transport '
         'and are not held to the derivation, which is the two-of-four '
-        'gap NEW-R10-1 found one round after it was declared closed.')
+        'gap NEW-R10-1 found one round after it was declared closed. '
+        'The expected set is discovered from each registered strategy '
+        'module and its actual classification surface, never guessed from '
+        'the selector spelling.')
 
 
 @pytest.mark.parametrize('protocol', CONTRACT_ROWS)
@@ -1565,6 +1851,20 @@ def test_the_write_route_enumeration_reaches_every_guarded_open() -> None:
         # against an open parent. It is the syscall the guard is made
         # of, not a route around it.
         'utils/paths.py::open_within',
+        # This upload-source open includes the function's ``nofollow``
+        # parameter in its flags. The conservative recognizer therefore
+        # keeps it in the census as a computed expression; this exact site
+        # is the guarded read path whose descriptor is checked with fstat
+        # before it is returned.
+        'utils/paths.py::_open_read_descriptor',
+        # Descriptor-relative guarded create/write/commit sites used by
+        # ``safe_writer``. These are exact functions rather than a paths.py
+        # exemption, so an unguarded os.open/os.write/os.replace elsewhere in
+        # the same module remains a finding.
+        'utils/paths.py::_temporary_file_for',
+        'utils/paths.py::_exclusive_file_for',
+        'utils/paths.py::_write_all',
+        'utils/paths.py::_replace_at',
     }
     # The three upload reads in `request_helper.py` are mode-literal
     # `'rb'`, so the census drops them on mode alone and they need no
@@ -1841,15 +2141,28 @@ def test_every_protocol_declares_a_local_destination_or_is_exempt(
             'local destination, so its row proves nothing.')
         return
 
-    source = inspect.getsource(soap_client.SoapRequest)
-    assert 'http_file_download_config=None' in source, (
-        'SOAP is exempt from LOCAL_IO because it hands the transport a '
-        'literal None for the download config, so no local file is '
-        'ever opened. That line is the exemption; it is gone.')
-    assert "info.get('http_file_download_config')" not in source, (
-        'SOAP now reads a caller-supplied download config, so it can '
-        'write a local file and the LOCAL_IO exemption is stale: give '
-        'it a row instead of an argument.')
+    with pytest.raises(KeyError):
+        local_io_call(protocol, '/tmp/x')
+
+    if protocol == 'SOAP':
+        source = inspect.getsource(soap_client.SoapRequest)
+        assert 'http_file_download_config=None' in source, (
+            'SOAP is exempt from LOCAL_IO because it hands the transport a '
+            'literal None for the download config, so no local file is '
+            'ever opened. That line is the exemption; it is gone.')
+        assert "info.get('http_file_download_config')" not in source, (
+            'SOAP now reads a caller-supplied download config, so it can '
+            'write a local file and the LOCAL_IO exemption is stale: give '
+            'it a row instead of an argument.')
+        return
+
+    allowed = protocol_mapping[protocol].ALLOWED_INFO_KEYS
+    assert allowed is not None
+    assert not {
+        'http_file_download_config', 'client_path', 'local_path'
+    } & set(allowed), (
+        f'{protocol} claims it cannot write locally but its closed option '
+        'inventory exposes a destination key.')
 
 
 @pytest.mark.parametrize('protocol', CONTRACT_ROWS)
@@ -4968,10 +5281,38 @@ async def test_the_conversion_point_is_the_only_place_that_converts(
 ) -> None:
     """One place turns a typed error into an envelope (R10, the one rule).
 
-    The entry point holds the only ``except AsyncGatewayError`` in the
-    package; every layer below it raises and none builds a failure shape.
+    The entry point is the sole handler which calls ``finalise_error``.
+    A strategy may catch the public base only to sanitize its message before
+    a bare re-raise; that structurally proven pass-through is not a second
+    conversion point.
     """
-    converters = files_containing(r'except AsyncGatewayError')
+    handlers = [
+        (module, *handler)
+        for module, source in package_sources()
+        for handler in async_gateway_error_handlers_in(source)
+    ]
+    converters = [
+        (module, enclosing)
+        for module, _, enclosing, converts, _ in handlers
+        if converts
+    ]
+    passthroughs = [
+        (module, enclosing)
+        for module, _, enclosing, converts, rethrows in handlers
+        if not converts and rethrows
+    ]
+    unsafe = [
+        (module, line, enclosing)
+        for module, line, enclosing, converts, rethrows in handlers
+        if not converts and not rethrows
+    ]
 
-    assert converters == ['asyncio_gateway.py']
+    assert converters == [('asyncio_gateway.py', 'request')]
+    assert passthroughs == [
+        ('asyncio_gateway.py', 'run_processor'),
+        ('logic/s3_client.py', 'S3Request.handle_request')]
+    assert not unsafe, (
+        'an AsyncGatewayError handler neither converts at the public entry '
+        'point nor sanitizes and rethrows unchanged: '
+        f'{unsafe!r}')
     assert hasattr(entrypoint, 'log_failure')
