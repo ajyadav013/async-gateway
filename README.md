@@ -183,7 +183,8 @@ just as a `BasicAuth` object was, so nothing is given up by moving to it.
 ### FTP
 
 FTP speaks TLS by default (`verify_ssl` defaults to `True`) and never silently
-downgrades to plaintext.
+downgrades to plaintext. Select `tls_mode='explicit'` for the common
+`AUTH TLS` flow; omitting it retains the legacy implicit-FTPS behavior.
 
 ```python
 from types import SimpleNamespace
@@ -199,6 +200,7 @@ result = await request(
         'server_path': '/exports/report.csv',
         'client_path': LOCAL_DOWNLOAD_PATH,
         'verify_ssl': True,
+        'tls_mode': 'explicit',
         'timeout': 30,
     },
 )
@@ -526,6 +528,7 @@ encoding as the bare media type.
 | `client_path` | `str` | `None` | The path on this machine. Omit for a command that touches no local file. |
 | `port` | `int` | `21` | Server port. |
 | `verify_ssl` | `bool` | `True` | FTPS. `False` opens the session in **plaintext** and logs a warning. |
+| `tls_mode` | `'implicit'` or `'explicit'` | legacy behavior | Optional named TLS negotiation mode. Named modes require `verify_ssl=True`; explicit mode does not support a client certificate. |
 | `certificate` | `(cert path, key path)` | `None` | A client certificate pair. |
 | `overwrite` | `bool` | `False` | Whether a download may replace an existing local file. |
 | `timeout` | number | `15` | Bounds the connect, and bounds **each** socket read and write. |
@@ -1119,27 +1122,28 @@ rather than prompting. A `certificate` that is not a loadable pair raises
 credentials as literal `USER`/`PASS` lines, and a default that puts your
 password on the wire is not a default anyone asked for.
 
-**It fails closed rather than downgrading.** A server that offers no TLS fails
-with `error['code'] == 'TLS'`; it never completes in plaintext. The value handed
-to the transport is never `None`, which is how `aioftp` is told to speak
-plaintext.
+**It fails closed rather than downgrading.** An implicit TLS handshake failure
+reports `error['code'] == 'TLS'`. In explicit mode, a server that refuses
+`AUTH TLS` reports `FTP_STATUS` with its real FTP reply code; a TLS handshake
+or certificate failure after a successful `234` reports `TLS`. All happen
+before login, with no plaintext fallback. Named modes require
+`verify_ssl=True`, so neither can become an unverified session.
 
-`verify_ssl=False` is honoured, **is unsafe**, and logs a warning naming the risk
-on every use: the session is opened in plaintext, so the credentials and every
-byte transferred cross the network in the clear.
+When `tls_mode` is omitted, `verify_ssl=False` retains the legacy opt-out. It is
+**unsafe** and logs a warning on every use: the session is opened in plaintext,
+so the credentials and every byte transferred cross the network in the clear.
 
-**It speaks implicit FTPS, not explicit FTPS.** The TLS value is handed to
-`aioftp.Client(ssl=...)`, which wraps the control connection from the first
-byte — implicit FTPS, conventionally port 990. *Explicit* FTPS, the more common
-deployment, connects in plaintext on port 21 and issues `AUTH TLS` to upgrade;
-this library never sends that command, so pointing it at an explicit-FTPS
-server fails the handshake with `error['code'] == 'TLS'` (it reads the server's
-plaintext `220` greeting where a ServerHello belongs).
+`tls_mode='implicit'` supplies the existing verified `SSLContext` before the
+first control-channel byte. `tls_mode='explicit'` opens the control transport,
+performs `AUTH TLS` through aioftp's native upgrade **before login**, and then
+protects data transfers with `PBSZ 0` and `PROT P`. Port selection is unchanged:
+the default remains 21 and an explicit `port` always wins.
 
-That failure is safe — it fails closed, and no credentials are sent — but it
-does mean this client interoperates with implicit FTPS only. If you need
-explicit FTPS, say so on the issue tracker; the change is confined to calling
-`aioftp`'s `upgrade_to_tls()` after a plaintext connect.
+Explicit mode rejects `certificate` before connecting because aioftp's native
+context helper cannot safely forward that custom context into its upgrade.
+Named implicit mode retains client-certificate support. The effective mode is
+reported as `protocol_details['tls_mode']` (`implicit`, `explicit`, or legacy
+`plaintext`).
 
 ### SFTP host keys
 

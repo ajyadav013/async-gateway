@@ -256,6 +256,195 @@ async def test_r15_ac2_an_unloadable_certificate_becomes_a_config_envelope(
     assert str(missing) in result['error']['message']
 
 
+# --- R2: named explicit FTPS without legacy drift --------------------------
+
+
+@pytest.mark.parametrize(
+    'info, expected_mode, expected_ssl',
+    [
+        pytest.param({}, 'implicit', ssl.SSLContext, id='implicit-default'),
+        pytest.param(
+            {'verify_ssl': False}, 'plaintext', False,
+            id='plaintext-opt-out',
+        ),
+    ],
+)
+async def test_legacy_tls_mode_arguments_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    info: dict[Text, Any],
+    expected_mode: Text,
+    expected_ssl: Any,
+) -> None:
+    """Omitting ``tls_mode`` preserves the exact established transport."""
+    double = install_ftp_double(monkeypatch)
+
+    result = await ftp_call(**info)
+
+    assert double.calls[0][0][:4] == ('host', 21, 'user', 'password')
+    assert 'upgrade_to_tls' not in double.kwargs
+    if expected_ssl is False:
+        assert double.kwargs['ssl'] is False
+    else:
+        assert isinstance(double.kwargs['ssl'], expected_ssl)
+    assert result['protocol_details']['tls_mode'] == expected_mode
+
+
+@pytest.mark.parametrize('tls_mode', ['implicit', 'explicit'])
+async def test_named_tls_modes_use_only_their_native_aioftp_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tls_mode: Text,
+) -> None:
+    """Implicit supplies a context; explicit upgrades before login."""
+    double = install_ftp_double(monkeypatch)
+
+    result = await ftp_call(tls_mode=tls_mode)
+
+    if tls_mode == 'explicit':
+        assert double.kwargs['ssl'] is None
+        assert double.kwargs['upgrade_to_tls'] is True
+    else:
+        assert isinstance(double.kwargs['ssl'], ssl.SSLContext)
+        assert 'upgrade_to_tls' not in double.kwargs
+    assert result['ok'] is True
+    assert result['protocol_details']['tls_mode'] == tls_mode
+
+
+@pytest.mark.parametrize('tls_mode', ['implicit', 'explicit'])
+async def test_named_tls_modes_reject_plaintext_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    tls_mode: Text,
+) -> None:
+    """A named TLS mode cannot be combined with the legacy opt-out."""
+    double = install_ftp_double(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match='verify_ssl'):
+        await ftp_call(tls_mode=tls_mode, verify_ssl=False)
+    assert double.calls == []
+
+
+async def test_explicit_tls_rejects_client_certificate_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aioftp's native explicit helper cannot receive a custom context."""
+    double = install_ftp_double(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match='explicit'):
+        await ftp_call(
+            tls_mode='explicit', certificate=('cert.pem', 'key.pem'))
+    assert double.calls == []
+
+
+@pytest.mark.parametrize(
+    'tls_mode',
+    [
+        pytest.param(None, id='null'),
+        pytest.param(False, id='false'),
+        pytest.param(True, id='true'),
+        pytest.param(1, id='integer'),
+        pytest.param([], id='list'),
+        pytest.param({}, id='mapping'),
+        pytest.param('', id='empty'),
+        pytest.param('IMPLICIT', id='wrong-case'),
+        pytest.param(' implicit ', id='padded'),
+        pytest.param('starttls', id='unknown'),
+    ],
+)
+async def test_invalid_tls_mode_fails_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    tls_mode: Any,
+) -> None:
+    """Only the exact two named modes cross the configuration boundary."""
+    double = install_ftp_double(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match='tls_mode'):
+        await ftp_call(tls_mode=tls_mode)
+    assert double.calls == []
+
+
+async def test_named_implicit_tls_keeps_client_certificate_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only explicit mode refuses the existing custom-certificate path."""
+    double = install_ftp_double(monkeypatch)
+
+    with certificate_pair() as pair:
+        result = await ftp_call(tls_mode='implicit', certificate=pair)
+
+    assert result['ok'] is True
+    assert isinstance(double.kwargs['ssl'], ssl.SSLContext)
+    assert 'upgrade_to_tls' not in double.kwargs
+    assert result['protocol_details']['tls_mode'] == 'implicit'
+
+
+@pytest.mark.parametrize(
+    'info, expected_port',
+    [
+        pytest.param({}, 21, id='default'),
+        pytest.param({'port': 2121}, 2121, id='caller-override'),
+    ],
+)
+async def test_explicit_tls_preserves_ftp_port_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    info: dict[Text, Any],
+    expected_port: int,
+) -> None:
+    """Selecting explicit TLS never implies a different destination port."""
+    double = install_ftp_double(monkeypatch)
+
+    result = await ftp_call(tls_mode='explicit', **info)
+
+    assert result['ok'] is True
+    assert double.calls[0][0][1] == expected_port
+
+
+@pytest.mark.parametrize(
+    'error, expected_code, expected_status',
+    [
+        pytest.param(
+            aioftp.StatusCodeError('2xx', '550', ['AUTH TLS refused']),
+            'FTP_STATUS', 550,
+            id='auth-tls-refused',
+        ),
+        pytest.param(
+            ssl.SSLError('TLS handshake failed'),
+            'TLS', 502,
+            id='post-auth-handshake-failed',
+        ),
+    ],
+)
+async def test_explicit_tls_failures_keep_their_transport_family(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    expected_code: Text,
+    expected_status: int,
+) -> None:
+    """AUTH reply and subsequent handshake failures stay distinguishable."""
+    double = install_ftp_double(monkeypatch, connect_error=error)
+
+    result = await ftp_call(tls_mode='explicit')
+
+    assert double.kwargs['ssl'] is None
+    assert double.kwargs['upgrade_to_tls'] is True
+    assert result['error'] is not None
+    assert result['error']['code'] == expected_code
+    assert result['status_code'] == expected_status
+
+
+@pytest.mark.parametrize('client_path', ['', 1])
+async def test_invalid_client_path_fails_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    client_path: Any,
+) -> None:
+    """Malformed optional local operands retain their typed boundary."""
+    double = install_ftp_double(monkeypatch)
+
+    result = await ftp_call(client_path=client_path)
+
+    assert result['error'] is not None
+    assert result['error']['code'] == 'CONFIG'
+    assert double.calls == []
+
+
 # --- R15-AC3 / AC4: FTPS by default, and never a downgrade -----------------
 
 
@@ -672,6 +861,7 @@ async def test_r15_ac6_every_command_reports_the_success_it_achieved(
         'server_path': SERVER_PATH,
         'client_path': client_path,
         'file_stats': dict(FILE_STATS) if stats_read else None,
+        'tls_mode': 'implicit',
     }
     assert ('stat' in dict(double.client.calls)) is stats_read
 

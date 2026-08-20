@@ -4,9 +4,10 @@ Three things S10's guards cannot be proven without.
 
 The first is a *recording* stand-in for ``aioftp.Client.context``. The
 fail-closed rule is a claim about the **value** the client hands
-``aioftp`` -- ``ssl=`` is never ``None`` when verification is on, and the
-connect and the transfer are both bounded -- and a stub that discards its
-arguments cannot see any of it. The recorded call log is also what lets a
+``aioftp`` -- verified implicit TLS never uses ``ssl=None``; named explicit
+TLS uses it only together with ``upgrade_to_tls=True`` -- and the connect and
+transfer are both bounded. A stub that discards its arguments cannot see any
+of it. The recorded call log is also what lets a
 test assert that ``stat`` did **not** run after a ``remove``, which no
 return value can carry.
 
