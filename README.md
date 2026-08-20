@@ -1,8 +1,8 @@
 # asyncio-gateway
 
-One `await` for HTTP, HTTPS, SOAP, FTP and SFTP. Every protocol returns the
-**same response envelope**, so a consuming service writes one success check and
-one error path instead of five.
+One `await` for `HTTP`, `HTTPS`, `FTP`, `SFTP`, `SOAP`, `JSONRPC`, `GRAPHQL`,
+`S3`, and `GRPC`. Every protocol returns the **same response envelope**, so a
+consuming service writes one success check and one error path instead of nine.
 
 ```python
 from asyncio_gateway.asyncio_gateway import request
@@ -61,7 +61,8 @@ pip install -e '.[dev]'
 Runtime dependencies are declared as ranges with a major-version ceiling, so
 installing this library does not pin your project to one patch release:
 `aiohttp>=3.14.3,<4` · `orjson>=3.12.0,<4` · `aioboto3>=15.5.0,<16` ·
-`aiofiles>=25.1.0,<26` · `aioftp>=0.28.0,<1` · `asyncssh>=2.24.0,<3` ·
+`grpcio>=1.83.0,<2` · `aiofiles>=25.1.0,<26` · `aioftp>=0.28.0,<1` ·
+`asyncssh>=2.24.0,<3` ·
 `pyfailsafe==0.6.0`.
 
 `pyfailsafe` is the one exact pin: `0.6.0` is the latest release of a dormant
@@ -124,16 +125,19 @@ impact of each, and what to do if you cannot migrate yet are in the
 
 ## Quickstart per protocol
 
-Every example below is executed against a live server by this project's own
-test suite (`tests/test_docs.py`), so an example that stops working fails CI.
+Every example below is executed against a loopback peer or deterministic
+double by this project's own test suite (`tests/test_docs.py`), so an example
+that stops working fails CI without contacting a third party.
 
 <a id="runnable-example-scripts"></a>
 **Complete runnable scripts live in the repository, not in the package.** The
-five end-to-end programs under
+nine end-to-end programs under
 [`examples/`](https://github.com/ajyadav013/asyncio-gateway/tree/master/examples) —
-`http_example.py`, `ftp_example.py`, `sftp_example.py`, `soap_example.py` and
-`error_handling_example.py` — are deliberately **not** shipped in the wheel or
-the sdist, so `pip install asyncio-gateway` does not place them on your disk.
+`http_example.py`, `ftp_example.py`, `sftp_example.py`, `soap_example.py`,
+`jsonrpc_example.py`, `graphql_example.py`, `s3_example.py`, `grpc_example.py`,
+and `error_handling_example.py` — are deliberately **not** shipped in the
+wheel or the sdist, so `pip install asyncio-gateway` does not place them on
+your disk.
 That is a decision rather than an oversight: a second copy of the API's
 documentation inside every install is a copy that drifts against this README.
 Read them on GitHub or in a clone; the snippets below are self-contained and
@@ -388,6 +392,85 @@ entity-expansion attacks and a SOAP envelope never legitimately carries one. The
 check is prolog-scoped, so a `<detail>` whose *content* contains the word
 DOCTYPE parses normally.
 
+### JSON-RPC 2.0
+
+`JSONRPC` is a single JSON-RPC 2.0 call over HTTP or HTTPS. It always sends
+POST, rejects redirects, owns its HTTP session and serializer, and requires a
+non-notification request id.
+
+```python
+from asyncio_gateway.asyncio_gateway import request
+
+result = await request(
+    url='https://api.example.com/rpc',
+    data={'value': 2},
+    protocol='JSONRPC',
+    protocol_info={'method': 'demo.double', 'request_id': 1},
+)
+assert result['ok'] is True
+assert result['protocol_details'] == {'id': 1, 'result': 4}
+```
+
+`python examples/jsonrpc_example.py` is a client example for a JSON-RPC
+endpoint that you run locally; the packaging tests supply its real loopback
+server. It never calls a third-party endpoint.
+A valid peer error is `JSONRPC_ERROR`, even when its HTTP status is non-2xx.
+A malformed envelope at a successful HTTP status is `JSONRPC_PROTOCOL`/502;
+malformed or non-result content at non-2xx remains `HTTP_STATUS`.
+
+### GraphQL
+
+`GRAPHQL` is one JSON-over-HTTP query or mutation. It always sends POST,
+rejects redirects, owns its HTTP session and serializer, and preserves partial
+`data` when the peer also returns `errors`.
+
+```python
+from asyncio_gateway.asyncio_gateway import request
+
+result = await request(
+    url='https://api.example.com/graphql',
+    data={'id': 'w-1'},
+    protocol='GRAPHQL',
+    protocol_info={
+        'query': 'query GetWidget($id: ID!) { widget(id: $id) { id } }',
+        'operation_name': 'GetWidget',
+    },
+)
+assert result['ok'] is True
+assert result['protocol_details']['data'] == {'widget': {'id': 'w-1'}}
+```
+
+`python examples/graphql_example.py` is a client example for a GraphQL
+endpoint that you run locally; the packaging tests supply its real loopback
+server. It never calls a third-party endpoint.
+GraphQL `errors` produce `GRAPHQL_ERROR`; invalid successful response shapes
+produce `GRAPHQL_PROTOCOL`/502. At non-2xx, only a valid
+`application/graphql-response+json` error takes precedence over `HTTP_STATUS`.
+
+### S3
+
+The S3 quickstart is a deterministic SDK double, so it is runnable without an
+AWS account, credentials, configuration, bucket, or network access:
+
+```text
+python examples/s3_example.py
+```
+
+It makes one public `S3` `head` request. Real calls use
+`s3://bucket/key`; download and upload additionally require `local_path`.
+
+### gRPC
+
+The gRPC quickstart creates a local generic server on loopback, makes one raw
+unary-unary call, then closes both channel and server:
+
+```text
+python examples/grpc_example.py
+```
+
+No generated stub or protobuf package is needed. `grpc://host:port` selects
+explicit plaintext and `grpcs://host:port` selects TLS with platform roots.
+
 ---
 
 ## Public API reference
@@ -397,7 +480,7 @@ DOCTYPE parses normally.
 ```python
 async def request(
     url: str,
-    data: Optional[Union[Dict, str]] = None,
+    data: object = None,
     auth: object = None,
     protocol: str = '',
     protocol_info: Dict = None,
@@ -409,11 +492,11 @@ async def request(
 
 | Argument | Meaning |
 |---|---|
-| `url` | An absolute URL for HTTP/HTTPS/SOAP; a **bare host name** for FTP/SFTP. |
-| `data` | The request payload. For SOAP it is the XML body (`str` or `Element`). Defaults to `{}`. |
-| `auth` | **Required for FTP and SFTP** — any object carrying `.login` and `.password`, e.g. `SimpleNamespace(login=..., password=...)`; omitted there, the call raises `ConfigurationError`, because those two protocols cannot connect without credentials. **Optional for HTTP/HTTPS/SOAP**, where `None` sends no credentials; put credentials in an `Authorization` header instead (see [HTTP credentials](#http-basic-auth)). `auth` is still forwarded to aiohttp untouched, but `aiohttp.BasicAuth` is deprecated in aiohttp 3.14. |
-| `protocol` | One of `'HTTP'`, `'HTTPS'`, `'FTP'`, `'SFTP'`, `'SOAP'`. Matched with surrounding whitespace stripped and without regard to case, so `'http'`, `' HTTP '` and `'Http'` are one protocol. |
-| `protocol_info` | Per-protocol configuration; see the tables below. `None` is a valid call for every protocol that requires no key. |
+| `url` | An absolute HTTP(S) URL for HTTP/HTTPS/SOAP/JSON-RPC/GraphQL; `s3://bucket/key` for S3; an explicit `grpc://host:port` or `grpcs://host:port` target for gRPC; a **bare host name** for FTP/SFTP. |
+| `data` | The request payload. For JSON-RPC/GraphQL, `None` omits params/variables; for SOAP it is XML (`str` or `Element`); for gRPC it is bytes-like unless a serializer is supplied. Existing selectors retain the legacy `{}` default. S3 takes operation data from its URI and `protocol_info`. |
+| `auth` | **Required for FTP and SFTP** as an object with `.login`/`.password`. **Optional for HTTP/HTTPS/SOAP/JSON-RPC/GraphQL**; prefer an `Authorization` header for HTTP-family credentials. For S3, `None` uses the normal AWS credential chain, while a supplied object provides its `.login` as access key and `.password` as secret access key. gRPC auth must be `None`; use bounded metadata instead. |
+| `protocol` | One of `HTTP`, `HTTPS`, `FTP`, `SFTP`, `SOAP`, `JSONRPC`, `GRAPHQL`, `S3`, or `GRPC`, matched case-insensitively after trimming surrounding whitespace. |
+| `protocol_info` | Per-protocol configuration; see the exact tables below. New selectors reject unknown keys before processors or I/O. |
 | `pre_processor_config` | `{'function': async_callable, 'params': {...}}`. Awaited before dispatch with `response=<envelope>` plus `params`; its return value lands in `pre_processor_response`. See [Processor hooks](#processor-hooks). |
 | `post_processor_config` | The same shape, awaited after the call; its return value lands in `post_processor_response`. |
 
@@ -609,6 +692,153 @@ a test failure, in both directions. In addition:
 
 `protocol_details` carries `soap_version`, `soap_body` and `soap_fault`.
 
+### `protocol_info` — JSONRPC
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `method` | non-empty `str` | **required** | Exact method name; the reserved `rpc.` prefix is refused. |
+| `request_id` | `str` or non-boolean `int` | **required** | Correlation id; notifications and null ids are unsupported. |
+| `headers` | mapping | `{}` | HTTP headers; `Content-Type` must remain `application/json`. |
+| `cookies` | mapping | `None` | HTTP cookies sent to the one target. |
+| `certificate` | `(cert path, key path)` | `None` | Client certificate pair. |
+| `verify_ssl` | `bool` | `True` | Verify HTTPS certificate and hostname. |
+| `trace_config` | list | a built-in tracer | Tracing from `request_tracer()`; pass `[]` to disable. |
+| `timeout` | positive number | `15` | Whole HTTP exchange deadline. |
+| `max_response_bytes` | positive `int` | `67108864` | Maximum copied response body. |
+| `circuit_breaker_config` | mapping | `{}` | Retry and breaker settings. |
+| `redact_query_params` | list of `str` | `()` | Additional sensitive query names. |
+
+`data` is params and must be a mapping, list, or `None`; `None` omits the
+member. The response must declare exactly JSON-RPC `2.0`, echo an id with the
+same type and value, and contain exactly one of `result` or `error`. Null and
+empty results are preserved. A valid error preserves its complete error object
+in `protocol_details`.
+
+### `protocol_info` — GRAPHQL
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `query` | non-empty `str` | **required** | GraphQL document; the gateway does not parse or validate it. |
+| `operation_name` | non-empty `str` | omitted | Optional operation selected from the document. |
+| `headers` | mapping | `{}` | HTTP headers with fixed JSON Content-Type and GraphQL Accept values. |
+| `cookies` | mapping | `None` | HTTP cookies sent to the one target. |
+| `certificate` | `(cert path, key path)` | `None` | Client certificate pair. |
+| `verify_ssl` | `bool` | `True` | Verify HTTPS certificate and hostname. |
+| `trace_config` | list | a built-in tracer | Tracing from `request_tracer()`; pass `[]` to disable. |
+| `timeout` | positive number | `15` | Whole HTTP exchange deadline. |
+| `max_response_bytes` | positive `int` | `67108864` | Maximum copied response body. |
+| `circuit_breaker_config` | mapping | `{}` | Retry and breaker settings. |
+| `redact_query_params` | list of `str` | `()` | Additional sensitive query names. |
+
+`data` supplies variables and must be a mapping or `None`; `None` omits the
+member. Responses carry `data`, a non-empty `errors` list, or both. Safe
+`path`, `locations`, and `extensions` fields are preserved with each error.
+
+### `protocol_info` — S3
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `command` | `download`, `upload`, `head`, or `list` | **required** | One allowlisted SDK operation. |
+| `local_path` | non-empty `str` | command-dependent | Required only for download/upload. |
+| `region` | non-empty `str` | SDK default | AWS region passed to the session. |
+| `max_response_bytes` | positive `int` | `67108864` | Mandatory bounded download ceiling. |
+| `max_upload_bytes` | positive `int` | `67108864` | Mandatory bounded upload ceiling. |
+| `max_items` | `int` in `1..1000` | `1000` | Maximum objects in the one list page. |
+| `continuation_token` | non-empty `str` | omitted | Explicit token for the one requested list page. |
+| `circuit_breaker_config` | mapping | `{}` | Gateway retry and breaker settings. |
+| `redact_query_params` | list of `str` | `()` | Additional sensitive names. |
+
+**S3 command option allowlists.** An option belonging to another command is a
+configuration error before session creation.
+
+| Command | Exact accepted keys |
+|---|---|
+| `download` | `command`, `local_path`, `region`, `max_response_bytes`, `circuit_breaker_config`, `redact_query_params` |
+| `upload` | `command`, `local_path`, `region`, `max_upload_bytes`, `circuit_breaker_config`, `redact_query_params` |
+| `head` | `command`, `region`, `circuit_breaker_config`, `redact_query_params` |
+| `list` | `command`, `region`, `max_items`, `continuation_token`, `circuit_breaker_config`, `redact_query_params` |
+
+Downloads exclusively create the destination and never overwrite it. Uploads
+read one held, no-follow regular-file descriptor and enforce the observed cap.
+List returns one page and never follows `next_continuation_token` implicitly.
+
+**S3 success detail schemas.** These sets are exact; optional scalar values
+are present as `None` rather than disappearing.
+
+| Command | Exact `protocol_details` keys |
+|---|---|
+| `download` | `command`, `bucket`, `key`, `local_path`, `bytes_written`, `etag` |
+| `upload` | `command`, `bucket`, `key`, `local_path`, `bytes_read`, `etag` |
+| `head` | `command`, `bucket`, `key`, `content_length`, `content_type`, `etag`, `last_modified`, `metadata` |
+| `list` | `command`, `bucket`, `prefix`, `items`, `key_count`, `is_truncated`, `next_continuation_token` |
+
+Each list item is exactly `key`, `size`, `etag`, `last_modified`, and
+`storage_class`; service order is preserved and `key_count == len(items)`.
+Service failures use `S3_STATUS` with the real valid HTTP status, AWS code,
+safe message, request id, and safe response metadata.
+
+### `protocol_info` — GRPC
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `method` | `/package.Service/Method` | **required** | One raw unary-unary method path. |
+| `metadata` | sequence of `(key, value)` pairs | `()` | Ordered, bounded ASCII request metadata. |
+| `request_serializer` | synchronous callable | omitted | Converts `data` to bytes before channel creation. |
+| `response_deserializer` | synchronous callable | omitted | Converts received bytes to finite JSON-safe data. |
+| `timeout` | positive number | `15` | Unary call deadline. |
+| `max_response_bytes` | positive `int` | `67108864` | grpcio receive ceiling and observed response cap. |
+| `circuit_breaker_config` | mapping | `{}` | Retry and breaker settings. |
+| `redact_query_params` | list of `str` | `()` | Additional sensitive target/metadata names. |
+
+Without a serializer, `data` must be bytes-like. Raw response bytes are
+base64 ASCII in `text`; `json` is `None` unless a deserializer is configured.
+Success has status 200 and the exact details keys `method`, `grpc_status`,
+`grpc_details`, `response_encoding`, `initial_metadata`, `trailing_metadata`,
+`initial_metadata_omitted`, and `trailing_metadata_omitted`.
+Failure keeps that identical key set: `response_encoding=None`, `text=''`, and
+`json=None`, while `grpc_status` is the canonical name and `grpc_details` is a
+redacted string or `None`. Initial and trailing metadata are separate ordered
+lists of at most 64 `{key, value, encoding}` mappings, with an independent
+omitted count for each; ASCII uses `encoding=None`, safe binary values use
+`encoding='base64'`, and sensitive values are `***`.
+
+**gRPC status map.** Every non-OK peer status becomes `GRPC_STATUS` with this
+deterministic HTTP-shaped status while retaining the canonical gRPC name.
+
+| gRPC status | `status_code` |
+|---|---|
+| `CANCELLED` | `499` |
+| `UNKNOWN` | `502` |
+| `INVALID_ARGUMENT` | `400` |
+| `DEADLINE_EXCEEDED` | `504` |
+| `NOT_FOUND` | `404` |
+| `ALREADY_EXISTS` | `409` |
+| `PERMISSION_DENIED` | `403` |
+| `RESOURCE_EXHAUSTED` | `429` |
+| `FAILED_PRECONDITION` | `412` |
+| `ABORTED` | `409` |
+| `OUT_OF_RANGE` | `400` |
+| `UNIMPLEMENTED` | `501` |
+| `INTERNAL` | `500` |
+| `UNAVAILABLE` | `503` |
+| `DATA_LOSS` | `500` |
+| `UNAUTHENTICATED` | `401` |
+
+### REST
+
+REST remains ordinary `HTTP`/`HTTPS` usage with an appropriate
+`request_type`; it is not a selector and there is no `REST` registry entry.
+
+### Rejected capabilities
+
+For JSON-RPC and GraphQL the rejected inventory is `request_type`, `file
+transfer` configuration, caller `session`, caller `serializer`, `redirect`
+controls, `allowed-scheme` overrides, endpoint `port override`, and
+`cross-origin` forwarding. S3 rejects every `endpoint override` and
+`arbitrary SDK` option or method. gRPC rejects `channel option`, `compression`,
+`credentials`, `custom roots`, `reflection`, and `method-shape` switches.
+These are refusals at the public boundary, not silently ignored options.
+
 ### File-transfer utilities
 
 These are exported from `asyncio_gateway.utils.http_file_config`, and that is the
@@ -644,6 +874,8 @@ async def download_file_from_s3(
     access_key: Optional[str] = None,
     secret_key: Optional[str] = None,
     region: Optional[str] = None,
+    overwrite: bool = True,
+    max_response_bytes: Optional[int] = None,
     **kwargs,
 ) -> None: ...
 
@@ -654,6 +886,18 @@ async def delete_local_file_path(local_filepath: str, **kwargs) -> None: ...
 `download_file_from_s3` is **keyword-only**. A positional call is a `TypeError`
 at the call site rather than a bucket name silently written to a local path.
 Credentials that cannot be resolved raise `ConfigurationError`.
+
+### S3 helper migration
+
+`download_file_from_s3()` remains **keyword-only**, returns `None`, and is
+compatible with its old behavior: `overwrite=True` means overwrite by default,
+and `max_response_bytes=None` means uncapped by default. Its two new optional
+controls use the same shared streaming primitive as the `S3` strategy. The
+strategy deliberately chooses `overwrite=False` plus a mandatory positive cap,
+so a new selector call cannot replace an existing destination or download an
+unbounded object. Overwrite mode writes and closes a guarded same-directory
+temporary file before one atomic replace; a pre-commit failure leaves the old
+target unchanged.
 
 `download_file_from_url` refuses **every** non-success status, not only 403: a
 404 body, a 500 stack trace or an HTML login page is never written to disk as
@@ -800,12 +1044,24 @@ explicitly rather than inventing a sentinel.
 | HTTP / HTTPS / SOAP success | the real HTTP status | — | `True` |
 | HTTP / HTTPS 4xx or 5xx | the real HTTP status | `HTTP_STATUS` | `False` |
 | SOAP Fault (any status, **including 200**) | the real HTTP status | `SOAP_FAULT` | `False` |
+| JSONRPC result at HTTP 2xx | the real HTTP status | — | `True` |
+| JSONRPC valid error (any HTTP status) | the real HTTP status | `JSONRPC_ERROR` | `False` |
+| JSONRPC malformed envelope at HTTP 2xx | `502` | `JSONRPC_PROTOCOL` | `False` |
+| JSONRPC non-result failure at non-2xx | the real HTTP status | `HTTP_STATUS` | `False` |
+| GRAPHQL data without errors at HTTP 2xx | the real HTTP status | — | `True` |
+| GRAPHQL errors with trusted semantics | the real HTTP status | `GRAPHQL_ERROR` | `False` |
+| GRAPHQL malformed response at HTTP 2xx | `502` | `GRAPHQL_PROTOCOL` | `False` |
+| GRAPHQL non-semantic non-2xx | the real HTTP status | `HTTP_STATUS` | `False` |
 | FTP success | the server's reply code (2xx), else `200` | — | `True` |
 | FTP failure | the server's reply code (4xx/5xx), else `500` | `FTP_STATUS` | `False` |
 | SFTP success | `200` | — | `True` |
 | SFTP `SSH_FX_NO_SUCH_FILE` | `404` | `SFTP_STATUS` | `False` |
 | SFTP `SSH_FX_PERMISSION_DENIED` | `403` | `SFTP_STATUS` | `False` |
 | SFTP other failure | `500` | `SFTP_STATUS` | `False` |
+| S3 success | the SDK's valid 2xx status, else `200` | — | `True` |
+| S3 service or malformed success | the real valid AWS status, else `502` | `S3_STATUS` | `False` |
+| GRPC success | `200` | — | `True` |
+| GRPC non-OK status | the exact gRPC status map above | `GRPC_STATUS` | `False` |
 | SSH host-key verification failure | `495` *(library-assigned)* | `HOST_KEY` | `False` |
 | Timeout (connect, read or total) | `504` | `TIMEOUT` | `False` |
 | Circuit open | `503` | `CIRCUIT_OPEN` | `False` |
@@ -849,24 +1105,34 @@ except ConfigurationError as exc:
 ```
 
 The errors that escape this way are: a `protocol` that is not a registered name;
-a `protocol_info` that is not a mapping or that omits a required key; a URL whose
-scheme the protocol will not dispatch on; an HTTP `request_type` outside the
-allowlist; an `http_file_upload_config` combined with a GET; an `auth` carrying
-no `login` and `password` on **FTP or SFTP**, which cannot connect without them
-(`auth` is optional in the signature, but not for those two protocols); and
-every other malformed value the HTTP and SOAP constructors check.
+a `protocol_info` that is not a mapping; a URL whose scheme the protocol will
+not dispatch on; an HTTP `request_type` outside the allowlist; an
+`http_file_upload_config` combined with a GET; an `auth` carrying no `login`
+and `password` on **FTP or SFTP**, which cannot connect without them (`auth` is
+optional in the signature, but not for those two protocols); and every other
+malformed value the HTTP and SOAP constructors check.
 
-**Everything else is an `ok=False` envelope** — every remote failure, every
-transport failure, and the four configuration keys two protocols defer by
-contract: FTP's `command` and `server_path`, and SFTP's `mode` and
-`remote_path`. Those arrive as `error['code'] == 'CONFIG'` with status 400.
+For **JSONRPC**, **GRAPHQL**, **S3**, and **GRPC**, unknown keys and missing
+required keys are rejected at the public boundary before processors. Their URL,
+auth, payload, and selector-specific method, query, command, path, cap, metadata,
+or serializer validation also raises `ConfigurationError` before dispatch, SDK
+session/channel creation, or network I/O. A pre-processor may deliberately
+replace JSONRPC params or GRAPHQL variables before that payload validation.
 
-Why those four and nothing else: `protocol_info` is optional for FTP and SFTP,
-so their request objects must stay constructible without one — which puts the
-check after construction, and construction is what runs outside the `try`. All
-four are still checked **before** their protocol opens a connection, so an
-unreachable host never answers for your typo with a `CONNECT`/502 you might
-then retry.
+Once boundary validation and construction succeed, remote and transport
+failures use an `ok=False` envelope. The four deferred FTP/SFTP option checks
+are FTP's `command` and `server_path`, plus SFTP's `mode` and `remote_path`.
+They arrive as `error['code'] == 'CONFIG'` with status 400 because
+`protocol_info` is optional for those protocols, so their request objects must
+stay constructible without those keys. All four are still checked **before**
+their protocol opens a connection, so an unreachable host never answers for a
+typo with a `CONNECT`/502 that might then be retried.
+
+S3 credential-provider discovery is a separate runtime case. An ambient AWS
+provider chain can confirm missing or partial credentials only during the
+operation, after construction. That failure therefore also becomes an
+`ok=False` envelope with `error['code'] == 'CONFIG'` and status 400; it is not
+one of the four deferred FTP/SFTP option checks.
 
 **The rule in one line:** whether a configuration error raises or envelopes is
 decided by *where* it is detected — in a protocol's constructor (raises) or once
@@ -999,8 +1265,10 @@ number. What it bounds differs per protocol:
 | Protocol | What `timeout` bounds |
 |---|---|
 | HTTP / HTTPS / SOAP | The **whole exchange**, redirect chain included — one budget spent across every hop, not handed afresh to each. |
+| JSONRPC / GRAPHQL | The whole HTTP exchange; redirects are disabled. |
 | FTP | The connect, and **each** individual socket read and write — not the transfer as a whole. |
 | SFTP | The connect and the login. asyncssh offers no transfer deadline. |
+| GRPC | The one unary call deadline. |
 
 The HTTP wording is precise and load-bearing: a per-hop deadline would let a
 `max_redirects=10` chain run for eleven times the deadline you set. It does not.
@@ -1075,6 +1343,27 @@ as themselves. Retrying them cannot help, and *counting* them would be worse:
 one caller passing a bad verb would drive the destination's circuit open for
 everyone else in the process.
 
+### New selector retry rules
+
+JSONRPC and GRAPHQL retry only retryable transport failures. With no policy
+there is one POST attempt; `allowed_retries=N` permits at most `N+1` identical
+POST attempts. That creates a **duplicate delivery** risk for a non-idempotent
+JSON-RPC method or GraphQL mutation, so opt in only when the application has an
+idempotency policy.
+
+S3 configures botocore with `total_max_attempts=1`: **SDK retries are disabled**
+and the gateway is the sole replay owner. Gateway `allowed_retries=N` therefore
+means at most `N+1` SDK calls, never nested multiplication. HTTP 408, 429, 500,
+502, 503, and 504 plus `RequestTimeout`, `RequestTimeoutException`,
+`Throttling`, `ThrottlingException`, `SlowDown`, `InternalError`, and
+`ServiceUnavailable` are retryable and counted. Access/absence/redirect/
+conflict statuses abort uncounted.
+
+GRPC retries only `UNKNOWN`, `DEADLINE_EXCEEDED`, `INTERNAL`, and `UNAVAILABLE`.
+Every other status is abortable. `RESOURCE_EXHAUSTED` is specifically abortable
+and uncounted for both a peer quota response and the receive ceiling; neither
+shape is retried or increments the breaker.
+
 ### The circuit breaker
 
 The breaker is keyed **per destination** — `(family, host, port)` — in a
@@ -1115,6 +1404,27 @@ certificate overrides `verify_ssl=False`: a caller who wants no verification
 gets it by supplying no certificate. A passphrase-protected key is refused
 rather than prompting. A `certificate` that is not a loadable pair raises
 `ConfigurationError` — your typo, reported at 400 and never retried.
+
+### S3 and gRPC security boundaries
+
+S3 with `auth=None` uses the **normal AWS credential chain**. If `auth` is
+supplied, non-empty `.login` and `.password` values become only the AWS access
+key and secret access key; no session-token or endpoint-override surface is
+added. Access keys, secret access keys, credential-provider details, and the
+caller continuation token are redacted from envelopes, exceptions, tracebacks,
+and logs. A server's next continuation token is returned only as the named
+success field needed for the next explicit page and is never interpolated into
+failure text.
+
+gRPC requires an explicit `grpc://host:port` plaintext target or
+`grpcs://host:port` TLS target. TLS uses platform roots; custom roots, mTLS,
+downgrades, reflection, generated stubs, and streaming are unavailable. The
+only supported call shape is raw **unary-unary**. Request metadata is limited
+to 64 ordered pairs, 64 characters per lowercase key, 8192 printable ASCII
+characters per value, and 32768 total value characters. Reserved `grpc-` and
+binary `-bin` request keys are refused. Peer metadata is independently capped
+at 64 entries; safe binary values are base64, and sensitive values are
+redacted as `***`.
 
 ### FTPS
 
@@ -1677,7 +1987,7 @@ CI-only list, so the two cannot drift apart silently.
 There is **no autoformatter** configured. Match the surrounding file by hand;
 `flake8` judges the result.
 
-### Docker: the wheel, and the four protocols against real servers
+### Docker: the wheel and the live integration transports
 
 Two assets, answering two different questions. Neither is a way to *deploy*
 this library — it is a library, there is nothing to serve — and both exist
@@ -1715,6 +2025,14 @@ the same connect succeeds once pinned, that an upload puts the **local** file's
 bytes at the **remote** path, and that a cross-origin redirect arrives at the
 second origin carrying no credentials — observed at that server, not asserted
 in-process.
+
+The compose stack's live coverage is specifically HTTP/HTTPS, FTPS, SFTP, and
+SOAP. It does not pretend to provision every new dependency. JSON-RPC and
+GraphQL run against loopback HTTP peers in the unit/docs suites; S3 uses a
+deterministic SDK double and **does not contact AWS**; gRPC starts a local
+generic server on loopback. Those deterministic checks run from the installed
+wheel too, but they are not advertised as live AWS or externally deployed gRPC
+infrastructure.
 
 House rules worth knowing before you open a pull request:
 

@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- First-class JSON-RPC 2.0, GraphQL, guarded S3, and raw unary-unary gRPC
+  selectors, all using the common response envelope, validation, redaction,
+  retry, circuit-breaker, cancellation, and bounded-response contracts.
+- Explicit FTP `tls_mode` support for verified implicit and explicit FTPS,
+  while preserving the legacy omitted-mode behavior.
+- Runnable loopback or deterministic-double examples for every new selector.
 
 ## [1.0.0] — 2026-08-19
 

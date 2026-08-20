@@ -153,7 +153,12 @@ from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
     BREAKER_CONFIG_KEYS,
     RETRY_CONFIG_KEYS,
 )
+from asyncio_gateway.logic import protocol_mapping
 from asyncio_gateway.logic.ftp_client import FTP_COMMANDS
+from asyncio_gateway.logic.graphql_client import GraphqlRequest
+from asyncio_gateway.logic.grpc_client import GRPC_HTTP_STATUS, GrpcRequest
+from asyncio_gateway.logic.jsonrpc_client import JsonRpcRequest
+from asyncio_gateway.logic.s3_client import S3Request, S3_OPERATION_INFO_KEYS
 from asyncio_gateway.logic.sftp_client import SFTP_MODES
 from asyncio_gateway.utils.envelope import GatewayError, GatewayResponse
 from asyncio_gateway.utils.http_file_config import (
@@ -221,6 +226,67 @@ PLACEHOLDERS = frozenset({
     'LOCAL_DOWNLOAD_PATH',
     'LOCAL_UPLOAD_PATH',
 })
+
+#: The public selector registry frozen by protocol-expansion R1.
+PROTOCOL_SELECTOR_CLASSES = {
+    'HTTP': 'HttpRequest',
+    'HTTPS': 'HttpRequest',
+    'FTP': 'FTPRequest',
+    'SFTP': 'SFTPRequest',
+    'SOAP': 'SoapRequest',
+    'JSONRPC': 'JsonRpcRequest',
+    'GRAPHQL': 'GraphqlRequest',
+    'S3': 'S3Request',
+    'GRPC': 'GrpcRequest',
+}
+
+#: Closed R12 inventories for the four additive selectors.
+NEW_SELECTOR_REQUIRED_KEYS = {
+    'JSONRPC': frozenset({'method', 'request_id'}),
+    'GRAPHQL': frozenset({'query'}),
+    'S3': frozenset({'command'}),
+    'GRPC': frozenset({'method'}),
+}
+NEW_SELECTOR_OPTION_KEYS = {
+    'JSONRPC': frozenset({
+        'method', 'request_id', 'headers', 'cookies', 'certificate',
+        'verify_ssl', 'trace_config', 'timeout', 'max_response_bytes',
+        'circuit_breaker_config', 'redact_query_params',
+    }),
+    'GRAPHQL': frozenset({
+        'query', 'operation_name', 'headers', 'cookies', 'certificate',
+        'verify_ssl', 'trace_config', 'timeout', 'max_response_bytes',
+        'circuit_breaker_config', 'redact_query_params',
+    }),
+    'S3': frozenset({
+        'command', 'local_path', 'region', 'max_response_bytes',
+        'max_upload_bytes', 'max_items', 'continuation_token',
+        'circuit_breaker_config', 'redact_query_params',
+    }),
+    'GRPC': frozenset({
+        'method', 'metadata', 'request_serializer', 'response_deserializer',
+        'timeout', 'max_response_bytes', 'circuit_breaker_config',
+        'redact_query_params',
+    }),
+}
+S3_COMMAND_OPTION_KEYS = {
+    'download': frozenset({
+        'command', 'local_path', 'region', 'max_response_bytes',
+        'circuit_breaker_config', 'redact_query_params',
+    }),
+    'upload': frozenset({
+        'command', 'local_path', 'region', 'max_upload_bytes',
+        'circuit_breaker_config', 'redact_query_params',
+    }),
+    'head': frozenset({
+        'command', 'region', 'circuit_breaker_config',
+        'redact_query_params',
+    }),
+    'list': frozenset({
+        'command', 'region', 'max_items', 'continuation_token',
+        'circuit_breaker_config', 'redact_query_params',
+    }),
+}
 
 #: The public callables a documented signature listing or call is checked
 #: against. Keyed by the name the README uses, which is the name the reader
@@ -297,6 +363,39 @@ def table_first_column(anchor: str) -> list[str]:
     return cells
 
 
+def table_rows(anchor: str) -> list[list[str]]:
+    """Return the data rows of the first Markdown table after an anchor.
+
+    Args:
+        anchor: Literal text immediately preceding the table.
+
+    Returns:
+        Cell strings with Markdown code/emphasis markers removed.
+
+    Raises:
+        AssertionError: If the anchor or its following table is absent.
+    """
+    start = README_TEXT.find(anchor)
+    assert start >= 0, f'README has no text containing {anchor!r}'
+    rows: list[list[str]] = []
+    started = False
+    for line in README_TEXT[start:].splitlines():
+        if not line.startswith('|'):
+            if started:
+                break
+            continue
+        started = True
+        cells = [
+            cell.strip().replace('`', '').replace('*', '')
+            for cell in line.strip('|').split('|')
+        ]
+        if all(cell and set(cell) <= set('- :') for cell in cells):
+            continue
+        rows.append(cells)
+    assert rows, f'no table follows {anchor!r}'
+    return rows[1:]
+
+
 def _table_end(text: str, start: int, seen: list[str]) -> int:
     """Return the offset at which the table begun after ``start`` ends.
 
@@ -359,9 +458,10 @@ def source_protocol_info_keys() -> set[str]:
     """Return the ``protocol_info`` keys the package actually reads.
 
     Walks every module's AST for a read of ``info``/``protocol_info`` -- a
-    ``.get('x')``, an ``['x']`` subscript, or an ``'x' in`` membership test --
-    so the answer comes from the code rather than from a list someone has to
-    remember to update.
+    ``.get('x')``, an ``['x']`` subscript, or an ``'x' in`` membership test.
+    It also reads the new selectors' production allowlists: their constructors
+    intentionally copy the mapping to a private name before reading it, so a
+    name-based AST scan alone would miss those frozen boundary keys.
 
     Returns:
         The key names read anywhere in the package.
@@ -374,6 +474,8 @@ def source_protocol_info_keys() -> set[str]:
     for path in sorted((REPO_ROOT / 'asyncio_gateway').rglob('*.py')):
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
             keys.update(_info_keys_in(node))
+    for strategy in (JsonRpcRequest, GraphqlRequest, S3Request, GrpcRequest):
+        keys.update(strategy.ALLOWED_INFO_KEYS)
     assert keys, 'no protocol_info key reads found; the AST shapes changed'
     return keys
 
@@ -426,10 +528,19 @@ def documented_protocol_info_keys() -> set[str]:
     """Return the ``protocol_info`` keys the README's own tables document.
 
     Returns:
-        The union of the first columns of the four per-protocol tables.
+        The union of the first columns of the eight per-protocol tables.
     """
     keys: set[str] = set()
-    for protocol in ('HTTP and HTTPS', 'FTP', 'SFTP', 'SOAP'):
+    for protocol in (
+        'HTTP and HTTPS',
+        'FTP',
+        'SFTP',
+        'SOAP',
+        'JSONRPC',
+        'GRAPHQL',
+        'S3',
+        'GRPC',
+    ):
         keys.update(table_first_column(f'### `protocol_info` — {protocol}'))
     return keys - {'Key'}
 
@@ -674,6 +785,12 @@ def _register_responses(server: RecordingHTTPServer) -> None:
                    body=b'{"detail": "no such item"}', headers=json_headers)
     server.respond('/v1/attachments', method='POST', body=b'{"stored": true}',
                    headers=json_headers)
+    server.respond('/rpc', method='POST', body=(
+        b'{"jsonrpc":"2.0","id":1,"result":4}'),
+        headers=json_headers)
+    server.respond('/graphql', method='POST', body=(
+        b'{"data":{"widget":{"id":"w-1"}}}'),
+        headers={'Content-Type': 'application/graphql-response+json'})
     server.respond('/report.csv', body=b'quarter,total\nQ1,17\n',
                    headers={'Content-Type': 'text/csv'})
     server.respond_in_sequence('/soap', _soap_specs())
@@ -833,6 +950,252 @@ def test_protocol_info_keys_match_the_code_both_ways() -> None:
     assert documented - real == set(), (
         f'the README documents protocol_info keys the code never reads: '
         f'{sorted(documented - real)}')
+
+
+def test_pe80_opening_and_registry_name_exactly_nine_selectors() -> None:
+    """The README opening and public registry expose the same closed set."""
+    opening = ' '.join(README_TEXT.partition('```python')[0].split())
+    match = re.search(
+        r'One `await` for (?P<selectors>[^.]+)\.',
+        opening,
+    )
+    assert match is not None, (
+        'the README opening must introduce all selectors in one sentence')
+    documented = tuple(re.findall(r'`([A-Z0-9]+)`', match['selectors']))
+    assert documented == tuple(PROTOCOL_SELECTOR_CLASSES)
+    assert {
+        name: strategy.__name__
+        for name, strategy in protocol_mapping.items()
+    } == PROTOCOL_SELECTOR_CLASSES
+
+
+@pytest.mark.parametrize(
+    ('selector', 'strategy'),
+    (
+        ('JSONRPC', JsonRpcRequest),
+        ('GRAPHQL', GraphqlRequest),
+        ('S3', S3Request),
+        ('GRPC', GrpcRequest),
+    ),
+)
+def test_pe80_new_selector_option_tables_are_exact(
+    selector: str,
+    strategy: type,
+) -> None:
+    """Each R12 table is both exhaustive and equal to its strategy class."""
+    documented = frozenset(
+        table_first_column(f'### `protocol_info` — {selector}')) - {'Key'}
+    assert documented == NEW_SELECTOR_OPTION_KEYS[selector]
+    assert strategy.REQUIRED_INFO_KEYS == NEW_SELECTOR_REQUIRED_KEYS[selector]
+    assert strategy.ALLOWED_INFO_KEYS == NEW_SELECTOR_OPTION_KEYS[selector]
+
+
+@pytest.mark.parametrize('selector', ('JSONRPC', 'GRAPHQL'))
+def test_pe80_http_semantic_default_cells_match_the_transport(
+    selector: str,
+) -> None:
+    """Semantic HTTP adapters document the inherited omission defaults."""
+    rows = {
+        row[0]: row
+        for row in table_rows(f'### `protocol_info` — {selector}')
+    }
+    assert rows['cookies'][2] == 'None'
+    assert rows['trace_config'][2] == 'a built-in tracer'
+
+
+def test_pe80_s3_command_option_inventory_is_exact() -> None:
+    """S3 documents the command-scoped allowlists, not one loose union."""
+    documented = {
+        row[0]: frozenset(part.strip() for part in row[1].split(',') if part)
+        for row in table_rows('**S3 command option allowlists.**')
+    }
+    assert documented == S3_COMMAND_OPTION_KEYS
+    assert dict(S3_OPERATION_INFO_KEYS) == S3_COMMAND_OPTION_KEYS
+
+
+def test_pe80_grpc_status_table_is_exact() -> None:
+    """Every grpcio status has its frozen public HTTP-shaped status."""
+    documented = {
+        row[0]: int(row[1])
+        for row in table_rows('**gRPC status map.**')
+    }
+    actual = {status.name: code for status, code in GRPC_HTTP_STATUS.items()}
+    assert documented == actual
+
+
+def test_pe80_central_status_table_covers_every_registered_selector() -> None:
+    """The central status guide cannot silently omit a registry selector."""
+    situations = ' '.join(
+        row[0] for row in table_rows('### `status_code` per protocol'))
+    for selector in PROTOCOL_SELECTOR_CLASSES:
+        assert selector in situations
+
+
+def test_pe80_error_boundary_names_every_new_selector_validation() -> None:
+    """Escaping configuration guidance covers all four new boundaries."""
+    boundary = prose_after('The errors that escape this way are:')
+    request_docs = inspect.getdoc(request) or ''
+    for selector in ('JSONRPC', 'GRAPHQL', 'S3', 'GRPC'):
+        assert selector in boundary
+    for term in (
+        'unknown keys', 'required keys', 'URL', 'auth', 'payload', 'command',
+        'before dispatch',
+    ):
+        assert term in boundary
+    assert '**Everything else is an `ok=False` envelope**' not in boundary
+    for guidance in (boundary, request_docs):
+        assert 'four deferred FTP/SFTP option checks' in guidance
+        assert 'S3 credential-provider discovery' in guidance
+        assert 'only during the operation' in guidance
+        assert 'CONFIG' in guidance and '400' in guidance
+        assert 'those four and nothing else' not in guidance
+        assert re.search(r'whole\s+of that set', guidance) is None
+
+
+def test_pe80_rest_is_documented_as_http_usage_not_a_selector() -> None:
+    """REST remains a usage style for HTTP/HTTPS and never a registry row."""
+    assert 'REST' not in protocol_mapping
+    rest = prose_after('### REST')
+    assert 'ordinary `HTTP`/`HTTPS` usage' in rest
+    assert 'not a selector' in rest
+
+
+def test_pe80_retry_warnings_name_replay_ownership_and_risks() -> None:
+    """The retry prose states each new transport's exact replay contract."""
+    retries = prose_after('### New selector retry rules')
+    for selector in ('JSONRPC', 'GRAPHQL'):
+        assert selector in retries
+    assert 'duplicate delivery' in retries
+    assert '`allowed_retries=N`' in retries and '`N+1`' in retries
+    assert '`total_max_attempts=1`' in retries
+    assert 'SDK retries are disabled' in retries
+    for status in (
+        'UNKNOWN', 'DEADLINE_EXCEEDED', 'INTERNAL', 'UNAVAILABLE',
+    ):
+        assert status in retries
+    assert 'RESOURCE_EXHAUSTED' in retries
+    assert 'abortable' in retries and 'uncounted' in retries
+
+
+def test_pe80_s3_helper_migration_contract_is_mechanical() -> None:
+    """The hardened helper migration preserves every compatibility default."""
+    section = prose_after('### S3 helper migration')
+    assert '`overwrite=True`' in section
+    assert '`max_response_bytes=None`' in section
+    assert 'overwrite by default' in section
+    assert 'uncapped by default' in section
+    assert 'keyword-only' in section
+    assert 'shared' in section
+    assert '`overwrite=False`' in section
+    assert 'mandatory positive cap' in section
+
+
+def test_pe80_rejected_capability_inventory_is_complete() -> None:
+    """Unsupported escape hatches stay explicit and selector-scoped."""
+    rejected = prose_after('### Rejected capabilities')
+    for term in (
+        'request_type', 'file transfer', 'session', 'serializer', 'redirect',
+        'allowed-scheme', 'port override', 'cross-origin',
+        'endpoint override', 'arbitrary SDK', 'channel option', 'compression',
+        'credentials', 'custom roots', 'reflection', 'method-shape',
+    ):
+        assert f'`{term}`' in rejected or term in rejected
+
+
+def test_pe80_s3_success_detail_schemas_are_exact() -> None:
+    """README consumers can rely on the four closed S3 detail shapes."""
+    documented = {
+        row[0]: frozenset(part.strip() for part in row[1].split(',') if part)
+        for row in table_rows('**S3 success detail schemas.**')
+    }
+    assert documented == {
+        'download': frozenset({
+            'command', 'bucket', 'key', 'local_path', 'bytes_written', 'etag',
+        }),
+        'upload': frozenset({
+            'command', 'bucket', 'key', 'local_path', 'bytes_read', 'etag',
+        }),
+        'head': frozenset({
+            'command', 'bucket', 'key', 'content_length', 'content_type',
+            'etag', 'last_modified', 'metadata',
+        }),
+        'list': frozenset({
+            'command', 'bucket', 'prefix', 'items', 'key_count',
+            'is_truncated', 'next_continuation_token',
+        }),
+    }
+
+
+def test_pe80_changelog_has_one_unreleased_added_section() -> None:
+    """Protocol expansion is recorded without inventing a release."""
+    changelog = (REPO_ROOT / 'CHANGELOG.md').read_text(encoding='utf-8')
+    unreleased = changelog.partition('## [Unreleased]')[2]
+    assert unreleased
+    unreleased = unreleased.partition('\n## ')[0]
+    assert re.findall(r'^### (.+)$', unreleased, re.MULTILINE) == ['Added']
+    for selector in ('JSON-RPC 2.0', 'GraphQL', 'S3', 'gRPC'):
+        assert selector in unreleased
+    assert re.search(r'\b20\d{2}-\d{2}-\d{2}\b', unreleased) is None
+
+
+def test_pe80_install_and_request_arguments_cover_new_transports() -> None:
+    """Install and boundary docs name the dependency and payload meanings."""
+    install = prose_after('## Install')
+    assert '`grpcio>=1.83.0,<2`' in install
+    arguments = {
+        row[0]: row[1]
+        for row in table_rows('### `request()`')
+    }
+    assert 'JSON-RPC/GraphQL' in arguments['data']
+    assert 'None' in arguments['data']
+    assert 's3://bucket/key' in arguments['url']
+    assert 'grpc://host:port' in arguments['url']
+    assert 'grpcs://host:port' in arguments['url']
+    assert 'AWS credential chain' in arguments['auth']
+    assert 'gRPC' in arguments['auth'] and 'must be None' in arguments['auth']
+    for selector in PROTOCOL_SELECTOR_CLASSES:
+        assert selector in arguments['protocol']
+
+
+def test_pe80_new_quickstarts_are_discoverable_and_runnable_locally() -> None:
+    """Each additive selector has a quickstart with no live dependency."""
+    quickstarts = prose_after('## Quickstart per protocol')
+    for selector in ('JSON-RPC 2.0', 'GraphQL', 'S3', 'gRPC'):
+        assert f'### {selector}' in README_TEXT
+    for script in (
+        'jsonrpc_example.py', 'graphql_example.py', 's3_example.py',
+        'grpc_example.py',
+    ):
+        assert f'python examples/{script}' in quickstarts
+    assert 'loopback' in quickstarts
+    assert 'deterministic SDK double' in quickstarts
+    assert 'local generic server' in quickstarts
+
+
+def test_pe80_s3_and_grpc_security_boundaries_are_explicit() -> None:
+    """Credential, metadata, target, and unary-only limits are documented."""
+    security = prose_after('### S3 and gRPC security boundaries')
+    for phrase in (
+        'normal AWS credential chain', 'access key', 'secret access key',
+        'credential-provider', 'continuation token', 'redacted',
+        '`grpc://host:port`', '`grpcs://host:port`', 'unary-unary',
+        'platform roots',
+        '64', '8192', '32768', 'base64',
+    ):
+        assert phrase in security
+
+
+def test_pe80_docker_claim_distinguishes_live_and_doubled_protocols() -> None:
+    """Docker docs do not imply AWS or gRPC infrastructure that is absent."""
+    docker = prose_after('### Docker:')
+    assert 'HTTP/HTTPS' in docker
+    assert 'FTPS' in docker and 'SFTP' in docker and 'SOAP' in docker
+    assert 'JSON-RPC' in docker and 'GraphQL' in docker
+    assert 'S3' in docker and 'gRPC' in docker
+    assert 'loopback' in docker
+    assert 'SDK double' in docker
+    assert 'local generic server' in docker
+    assert 'does not contact AWS' in docker
 
 
 def test_http_verbs_match_the_allowlist_both_ways() -> None:
@@ -1687,7 +2050,7 @@ def test_no_bare_container_return_annotations(path: Path) -> None:
 
 
 def test_handle_request_everywhere_returns_the_envelope() -> None:
-    """The base and all four overrides are annotated ``GatewayResponse``.
+    """The base and all six overrides are annotated ``GatewayResponse``.
 
     R30 names this signature specifically because it is the library's
     core method and the one place a caller's expectations are set: every
@@ -1709,8 +2072,8 @@ def test_handle_request_everywhere_returns_the_envelope() -> None:
 
     wrong = [entry for entry in found if entry[1] != 'GatewayResponse']
 
-    assert len(found) == 5, (
-        f'expected the base plus four protocol overrides, found '
+    assert len(found) == 7, (
+        f'expected the base plus six protocol overrides, found '
         f'{len(found)}: {found}')
     assert not wrong, (
         f'handle_request must return GatewayResponse; these do not: '

@@ -11,7 +11,7 @@ failed network call.
 import logging
 import traceback
 from collections.abc import Callable, Collection, Mapping
-from typing import Any, Dict, Final, Optional, Tuple, Union
+from typing import Any, Dict, Final, Optional, Tuple
 from urllib.parse import urlsplit
 
 from asyncio_gateway.helpers.internal.base import (
@@ -607,7 +607,7 @@ def log_failure(
 
 async def request(
         url: str,
-        data: Optional[Union[Dict, str]] = None,
+        data: object = None,
         auth: object = None,
         protocol: str = '',
         protocol_info: Optional[Dict[str, Any]] = None,
@@ -619,20 +619,27 @@ async def request(
 
      calls with pre-processor, post processor and retry support.
     :param url: URL to call
-    :param data: Data to be sent in calls
+    :param data: Selector-owned request data. JSONRPC accepts a mapping, list,
+        or None for optional params; GRAPHQL accepts a mapping or None for
+        optional variables; GRPC accepts bytes-like data without a serializer
+        and arbitrary input when ``request_serializer`` is supplied; SOAP
+        accepts XML text or an Element. S3 does not use this argument. Legacy
+        selectors retain their existing payload behavior.
     :param protocol: one of the names registered in
         ``asyncio_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP,
-        SFTP. Matched with surrounding whitespace stripped and without
-        regard to case, so 'http', ' HTTP ' and 'Http' are the same
-        protocol. HTTPS additionally requires that the call go out over
-        TLS; see :raises: below
-    :param auth: aiohttp.BasicAuth(username, password), or any auth
-        object aiohttp accepts. Optional for the HTTP family and SOAP,
-        where None means "send no credentials" and is the common case.
+        SFTP, SOAP, JSONRPC, GRAPHQL, S3, or GRPC. Matched with surrounding
+        whitespace stripped and without regard to case, so 'http', ' HTTP '
+        and 'Http' are the same protocol. HTTPS additionally requires that
+        the call go out over TLS; see :raises: below
+    :param auth: Optional aiohttp-compatible authentication for HTTP, HTTPS,
+        SOAP, JSONRPC, and GRAPHQL, where None sends no credentials.
         **Required for FTP and SFTP**, which read ``.login`` and
         ``.password`` off it to build their connect: omitted there, the
         call raises ``ConfigurationError`` before anything is dispatched
-        rather than crashing on ``None.login`` as it once did (H5)
+        rather than crashing on ``None.login`` as it once did (H5). For S3,
+        None selects the normal AWS credential chain and a supplied object
+        provides non-empty string ``.login``/``.password`` access and secret
+        keys. GRPC requires None; request credentials use bounded metadata.
     :param protocol_info: {
         "request_type": "GET", #required
         "timeout": int, #Optional
@@ -727,8 +734,11 @@ async def request(
         to carry it; every other malformed value the HTTP and SOAP
         constructors check; and an ``auth`` carrying no string ``login``
         and ``password`` on FTP or SFTP, which cannot form a connect at
-        all -- note that ``auth`` is optional in this signature but
-        **required by those two protocols**. These are programming
+        all; malformed JSONRPC method/id/params, GRAPHQL query/variables,
+        S3 target/auth/command/path/cap, or GRPC target/auth/payload/hooks;
+        and unknown or missing required options on any new selector. Note
+        that ``auth`` is optional in this signature but **required by FTP
+        and SFTP**. These are programming
         errors on the caller's side and are not retryable, so they
         escape synchronously rather than becoming an envelope a retry
         loop would re-attempt forever -- and, escaping, they are
@@ -746,15 +756,13 @@ async def request(
         and is logged, because every envelope-producing failure is. The
         list above is the escaping set, not the whole set.
 
-        The configuration errors that arrive the second way are exactly
-        the ones a protocol defers by contract, and they are the whole
-        of that set: FTP's ``command`` and ``server_path``, and SFTP's
-        ``mode`` and ``remote_path`` -- absent, malformed, or outside
-        the R21 allowlist. They are checked once the protocol object is
-        running because ``protocol_info`` is optional for those two
-        protocols at this boundary, so the object must stay
-        constructible without one and the keys cannot be checked in the
-        constructor with everything else.
+        The four deferred FTP/SFTP option checks are FTP's ``command``
+        and ``server_path``, plus SFTP's ``mode`` and ``remote_path`` --
+        absent, malformed, or outside the R21 allowlist. They are checked
+        once the protocol object is running because ``protocol_info`` is
+        optional for those two protocols at this boundary, so the object
+        must stay constructible without one and the keys cannot be
+        checked in the constructor with everything else.
 
         All four are nonetheless checked *before* their protocol opens a
         connection, so an unreachable host cannot answer for a caller's
@@ -762,6 +770,13 @@ async def request(
         ``command`` report ``CONNECT``/502 and an unknown SFTP ``mode``
         report ``HOST_KEY``/495: transport verdicts, carrying a retry
         recommendation, for calls that could never have run.
+
+        S3 credential-provider discovery is a separate runtime case. The
+        ambient AWS provider chain can confirm missing or partial
+        credentials only during the operation, after construction. That
+        failure therefore becomes an ``ok=False`` envelope carrying
+        ``error['code'] == 'CONFIG'`` and status 400; it is not one of the
+        four deferred FTP/SFTP option checks.
 
         A caller who wants to handle both alike should catch
         ``ConfigurationError`` *and* branch on

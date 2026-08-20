@@ -386,7 +386,11 @@ class _S3BodyCloser:
     """Idempotently own one provider body until cleanup has completed."""
 
     def __init__(self, body: Any) -> None:
-        """Store the body whose close operation this instance owns."""
+        """Store the body whose close operation this instance owns.
+
+        Args:
+            body: Provider streaming body to close exactly once.
+        """
         self.body = body
         self.closed = False
 
