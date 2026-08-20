@@ -1445,15 +1445,16 @@ so the credentials and every byte transferred cross the network in the clear.
 
 `tls_mode='implicit'` supplies the existing verified `SSLContext` before the
 first control-channel byte. `tls_mode='explicit'` opens the control transport,
-performs `AUTH TLS` through aioftp's native upgrade **before login**, and then
-protects data transfers with `PBSZ 0` and `PROT P`. Port selection is unchanged:
-the default remains 21 and an explicit `port` always wins.
+builds the same verified context off the event loop, and passes that context to
+aioftp's native `AUTH TLS` upgrade **before login**. It then protects data
+transfers with `PBSZ 0` and `PROT P`. Port selection is unchanged: the default
+remains 21 and an explicit `port` always wins.
 
-Explicit mode rejects `certificate` before connecting because aioftp's native
-context helper cannot safely forward that custom context into its upgrade.
-Named implicit mode retains client-certificate support. The effective mode is
-reported as `protocol_details['tls_mode']` (`implicit`, `explicit`, or legacy
-`plaintext`).
+Explicit mode rejects `certificate` before connecting: this release keeps its
+public authentication surface to platform-root server verification and does not
+add explicit-mode mTLS. Named implicit mode retains client-certificate support.
+The effective mode is reported as `protocol_details['tls_mode']` (`implicit`,
+`explicit`, or legacy `plaintext`).
 
 ### SFTP host keys
 

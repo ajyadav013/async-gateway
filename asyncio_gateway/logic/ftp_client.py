@@ -15,8 +15,10 @@ branch read ``ssl_context.get('ssl_context')``, a key
 ``get_ssl_config`` returns *only* when a client certificate was supplied,
 so asking for verification without one passed ``ssl=None`` without an
 explicit-upgrade flag -- which is how ``aioftp`` is told to speak plaintext
-(M2). Named explicit FTPS is the deliberate exception: it pairs ``ssl=None``
-with ``upgrade_to_tls=True`` so aioftp performs ``AUTH TLS`` before login.
+(M2). Named explicit FTPS is the deliberate exception: it opens with
+``ssl=None``, then passes a prebuilt verifying context to ``upgrade_to_tls``
+so aioftp performs ``AUTH TLS`` before login without reading the CA bundle on
+the event loop.
 
 M2's other half lived one branch across, and is repaired with it: the
 context ``get_ssl_config`` *did* return for a caller with a client
@@ -34,7 +36,8 @@ import asyncio
 import logging
 import socket
 import ssl
-from collections.abc import Collection, Mapping
+from collections.abc import AsyncIterator, Collection, Mapping
+from contextlib import asynccontextmanager
 from types import MappingProxyType
 from typing import Any, Final, Optional, Sequence, Tuple, Union
 
@@ -277,6 +280,77 @@ def tls_context_for(ssl_config: Mapping[str, Any]) -> ssl.SSLContext:
                     'session no server has to authenticate itself for')
             return context
     return ssl.create_default_context()
+
+
+@asynccontextmanager
+async def _explicit_ftps_context(
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    *,
+    ssl_context: ssl.SSLContext,
+    connection_timeout: Any,
+    socket_timeout: Any,
+    path_io_factory: Any,
+) -> AsyncIterator[aioftp.Client]:
+    """Open an explicit-FTPS session with a prebuilt verifying context.
+
+    ``aioftp.Client.context(upgrade_to_tls=True)`` creates its default
+    ``SSLContext`` synchronously from inside a coroutine. Creating it reads
+    the platform CA bundle, so that convenience path blocks the event loop.
+    This mirrors aioftp's lifecycle but supplies the context already built by
+    :meth:`FTPRequest._tls_value` to the native ``AUTH TLS`` upgrade.
+
+    The client starts with ``ssl=None`` because explicit FTPS begins on a
+    plaintext control transport. Credentials are not sent until the upgrade
+    and its TLS handshake have completed. Any failure or cancellation during
+    setup immediately closes the half-open transport exactly once. A close
+    failure cannot replace the setup failure or cancellation already in flight.
+    After a successful login, normal and exceptional exits retain aioftp's
+    established graceful ``QUIT`` behavior.
+
+    Args:
+        host: FTP server host name.
+        port: FTP control-channel port.
+        user: Login user name.
+        password: Login password.
+        ssl_context: Prebuilt context that verifies the server.
+        connection_timeout: Maximum connect duration, forwarded to aioftp.
+        socket_timeout: Per-socket-operation timeout, forwarded to aioftp.
+        path_io_factory: Local filesystem layer, forwarded to aioftp.
+
+    Yields:
+        The connected, TLS-upgraded, authenticated aioftp client.
+
+    Raises:
+        BaseException: Any setup, operation, cancellation, or teardown failure,
+            unchanged. The request boundary classifies supported transport
+            failures and deliberately lets library bugs escape.
+    """
+    client = aioftp.Client(
+        ssl=None,
+        connection_timeout=connection_timeout,
+        socket_timeout=socket_timeout,
+        path_io_factory=path_io_factory,
+    )
+    try:
+        await client.connect(host, port)
+        await client.upgrade_to_tls(ssl_context)
+        await client.login(user, password)
+    except BaseException:
+        try:
+            client.close()
+        except BaseException:
+            # Preserve the setup failure -- especially CancelledError. A
+            # best-effort close of a half-open stream must not turn task
+            # cancellation into an unrelated teardown exception.
+            pass
+        raise
+    try:
+        yield client
+    finally:
+        await client.quit()
 
 
 def reply_status(error: aioftp.StatusCodeError) -> Optional[int]:
@@ -592,10 +666,13 @@ class FTPRequest(BaseRequestClass):
             # reported through the same contract as everything else
             # instead of escaping raw from an unguarded prologue.
             if self.tls_mode == 'explicit':
-                client_context = aioftp.Client.context(
+                tls = await self._tls_value()
+                if not isinstance(tls, ssl.SSLContext):
+                    raise TlsError(
+                        'explicit FTP TLS requires a verified SSL context')
+                client_context = _explicit_ftps_context(
                     self.url, self.port, self.user, self.password,
-                    ssl=None,
-                    upgrade_to_tls=True,
+                    ssl_context=tls,
                     connection_timeout=self.timeout,
                     socket_timeout=self.timeout,
                     path_io_factory=self._path_io_factory(),
@@ -713,14 +790,15 @@ class FTPRequest(BaseRequestClass):
             budget=TransferBudget(self.max_response_bytes))
 
     async def _tls_value(self) -> Union[ssl.SSLContext, bool]:
-        """Return what a legacy or implicit session hands aioftp as SSL.
+        """Return the TLS value used by every FTP negotiation mode.
 
-        Explicit mode bypasses this helper and uses aioftp's native
-        ``upgrade_to_tls=True`` path. Both blocking reads this helper needs
-        happen off the event loop: the
-        caller's own certificate files inside ``get_ssl_config``
-        (AGW-36), and the system CA bundle the no-certificate fallback
-        reads inside :func:`tls_context_for` (AGW-37).
+        Legacy and implicit sessions hand this value to aioftp's constructor;
+        explicit mode hands the same verified context to
+        :func:`_explicit_ftps_context`, which passes it to the native
+        ``upgrade_to_tls`` call before login. Both blocking reads this helper
+        needs happen off the event loop: the caller's own certificate files
+        inside ``get_ssl_config`` (AGW-36), and the system CA bundle the
+        no-certificate fallback reads inside :func:`tls_context_for` (AGW-37).
 
         Returns:
             A verifying TLS context, or ``False`` when the caller

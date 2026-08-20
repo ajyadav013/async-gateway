@@ -112,12 +112,15 @@ lane may run in parallel only when it writes none of the active story's files.
   `tests/fixtures/ftp.py`
 - **Traceability:** R2/AC2.1-AC2.6, AC13.1-AC13.2
 - **RED:** prove legacy implicit/plaintext arguments are unchanged; explicit
-  mode passes `ssl=None, upgrade_to_tls=True`; named modes reject
-  `verify_ssl=False`; explicit rejects client certificates; invalid values
-  make no connection; effective mode is reported. Run
+  mode builds a verified context off-loop and supplies it to
+  `upgrade_to_tls(context)` before login while constructing the client with
+  `ssl=None`; named modes reject `verify_ssl=False`; explicit rejects client
+  certificates; invalid values make no connection; effective mode is reported. Run
   `.venv/bin/pytest -q tests/logic/test_ftp_client.py -k 'tls_mode or explicit
   or legacy_tls'`.
-- **GREEN:** make the smallest constructor/context-call change; never add an
+- **GREEN:** use a bounded private lifecycle that connects, injects the prebuilt
+  context into `AUTH TLS`, and only then logs in; close half-open setup on error
+  or cancellation, retain graceful `QUIT` after login, and never add an
   unverified or fallback TLS path.
 - **Regression gate:** full FTP file, then `.venv/bin/pytest -q`.
 

@@ -130,6 +130,90 @@ def ftp_request(**info: Any) -> tuple[FTPRequest, GatewayResponse]:
     return client, envelope
 
 
+class _ExplicitLifecycleClient:
+    """A real-lifecycle double for the private explicit-FTPS context."""
+
+    def __init__(
+        self,
+        events: list[tuple[Text, Any]],
+        *,
+        failure_at: Optional[Text] = None,
+        failure: Optional[BaseException] = None,
+        wait_at: Optional[Text] = None,
+        close_failure: Optional[BaseException] = None,
+    ) -> None:
+        """Configure one setup failure or one cancellable setup wait."""
+        self.events = events
+        self.failure_at = failure_at
+        self.failure = failure
+        self.wait_at = wait_at
+        self.close_failure = close_failure
+        self.started = asyncio.Event()
+        self.close_count = 0
+
+    async def _step(self, name: Text, value: Any) -> None:
+        """Record a lifecycle step, then run its configured behavior."""
+        self.events.append((name, value))
+        if self.wait_at == name:
+            self.started.set()
+            await asyncio.Event().wait()
+        if self.failure_at == name:
+            assert self.failure is not None
+            raise self.failure
+
+    async def connect(self, host: Text, port: int) -> None:
+        """Record the initial plaintext control-channel connection."""
+        await self._step('connect', (host, port))
+
+    async def upgrade_to_tls(self, context: ssl.SSLContext) -> None:
+        """Record the exact context supplied to the AUTH TLS upgrade."""
+        await self._step('upgrade_to_tls', context)
+
+    async def login(self, user: Text, password: Text) -> None:
+        """Record credentials without exposing them outside the test."""
+        await self._step('login', (user, password))
+
+    def close(self) -> None:
+        """Record an immediate setup-failure close."""
+        self.close_count += 1
+        self.events.append(('close', None))
+        if self.close_failure is not None:
+            raise self.close_failure
+
+    async def graceful_quit(self) -> None:
+        """Record graceful exit and model ``aioftp`` closing afterward."""
+        self.events.append(('quit', None))
+        self.close()
+
+
+def _install_explicit_lifecycle_client(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failure_at: Optional[Text] = None,
+    failure: Optional[BaseException] = None,
+    wait_at: Optional[Text] = None,
+    close_failure: Optional[BaseException] = None,
+) -> tuple[_ExplicitLifecycleClient, list[tuple[Text, Any]]]:
+    """Install and return a constructor-aware explicit lifecycle double."""
+    events: list[tuple[Text, Any]] = []
+    client = _ExplicitLifecycleClient(
+        events,
+        failure_at=failure_at,
+        failure=failure,
+        wait_at=wait_at,
+        close_failure=close_failure,
+    )
+    setattr(client, 'quit', client.graceful_quit)
+
+    def construct(**kwargs: Any) -> _ExplicitLifecycleClient:
+        """Record the real ``aioftp.Client`` constructor arguments."""
+        events.append(('construct', dict(kwargs)))
+        return client
+
+    monkeypatch.setattr(ftp_client.aioftp, 'Client', construct)
+    return client, events
+
+
 # --- R15-AC1: the client executes at all -----------------------------------
 
 
@@ -290,7 +374,7 @@ async def test_legacy_tls_mode_arguments_are_unchanged(
 
 
 @pytest.mark.parametrize('tls_mode', ['implicit', 'explicit'])
-async def test_named_tls_modes_use_only_their_native_aioftp_path(
+async def test_named_tls_modes_use_their_verified_context_path(
     monkeypatch: pytest.MonkeyPatch,
     tls_mode: Text,
 ) -> None:
@@ -300,8 +384,9 @@ async def test_named_tls_modes_use_only_their_native_aioftp_path(
     result = await ftp_call(tls_mode=tls_mode)
 
     if tls_mode == 'explicit':
-        assert double.kwargs['ssl'] is None
-        assert double.kwargs['upgrade_to_tls'] is True
+        assert isinstance(double.kwargs['ssl_context'], ssl.SSLContext)
+        assert 'ssl' not in double.kwargs
+        assert 'upgrade_to_tls' not in double.kwargs
     else:
         assert isinstance(double.kwargs['ssl'], ssl.SSLContext)
         assert 'upgrade_to_tls' not in double.kwargs
@@ -325,7 +410,7 @@ async def test_named_tls_modes_reject_plaintext_before_connect(
 async def test_explicit_tls_rejects_client_certificate_before_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Aioftp's native explicit helper cannot receive a custom context."""
+    """The frozen explicit-mode contract admits no client certificate."""
     double = install_ftp_double(monkeypatch)
 
     with pytest.raises(ConfigurationError, match='explicit'):
@@ -423,11 +508,174 @@ async def test_explicit_tls_failures_keep_their_transport_family(
 
     result = await ftp_call(tls_mode='explicit')
 
-    assert double.kwargs['ssl'] is None
-    assert double.kwargs['upgrade_to_tls'] is True
+    assert isinstance(double.kwargs['ssl_context'], ssl.SSLContext)
+    assert 'ssl' not in double.kwargs
+    assert 'upgrade_to_tls' not in double.kwargs
     assert result['error'] is not None
     assert result['error']['code'] == expected_code
     assert result['status_code'] == expected_status
+
+
+async def test_explicit_tls_refuses_a_non_context_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The named mode fails closed if its TLS resolver breaks contract."""
+    double = install_ftp_double(monkeypatch)
+
+    async def answer_false(request: FTPRequest) -> bool:
+        """Model a regressed resolver returning the plaintext sentinel."""
+        return False
+
+    monkeypatch.setattr(FTPRequest, '_tls_value', answer_false)
+
+    result = await ftp_call(tls_mode='explicit')
+
+    assert result['ok'] is False
+    assert result['error'] is not None
+    assert result['error']['code'] == 'TLS'
+    assert result['status_code'] == 502
+    assert double.calls == []
+
+
+async def test_explicit_context_upgrades_before_login_and_quits_on_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manual lifecycle preserves wire order and graceful teardown."""
+    context = ssl.create_default_context()
+    path_factory = aioftp.pathio.PathIO
+    client, events = _install_explicit_lifecycle_client(monkeypatch)
+
+    async with ftp_client._explicit_ftps_context(
+        'host',
+        2121,
+        'user',
+        'password',
+        ssl_context=context,
+        connection_timeout=3,
+        socket_timeout=4,
+        path_io_factory=path_factory,
+    ) as yielded:
+        assert yielded is client
+        events.append(('operation', None))
+
+    assert [name for name, _ in events] == [
+        'construct',
+        'connect',
+        'upgrade_to_tls',
+        'login',
+        'operation',
+        'quit',
+        'close',
+    ]
+    assert events[0][1] == {
+        'ssl': None,
+        'connection_timeout': 3,
+        'socket_timeout': 4,
+        'path_io_factory': path_factory,
+    }
+    assert events[1][1] == ('host', 2121)
+    assert events[2][1] is context
+    assert events[3][1] == ('user', 'password')
+    assert client.close_count == 1
+
+
+@pytest.mark.parametrize('failure_at', ['connect', 'upgrade_to_tls', 'login'])
+async def test_explicit_context_closes_once_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_at: Text,
+) -> None:
+    """Every incomplete explicit session is closed, never gracefully quit."""
+    failure = RuntimeError(f'{failure_at} failed')
+    client, events = _install_explicit_lifecycle_client(
+        monkeypatch, failure_at=failure_at, failure=failure)
+
+    with pytest.raises(RuntimeError) as caught:
+        async with ftp_client._explicit_ftps_context(
+            'host',
+            21,
+            'user',
+            'password',
+            ssl_context=ssl.create_default_context(),
+            connection_timeout=3,
+            socket_timeout=4,
+            path_io_factory=aioftp.pathio.PathIO,
+        ):
+            pytest.fail('a failed setup must never yield a client')
+
+    assert caught.value is failure
+    assert client.close_count == 1
+    assert [name for name, _ in events].count('close') == 1
+    assert [name for name, _ in events].count('quit') == 0
+
+
+async def test_explicit_context_setup_cancellation_closes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during AUTH TLS closes the half-open control socket."""
+    client, events = _install_explicit_lifecycle_client(
+        monkeypatch,
+        wait_at='upgrade_to_tls',
+        close_failure=RuntimeError('close failed'),
+    )
+
+    async def open_session() -> None:
+        """Wait forever in the explicit upgrade until the test cancels."""
+        async with ftp_client._explicit_ftps_context(
+            'host',
+            21,
+            'user',
+            'password',
+            ssl_context=ssl.create_default_context(),
+            connection_timeout=3,
+            socket_timeout=4,
+            path_io_factory=aioftp.pathio.PathIO,
+        ):
+            pytest.fail('a cancelled setup must never yield a client')
+
+    task = asyncio.create_task(open_session())
+    await client.started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.close_count == 1
+    assert [name for name, _ in events].count('close') == 1
+    assert [name for name, _ in events].count('quit') == 0
+
+
+async def test_explicit_context_body_cancellation_quits_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation after login retains the established QUIT teardown."""
+    client, events = _install_explicit_lifecycle_client(monkeypatch)
+    entered = asyncio.Event()
+
+    async def use_session() -> None:
+        """Wait in the operation body until the test cancels this task."""
+        async with ftp_client._explicit_ftps_context(
+            'host',
+            21,
+            'user',
+            'password',
+            ssl_context=ssl.create_default_context(),
+            connection_timeout=3,
+            socket_timeout=4,
+            path_io_factory=aioftp.pathio.PathIO,
+        ):
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(use_session())
+    await entered.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [name for name, _ in events].count('quit') == 1
+    assert client.close_count == 1
+    assert [name for name, _ in events].count('close') == 1
 
 
 @pytest.mark.parametrize('client_path', ['', 1])
@@ -705,6 +953,39 @@ def test_agw37_the_blocking_resolver_is_a_plain_def() -> None:
     approach the same regression from opposite sides.
     """
     assert not inspect.iscoroutinefunction(tls_context_for)
+
+
+async def test_explicit_tls_builds_and_injects_its_context_off_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit FTPS never lets ``aioftp`` build platform trust on-loop.
+
+    ``aioftp.Client.context(upgrade_to_tls=True)`` calls
+    ``ssl.create_default_context()`` synchronously from its coroutine.
+    The gateway must instead reuse :meth:`FTPRequest._tls_value`, whose
+    thread boundary is already pinned above, and inject that exact verified
+    context into the explicit upgrade seam before login.
+
+    Args:
+        monkeypatch: Installs the transport and thread-recording doubles.
+    """
+    double = install_ftp_double(monkeypatch)
+    ran_on: list[int] = []
+    expected = ssl.create_default_context()
+
+    def record_thread(ssl_config: Any) -> ssl.SSLContext:
+        """Return one known context while recording the worker thread."""
+        ran_on.append(threading.get_ident())
+        return expected
+
+    monkeypatch.setattr(ftp_client, 'tls_context_for', record_thread)
+
+    result = await ftp_call(tls_mode='explicit')
+
+    assert result['ok'] is True
+    assert len(ran_on) == 1
+    assert ran_on[0] != threading.get_ident()
+    assert double.kwargs['ssl_context'] is expected
 
 
 async def test_r15_ac4_a_client_certificate_does_not_buy_an_unverified_peer(

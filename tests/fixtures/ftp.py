@@ -2,12 +2,12 @@
 
 Three things S10's guards cannot be proven without.
 
-The first is a *recording* stand-in for ``aioftp.Client.context``. The
-fail-closed rule is a claim about the **value** the client hands
-``aioftp`` -- verified implicit TLS never uses ``ssl=None``; named explicit
-TLS uses it only together with ``upgrade_to_tls=True`` -- and the connect and
-transfer are both bounded. A stub that discards its arguments cannot see any
-of it. The recorded call log is also what lets a
+The first is a *recording* stand-in for both FTP session-context seams. The
+fail-closed rule is a claim about the **value** the client hands to the
+transport -- verified implicit TLS receives ``ssl`` at construction; named
+explicit TLS receives a prebuilt ``ssl_context`` for ``AUTH TLS`` -- and the
+connect and transfer are both bounded. A stub that discards its arguments
+cannot see any of it. The recorded call log is also what lets a
 test assert that ``stat`` did **not** run after a ``remove``, which no
 return value can carry.
 
@@ -46,6 +46,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 import pytest
+
+from asyncio_gateway.logic import ftp_client
 
 # One recorded call: the method name and the positional arguments it was
 # given. The name is recorded rather than a count, because M3 is about
@@ -476,12 +478,12 @@ class RefusingContext:
 
 
 class FTPContextDouble:
-    """A stand-in for ``aioftp.Client.context`` that records its call.
+    """A stand-in for both FTP session contexts that records their call.
 
-    Installed on the class, so the client's own
-    ``aioftp.Client.context(host, port, user, password, ssl=...)`` reaches
-    this object with every argument intact -- which is the point, because
-    the TLS and timeout criteria are assertions about those arguments.
+    Installed on ``aioftp.Client.context`` for legacy/implicit mode and on
+    ``ftp_client._explicit_ftps_context`` for explicit mode. Each reaches
+    this object with every argument intact, which is the point: the TLS and
+    timeout criteria are assertions about those arguments.
     """
 
     def __init__(
@@ -548,7 +550,7 @@ class FTPContextDouble:
                 asserts on the arguments of a call that never happened
                 would otherwise pass vacuously.
         """
-        assert self.calls, 'aioftp.Client.context was never called'
+        assert self.calls, 'FTP session context was never called'
         return self.calls[-1][1]
 
 
@@ -597,7 +599,7 @@ def install_ftp_double(
     connect_error: Optional[BaseException] = None,
     quit_error: Optional[BaseException] = None,
 ) -> FTPContextDouble:
-    """Replace ``aioftp.Client.context`` for the duration of one test.
+    """Replace both FTP session contexts for the duration of one test.
 
     Args:
         monkeypatch: The pytest patcher, which undoes this on teardown.
@@ -612,6 +614,7 @@ def install_ftp_double(
     double = FTPContextDouble(
         client=client, connect_error=connect_error, quit_error=quit_error)
     monkeypatch.setattr(aioftp.Client, 'context', double)
+    monkeypatch.setattr(ftp_client, '_explicit_ftps_context', double)
     return double
 
 

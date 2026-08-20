@@ -67,13 +67,16 @@ The existing `FTP` strategy shall accept optional
 - **AC2.2:** Named `implicit` mode uses the existing verified implicit TLS
   path. Named `explicit` mode opens plaintext control transport, invokes
   `AUTH TLS` before login through `aioftp`'s native
-  `upgrade_to_tls=True`, then protects data with `PBSZ 0` and `PROT P`.
+  `upgrade_to_tls(prebuilt_verified_context)`, then protects data with `PBSZ 0`
+  and `PROT P`. Building platform trust is offloaded before connection; aioftp
+  never builds its default context on the event-loop path.
 - **AC2.3:** A named TLS mode combined with `verify_ssl=False` raises
   `ConfigurationError` before any connection; there is no unverified or
   silently downgraded named TLS mode.
 - **AC2.4:** Explicit mode combined with a client `certificate` raises
-  `ConfigurationError` before connection because aioftp's context helper
-  cannot apply that custom context to the explicit upgrade safely.
+  `ConfigurationError` before connection. Explicit-mode mTLS is outside this
+  release's frozen public authentication surface; named implicit mode retains
+  the existing client-certificate path.
 - **AC2.5:** Invalid `tls_mode` shapes/values fail before connection. Existing
   port selection remains unchanged and caller-overridable.
 - **AC2.6:** `protocol_details['tls_mode']` reports the effective value
@@ -413,7 +416,9 @@ compression, credentials, roots, reflection, and method-shape switches.
   Deterministic cancellation tests cover before, during, and after atomic
   replacement and prove the AC6.6 linearization rule.
 - **AC13.4:** Full `pytest` passes with 100% line and branch coverage; no new
-  blocking file/network I/O appears on the event-loop path.
+  blocking file/network I/O appears on the event-loop path. In particular,
+  explicit FTPS builds platform trust off-loop and injects the resulting
+  context into `upgrade_to_tls(context)` before login.
 - **AC13.5:** `mypy asyncio_gateway`, committed-tree flake8, and exact
   `flake8 .` in a clean worktree pass with no output/errors.
 - **AC13.6:** README examples are runnable and documentation/tests cannot
