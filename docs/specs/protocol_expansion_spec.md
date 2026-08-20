@@ -84,8 +84,10 @@ The existing `FTP` strategy shall accept optional
 `protocol='JSONRPC'` shall perform one logical HTTP(S) call. Every transport
 attempt is a POST. Required
 `protocol_info` keys are a non-empty string `method` and `request_id`, which
-must be a string or integer but not a boolean. `data` is the RPC `params` and
-must be a mapping, a list, or `None`.
+must be a string or integer but not a boolean. Integer identifiers are limited
+to the repository JSON engine's exactly round-trippable wire domain,
+`-2^63..2^64-1` inclusive; larger identifiers use strings. `data` is the RPC
+`params` and must be a mapping, a list, or `None`.
 
 - **AC3.1:** Only `http` and `https` targets dispatch. JSON-RPC explicitly
   rejects URL user info, and the dispatcher rejects protocol-relative,
@@ -117,8 +119,9 @@ or `error`.
 
 - **AC4.1:** A result response returns `ok=True`; `protocol_details` includes
   `id` and `result`, including a legitimate null result.
-- **AC4.2:** An error object requires an integer non-boolean `code` and a
-  string `message`; optional `data` is preserved. It raises a typed
+- **AC4.2:** An error object requires an integer non-boolean `code` in the
+  same exactly round-trippable `-2^63..2^64-1` JSON wire domain and a string
+  `message`; optional `data` is preserved. It raises a typed
   `JsonRpcError` with stable code `JSONRPC_ERROR`. A valid RPC error at HTTP
   200 still yields `ok=False` while retaining status, headers, text, parsed
   JSON, and protocol details.
