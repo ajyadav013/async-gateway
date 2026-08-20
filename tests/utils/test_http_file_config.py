@@ -33,7 +33,10 @@ aioboto3's real surface without the signature test noticing.
 """
 
 import ast
+import asyncio
 import importlib
+import logging
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Text
 
@@ -41,9 +44,13 @@ from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 
 import pytest
 
+from asyncio_gateway.utils import http_file_config as file_config
 from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     HttpStatusError,
+    ResponseTooLargeError,
+    SerializationError,
+    TransportError,
     UnsupportedVerbError,
 )
 from asyncio_gateway.utils.http_file_config import (
@@ -62,32 +69,257 @@ HTTP_FILE_CONFIG_SOURCE = (
 )
 
 
+class ChunkedS3Body:
+    """Small async S3 body double with an observable close."""
+
+    def __init__(self, chunks: List[Any]) -> None:
+        """Store chunks for one streamed read.
+
+        Args:
+            chunks: Pieces yielded to the downloader.
+        """
+        self.chunks = chunks
+        self.closed = False
+        self.iterations = 0
+        self.chunk_sizes: List[int] = []
+
+    async def iter_chunks(self, chunk_size: int) -> Any:
+        """Yield the configured pieces.
+
+        Args:
+            chunk_size: Requested bound, accepted for API compatibility.
+
+        Yields:
+            Each configured piece.
+        """
+        self.chunk_sizes.append(chunk_size)
+        for chunk in self.chunks:
+            self.iterations += 1
+            yield chunk
+
+    def close(self) -> None:
+        """Record body cleanup."""
+        self.closed = True
+
+
+class RaisingS3Body(ChunkedS3Body):
+    """S3 body whose async iterator fails with provider-authored text."""
+
+    async def iter_chunks(self, chunk_size: int) -> Any:
+        """Raise after one chunk to exercise typed, redacted cleanup."""
+        del chunk_size
+        yield b'partial'
+        raise RuntimeError('provider detail: secret=do-not-return')
+
+
+class SyncIteratorS3Body(ChunkedS3Body):
+    """Malformed S3 body returning an ordinary list of chunks."""
+
+    def iter_chunks(self, chunk_size: int) -> List[bytes]:
+        """Return a non-async iterator, which the seam must type safely."""
+        del chunk_size
+        return list(self.chunks)
+
+
+async def test_pe50_shared_s3_stream_writes_and_closes_the_body(
+    tmp_path: Path,
+) -> None:
+    """The strategy/helper primitive streams one body under a mandatory cap."""
+    target = tmp_path / 'object.bin'
+    client = RecordingS3Client(
+        chunks=[b'abc', b'def'], content_length=6)
+
+    result = await file_config.stream_s3_download(
+        client,
+        bucket_name='bucket',
+        s3_filepath='key',
+        local_filepath=str(target),
+        max_response_bytes=6,
+        overwrite=False,
+        chunk_size=3,
+    )
+
+    assert result['bytes_written'] == 6
+    assert result['response'] is client.responses[0]
+    assert target.read_bytes() == b'abcdef'
+    assert client.bodies[0].closed is True
+    assert client.bodies[0].chunk_sizes == [3]
+
+
+async def test_pe50_failed_overwrite_preserves_the_existing_target(
+    tmp_path: Path,
+) -> None:
+    """An interrupted overwrite removes only its temporary file."""
+    target = tmp_path / 'object.bin'
+    target.write_bytes(b'original')
+    client = RecordingS3Client(
+        chunks=[b'replacement', b'overflow'], content_length=None)
+
+    with pytest.raises(Exception):
+        await file_config.stream_s3_download(
+            client,
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(target),
+            max_response_bytes=11,
+            overwrite=True,
+            chunk_size=11,
+        )
+
+    assert target.read_bytes() == b'original'
+    assert list(tmp_path.iterdir()) == [target]
+    assert client.bodies[0].closed is True
+
+
+@pytest.mark.parametrize(
+    ('option', 'value'),
+    [
+        pytest.param('overwrite', 'yes', id='non-bool-overwrite'),
+        pytest.param('max_response_bytes', True, id='bool-cap'),
+        pytest.param('max_response_bytes', 0, id='zero-cap'),
+        pytest.param('max_response_bytes', -1, id='negative-cap'),
+    ],
+)
+async def test_pe50_invalid_stream_options_are_refused_before_get_object(
+    tmp_path: Path,
+    option: str,
+    value: Any,
+) -> None:
+    """Local policy validation performs no SDK I/O."""
+    client = RecordingS3Client()
+    kwargs: Dict[str, Any] = {
+        'bucket_name': 'bucket',
+        's3_filepath': 'key',
+        'local_filepath': str(tmp_path / 'object.bin'),
+        'overwrite': False,
+        'max_response_bytes': 1024,
+    }
+    kwargs[option] = value
+
+    with pytest.raises(ConfigurationError):
+        await file_config.stream_s3_download(client, **kwargs)
+
+    assert client.get_calls == []
+
+
+async def test_pe50_malformed_chunk_is_typed_without_returning_its_value(
+    tmp_path: Path,
+) -> None:
+    """Provider values never escape via a raw aiofiles TypeError."""
+    client = RecordingS3Client(chunks=[b'good', 'secret chunk'])
+    target = tmp_path / 'object.bin'
+
+    with pytest.raises(SerializationError) as caught:
+        await file_config.stream_s3_download(
+            client,
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(target),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert 'secret chunk' not in str(caught.value)
+    assert not target.exists()
+    assert client.bodies[0].closed is True
+
+
+async def test_pe50_malformed_body_iterator_is_typed_and_closed(
+    tmp_path: Path,
+) -> None:
+    """A synchronous body iterator becomes a safe typed response failure."""
+    body = SyncIteratorS3Body([b'body'])
+
+    class Client:
+        """Return the one malformed body."""
+
+        async def get_object(self, **kwargs: Any) -> Dict[str, Any]:
+            """Return a response carrying the malformed iterator."""
+            del kwargs
+            return {'Body': body, 'ContentLength': 4}
+
+    with pytest.raises(SerializationError):
+        await file_config.stream_s3_download(
+            Client(),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert body.closed is True
+
+
+async def test_pe50_body_failure_is_typed_redacted_closed_and_cleaned(
+    tmp_path: Path,
+) -> None:
+    """Iterator exceptions are chained behind a generic transport error."""
+    body = RaisingS3Body([])
+
+    class Client:
+        """Return the one failing body."""
+
+        async def get_object(self, **kwargs: Any) -> Dict[str, Any]:
+            """Return a response carrying the failing iterator."""
+            del kwargs
+            return {'Body': body}
+
+    target = tmp_path / 'object.bin'
+    with pytest.raises(TransportError) as caught:
+        await file_config.stream_s3_download(
+            Client(),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(target),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert 'secret' not in str(caught.value)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert body.closed is True
+    assert not target.exists()
+
+
 class RecordingS3Client:
-    """An S3 client double that records the download call it received.
+    """An S3 client double that records the streamed object request.
 
     Attributes:
-        download_calls: One entry per ``download_file`` call, holding the
+        get_calls: One entry per ``get_object`` call, holding the
             keyword arguments exactly as passed. Positional arguments are
             captured separately so a call that stopped using keywords is
             visible rather than silently reshaped into one that did.
         positional_calls: One entry per call, holding its positional
             arguments.
-        raises: An exception to raise from ``download_file`` instead of
+        raises: An exception to raise from ``get_object`` instead of
             recording, or None to record normally.
     """
 
-    def __init__(self, raises: Optional[BaseException] = None) -> None:
+    def __init__(
+        self,
+        raises: Optional[BaseException] = None,
+        *,
+        chunks: Optional[List[Any]] = None,
+        content_length: Optional[int] = len(b'downloaded object'),
+    ) -> None:
         """Build the double.
 
         Args:
-            raises: Exception ``download_file`` should raise, or None.
+            raises: Exception ``get_object`` should raise, or None.
+            chunks: Body chunks, or the default object bytes.
+            content_length: Advertised length, or None to omit it.
         """
-        self.download_calls: List[Dict[str, Any]] = []
+        self.get_calls: List[Dict[str, Any]] = []
         self.positional_calls: List[tuple] = []
         self.raises = raises
+        self.bodies: List[ChunkedS3Body] = []
+        self.chunks = [b'downloaded object'] if chunks is None else chunks
+        self.content_length = content_length
+        self.responses: List[Dict[str, Any]] = []
 
-    async def download_file(self, *args: Any, **kwargs: Any) -> None:
-        """Record a download request, or raise the configured error.
+    async def get_object(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Record a streamed object request, or raise the configured error.
 
         Args:
             *args: Positional arguments, recorded so their absence can be
@@ -95,15 +327,708 @@ class RecordingS3Client:
             **kwargs: Keyword arguments, recorded for exact comparison.
 
         Returns:
-            None.
+            A fresh streaming body and its declared length.
 
         Raises:
             BaseException: Whatever ``raises`` was constructed with.
         """
         self.positional_calls.append(args)
-        self.download_calls.append(dict(kwargs))
+        self.get_calls.append(dict(kwargs))
         if self.raises is not None:
             raise self.raises
+        body = ChunkedS3Body(list(self.chunks))
+        self.bodies.append(body)
+        response: Dict[str, Any] = {'Body': body}
+        if self.content_length is not None:
+            response['ContentLength'] = self.content_length
+        self.responses.append(response)
+        return response
+
+
+class RawResponseS3Client:
+    """S3 double returning one caller-supplied raw SDK response."""
+
+    def __init__(self, response: Any) -> None:
+        """Store the raw response and initialize request recording."""
+        self.response = response
+        self.get_calls: List[Dict[str, Any]] = []
+
+    async def get_object(self, **kwargs: Any) -> Any:
+        """Record keywords and return the raw response unchanged."""
+        self.get_calls.append(dict(kwargs))
+        return self.response
+
+
+class ControlledAsyncCloseBody(ChunkedS3Body):
+    """Body with an async close the test can pause or fail."""
+
+    def __init__(
+        self,
+        chunks: List[Any],
+        *,
+        close_started: Optional[asyncio.Event] = None,
+        close_release: Optional[asyncio.Event] = None,
+        close_error: Optional[BaseException] = None,
+    ) -> None:
+        """Configure close coordination and an optional provider failure."""
+        super().__init__(chunks)
+        self.close_started = close_started
+        self.close_release = close_release
+        self.close_error = close_error
+
+    async def close(self) -> None:
+        """Wait when requested, then close or raise the configured failure."""
+        if self.close_started is not None:
+            self.close_started.set()
+        if self.close_release is not None:
+            await self.close_release.wait()
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class WaitingS3Body(ChunkedS3Body):
+    """Body that yields partial bytes and then waits for cancellation."""
+
+    def __init__(self, started: asyncio.Event) -> None:
+        """Store the event raised after the first chunk."""
+        super().__init__([])
+        self.started = started
+
+    async def iter_chunks(self, chunk_size: int) -> Any:
+        """Yield one chunk and wait forever at the stream boundary."""
+        self.chunk_sizes.append(chunk_size)
+        self.iterations += 1
+        yield b'partial'
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+async def test_pe50_declared_oversize_does_not_iterate_and_closes_body(
+    tmp_path: Path,
+) -> None:
+    """An advertised cap refusal happens before body bytes or file creation."""
+    target = tmp_path / 'object.bin'
+    client = RecordingS3Client(chunks=[b'never'], content_length=5)
+
+    with pytest.raises(ResponseTooLargeError):
+        await file_config.stream_s3_download(
+            client,
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(target),
+            overwrite=False,
+            max_response_bytes=4,
+        )
+
+    assert client.bodies[0].iterations == 0
+    assert client.bodies[0].closed is True
+    assert not target.exists()
+
+
+async def test_pe50_exclusive_refusal_closes_without_consuming_s3_body(
+    tmp_path: Path,
+) -> None:
+    """An existing non-overwrite target remains unchanged and unread."""
+    target = tmp_path / 'object.bin'
+    target.write_bytes(b'old')
+    client = RecordingS3Client(chunks=[b'new'], content_length=3)
+
+    with pytest.raises(ConfigurationError):
+        await file_config.stream_s3_download(
+            client,
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(target),
+            overwrite=False,
+            max_response_bytes=3,
+        )
+
+    assert target.read_bytes() == b'old'
+    assert client.bodies[0].iterations == 0
+    assert client.bodies[0].closed is True
+
+
+@pytest.mark.parametrize('overwrite', [False, True])
+async def test_pe50_s3_stream_cancellation_closes_and_cleans_before_commit(
+    tmp_path: Path,
+    overwrite: bool,
+) -> None:
+    """Cancellation during the body keeps old targets and removes partials."""
+    target = tmp_path / 'object.bin'
+    if overwrite:
+        target.write_bytes(b'old')
+    started = asyncio.Event()
+    body = WaitingS3Body(started)
+    client = RawResponseS3Client({'Body': body})
+    downloading = asyncio.create_task(file_config.stream_s3_download(
+        client,
+        bucket_name='bucket',
+        s3_filepath='key',
+        local_filepath=str(target),
+        overwrite=overwrite,
+        max_response_bytes=1024,
+    ))
+    await started.wait()
+    downloading.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await downloading
+    assert body.closed is True
+    if overwrite:
+        assert target.read_bytes() == b'old'
+        assert list(tmp_path.iterdir()) == [target]
+    else:
+        assert not target.exists()
+
+
+@pytest.mark.parametrize('overwrite', [False, True])
+async def test_pe50_close_cancellation_obeys_overwrite_commit_policy(
+    tmp_path: Path,
+    overwrite: bool,
+) -> None:
+    """Body-close cancellation precedes commit and preserves old bytes."""
+    target = tmp_path / 'object.bin'
+    if overwrite:
+        target.write_bytes(b'old')
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    body = ControlledAsyncCloseBody(
+        [b'new'],
+        close_started=close_started,
+        close_release=close_release,
+    )
+    client = RawResponseS3Client(
+        {'Body': body, 'ContentLength': 3})
+    downloading = asyncio.create_task(file_config.stream_s3_download(
+        client,
+        bucket_name='bucket',
+        s3_filepath='key',
+        local_filepath=str(target),
+        overwrite=overwrite,
+        max_response_bytes=3,
+    ))
+    await close_started.wait()
+    downloading.cancel()
+    await asyncio.sleep(0)
+    close_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await downloading
+    assert body.closed is True
+    if overwrite:
+        assert target.read_bytes() == b'old'
+        assert list(tmp_path.iterdir()) == [target]
+    else:
+        assert not target.exists()
+
+
+async def test_pe50_successful_async_body_close_precedes_commit(
+    tmp_path: Path,
+) -> None:
+    """A successful awaitable body close completes before returning bytes."""
+    body = ControlledAsyncCloseBody([b'body'])
+    target = tmp_path / 'object.bin'
+
+    result = await file_config.stream_s3_download(
+        RawResponseS3Client({'Body': body}),
+        bucket_name='bucket',
+        s3_filepath='key',
+        local_filepath=str(target),
+        overwrite=False,
+        max_response_bytes=4,
+    )
+
+    assert result['bytes_written'] == 4
+    assert body.closed is True
+    assert target.read_bytes() == b'body'
+
+
+async def test_pe50_async_body_close_self_cancellation_propagates_exactly(
+    tmp_path: Path,
+) -> None:
+    """A child-cancelled cleanup task terminates with its exact marker."""
+    marker = asyncio.CancelledError('body-close-self-cancelled')
+
+    class SelfCancellingCloseBody(ChunkedS3Body):
+        """Cancel from inside the provider's awaitable close operation."""
+
+        async def close(self) -> None:
+            """Record entry and raise the child cancellation marker."""
+            self.closed = True
+            raise marker
+
+    body = SelfCancellingCloseBody([b'body'])
+    target = tmp_path / 'object.bin'
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': body}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(target),
+            overwrite=False,
+            max_response_bytes=4,
+        )
+
+    assert caught.value is marker
+    assert body.closed is True
+    assert not target.exists()
+
+
+async def test_pe50_async_body_close_failure_is_typed_and_redacted(
+    tmp_path: Path,
+) -> None:
+    """Provider close text is chained behind the transport vocabulary."""
+    body = ControlledAsyncCloseBody(
+        [b'body'],
+        close_error=RuntimeError('provider secret close detail'),
+    )
+    client = RawResponseS3Client({'Body': body})
+
+    with pytest.raises(TransportError) as caught:
+        await file_config.stream_s3_download(
+            client,
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert 'secret' not in str(caught.value)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert body.closed is True
+
+
+async def test_pe50_body_close_failure_precedes_overwrite_commit(
+    tmp_path: Path,
+) -> None:
+    """Preserve the old target when body cleanup fails before dispatch."""
+    target = tmp_path / 'object.bin'
+    target.write_bytes(b'old')
+    body = ControlledAsyncCloseBody(
+        [b'new'],
+        close_error=RuntimeError('provider secret close detail'),
+    )
+
+    with pytest.raises(TransportError):
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': body}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(target),
+            overwrite=True,
+            max_response_bytes=3,
+        )
+
+    assert body.closed is True
+    assert target.read_bytes() == b'old'
+    assert list(tmp_path.iterdir()) == [target]
+
+
+async def test_pe50_stream_failure_precedes_a_secondary_body_close_failure(
+    tmp_path: Path,
+) -> None:
+    """Cleanup completes without hiding the primary provider stream error."""
+    stream_error = RuntimeError('provider secret stream detail')
+    close_error = RuntimeError('provider secret close detail')
+
+    class StreamAndCloseFailureBody(ControlledAsyncCloseBody):
+        """Fail during both iteration and subsequent body cleanup."""
+
+        async def iter_chunks(self, chunk_size: int) -> Any:
+            """Raise the configured primary provider failure."""
+            del chunk_size
+            if False:
+                yield b''
+            raise stream_error
+
+    body = StreamAndCloseFailureBody([], close_error=close_error)
+    target = tmp_path / 'object.bin'
+    with pytest.raises(TransportError) as caught:
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': body}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(target),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert caught.value.__cause__ is stream_error
+    assert body.closed is True
+    assert not target.exists()
+
+
+async def test_pe50_early_fallback_body_close_failure_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The setup fallback reports cleanup failure before any path commit."""
+    async def skip_iteration(*args: Any, **kwargs: Any) -> int:
+        """Simulate an early path layer that never starts the body iterable."""
+        del args, kwargs
+        return 0
+
+    body = ControlledAsyncCloseBody(
+        [], close_error=RuntimeError('provider secret close detail'))
+    monkeypatch.setattr(file_config, 'stream_to_path', skip_iteration)
+
+    with pytest.raises(TransportError) as caught:
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': body}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=True,
+            max_response_bytes=1024,
+        )
+
+    assert 'secret' not in str(caught.value)
+    assert body.closed is True
+
+
+@pytest.mark.parametrize(
+    'raw_response',
+    [
+        pytest.param([], id='not-a-mapping'),
+        pytest.param({}, id='body-missing'),
+    ],
+)
+async def test_pe50_malformed_s3_response_is_typed(
+    tmp_path: Path,
+    raw_response: Any,
+) -> None:
+    """Malformed SDK mappings never leak a KeyError or TypeError."""
+    with pytest.raises(SerializationError):
+        await file_config.stream_s3_download(
+            RawResponseS3Client(raw_response),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+
+@pytest.mark.parametrize(
+    'content_length',
+    [
+        pytest.param(True, id='bool'),
+        pytest.param(-1, id='negative'),
+        pytest.param('4', id='string'),
+    ],
+)
+async def test_pe50_invalid_content_length_is_typed_and_body_is_closed(
+    tmp_path: Path,
+    content_length: Any,
+) -> None:
+    """SDK metadata shape failure still closes the already-owned body."""
+    body = ChunkedS3Body([b'body'])
+    client = RawResponseS3Client({
+        'Body': body,
+        'ContentLength': content_length,
+    })
+
+    with pytest.raises(SerializationError):
+        await file_config.stream_s3_download(
+            client,
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert body.closed is True
+    assert body.iterations == 0
+
+
+async def test_pe50_body_without_close_or_iterator_is_typed(
+    tmp_path: Path,
+) -> None:
+    """Both mandatory streaming-body operations are shape-checked."""
+    class NoClose:
+        """Body exposing only the iterator."""
+
+        async def iter_chunks(self, chunk_size: int) -> Any:
+            """Yield no chunks."""
+            del chunk_size
+            if False:
+                yield b''
+
+    class NoIterator:
+        """Body exposing only cleanup."""
+
+        def __init__(self) -> None:
+            """Initialize cleanup recording."""
+            self.closed = False
+
+        def close(self) -> None:
+            """Record cleanup."""
+            self.closed = True
+
+    with pytest.raises(SerializationError):
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': NoClose()}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'no-close'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+    no_iterator = NoIterator()
+    with pytest.raises(SerializationError):
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': no_iterator}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'no-iterator'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+    assert no_iterator.closed is True
+
+
+async def test_pe50_iterator_creation_failure_is_typed_redacted_and_closed(
+    tmp_path: Path,
+) -> None:
+    """A provider failure before iteration is safe and still owns cleanup."""
+    class CreationFailureBody(ChunkedS3Body):
+        """Body whose iterator factory raises."""
+
+        def iter_chunks(self, chunk_size: int) -> Any:
+            """Raise provider-authored detail before returning an iterator."""
+            del chunk_size
+            raise RuntimeError('provider secret iterator detail')
+
+    body = CreationFailureBody([])
+    with pytest.raises(SerializationError) as caught:
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': body}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert 'secret' not in str(caught.value)
+    assert body.closed is True
+
+
+async def test_pe50_stream_wraps_even_typed_provider_failure(
+    tmp_path: Path,
+) -> None:
+    """Wrap even provider-raised gateway types behind a generic message."""
+    marker = SerializationError('provider secret typed marker')
+
+    class TypedFailureBody(ChunkedS3Body):
+        """Body raising one typed gateway error during iteration."""
+
+        async def iter_chunks(self, chunk_size: int) -> Any:
+            """Raise the exact marker from the async iterator."""
+            del chunk_size
+            if False:
+                yield b''
+            raise marker
+
+    body = TypedFailureBody([])
+    with pytest.raises(TransportError) as caught:
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': body}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert 'secret' not in str(caught.value)
+    assert caught.value.__cause__ is marker
+    assert body.closed is True
+
+
+async def test_pe50_legacy_helper_new_controls_preserve_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep legacy defaults while routing new controls through one seam."""
+    target = tmp_path / 'object.bin'
+    target.write_bytes(b'old')
+    default_client = RecordingS3Client(
+        chunks=[b'a' * 64], content_length=64)
+    default_session = RecordingSession(default_client)
+    monkeypatch.setattr(file_config.aioboto3, 'Session', default_session)
+
+    result = await download_file_from_s3(
+        bucket_name='bucket',
+        s3_filepath='key',
+        local_filepath=str(target),
+    )
+
+    assert result is None
+    assert target.read_bytes() == b'a' * 64
+
+    refusing_client = RecordingS3Client(chunks=[b'new'], content_length=3)
+    refusing_session = RecordingSession(refusing_client)
+    monkeypatch.setattr(file_config.aioboto3, 'Session', refusing_session)
+    with pytest.raises(ConfigurationError):
+        await download_file_from_s3(
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(target),
+            overwrite=False,
+            max_response_bytes=3,
+        )
+    assert target.read_bytes() == b'a' * 64
+    assert refusing_client.bodies[0].closed is True
+
+
+async def test_pe50_body_attribute_failure_is_typed_and_redacted(
+    tmp_path: Path,
+) -> None:
+    """A hostile close property cannot leak its provider-authored detail."""
+    class AttributeFailureBody:
+        """Body whose close attribute cannot be inspected."""
+
+        @property
+        def close(self) -> Any:
+            """Raise while the library validates or obtains cleanup."""
+            raise RuntimeError('provider secret attribute detail')
+
+        async def iter_chunks(self, chunk_size: int) -> Any:
+            """Yield no chunks."""
+            del chunk_size
+            if False:
+                yield b''
+
+    with pytest.raises(SerializationError) as caught:
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': AttributeFailureBody()}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert 'secret' not in str(caught.value)
+
+
+async def test_pe50_response_metadata_accessor_failure_closes_body(
+    tmp_path: Path,
+) -> None:
+    """A mapping method failure is typed and cannot skip body ownership."""
+    body = ChunkedS3Body([])
+
+    class BrokenGet(dict):
+        """Mapping whose optional metadata accessor fails."""
+
+        def get(self, key: str, default: Any = None) -> Any:
+            """Raise provider detail instead of returning metadata."""
+            del key, default
+            raise RuntimeError('provider secret mapping detail')
+
+    response = BrokenGet(Body=body)
+    with pytest.raises(SerializationError) as caught:
+        await file_config.stream_s3_download(
+            RawResponseS3Client(response),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert 'secret' not in str(caught.value)
+    assert body.closed is True
+
+
+@pytest.mark.parametrize('cancelled', [False, True])
+async def test_pe50_sync_body_close_failure_is_not_raw(
+    tmp_path: Path,
+    cancelled: bool,
+) -> None:
+    """Synchronous close preserves cancellation and types other failures."""
+    class SyncCloseFailureBody(ChunkedS3Body):
+        """Body whose synchronous close fails."""
+
+        def close(self) -> None:
+            """Raise the configured cleanup outcome."""
+            if cancelled:
+                raise asyncio.CancelledError
+            raise RuntimeError('provider secret sync-close detail')
+
+    body = SyncCloseFailureBody([b'body'])
+    error_type = asyncio.CancelledError if cancelled else TransportError
+    with pytest.raises(error_type) as caught:
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': body}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+
+    assert 'secret' not in str(caught.value)
+
+
+async def test_pe50_cancelled_async_close_prefers_cancellation_to_late_error(
+    tmp_path: Path,
+) -> None:
+    """Retrieve a late provider close failure behind caller cancellation."""
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    body = ControlledAsyncCloseBody(
+        [b'body'],
+        close_started=close_started,
+        close_release=close_release,
+        close_error=RuntimeError('provider secret late-close detail'),
+    )
+    downloading = asyncio.create_task(file_config.stream_s3_download(
+        RawResponseS3Client({'Body': body}),
+        bucket_name='bucket',
+        s3_filepath='key',
+        local_filepath=str(tmp_path / 'object.bin'),
+        overwrite=False,
+        max_response_bytes=1024,
+    ))
+    await close_started.wait()
+    downloading.cancel()
+    await asyncio.sleep(0)
+    downloading.cancel()
+    close_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await downloading
+    assert body.closed is True
+
+
+async def test_pe50_iterator_factory_cancellation_propagates_and_closes(
+    tmp_path: Path,
+) -> None:
+    """Cancellation raised by iterator creation is not relabelled."""
+    class CancelledFactoryBody(ChunkedS3Body):
+        """Body whose iterator factory reports cancellation."""
+
+        def iter_chunks(self, chunk_size: int) -> Any:
+            """Raise cancellation before returning an iterator."""
+            del chunk_size
+            raise asyncio.CancelledError
+
+    body = CancelledFactoryBody([])
+    with pytest.raises(asyncio.CancelledError):
+        await file_config.stream_s3_download(
+            RawResponseS3Client({'Body': body}),
+            bucket_name='bucket',
+            s3_filepath='key',
+            local_filepath=str(tmp_path / 'object.bin'),
+            overwrite=False,
+            max_response_bytes=1024,
+        )
+    assert body.closed is True
 
 
 class RecordingS3ClientContext:
@@ -245,36 +1170,37 @@ def test_the_retired_status_constant_is_gone() -> None:
 # --- H15: the S3 call, against the aioboto3 15.x API ----------------------
 
 
-async def test_the_s3_download_calls_download_file_with_filename(
+async def test_the_s3_download_streams_get_object_into_the_local_file(
     s3_session: RecordingSession,
+    tmp_path: Path,
 ) -> None:
-    """R25-AC2: the exact ``download_file`` signature, pinned.
+    """PE-50: the helper and strategy now share the streamed primitive."""
+    target = tmp_path / 'object.png'
 
-    ``Filename=`` is the assertion that matters. The call passed
-    ``file_save_path=``, which ``download_file`` does not accept, so the
-    function could never have succeeded in either copy.
-    """
-    await download_file_from_s3(
+    result = await download_file_from_s3(
         bucket_name='my-bucket',
         s3_filepath='path/to/object.png',
-        local_filepath='/tmp/object.png',
+        local_filepath=str(target),
     )
 
-    assert s3_session.client_double.download_calls == [{
+    assert result is None
+    assert s3_session.client_double.get_calls == [{
         'Bucket': 'my-bucket',
         'Key': 'path/to/object.png',
-        'Filename': '/tmp/object.png',
     }]
+    assert target.read_bytes() == b'downloaded object'
+    assert s3_session.client_double.bodies[0].closed is True
 
 
 async def test_the_s3_download_passes_no_positional_arguments(
     s3_session: RecordingSession,
+    tmp_path: Path,
 ) -> None:
     """The three arguments are named, so none can be silently reordered."""
     await download_file_from_s3(
         bucket_name='my-bucket',
         s3_filepath='k',
-        local_filepath='/tmp/f',
+        local_filepath=str(tmp_path / 'f'),
     )
 
     assert s3_session.client_double.positional_calls == [()]
@@ -282,6 +1208,7 @@ async def test_the_s3_download_passes_no_positional_arguments(
 
 async def test_the_s3_download_builds_a_session_not_a_module_client(
     s3_session: RecordingSession,
+    tmp_path: Path,
 ) -> None:
     """R25-AC2: ``Session().client('s3')``, the surviving 15.x API.
 
@@ -292,7 +1219,7 @@ async def test_the_s3_download_builds_a_session_not_a_module_client(
     await download_file_from_s3(
         bucket_name='b',
         s3_filepath='k',
-        local_filepath='/tmp/f',
+        local_filepath=str(tmp_path / 'f'),
         access_key='AKIA-not-a-real-key',
         secret_key='not-a-real-secret',
         region='eu-west-1',
@@ -332,8 +1259,8 @@ def _module_level_aioboto3_client_calls(source: str) -> List[int]:
     )
 
 
-def _download_file_keywords(source: str) -> List[str]:
-    """Collect the keywords every ``download_file(...)`` call passes.
+def _get_object_keywords(source: str) -> List[str]:
+    """Collect the keywords every ``get_object(...)`` call passes.
 
     Args:
         source: The module's source text.
@@ -345,7 +1272,7 @@ def _download_file_keywords(source: str) -> List[str]:
         keyword.arg or '**'
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.Call)
-        and getattr(node.func, 'attr', None) == 'download_file'
+        and getattr(node.func, 'attr', None) == 'get_object'
         for keyword in node.keywords
     ]
 
@@ -362,18 +1289,13 @@ def test_the_module_level_aioboto3_client_factory_is_not_called() -> None:
     assert _module_level_aioboto3_client_calls(source) == []
 
 
-def test_the_download_call_uses_filename_and_not_file_save_path() -> None:
-    """``file_save_path=`` is not a keyword ``download_file`` accepts.
-
-    Pinned on the parsed call rather than the text so that the docstring
-    naming the old keyword does not satisfy -- or trip -- the check.
-    """
+def test_the_streamed_get_object_call_names_only_bucket_and_key() -> None:
+    """The SDK never reopens the local path through ``download_file``."""
     source = HTTP_FILE_CONFIG_SOURCE.read_text(encoding='utf-8')
 
-    keywords = _download_file_keywords(source)
+    keywords = _get_object_keywords(source)
 
-    assert 'Filename' in keywords
-    assert 'file_save_path' not in keywords
+    assert keywords == ['Bucket', 'Key']
 
 
 def test_the_call_scan_reports_the_forms_it_bans() -> None:
@@ -381,15 +1303,15 @@ def test_the_call_scan_reports_the_forms_it_bans() -> None:
     source = (
         'async def one():\n'
         '    c = aioboto3.client("s3")\n'
-        '    await c.download_file(Bucket=b, Key=k, file_save_path=p)\n'
+        '    await c.get_object(Bucket=b, Key=k)\n'
         'async def two():\n'
         '    async with session.client("s3") as c:\n'
-        '        await c.download_file(Bucket=b, Key=k, Filename=p)\n'
+        '        await c.get_object(Bucket=b, Key=k)\n'
     )
 
     assert _module_level_aioboto3_client_calls(source) == [2]
-    assert _download_file_keywords(source) == [
-        'Bucket', 'Key', 'file_save_path', 'Bucket', 'Key', 'Filename']
+    assert _get_object_keywords(source) == [
+        'Bucket', 'Key', 'Bucket', 'Key']
 
 
 # --- R25-AC3: keyword-only, so a positional call is a TypeError -----------
@@ -413,6 +1335,7 @@ def test_the_s3_download_refuses_positional_arguments() -> None:
 
 async def test_the_s3_download_still_accepts_every_argument_by_keyword(
     s3_session: RecordingSession,
+    tmp_path: Path,
 ) -> None:
     """Keyword-only bites positional callers, not legitimate ones.
 
@@ -422,17 +1345,18 @@ async def test_the_s3_download_still_accepts_every_argument_by_keyword(
     await download_file_from_s3(
         bucket_name='b',
         s3_filepath='k',
-        local_filepath='/tmp/f',
+        local_filepath=str(tmp_path / 'f'),
         access_key=None,
         secret_key=None,
         region=None,
     )
 
-    assert len(s3_session.client_double.download_calls) == 1
+    assert len(s3_session.client_double.get_calls) == 1
 
 
 async def test_the_s3_download_ignores_extra_pre_processor_params(
     s3_session: RecordingSession,
+    tmp_path: Path,
 ) -> None:
     """The README invokes this as a ``pre_processor_config`` callable.
 
@@ -442,11 +1366,11 @@ async def test_the_s3_download_ignores_extra_pre_processor_params(
     await download_file_from_s3(
         bucket_name='b',
         s3_filepath='k',
-        local_filepath='/tmp/f',
+        local_filepath=str(tmp_path / 'f'),
         file_download_path='https://example.invalid/ignored',
     )
 
-    assert len(s3_session.client_double.download_calls) == 1
+    assert len(s3_session.client_double.get_calls) == 1
 
 
 # --- R25 edge case: absent credentials are the caller's misconfiguration --
@@ -457,12 +1381,17 @@ async def test_the_s3_download_ignores_extra_pre_processor_params(
     [
         pytest.param(NoCredentialsError(), id='no-credentials'),
         pytest.param(
-            PartialCredentialsError(provider='env', cred_var='secret_key'),
+            PartialCredentialsError(
+                provider='provider-canary',
+                cred_var='credential-canary',
+            ),
             id='partial-credentials'),
     ],
 )
 async def test_absent_s3_credentials_become_a_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
     raised: BaseException,
 ) -> None:
     """Wrapped in this library's vocabulary, not swallowed.
@@ -477,15 +1406,33 @@ async def test_absent_s3_credentials_become_a_configuration_error(
 
     with pytest.raises(ConfigurationError) as caught:
         await download_file_from_s3(
-            bucket_name='b', s3_filepath='k', local_filepath='/tmp/f')
+            bucket_name='b', s3_filepath='k',
+            local_filepath=str(tmp_path / 'f'))
 
     assert caught.value.code == 'CONFIG'
     assert caught.value.status_code == 400
-    assert caught.value.__cause__ is raised
+    formatted = ''.join(traceback.format_exception(caught.value))
+    caplog.set_level(logging.ERROR)
+    logging.getLogger(__name__).error(
+        'safe credential failure',
+        exc_info=(
+            type(caught.value),
+            caught.value,
+            caught.value.__traceback__,
+        ),
+    )
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    assert raised.args == ()
+    combined = formatted + caplog.text
+    assert 'provider-canary' not in combined
+    assert 'credential-canary' not in combined
+    assert 'partial credentials' not in combined.lower()
 
 
 async def test_an_s3_failure_that_is_not_credentials_is_not_wrapped(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Only the credential chain's errors are reclassified.
 
@@ -499,7 +1446,8 @@ async def test_an_s3_failure_that_is_not_credentials_is_not_wrapped(
 
     with pytest.raises(OSError) as caught:
         await download_file_from_s3(
-            bucket_name='b', s3_filepath='k', local_filepath='/tmp/f')
+            bucket_name='b', s3_filepath='k',
+            local_filepath=str(tmp_path / 'f'))
 
     assert caught.value is raised
 

@@ -118,21 +118,35 @@ unlocked; the two are the same escape wearing different metadata.
 import asyncio
 import errno
 import fcntl
+import inspect
 import os
+import secrets
 import stat
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path, PurePath
-from typing import AsyncIterator, Callable, Final, Union
+from typing import (
+    Any,
+    AsyncIterable,
+    AsyncIterator,
+    Callable,
+    Final,
+    Optional,
+    TypeVar,
+    Union,
+)
 
 import aiofiles
 import aiofiles.os
 from aiofiles.threadpool.binary import AsyncBufferedIOBase
 
+from asyncio_gateway.utils.constants import CHUNK_SIZE_CONSTANT
 from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     ConfigurationError,
     LocalWriteError,
     PathContainmentError,
+    ResponseTooLargeError,
+    SerializationError,
 )
 
 #: Anything path-like this module accepts from a caller or from a remote
@@ -1056,3 +1070,768 @@ async def safe_unlink(path: PathLike) -> None:
         await aiofiles.os.remove(path)
     except FileNotFoundError:
         return
+
+
+ThreadResult = TypeVar('ThreadResult')
+ShieldedResult = TypeVar('ShieldedResult')
+
+
+def _validated_byte_limit(value: object, *, setting: str) -> int:
+    """Return a caller-supplied byte ceiling once proven positive.
+
+    Args:
+        value: The proposed ceiling.
+        setting: The public option name to quote in a refusal.
+
+    Returns:
+        The positive integer ceiling.
+
+    Raises:
+        ConfigurationError: If ``value`` is not a positive non-boolean int.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigurationError(
+            f'{setting} must be a positive int, got {value!r}')
+    return value
+
+
+def _leaf_name(path: PathLike) -> str:
+    """Return the final component of a previously validated file path.
+
+    Args:
+        path: A caller path already canonicalised by
+            :func:`resolve_caller_path`.
+
+    Returns:
+        The final path component.
+
+    Raises:
+        PathContainmentError: If ``path`` does not name a file leaf.
+    """
+    pure = PurePath(os.fspath(path))
+    if not pure.parts or not pure.name:
+        raise PathContainmentError(
+            f'{str(path)!r} names a directory, not a file')
+    return pure.name
+
+
+def _open_parent_descriptor(path: PathLike) -> int:
+    """Open and pin the parent directory of one canonical file path.
+
+    Every component is descended relative to the descriptor already held.
+    A rename after a component has been opened therefore cannot redirect a
+    later leaf open, temporary creation, cleanup, or replacement.
+
+    Args:
+        path: Canonical caller path whose parent is opened.
+
+    Returns:
+        A held directory descriptor owned by the caller.
+
+    Raises:
+        PathContainmentError: If ``path`` has no file leaf.
+        OSError: If a directory component cannot be opened safely.
+    """
+    pure = PurePath(os.fspath(path))
+    anchor = pure.anchor or '.'
+    parts = pure.parts[1:] if pure.anchor else pure.parts
+    if not parts:
+        raise PathContainmentError(
+            f'{str(path)!r} names a directory, not a file')
+    base_descriptor = os.open(anchor, DIRECTORY_FLAGS)
+    try:
+        return _walk_to_parent(base_descriptor, parts[:-1])
+    finally:
+        os.close(base_descriptor)
+
+
+def _open_read_descriptor(
+    path: PathLike,
+    *,
+    nofollow: int = O_NOFOLLOW,
+) -> int:
+    """Open one regular file for upload and return its held descriptor.
+
+    The descriptor is the object later reads use; the path is never reopened.
+    On platforms with ``O_NOFOLLOW`` the leaf refusal is atomic with the open.
+    The fallback records ``lstat`` identity before opening and requires the
+    opened descriptor to name that same device/inode, closing the check/use
+    window as far as a platform without the flag permits.
+
+    Args:
+        path: Caller-named upload source.
+        nofollow: ``O_NOFOLLOW`` or zero to exercise the fallback.
+
+    Returns:
+        An ``O_RDONLY`` descriptor owned by the caller.
+
+    Raises:
+        ConfigurationError: If the source is not a regular readable file.
+        PathContainmentError: If a symbolic link or fallback identity swap is
+            detected.
+        OSError: For other filesystem refusals.
+    """
+    leaf = _leaf_name(path)
+    parent_descriptor = _open_parent_descriptor(path)
+    before: Optional[os.stat_result] = None
+    try:
+        if not nofollow:
+            before = os.lstat(leaf, dir_fd=parent_descriptor)
+            if stat.S_ISLNK(before.st_mode):
+                raise PathContainmentError(
+                    f'refusing to read through the symbolic link at '
+                    f'{str(path)!r}')
+            if not stat.S_ISREG(before.st_mode):
+                raise ConfigurationError(
+                    f'{str(path)!r} is not a regular file to upload')
+
+        try:
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | nofollow | O_NONBLOCK | O_CLOEXEC,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as err:
+            if err.errno not in SYMLINK_ERRNOS:
+                raise
+            raise PathContainmentError(
+                f'refusing to read through the symbolic link at '
+                f'{str(path)!r}') from err
+
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ConfigurationError(
+                    f'{str(path)!r} is not a regular file to upload')
+            if before is not None and (
+                before.st_dev != opened.st_dev
+                or before.st_ino != opened.st_ino
+            ):
+                raise PathContainmentError(
+                    f'{str(path)!r} changed between lstat and open; refusing '
+                    f'to read a substituted upload source')
+            _restore_blocking(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+    finally:
+        os.close(parent_descriptor)
+
+
+async def _run_thread_call(
+    function: Callable[..., ThreadResult],
+    *args: Any,
+    suppress_cancellation: bool = False,
+) -> ThreadResult:
+    """Run one blocking operation to completion under cancellation.
+
+    The worker is always awaited before control returns. Cancellation is
+    deferred until the worker has stopped touching its descriptor, then
+    re-raised unless the caller has crossed the atomic-replace commit point.
+
+    Args:
+        function: Blocking callable to dispatch.
+        *args: Positional arguments for ``function``.
+        suppress_cancellation: Whether a deferred cancellation is deliberately
+            consumed after completion.
+
+    Returns:
+        The callable's result.
+
+    Raises:
+        asyncio.CancelledError: After completion unless suppression was chosen.
+        BaseException: Any ordinary callable failure.
+    """
+    operation = asyncio.create_task(asyncio.to_thread(function, *args))
+    return await _await_shielded_operation(
+        operation,
+        suppress_cancellation=suppress_cancellation,
+    )
+
+
+async def _await_shielded_operation(
+    operation: 'asyncio.Future[ShieldedResult]',
+    *,
+    suppress_cancellation: bool = False,
+) -> ShieldedResult:
+    """Await a child fully while distinguishing whose cancellation fired.
+
+    A cancellation raised by a completed child is retrieved immediately from
+    that child, preserving its exact exception. Cancellation of this calling
+    task is deferred only while the child remains live, then re-raised unless
+    the caller has crossed an explicitly non-cancellable commit point.
+
+    Args:
+        operation: Already-started child future or task.
+        suppress_cancellation: Whether caller cancellation may be consumed
+            after the child completes. Child cancellation is never consumed.
+
+    Returns:
+        The child's result.
+
+    Raises:
+        asyncio.CancelledError: Exact child cancellation, or deferred caller
+            cancellation unless suppression was requested.
+        BaseException: Any other child failure.
+    """
+    caller_cancellation: Optional[asyncio.CancelledError] = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            if operation.done():
+                if (
+                    not operation.cancelled()
+                    and caller_cancellation is None
+                ):
+                    caller_cancellation = exc
+                break
+            if caller_cancellation is None:
+                caller_cancellation = exc
+        except BaseException:
+            break
+
+    if operation.cancelled():
+        return operation.result()
+    try:
+        result = operation.result()
+    except BaseException:
+        if caller_cancellation is not None and not suppress_cancellation:
+            raise caller_cancellation
+        raise
+    if caller_cancellation is not None and not suppress_cancellation:
+        raise caller_cancellation
+    return result
+
+
+async def _await_open_descriptor(
+    opening: 'asyncio.Task[int]',
+) -> int:
+    """Await an opening worker without leaking its result on cancellation.
+
+    Args:
+        opening: Task returning one newly owned descriptor.
+
+    Returns:
+        The opened descriptor.
+
+    Raises:
+        asyncio.CancelledError: After closing a descriptor opened meanwhile.
+        BaseException: Any ordinary open failure.
+    """
+    try:
+        return await asyncio.shield(opening)
+    except asyncio.CancelledError as cancelled:
+        while not opening.done():
+            try:
+                await asyncio.shield(opening)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            descriptor = opening.result()
+        except BaseException:
+            raise cancelled
+        with suppress(OSError):
+            await _run_thread_call(
+                os.close, descriptor, suppress_cancellation=True)
+        raise cancelled
+
+
+async def _read_descriptor(descriptor: int, chunk_size: int) -> bytes:
+    """Read one chunk from a held descriptor without blocking the loop.
+
+    Args:
+        descriptor: Open descriptor to read.
+        chunk_size: Maximum bytes requested.
+
+    Returns:
+        The bytes read, or ``b''`` at EOF.
+    """
+    return await _run_thread_call(os.read, descriptor, chunk_size)
+
+
+async def _close_descriptor(
+    descriptor: int,
+    *,
+    suppress_cancellation: bool = False,
+) -> None:
+    """Close a descriptor to completion even if the caller is cancelled.
+
+    Args:
+        descriptor: Descriptor owned by this call.
+        suppress_cancellation: True only after atomic replacement dispatch or
+            while preserving an exception already in flight.
+
+    Returns:
+        None.
+    """
+    await _run_thread_call(
+        os.close,
+        descriptor,
+        suppress_cancellation=suppress_cancellation,
+    )
+
+
+async def read_guarded_file(
+    path: PathLike,
+    *,
+    max_bytes: int,
+    chunk_size: int = CHUNK_SIZE_CONSTANT,
+) -> bytes:
+    """Read a bounded upload from one held no-follow descriptor.
+
+    Args:
+        path: Caller-named local source.
+        max_bytes: Positive observed-byte ceiling.
+        chunk_size: Positive bytes requested per asynchronous read.
+
+    Returns:
+        The complete bounded file body.
+
+    Raises:
+        ConfigurationError: If a limit is invalid, the source is not a
+            regular file, or the observed bytes cross the upload ceiling.
+        PathContainmentError: If a symbolic link or identity swap is found.
+        OSError: For other open/read failures.
+        asyncio.CancelledError: Unchanged, after the descriptor is closed.
+    """
+    limit = _validated_byte_limit(
+        max_bytes, setting='max_bytes')
+    read_size = _validated_byte_limit(chunk_size, setting='chunk_size')
+    source = await resolve_caller_path(path)
+    opening = asyncio.create_task(
+        asyncio.to_thread(_open_read_descriptor, source))
+    descriptor = await _await_open_descriptor(opening)
+    chunks: list[bytes] = []
+    observed = 0
+    try:
+        while True:
+            chunk = await _read_descriptor(descriptor, read_size)
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > limit:
+                raise ConfigurationError(
+                    f'upload source {str(path)!r} exceeds '
+                    f'max_bytes={limit}; the read was abandoned '
+                    f'after {observed} bytes')
+            chunks.append(chunk)
+    except BaseException:
+        with suppress(OSError):
+            await _close_descriptor(
+                descriptor, suppress_cancellation=True)
+        raise
+    await _close_descriptor(descriptor)
+    return b''.join(chunks)
+
+
+def _temporary_file_for(
+    parent_descriptor: int,
+) -> tuple[int, str]:
+    """Create a guarded unique temporary relative to a held parent.
+
+    Args:
+        parent_descriptor: Held destination-directory descriptor.
+
+    Returns:
+        The held descriptor and relative unique name created with mode 0600.
+
+    Raises:
+        ConfigurationError: If unique-name generation is exhausted.
+        OSError: If creation or mode restriction fails.
+    """
+    for _ in range(128):
+        name = f'.asyncio-gateway-{secrets.token_hex(16)}.tmp'
+        try:
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | O_NOFOLLOW | O_CLOEXEC,
+                FILE_MODE,
+                dir_fd=parent_descriptor,
+            )
+        except FileExistsError:
+            continue
+        try:
+            os.fchmod(descriptor, FILE_MODE)
+        except BaseException:
+            os.close(descriptor)
+            with suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=parent_descriptor)
+            raise
+        return descriptor, name
+    raise ConfigurationError(
+        'could not create a unique temporary download file')
+
+
+def _exclusive_file_for(parent_descriptor: int, target_name: str) -> int:
+    """Exclusively create a mode-0600 destination under a held parent.
+
+    Args:
+        parent_descriptor: Held destination-directory descriptor.
+        target_name: Caller-selected final leaf.
+
+    Returns:
+        The new write descriptor.
+
+    Raises:
+        OSError: If the target exists or cannot be created safely.
+    """
+    descriptor = os.open(
+        target_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+        FILE_MODE,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        os.fchmod(descriptor, FILE_MODE)
+    except BaseException:
+        os.close(descriptor)
+        with suppress(FileNotFoundError):
+            os.unlink(target_name, dir_fd=parent_descriptor)
+        raise
+    return descriptor
+
+
+def _unlink_at(parent_descriptor: int, name: str) -> None:
+    """Remove one relative leaf, succeeding when it is already absent."""
+    try:
+        os.unlink(name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return
+
+
+def _write_all(descriptor: int, chunk: bytes) -> None:
+    """Write one complete chunk, accounting for short ``os.write`` calls."""
+    remaining = memoryview(chunk)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError(errno.EIO, 'local write made no progress')
+        remaining = remaining[written:]
+
+
+def _replace_at(
+    parent_descriptor: int,
+    source_name: str,
+    target_name: str,
+) -> None:
+    """Replace two leaves relative to the same held destination directory."""
+    os.replace(
+        source_name,
+        target_name,
+        src_dir_fd=parent_descriptor,
+        dst_dir_fd=parent_descriptor,
+    )
+
+
+async def _atomic_replace_at(
+    parent_descriptor: int,
+    source_name: str,
+    target_name: str,
+) -> None:
+    """Dispatch one descriptor-relative atomic replace as the commit point."""
+    await asyncio.sleep(0)
+    loop = asyncio.get_running_loop()
+    replacing = loop.run_in_executor(
+        None,
+        _replace_at,
+        parent_descriptor,
+        source_name,
+        target_name,
+    )
+    await _await_shielded_operation(
+        replacing,
+        suppress_cancellation=True,
+    )
+
+
+async def _await_temporary_file(
+    opening: 'asyncio.Task[tuple[int, str]]',
+    parent_descriptor: int,
+) -> tuple[int, str]:
+    """Await a temporary and clean a result abandoned by cancellation."""
+    try:
+        return await asyncio.shield(opening)
+    except asyncio.CancelledError as cancelled:
+        while not opening.done():
+            try:
+                await asyncio.shield(opening)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            descriptor, name = opening.result()
+        except BaseException:
+            raise cancelled
+        with suppress(OSError):
+            await _close_descriptor(
+                descriptor, suppress_cancellation=True)
+        with suppress(OSError):
+            await _run_thread_call(
+                _unlink_at,
+                parent_descriptor,
+                name,
+                suppress_cancellation=True,
+            )
+        raise cancelled
+
+
+async def _await_exclusive_file(
+    opening: 'asyncio.Task[int]',
+    parent_descriptor: int,
+    target_name: str,
+) -> int:
+    """Await exclusive create and remove a cancellation-abandoned result."""
+    try:
+        return await asyncio.shield(opening)
+    except asyncio.CancelledError as cancelled:
+        while not opening.done():
+            try:
+                await asyncio.shield(opening)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            descriptor = opening.result()
+        except BaseException:
+            raise cancelled
+        with suppress(OSError):
+            await _close_descriptor(
+                descriptor, suppress_cancellation=True)
+        with suppress(OSError):
+            await _run_thread_call(
+                _unlink_at,
+                parent_descriptor,
+                target_name,
+                suppress_cancellation=True,
+            )
+        raise cancelled
+
+
+async def _finalize_async_iterator(iterator: AsyncIterator[bytes]) -> None:
+    """Run an iterator's optional async finalizer fully under cancellation.
+
+    Args:
+        iterator: The exact iterator consumed by the streamed writer.
+
+    Returns:
+        None after an available ``aclose`` operation completes.
+
+    Raises:
+        SerializationError: If ``aclose`` returns a non-awaitable value.
+        BaseException: Any close failure, or deferred caller cancellation.
+    """
+    close = getattr(iterator, 'aclose', None)
+    if not callable(close):
+        return
+    result = close()
+    if not inspect.isawaitable(result):
+        raise SerializationError(
+            'response body async iterator has an invalid close operation')
+    closing = asyncio.ensure_future(result)
+    await _await_shielded_operation(closing)
+
+
+async def _stream_descriptor(
+    descriptor: int,
+    chunks: AsyncIterable[bytes],
+    *,
+    limit: Optional[int],
+) -> int:
+    """Validate, write, then explicitly finalize one remote iterator."""
+    written = 0
+    iterator = chunks.__aiter__()
+    failure: Optional[BaseException] = None
+    try:
+        while True:
+            try:
+                supplied = await iterator.__anext__()
+            except StopAsyncIteration:
+                break
+            if not isinstance(supplied, (bytes, bytearray, memoryview)):
+                raise SerializationError(
+                    'response body yielded a non-bytes chunk')
+            chunk = bytes(supplied)
+            written += len(chunk)
+            if limit is not None and written > limit:
+                raise ResponseTooLargeError(
+                    f'response body exceeds max_bytes={limit}; the read was '
+                    f'abandoned after {written} bytes')
+            if chunk:
+                await _run_thread_call(_write_all, descriptor, chunk)
+    except BaseException as exc:
+        failure = exc
+    try:
+        await _finalize_async_iterator(iterator)
+    except BaseException:
+        if failure is None:
+            raise
+    if failure is not None:
+        raise failure
+    return written
+
+
+async def _stream_overwrite(
+    target: Path,
+    chunks: AsyncIterable[bytes],
+    *,
+    limit: Optional[int],
+) -> int:
+    """Stream to a held-parent temporary and atomically replace ``target``."""
+    opening = asyncio.create_task(
+        asyncio.to_thread(_open_parent_descriptor, target))
+    parent_descriptor = await _await_open_descriptor(opening)
+    descriptor: Optional[int] = None
+    temporary_name: Optional[str] = None
+    committed = False
+    failed = False
+    try:
+        creating = asyncio.create_task(asyncio.to_thread(
+            _temporary_file_for, parent_descriptor))
+        descriptor, temporary_name = await _await_temporary_file(
+            creating, parent_descriptor)
+        written = await _stream_descriptor(
+            descriptor, chunks, limit=limit)
+        await _run_thread_call(os.fsync, descriptor)
+        closing_descriptor = descriptor
+        descriptor = None
+        await _close_descriptor(closing_descriptor)
+        await _atomic_replace_at(
+            parent_descriptor, temporary_name, target.name)
+        committed = True
+        return written
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                await _close_descriptor(
+                    descriptor, suppress_cancellation=True)
+        if temporary_name is not None and not committed:
+            with suppress(OSError):
+                await _run_thread_call(
+                    _unlink_at,
+                    parent_descriptor,
+                    temporary_name,
+                    suppress_cancellation=True,
+                )
+        with suppress(OSError):
+            await _close_descriptor(
+                parent_descriptor,
+                suppress_cancellation=committed or failed,
+            )
+
+
+async def _stream_exclusive(
+    target: Path,
+    chunks: AsyncIterable[bytes],
+    *,
+    limit: Optional[int],
+) -> int:
+    """Stream to a securely and exclusively created final destination."""
+    opening = asyncio.create_task(
+        asyncio.to_thread(_open_parent_descriptor, target))
+    parent_descriptor = await _await_open_descriptor(opening)
+    descriptor: Optional[int] = None
+    created = False
+    succeeded = False
+    failed = False
+    try:
+        creating = asyncio.create_task(asyncio.to_thread(
+            _exclusive_file_for, parent_descriptor, target.name))
+        descriptor = await _await_exclusive_file(
+            creating, parent_descriptor, target.name)
+        created = True
+        written = await _stream_descriptor(
+            descriptor, chunks, limit=limit)
+        await _run_thread_call(os.fsync, descriptor)
+        closing_descriptor = descriptor
+        descriptor = None
+        await _close_descriptor(closing_descriptor)
+        succeeded = True
+        return written
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                await _close_descriptor(
+                    descriptor, suppress_cancellation=True)
+        if created and not succeeded:
+            with suppress(OSError):
+                await _run_thread_call(
+                    _unlink_at,
+                    parent_descriptor,
+                    target.name,
+                    suppress_cancellation=True,
+                )
+        with suppress(OSError):
+            await _close_descriptor(
+                parent_descriptor,
+                suppress_cancellation=failed,
+            )
+
+
+async def stream_to_path(
+    path: PathLike,
+    chunks: AsyncIterable[bytes],
+    *,
+    overwrite: bool,
+    max_bytes: Optional[int],
+    advertised_bytes: Optional[int] = None,
+) -> int:
+    """Stream chunks to a guarded path under one explicit write policy.
+
+    Args:
+        path: Caller-named final destination.
+        chunks: Async byte chunks from the remote body.
+        overwrite: False for exclusive creation; True for atomic replacement.
+        max_bytes: Positive observed-byte ceiling, or None for an explicitly
+            uncapped compatibility call.
+        advertised_bytes: Remote-declared size, when present.
+
+    Returns:
+        Number of bytes written.
+
+    Raises:
+        ConfigurationError: If a local option is malformed or exclusive
+            creation finds an existing file.
+        ResponseTooLargeError: If the declared or observed size crosses
+            ``max_bytes``.
+        SerializationError: If the stream yields a non-bytes chunk.
+        BaseException: Any stream, write, flush, close, or pre-commit
+            cancellation failure after partial/temp cleanup.
+    """
+    if not isinstance(overwrite, bool):
+        raise ConfigurationError(
+            f'overwrite must be a bool, got {type(overwrite).__name__}')
+    limit = (
+        None if max_bytes is None
+        else _validated_byte_limit(max_bytes, setting='max_bytes')
+    )
+    if (
+        limit is not None
+        and isinstance(advertised_bytes, int)
+        and not isinstance(advertised_bytes, bool)
+        and advertised_bytes > limit
+    ):
+        raise ResponseTooLargeError(
+            f'response declares {advertised_bytes} bytes, which is over '
+            f'max_bytes={limit}; the body was not read')
+
+    target = await resolve_caller_path(path)
+    try:
+        if overwrite:
+            return await _stream_overwrite(target, chunks, limit=limit)
+        return await _stream_exclusive(target, chunks, limit=limit)
+    except OSError as err:
+        raise await asyncio.to_thread(
+            classify_refusal, target, err) from err

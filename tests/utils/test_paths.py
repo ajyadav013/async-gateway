@@ -42,10 +42,13 @@ import aiofiles
 
 import pytest
 
+from asyncio_gateway.utils import paths as path_utils
 from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     LocalWriteError,
     PathContainmentError,
+    ResponseTooLargeError,
+    SerializationError,
 )
 from asyncio_gateway.utils.paths import (
     FILE_MODE,
@@ -92,6 +95,1267 @@ DOTTED_BUT_ORDINARY: tuple[tuple[Text, Text], ...] = (
     ('..evil/f', 'a-name-beginning-with-two-dots'),
     ('a..b/f', 'two-dots-inside-a-name'),
 )
+
+
+# --- PE-50: held-descriptor S3 upload reads -------------------------------
+
+
+async def test_pe50_guarded_upload_read_returns_bytes_from_one_regular_file(
+    tmp_path: Path,
+) -> None:
+    """The upload reader returns the bytes read through its held descriptor."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'one bounded upload')
+
+    payload = await path_utils.read_guarded_file(
+        source, max_bytes=1024, chunk_size=4)
+
+    assert payload == b'one bounded upload'
+
+
+async def test_pe50_guarded_upload_read_refuses_an_observed_oversize(
+    tmp_path: Path,
+) -> None:
+    """The positive upload ceiling is enforced while bytes are observed."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'five!')
+
+    with pytest.raises(ConfigurationError) as caught:
+        await path_utils.read_guarded_file(
+            source, max_bytes=4, chunk_size=2)
+
+    assert 'max_bytes=4' in str(caught.value)
+
+
+async def test_pe50_guarded_reader_pins_the_parent_before_leaf_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Swapping the directory at leaf-open cannot substitute the source."""
+    live = tmp_path / 'live'
+    live.mkdir()
+    source = live / 'upload.bin'
+    source.write_bytes(b'held inode')
+    replacement = tmp_path / 'replacement'
+    replacement.mkdir()
+    (replacement / source.name).write_bytes(b'substituted inode')
+    retired = tmp_path / 'retired'
+    original_open = path_utils.os.open
+    swapped = False
+
+    def swapping_open(
+        name: Any,
+        flags: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> int:
+        """Swap the parent immediately before the upload leaf is opened."""
+        nonlocal swapped
+        spelled = os.fspath(name)
+        if not swapped and (
+            spelled == source.name or spelled == os.fspath(source)
+        ):
+            live.rename(retired)
+            replacement.rename(live)
+            swapped = True
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(path_utils.os, 'open', swapping_open)
+
+    payload = await path_utils.read_guarded_file(
+        source, max_bytes=1024, chunk_size=32)
+
+    assert swapped is True
+    assert payload == b'held inode'
+    assert source.read_bytes() == b'substituted inode'
+
+
+async def test_pe50_cancelled_read_waits_for_worker_before_closing_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Cancellation cannot close a descriptor under an in-flight os.read."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'body')
+    started = threading.Event()
+    release = threading.Event()
+    read_descriptor: list[int] = []
+    closed_descriptors: list[int] = []
+    original_close = path_utils.os.close
+
+    def blocking_read(descriptor: int, chunk_size: int) -> bytes:
+        """Hold the worker until the test has delivered cancellation."""
+        del chunk_size
+        read_descriptor.append(descriptor)
+        started.set()
+        release.wait(timeout=5)
+        return b''
+
+    def recording_close(descriptor: int) -> None:
+        """Record exactly when the upload descriptor is closed."""
+        if started.is_set():
+            closed_descriptors.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(path_utils.os, 'read', blocking_read)
+    monkeypatch.setattr(path_utils.os, 'close', recording_close)
+    reading = asyncio.create_task(path_utils.read_guarded_file(
+        source, max_bytes=1024, chunk_size=32))
+    assert await asyncio.to_thread(started.wait, 2)
+
+    try:
+        reading.cancel()
+        await asyncio.sleep(0)
+
+        assert read_descriptor[0] not in closed_descriptors
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+    assert read_descriptor[0] in closed_descriptors
+
+
+async def test_pe50_atomic_replace_uses_one_pinned_parent_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A parent swap at commit cannot redirect either replace operand."""
+    live = tmp_path / 'live'
+    live.mkdir()
+    target = live / 'target.bin'
+    target.write_bytes(b'old')
+    replacement = tmp_path / 'replacement'
+    replacement.mkdir()
+    (replacement / target.name).write_bytes(b'decoy')
+    retired = tmp_path / 'retired'
+    original_replace = path_utils.os.replace
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def swapping_replace(*args: Any, **kwargs: Any) -> None:
+        """Swap the name after the primitive has pinned its parent."""
+        calls.append((args, kwargs))
+        live.rename(retired)
+        replacement.rename(live)
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(path_utils.os, 'replace', swapping_replace)
+
+    async def chunks() -> Any:
+        """Yield the replacement through the production writer."""
+        yield b'new'
+
+    written = await path_utils.stream_to_path(
+        target, chunks(), overwrite=True, max_bytes=3)
+
+    assert written == 3
+    assert retired.joinpath(target.name).read_bytes() == b'new'
+    assert live.joinpath(target.name).read_bytes() == b'decoy'
+    assert calls[0][1]['src_dir_fd'] == calls[0][1]['dst_dir_fd']
+
+
+@pytest.mark.parametrize('setting', ['max_bytes', 'chunk_size'])
+@pytest.mark.parametrize('value', [True, 0, -1, 1.5, '1'])
+async def test_pe50_guarded_reader_rejects_invalid_positive_limits(
+    tmp_path: Path,
+    setting: str,
+    value: Any,
+) -> None:
+    """Both byte controls are positive non-boolean integers."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'body')
+    kwargs: dict[str, Any] = {'max_bytes': 8, 'chunk_size': 4}
+    kwargs[setting] = value
+
+    with pytest.raises(ConfigurationError):
+        await path_utils.read_guarded_file(source, **kwargs)
+
+
+async def test_pe50_stream_refuses_declared_and_observed_oversize(
+    tmp_path: Path,
+) -> None:
+    """The shared writer checks both advertised and running byte counts."""
+    advertised_target = tmp_path / 'advertised.bin'
+    iterated = False
+
+    async def chunks() -> Any:
+        """Record whether a declared-size refusal touched the body."""
+        nonlocal iterated
+        iterated = True
+        yield b'body'
+
+    with pytest.raises(ResponseTooLargeError):
+        await path_utils.stream_to_path(
+            advertised_target,
+            chunks(),
+            overwrite=False,
+            max_bytes=3,
+            advertised_bytes=4,
+        )
+    assert iterated is False
+    assert not advertised_target.exists()
+
+    observed_target = tmp_path / 'observed.bin'
+    with pytest.raises(ResponseTooLargeError):
+        await path_utils.stream_to_path(
+            observed_target,
+            chunks(),
+            overwrite=False,
+            max_bytes=3,
+        )
+    assert not observed_target.exists()
+
+
+def test_pe50_reader_uses_required_leaf_open_flags_and_parent_fd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The upload leaf is read-only, no-follow, close-on-exec, and relative."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'body')
+    original_open = path_utils.os.open
+    leaf_call: list[tuple[int, dict[str, Any]]] = []
+
+    def recording_open(
+        name: Any,
+        flags: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> int:
+        """Capture only the final upload-leaf open."""
+        if os.fspath(name) == source.name:
+            leaf_call.append((flags, dict(kwargs)))
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(path_utils.os, 'open', recording_open)
+    descriptor = path_utils._open_read_descriptor(source)
+    os.close(descriptor)
+
+    flags, keywords = leaf_call[0]
+    assert not flags & (os.O_WRONLY | os.O_RDWR)
+    assert flags & path_utils.O_NOFOLLOW
+    assert flags & path_utils.O_CLOEXEC
+    assert isinstance(keywords['dir_fd'], int)
+
+
+def test_pe50_reader_fallback_accepts_the_same_regular_inode(
+    tmp_path: Path,
+) -> None:
+    """The no-O_NOFOLLOW fallback admits an unchanged regular source."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'fallback')
+
+    descriptor = path_utils._open_read_descriptor(source, nofollow=0)
+    try:
+        assert os.read(descriptor, 32) == b'fallback'
+    finally:
+        os.close(descriptor)
+
+
+def test_pe50_reader_fallback_refuses_symlink_and_nonregular_leaf(
+    tmp_path: Path,
+) -> None:
+    """Fallback lstat refuses both links and directories before leaf open."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'body')
+    linked = tmp_path / 'linked.bin'
+    linked.symlink_to(source)
+
+    with pytest.raises(PathContainmentError):
+        path_utils._open_read_descriptor(linked, nofollow=0)
+    with pytest.raises(ConfigurationError):
+        path_utils._open_read_descriptor(tmp_path, nofollow=0)
+
+
+@pytest.mark.parametrize('changed_field', ['st_dev', 'st_ino'])
+def test_pe50_reader_fallback_refuses_changed_identity_and_closes_leaf(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    changed_field: str,
+) -> None:
+    """Either device or inode mismatch closes and refuses the opened leaf."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'body')
+    real_lstat = path_utils.os.lstat
+    real_open = path_utils.os.open
+    leaf_descriptor: list[int] = []
+
+    def changed_lstat(
+        name: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Return regular metadata with one identity field changed."""
+        info = real_lstat(name, *args, **kwargs)
+        values = {
+            'st_mode': info.st_mode,
+            'st_dev': info.st_dev,
+            'st_ino': info.st_ino,
+        }
+        values[changed_field] += 1
+        return mock.Mock(**values)
+
+    def recording_open(
+        name: Any,
+        flags: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> int:
+        """Remember the fallback's final descriptor."""
+        descriptor = real_open(name, flags, *args, **kwargs)
+        if os.fspath(name) == source.name:
+            leaf_descriptor.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(path_utils.os, 'lstat', changed_lstat)
+    monkeypatch.setattr(path_utils.os, 'open', recording_open)
+
+    with pytest.raises(PathContainmentError):
+        path_utils._open_read_descriptor(source, nofollow=0)
+
+    with pytest.raises(OSError):
+        os.fstat(leaf_descriptor[0])
+
+
+def test_pe50_reader_refuses_symlink_directory_and_missing_leaf(
+    tmp_path: Path,
+) -> None:
+    """Keep no-follow/fstat refusals typed and unrelated errno unchanged."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'body')
+    linked = tmp_path / 'linked.bin'
+    linked.symlink_to(source)
+
+    with pytest.raises(PathContainmentError):
+        path_utils._open_read_descriptor(linked)
+    with pytest.raises(ConfigurationError):
+        path_utils._open_read_descriptor(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        path_utils._open_read_descriptor(tmp_path / 'missing.bin')
+
+
+async def test_pe50_cancellation_during_open_closes_the_eventual_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An open finishing after cancellation cannot leak its descriptor."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'body')
+    real_open = path_utils._open_read_descriptor
+    started = threading.Event()
+    release = threading.Event()
+    opened: list[int] = []
+
+    def delayed_open(path: Any) -> int:
+        """Wait until cancellation, then return a real descriptor."""
+        started.set()
+        release.wait(timeout=5)
+        descriptor = real_open(path)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(path_utils, '_open_read_descriptor', delayed_open)
+    reading = asyncio.create_task(path_utils.read_guarded_file(
+        source, max_bytes=1024))
+    assert await asyncio.to_thread(started.wait, 2)
+    reading.cancel()
+    await asyncio.sleep(0)
+    reading.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+async def test_pe50_cancellation_wins_over_a_late_read_error_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Retrieve a late worker error without leaking or reporting it."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'body')
+    started = threading.Event()
+    release = threading.Event()
+    descriptor: list[int] = []
+
+    def failing_read(opened: int, chunk_size: int) -> bytes:
+        """Fail only after the caller has cancelled the read."""
+        del chunk_size
+        descriptor.append(opened)
+        started.set()
+        release.wait(timeout=5)
+        raise OSError(errno.EIO, 'late read failure')
+
+    monkeypatch.setattr(path_utils.os, 'read', failing_read)
+    reading = asyncio.create_task(path_utils.read_guarded_file(
+        source, max_bytes=1024))
+    assert await asyncio.to_thread(started.wait, 2)
+    reading.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+    with pytest.raises(OSError):
+        os.fstat(descriptor[0])
+
+
+@pytest.mark.parametrize('suppress_cancellation', [False, True])
+async def test_pe50_descriptor_close_defers_then_obeys_cancel_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    suppress_cancellation: bool,
+) -> None:
+    """Finish cleanup, then either re-raise or consume cancellation."""
+    source = tmp_path / 'descriptor.bin'
+    descriptor = os.open(source, os.O_WRONLY | os.O_CREAT, FILE_MODE)
+    real_close = path_utils.os.close
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_close(candidate: int) -> None:
+        """Block only the descriptor under test."""
+        if candidate == descriptor:
+            started.set()
+            release.wait(timeout=5)
+        real_close(candidate)
+
+    monkeypatch.setattr(path_utils.os, 'close', delayed_close)
+    closing = asyncio.create_task(path_utils._close_descriptor(
+        descriptor, suppress_cancellation=suppress_cancellation))
+    assert await asyncio.to_thread(started.wait, 2)
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    release.set()
+
+    if suppress_cancellation:
+        await closing
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+async def test_pe50_atomic_replace_cancellation_before_dispatch_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Preserve both files when cancelled at the pre-dispatch checkpoint."""
+    target = tmp_path / 'target.bin'
+    target.write_bytes(b'old')
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    replace_calls: list[None] = []
+
+    async def held_checkpoint(delay: float) -> None:
+        """Hold the explicit pre-dispatch checkpoint."""
+        assert delay == 0
+        entered.set()
+        await release.wait()
+
+    def forbidden_replace(*args: Any, **kwargs: Any) -> None:
+        """Record a dispatch that must not happen."""
+        del args, kwargs
+        replace_calls.append(None)
+
+    monkeypatch.setattr(path_utils.asyncio, 'sleep', held_checkpoint)
+    monkeypatch.setattr(path_utils.os, 'replace', forbidden_replace)
+
+    async def chunks() -> Any:
+        """Yield the complete pre-commit replacement."""
+        yield b'new'
+
+    replacing = asyncio.create_task(path_utils.stream_to_path(
+        target, chunks(), overwrite=True, max_bytes=3))
+    await entered.wait()
+    replacing.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await replacing
+    assert replace_calls == []
+    assert target.read_bytes() == b'old'
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.parametrize('overwrite', [False, True])
+@pytest.mark.parametrize('outcome', ['cancel', 'error'])
+async def test_pe50_file_close_releases_descriptor_ownership_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    overwrite: bool,
+    outcome: str,
+) -> None:
+    """A completed close is never repeated after cancellation or failure."""
+    target = tmp_path / 'target.bin'
+    if overwrite:
+        target.write_bytes(b'old')
+    started = asyncio.Event()
+    release = asyncio.Event()
+    real_close = path_utils._close_descriptor
+    file_descriptor: list[int] = []
+    close_calls: list[int] = []
+
+    async def controlled_close(
+        descriptor: int,
+        *,
+        suppress_cancellation: bool = False,
+    ) -> None:
+        """Close the first writer fd, then expose its post-release result."""
+        if not file_descriptor:
+            file_descriptor.append(descriptor)
+            close_calls.append(descriptor)
+            started.set()
+            cancellation: Optional[asyncio.CancelledError] = None
+            try:
+                await release.wait()
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+                while not release.is_set():
+                    try:
+                        await asyncio.shield(release.wait())
+                    except asyncio.CancelledError:
+                        continue
+            await real_close(descriptor, suppress_cancellation=True)
+            if cancellation is not None:
+                raise cancellation
+            raise OSError(errno.EIO, 'close failed after descriptor release')
+
+        close_calls.append(descriptor)
+        if descriptor == file_descriptor[0]:
+            return
+        await real_close(
+            descriptor,
+            suppress_cancellation=suppress_cancellation,
+        )
+
+    monkeypatch.setattr(path_utils, '_close_descriptor', controlled_close)
+
+    async def chunks() -> Any:
+        """Yield one complete file before its coordinated close."""
+        yield b'new'
+
+    streaming = asyncio.create_task(path_utils.stream_to_path(
+        target, chunks(), overwrite=overwrite, max_bytes=3))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    if outcome == 'cancel':
+        streaming.cancel()
+        await asyncio.sleep(0)
+    release.set()
+
+    if outcome == 'cancel':
+        with pytest.raises(asyncio.CancelledError):
+            await streaming
+    else:
+        with pytest.raises(LocalWriteError):
+            await streaming
+
+    assert close_calls.count(file_descriptor[0]) == 1
+    if overwrite:
+        assert target.read_bytes() == b'old'
+        assert list(tmp_path.iterdir()) == [target]
+    else:
+        assert not target.exists()
+
+
+async def test_pe50_stream_explicitly_finalizes_chunks_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    """A consumer-side refusal closes its iterable before target cleanup."""
+    target = tmp_path / 'target.bin'
+    target.write_bytes(b'old')
+    finalized = asyncio.Event()
+
+    async def chunks() -> Any:
+        """Record explicit finalization after yielding an oversized chunk."""
+        try:
+            yield b'too large'
+        finally:
+            finalized.set()
+
+    with pytest.raises(ResponseTooLargeError):
+        await path_utils.stream_to_path(
+            target,
+            chunks(),
+            overwrite=True,
+            max_bytes=1,
+        )
+
+    assert finalized.is_set()
+    assert target.read_bytes() == b'old'
+    assert list(tmp_path.iterdir()) == [target]
+
+
+async def test_pe50_stream_accepts_an_iterator_without_async_close(
+    tmp_path: Path,
+) -> None:
+    """Async iteration does not require the optional ``aclose`` protocol."""
+    class PlainIterator:
+        """Yield one chunk without exposing ``aclose``."""
+
+        def __init__(self) -> None:
+            """Initialize the one-shot iterator."""
+            self.sent = False
+
+        def __aiter__(self) -> 'PlainIterator':
+            """Return this iterator."""
+            return self
+
+        async def __anext__(self) -> bytes:
+            """Yield one byte, then stop."""
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return b'x'
+
+    target = tmp_path / 'plain.bin'
+    written = await path_utils.stream_to_path(
+        target, PlainIterator(), overwrite=False, max_bytes=1)
+
+    assert written == 1
+    assert target.read_bytes() == b'x'
+
+
+async def test_pe50_stream_types_a_nonawaitable_iterator_close(
+    tmp_path: Path,
+) -> None:
+    """A malformed optional close operation cannot leak a raw TypeError."""
+    class InvalidCloseIterator:
+        """Stop immediately and return a non-awaitable from ``aclose``."""
+
+        def __aiter__(self) -> 'InvalidCloseIterator':
+            """Return this iterator."""
+            return self
+
+        async def __anext__(self) -> bytes:
+            """Stop without yielding bytes."""
+            raise StopAsyncIteration
+
+        def aclose(self) -> None:
+            """Violate the optional async-close protocol."""
+            return None
+
+    target = tmp_path / 'invalid-close.bin'
+    with pytest.raises(SerializationError):
+        await path_utils.stream_to_path(
+            target,
+            InvalidCloseIterator(),
+            overwrite=False,
+            max_bytes=1,
+        )
+
+    assert not target.exists()
+
+
+@pytest.mark.parametrize('close_fails', [False, True])
+async def test_pe50_stream_close_completes_before_cancellation_propagates(
+    tmp_path: Path,
+    close_fails: bool,
+) -> None:
+    """Repeated cancellation waits for close and wins over a late failure."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class ControlledIterator:
+        """Stop immediately, then expose a coordinated async close."""
+
+        def __aiter__(self) -> 'ControlledIterator':
+            """Return this iterator."""
+            return self
+
+        async def __anext__(self) -> bytes:
+            """Stop without yielding bytes."""
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            """Wait to finish, then optionally report a late close error."""
+            started.set()
+            await release.wait()
+            if close_fails:
+                raise RuntimeError('late close failure')
+
+    target = tmp_path / 'cancel-close.bin'
+    streaming = asyncio.create_task(path_utils.stream_to_path(
+        target,
+        ControlledIterator(),
+        overwrite=False,
+        max_bytes=1,
+    ))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    streaming.cancel()
+    await asyncio.sleep(0)
+    streaming.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await streaming
+    assert not target.exists()
+
+
+async def test_pe50_iterator_close_self_cancellation_propagates_exactly(
+    tmp_path: Path,
+) -> None:
+    """A completed self-cancelled finalizer cannot spin the shield loop."""
+    marker = asyncio.CancelledError('iterator-close-self-cancelled')
+
+    class SelfCancellingIterator:
+        """Stop immediately and cancel from inside ``aclose``."""
+
+        def __aiter__(self) -> 'SelfCancellingIterator':
+            """Return this iterator."""
+            return self
+
+        async def __anext__(self) -> bytes:
+            """Stop without yielding bytes."""
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            """Raise the exact child-side cancellation marker."""
+            raise marker
+
+    target = tmp_path / 'self-cancelled-close.bin'
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await path_utils.stream_to_path(
+            target,
+            SelfCancellingIterator(),
+            overwrite=False,
+            max_bytes=1,
+        )
+
+    assert caught.value is marker
+    assert not target.exists()
+
+
+@pytest.mark.parametrize('consumer_fails', [False, True])
+async def test_pe50_stream_close_error_obeys_existing_failure_precedence(
+    tmp_path: Path,
+    consumer_fails: bool,
+) -> None:
+    """A close error propagates normally but cannot hide a body refusal."""
+    class FailingCloseIterator:
+        """Yield once and fail whenever explicitly closed."""
+
+        def __init__(self) -> None:
+            """Initialize the one-shot iterator."""
+            self.sent = False
+
+        def __aiter__(self) -> 'FailingCloseIterator':
+            """Return this iterator."""
+            return self
+
+        async def __anext__(self) -> bytes:
+            """Yield two bytes, then stop."""
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return b'xx'
+
+        async def aclose(self) -> None:
+            """Raise after the iterator has released its resources."""
+            raise RuntimeError('close failure after release')
+
+    target = tmp_path / 'close-error.bin'
+    expected = ResponseTooLargeError if consumer_fails else RuntimeError
+    with pytest.raises(expected):
+        await path_utils.stream_to_path(
+            target,
+            FailingCloseIterator(),
+            overwrite=False,
+            max_bytes=1 if consumer_fails else 2,
+        )
+
+    assert not target.exists()
+
+
+async def test_pe50_late_open_error_still_reports_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A cancelled open retrieves and hides its later worker exception."""
+    source = tmp_path / 'upload.bin'
+    source.write_bytes(b'body')
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_failure(path: Any) -> int:
+        """Fail only after cancellation reaches the awaiting task."""
+        del path
+        started.set()
+        release.wait(timeout=5)
+        raise OSError(errno.EIO, 'late open failure')
+
+    monkeypatch.setattr(path_utils, '_open_read_descriptor', delayed_failure)
+    reading = asyncio.create_task(path_utils.read_guarded_file(
+        source, max_bytes=1024))
+    assert await asyncio.to_thread(started.wait, 2)
+    reading.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+
+
+async def test_pe50_thread_worker_error_propagates_without_cancellation(
+) -> None:
+    """The cancellation guard does not relabel an ordinary worker failure."""
+    def failure() -> None:
+        """Raise the marker error in the worker."""
+        raise OSError(errno.EIO, 'worker failed')
+
+    with pytest.raises(OSError, match='worker failed'):
+        await path_utils._run_thread_call(failure)
+
+
+async def test_pe50_thread_worker_self_cancellation_propagates_exactly(
+) -> None:
+    """A child-side ``CancelledError`` cannot become a shield busy loop."""
+    marker = asyncio.CancelledError('thread-worker-self-cancelled')
+
+    def self_cancel() -> None:
+        """Raise the exact marker from inside the worker child."""
+        raise marker
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await path_utils._run_thread_call(self_cancel)
+
+    assert caught.value is marker
+
+
+async def test_pe50_completed_child_does_not_hide_caller_cancellation(
+) -> None:
+    """A success/caller-cancel race still reports the caller's marker."""
+    marker = 'caller-cancelled-after-child-success'
+
+    async def race() -> None:
+        """Complete the child, then cancel this waiter in one callback."""
+        loop = asyncio.get_running_loop()
+        operation: asyncio.Future[None] = loop.create_future()
+        waiter = asyncio.current_task()
+        assert waiter is not None
+
+        def complete_then_cancel() -> None:
+            """Make the child done before delivering caller cancellation."""
+            operation.set_result(None)
+            waiter.cancel(marker)
+
+        loop.call_soon(complete_then_cancel)
+        await path_utils._await_shielded_operation(operation)
+
+    waiting = asyncio.create_task(race())
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await waiting
+
+    assert caught.value.args == (marker,)
+
+
+def test_pe50_private_path_splitters_refuse_a_directory_root() -> None:
+    """Defensive private seams reject a value with no file component."""
+    with pytest.raises(PathContainmentError):
+        path_utils._leaf_name('/')
+    with pytest.raises(PathContainmentError):
+        path_utils._open_parent_descriptor('/')
+
+
+def test_pe50_temporary_creation_retries_collision_and_uses_mode_0600(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A guessed temp name is never opened without exclusive creation."""
+    parent = os.open(tmp_path, os.O_RDONLY)
+    collision = tmp_path / '.asyncio-gateway-collision.tmp'
+    collision.write_bytes(b'occupied')
+    tokens = iter(['collision', 'unique'])
+    monkeypatch.setattr(
+        path_utils.secrets, 'token_hex', lambda size: next(tokens))
+    try:
+        descriptor, name = path_utils._temporary_file_for(parent)
+        os.close(descriptor)
+        created = tmp_path / name
+        assert created.name == '.asyncio-gateway-unique.tmp'
+        assert stat.S_IMODE(created.stat().st_mode) == FILE_MODE
+    finally:
+        os.close(parent)
+
+
+def test_pe50_temporary_creation_cleans_a_mode_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed 0600 restriction closes and removes only the new temp."""
+    parent = os.open(tmp_path, os.O_RDONLY)
+
+    def fail_mode(descriptor: int, mode: int) -> None:
+        """Refuse the post-open mode restriction."""
+        del descriptor, mode
+        raise OSError(errno.EPERM, 'mode refused')
+
+    monkeypatch.setattr(path_utils.os, 'fchmod', fail_mode)
+    try:
+        with pytest.raises(OSError, match='mode refused'):
+            path_utils._temporary_file_for(parent)
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        os.close(parent)
+
+
+def test_pe50_temporary_creation_refuses_exhausted_unique_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Repeated collisions fail closed without overwriting the occupant."""
+    parent = os.open(tmp_path, os.O_RDONLY)
+    occupied = tmp_path / '.asyncio-gateway-same.tmp'
+    occupied.write_bytes(b'occupied')
+    monkeypatch.setattr(
+        path_utils.secrets, 'token_hex', lambda size: 'same')
+    try:
+        with pytest.raises(ConfigurationError):
+            path_utils._temporary_file_for(parent)
+        assert occupied.read_bytes() == b'occupied'
+    finally:
+        os.close(parent)
+
+
+def test_pe50_exclusive_creation_cleans_a_mode_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exclusive-create cleanup removes the leaf when fchmod fails."""
+    parent = os.open(tmp_path, os.O_RDONLY)
+
+    def fail_mode(descriptor: int, mode: int) -> None:
+        """Refuse the post-open mode restriction."""
+        del descriptor, mode
+        raise OSError(errno.EPERM, 'mode refused')
+
+    monkeypatch.setattr(path_utils.os, 'fchmod', fail_mode)
+    try:
+        with pytest.raises(OSError, match='mode refused'):
+            path_utils._exclusive_file_for(parent, 'target.bin')
+        path_utils._unlink_at(parent, 'already-absent.bin')
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        os.close(parent)
+
+
+def test_pe50_write_all_handles_short_write_and_refuses_no_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short write continues; a zero-byte write cannot silently truncate."""
+    answers = iter([2, 3])
+    seen: list[bytes] = []
+
+    def short_write(descriptor: int, value: Any) -> int:
+        """Write the supplied number of bytes from each remaining view."""
+        del descriptor
+        seen.append(bytes(value))
+        return next(answers)
+
+    monkeypatch.setattr(path_utils.os, 'write', short_write)
+    path_utils._write_all(99, b'abcde')
+    assert seen == [b'abcde', b'cde']
+
+    monkeypatch.setattr(path_utils.os, 'write', lambda descriptor, value: 0)
+    with pytest.raises(OSError, match='no progress'):
+        path_utils._write_all(99, b'x')
+
+
+@pytest.mark.parametrize('overwrite', [False, True])
+@pytest.mark.parametrize('late_failure', [False, True])
+async def test_pe50_cancellation_during_create_cleans_eventual_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    overwrite: bool,
+    late_failure: bool,
+) -> None:
+    """A create worker finishing after cancellation leaves no owned leaf."""
+    target = tmp_path / 'target.bin'
+    if overwrite:
+        target.write_bytes(b'old')
+        real_create = path_utils._temporary_file_for
+        attribute = '_temporary_file_for'
+    else:
+        real_create = path_utils._exclusive_file_for
+        attribute = '_exclusive_file_for'
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_create(*args: Any) -> Any:
+        """Return or fail only after the caller cancels."""
+        started.set()
+        release.wait(timeout=5)
+        if late_failure:
+            raise OSError(errno.EIO, 'late create failure')
+        return real_create(*args)
+
+    monkeypatch.setattr(path_utils, attribute, delayed_create)
+
+    async def chunks() -> Any:
+        """Yield bytes only if create unexpectedly reaches iteration."""
+        yield b'new'
+
+    streaming = asyncio.create_task(path_utils.stream_to_path(
+        target, chunks(), overwrite=overwrite, max_bytes=1024))
+    assert await asyncio.to_thread(started.wait, 2)
+    streaming.cancel()
+    await asyncio.sleep(0)
+    streaming.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await streaming
+    if overwrite:
+        assert target.read_bytes() == b'old'
+        assert list(tmp_path.iterdir()) == [target]
+    else:
+        assert list(tmp_path.iterdir()) == []
+
+
+def test_pe50_atomic_replace_is_not_an_extra_public_path_seam() -> None:
+    """Keep atomic replacement private to the shared streamed writer."""
+    assert not hasattr(path_utils, 'atomic_replace')
+
+
+async def test_pe50_exclusive_empty_stream_creates_a_private_empty_file(
+    tmp_path: Path,
+) -> None:
+    """Zero bytes is a valid bounded response and exercises success cleanup."""
+    target = tmp_path / 'empty.bin'
+
+    async def chunks() -> Any:
+        """Yield an empty bytes-like chunk."""
+        yield b''
+
+    written = await path_utils.stream_to_path(
+        target, chunks(), overwrite=False, max_bytes=1)
+
+    assert written == 0
+    assert target.read_bytes() == b''
+    assert stat.S_IMODE(target.stat().st_mode) == FILE_MODE
+
+
+async def test_pe50_stream_rejects_non_bytes_chunk_directly(
+    tmp_path: Path,
+) -> None:
+    """The path seam itself owns runtime bytes-like validation."""
+    async def chunks() -> Any:
+        """Yield one malformed provider value."""
+        yield 'not bytes'
+
+    target = tmp_path / 'bad.bin'
+    with pytest.raises(SerializationError):
+        await path_utils.stream_to_path(
+            target, chunks(), overwrite=False, max_bytes=1024)
+    assert not target.exists()
+
+
+async def test_pe50_atomic_replace_cancellation_during_dispatch_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Once submitted, cancellation waits for and reports the real commit."""
+    target = tmp_path / 'target.bin'
+    target.write_bytes(b'old')
+    started = threading.Event()
+    release = threading.Event()
+    real_replace = path_utils._replace_at
+
+    def replace_after_release(*args: Any) -> None:
+        """Pause before the actual linearized filesystem operation."""
+        started.set()
+        release.wait(timeout=5)
+        real_replace(*args)
+
+    monkeypatch.setattr(path_utils, '_replace_at', replace_after_release)
+
+    async def chunks() -> Any:
+        """Yield the replacement through the production writer."""
+        yield b'new'
+
+    replacing = asyncio.create_task(path_utils.stream_to_path(
+        target, chunks(), overwrite=True, max_bytes=3))
+    assert await asyncio.to_thread(started.wait, 2)
+    replacing.cancel()
+    replacing.cancel()
+    release.set()
+
+    assert await replacing == 3
+    assert target.read_bytes() == b'new'
+    assert list(tmp_path.iterdir()) == [target]
+
+
+async def test_pe50_atomic_replace_cancellation_after_commit_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Report success when cancellation arrives after os.replace ran."""
+    target = tmp_path / 'target.bin'
+    target.write_bytes(b'old')
+    committed = threading.Event()
+    release = threading.Event()
+    real_replace = path_utils._replace_at
+
+    def replace_then_wait(*args: Any) -> None:
+        """Commit first, but hold the worker future incomplete."""
+        real_replace(*args)
+        committed.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(path_utils, '_replace_at', replace_then_wait)
+
+    async def chunks() -> Any:
+        """Yield the replacement through the production writer."""
+        yield b'new'
+
+    replacing = asyncio.create_task(path_utils.stream_to_path(
+        target, chunks(), overwrite=True, max_bytes=3))
+    assert await asyncio.to_thread(committed.wait, 2)
+    replacing.cancel()
+    release.set()
+
+    assert await replacing == 3
+    assert target.read_bytes() == b'new'
+    assert list(tmp_path.iterdir()) == [target]
+
+
+async def test_pe50_overwrite_temp_is_same_directory_private_and_atomic(
+    tmp_path: Path,
+) -> None:
+    """The held-parent temp is 0600 beside the target until replacement."""
+    target = tmp_path / 'target.bin'
+    target.write_bytes(b'old')
+    observed_temp: list[Path] = []
+
+    async def chunks() -> Any:
+        """Inspect the temporary while the stream owns it."""
+        candidates = [
+            entry for entry in tmp_path.iterdir()
+            if entry != target
+        ]
+        observed_temp.extend(candidates)
+        assert len(candidates) == 1
+        assert stat.S_IMODE(candidates[0].stat().st_mode) == FILE_MODE
+        yield bytearray(b'new')
+        yield memoryview(b' body')
+
+    written = await path_utils.stream_to_path(
+        target, chunks(), overwrite=True, max_bytes=None)
+
+    assert written == 8
+    assert observed_temp[0].parent == target.parent
+    assert target.read_bytes() == b'new body'
+    assert stat.S_IMODE(target.stat().st_mode) == FILE_MODE
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.parametrize('overwrite', [False, True])
+async def test_pe50_cancelled_stream_cleans_only_its_created_file(
+    tmp_path: Path,
+    overwrite: bool,
+) -> None:
+    """Cancellation before overwrite dispatch removes partial/new bytes."""
+    target = tmp_path / 'target.bin'
+    if overwrite:
+        target.write_bytes(b'old')
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def chunks() -> Any:
+        """Yield partial bytes, then wait to be cancelled."""
+        yield b'partial'
+        started.set()
+        await release.wait()
+
+    streaming = asyncio.create_task(path_utils.stream_to_path(
+        target, chunks(), overwrite=overwrite, max_bytes=1024))
+    await started.wait()
+    streaming.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await streaming
+    if overwrite:
+        assert target.read_bytes() == b'old'
+        assert list(tmp_path.iterdir()) == [target]
+    else:
+        assert not target.exists()
+        assert list(tmp_path.iterdir()) == []
+
+
+async def test_pe50_replace_failure_preserves_old_target_and_removes_temp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A dispatched replace failure cannot damage the pre-existing target."""
+    target = tmp_path / 'target.bin'
+    target.write_bytes(b'old')
+
+    def failing_replace(*args: Any) -> None:
+        """Refuse the atomic commit."""
+        del args
+        raise OSError(errno.EIO, 'replace failed')
+
+    monkeypatch.setattr(path_utils, '_replace_at', failing_replace)
+
+    async def chunks() -> Any:
+        """Yield a complete candidate replacement."""
+        yield b'new'
+
+    with pytest.raises(LocalWriteError):
+        await path_utils.stream_to_path(
+            target, chunks(), overwrite=True, max_bytes=1024)
+
+    assert target.read_bytes() == b'old'
+    assert list(tmp_path.iterdir()) == [target]
+
+
+async def test_pe50_exclusive_stream_refuses_existing_without_iteration(
+    tmp_path: Path,
+) -> None:
+    """Non-overwrite remains exclusive and never consumes a refused body."""
+    target = tmp_path / 'target.bin'
+    target.write_bytes(b'old')
+    iterated = False
+
+    async def chunks() -> Any:
+        """Record any accidental body consumption."""
+        nonlocal iterated
+        iterated = True
+        yield b'new'
+
+    with pytest.raises(ConfigurationError):
+        await path_utils.stream_to_path(
+            target, chunks(), overwrite=False, max_bytes=1024)
+
+    assert iterated is False
+    assert target.read_bytes() == b'old'
+
+
+async def test_pe50_stream_validates_its_own_overwrite_and_limit_options(
+    tmp_path: Path,
+) -> None:
+    """The stable path seam rejects malformed policy even without S3."""
+    async def chunks() -> Any:
+        """Supply no bytes."""
+        if False:
+            yield b''
+
+    with pytest.raises(ConfigurationError):
+        await path_utils.stream_to_path(
+            tmp_path / 'bad-overwrite',
+            chunks(),
+            overwrite='yes',  # type: ignore[arg-type]
+            max_bytes=1,
+        )
+    with pytest.raises(ConfigurationError):
+        await path_utils.stream_to_path(
+            tmp_path / 'bad-limit',
+            chunks(),
+            overwrite=False,
+            max_bytes=0,
+        )
 
 
 def base_and_outside(tmp_path: Path) -> tuple[Path, Path]:
