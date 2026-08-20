@@ -73,6 +73,22 @@ Sleep = Callable[[float], Awaitable[None]]
 #: What a retried call looks like to :meth:`CircuitBreakerHelper.run`.
 Call = Callable[..., Awaitable[Any]]
 
+
+class AbortableServiceError(AsyncGatewayError):
+    """Internal marker for a remote response that retries cannot heal.
+
+    Protocol adapters use a private subclass while a response crosses the
+    breaker seam, then convert it to their public protocol error afterward.
+    Keeping the marker here avoids importing a protocol module into this
+    shared helper (and the circular import that would create) while making
+    the uncounted classification explicit and independent of message text.
+
+    This type must never reach a public response directly. Its inherited
+    wire code is therefore intentionally irrelevant; the owning adapter is
+    responsible for the stable public conversion.
+    """
+
+
 #: The failures a retry is *for*: a transport that did not answer, or
 #: answered with something the next attempt might not see.
 #:
@@ -131,6 +147,7 @@ RETRIABLE_FAILURES: Final[tuple[type[BaseException], ...]] = (
 #: ``CIRCUIT_OPEN``. Neither is evidence about the remote side, which is
 #: the whole of what a breaker exists to measure.
 DEFAULT_ABORTABLE_EXCEPTIONS: Final[tuple[type[BaseException], ...]] = (
+    AbortableServiceError,
     ConfigurationError,
     ResponseTooLargeError,
     LocalWriteError,

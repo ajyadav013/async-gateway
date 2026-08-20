@@ -17,7 +17,6 @@ from urllib.parse import urlsplit
 from asyncio_gateway.helpers.internal.base import (
     BaseRequestClass,
     validated_port,
-    validated_protocol_info,
 )
 from asyncio_gateway.logic import protocol_mapping
 from asyncio_gateway.utils.envelope import (
@@ -817,11 +816,8 @@ async def request(
             f'url must be a str, got {type(url).__name__}')
 
     protocol_name, protocol_class = resolve_protocol(protocol)
-    info: Dict[str, Any] = validated_protocol_info(
-        protocol_info,
-        required=protocol_class.REQUIRED_INFO_KEYS,
-        allowed=protocol_class.ALLOWED_INFO_KEYS,
-    )
+    info: Dict[str, Any] = protocol_class.validate_protocol_info(
+        protocol_info)
 
     # `port` is checked here, at the boundary, with the rest of the
     # `validated_*` family and *outside* the one conversion `try` -- the
@@ -960,7 +956,8 @@ async def request(
             response, exc, started=started,
             redact_query_params=redact_query_params)
         log_failure(
-            protocol_name, target_url, response, exc, redact_query_params)
+            protocol_name, response['url'], response, exc,
+            redact_query_params)
 
     if post_processor is not None:
         response['post_processor_response'] = await run_processor(

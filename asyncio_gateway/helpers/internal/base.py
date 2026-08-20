@@ -303,6 +303,37 @@ class BaseRequestClass(abc.ABC):
     #: callers may already pass to the original protocol strategies.
     ALLOWED_INFO_KEYS: ClassVar[Optional[frozenset[str]]] = None
 
+    @classmethod
+    def validate_protocol_info(
+        cls,
+        info: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Validate and copy this strategy's public ``protocol_info``.
+
+        This is the single protocol-specific extension point at the public
+        boundary. The default applies the class-declared required and allowed
+        key inventories exactly as before; a strategy with command-dependent
+        contracts may override it, delegate here first, and return a further
+        validated/normalized copy. :func:`asyncio_gateway.request` invokes
+        the hook once, before either caller processor runs, and the constructor
+        receives that returned mapping unchanged.
+
+        Args:
+            info: Caller-supplied mapping or None.
+
+        Returns:
+            A fresh validated mapping for construction and dispatch.
+
+        Raises:
+            ConfigurationError: If the mapping violates this strategy's
+            required/allowed inventory or an override's narrower contract.
+        """
+        return validated_protocol_info(
+            info,
+            required=cls.REQUIRED_INFO_KEYS,
+            allowed=cls.ALLOWED_INFO_KEYS,
+        )
+
     def __init__(
         self, url: str,
         auth: Any,

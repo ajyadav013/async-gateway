@@ -27,7 +27,8 @@ named test below.
 """
 
 import logging
-from typing import Any, Callable, Final
+from collections.abc import Mapping
+from typing import Any, Callable, Final, Optional
 
 from aiohttp import BasicAuth
 
@@ -1732,6 +1733,49 @@ class _SemanticBoundaryRequest(BaseRequestClass):
         """Return the envelope without opening a transport."""
         return finalise_ok(
             self.response, status_code=200, started=self.start_time)
+
+
+class _InfoHookRequest(BaseRequestClass):
+    """Strategy double proving class-specific boundary validation runs once."""
+
+    ALLOWED_INFO_KEYS = frozenset({'known'})
+    validation_calls = 0
+
+    @classmethod
+    def validate_protocol_info(
+        cls,
+        info: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Count, delegate, and normalize one protocol-specific value."""
+        cls.validation_calls += 1
+        validated = super().validate_protocol_info(info)
+        validated['known'] = 'normalized'
+        return validated
+
+    async def handle_request(self) -> GatewayResponse:
+        """Expose the exact validated mapping the constructor received."""
+        self.response['protocol_details'] = {'info': self.info}
+        return finalise_ok(
+            self.response, status_code=200, started=self.start_time)
+
+
+async def test_protocol_specific_info_hook_runs_once_at_public_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A strategy owns one extension hook whose returned copy is dispatched."""
+    _InfoHookRequest.validation_calls = 0
+    monkeypatch.setitem(protocol_mapping, 'JSONRPC', _InfoHookRequest)
+
+    result = await request(
+        'https://host/rpc',
+        protocol='JSONRPC',
+        protocol_info={'known': 'caller spelling'},
+    )
+
+    assert _InfoHookRequest.validation_calls == 1
+    assert result['protocol_details'] == {
+        'info': {'known': 'normalized'},
+    }
 
 
 def test_protocol_info_can_opt_into_an_exact_key_allowlist() -> None:
