@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from failsafe import CircuitOpen, RetriesExhausted
 
+# `type: ignore[import-untyped]` -- grpcio has no py.typed marker.
 import grpc  # type: ignore[import-untyped]
 
 from asyncio_gateway.helpers.internal.base import BaseRequestClass

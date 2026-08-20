@@ -1117,6 +1117,7 @@ async def test_nonmapping_sdk_success_becomes_s3_status_502(
     sdk: SdkDouble,
 ) -> None:
     """The adapter never assumes the SDK returned a mapping."""
+    # `type: ignore[arg-type]` -- inject a malformed non-mapping SDK result.
     sdk.client.script('head', [])  # type: ignore[arg-type]
 
     result = await request(

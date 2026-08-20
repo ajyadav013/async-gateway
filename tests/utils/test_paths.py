@@ -1346,6 +1346,7 @@ async def test_pe50_stream_validates_its_own_overwrite_and_limit_options(
         await path_utils.stream_to_path(
             tmp_path / 'bad-overwrite',
             chunks(),
+            # `type: ignore[arg-type]` -- exercise invalid-input rejection.
             overwrite='yes',  # type: ignore[arg-type]
             max_bytes=1,
         )

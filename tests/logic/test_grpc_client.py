@@ -638,6 +638,7 @@ async def test_bytes_like_request_is_frozen_before_channel(
     """The raw path copies any buffer-protocol input into immutable bytes."""
     result = await request(
         'grpc://service.test:50051',
+        # `type: ignore[arg-type]` -- exercise supported runtime buffers.
         data=payload,  # type: ignore[arg-type]
         protocol='GRPC',
         protocol_info=grpc_info(),
@@ -1426,6 +1427,7 @@ async def test_rpc_cancel_hook_failure_cannot_replace_parent_cancellation(
         protocol_info=grpc_info(),
     ))
     await asyncio.wait_for(entered.wait(), timeout=1)
+    # `type: ignore[method-assign]` -- inject a hostile cancel hook.
     grpc_double.calls[0].cancel = failing_cancel  # type: ignore[method-assign]
     task.cancel('parent cancellation')
 
