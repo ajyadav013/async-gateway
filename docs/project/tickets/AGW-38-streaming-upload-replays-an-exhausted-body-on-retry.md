@@ -1,6 +1,6 @@
 # AGW-38: Streaming upload path replays an exhausted body — attempt 2 uploads zero bytes
 
-- **Status:** OPEN
+- **Status:** DONE
 - **Severity:** **High** — this is the sibling-path instance of already-registered finding **H9**
   (`docs/specs/v1_release_spec.md:2349`), and it takes H9's severity. (S14's artifacts briefly
   called it Critical; corrected to High so the register and the code comments agree.)
@@ -84,6 +84,17 @@ docstring).
 - **blocks:** S15's H9 criterion cannot be honestly claimed complete while this path is unfixed
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`c5026c9`](https://github.com/ajyadav013/asyncio-gateway/commit/c5026c9); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 - **2026-08-17 (S14 review, iteration 3):** found by the `sdlc-code-reviewer` under measurement
   while checking whether S14's artifacts over-claimed. Reading alone would have missed it — nothing

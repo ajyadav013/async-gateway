@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Added the typed `SFTPAuth` model for password, explicit client-key, or mixed
+  SFTP authentication, including optional encrypted-key passphrases and an
+  explicit SSH-agent opt-in.
+- Added Documentation, Source, Issues, Changelog, and Security project links
+  to package metadata, plus the repository security policy.
+
+### Changed
+
+- Pre-processors may still enrich payload and metadata, but now raise
+  `ProcessorError` if they change `url` or `protocol`; post-processors retain
+  report-field editability.
+- Unknown ordinary `protocol_info` keys emit `DeprecationWarning` in 1.x and
+  will become errors in 2.0. Unknown security-sensitive keys fail immediately.
+
+### Fixed
+
+- Unknown top-level `request()` keywords now raise `ConfigurationError` before
+  processors or network code instead of being silently ignored.
+- SFTP key-only authentication no longer passes through the FTP validator that
+  required a password.
+- Package metadata now describes HTTP, HTTPS, SOAP, FTP, and SFTP rather than
+  claiming unsupported Redis/XML protocols.
+
+### Security
+
+- SFTP now passes `agent_path=None` unless `SFTPAuth.use_ssh_agent=True`, so
+  explicit client keys cannot implicitly activate `SSH_AUTH_SOCK`.
 
 ## [1.0.0] — 2026-08-19
 

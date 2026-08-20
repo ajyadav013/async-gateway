@@ -30,7 +30,7 @@ name = "asyncio-gateway"
 # only in the spec and the changelog history, and a packaging test asserts
 # that.
 version = "1.0.0"
-description = "Any microservice will be able to use the “asyncio_gateway” can make an async request(HTTP/SOAP/XML/FTP/redis) with the given payload to given address"
+description = "One async request interface for HTTP, HTTPS, SOAP, FTP, and SFTP"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -112,6 +112,11 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/ajyadav013/asyncio-gateway"
+Documentation = "https://github.com/ajyadav013/asyncio-gateway#readme"
+Source = "https://github.com/ajyadav013/asyncio-gateway"
+Issues = "https://github.com/ajyadav013/asyncio-gateway/issues"
+Changelog = "https://github.com/ajyadav013/asyncio-gateway/blob/master/CHANGELOG.md"
+Security = "https://github.com/ajyadav013/asyncio-gateway/security/policy"
 
 [tool.setuptools.packages.find]
 include = ["asyncio_gateway*"]

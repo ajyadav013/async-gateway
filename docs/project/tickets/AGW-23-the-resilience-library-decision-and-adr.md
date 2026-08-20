@@ -1,6 +1,6 @@
 # AGW-23: The resilience-library decision + ADR
 
-- **Status:** DONE (commit `0ef3923`, branch `lane/s23`)
+- **Status:** DONE
 - **Story:** S23 — spec Step 22, size **S under KEEP** (`docs/specs/v1_release_stories.md` §4, Phase 5). *Step 21 is **vacated** and carries no story — the dependency upgrade moved to Step 1.5 (AGW-2).*
 - **Spec:** `docs/specs/v1_release_spec.md` — R7-AC2,3,4,5,6 (AC1 run-in-CI half) (Group B — Dependency upgrades and the resilience-library decision)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; Orchestrator Ruling D
@@ -76,6 +76,17 @@ Closes findings: MG1.
   carries no scoped steps). Logged as an accepted cost with owner + revisit trigger, not buried.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`0ef3923`](https://github.com/ajyadav013/asyncio-gateway/commit/0ef3923), [`3d0e5da`](https://github.com/ajyadav013/asyncio-gateway/commit/3d0e5da); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 **2026-08-17 — S23 implemented on `lane/s23`, commit `0ef3923`.**
 

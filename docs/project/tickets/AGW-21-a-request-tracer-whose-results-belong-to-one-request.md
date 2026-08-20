@@ -1,6 +1,6 @@
 # AGW-21: A request tracer whose results belong to one request
 
-- **Status:** IMPLEMENTED (branch `lane/s21`)
+- **Status:** DONE
 - **Story:** S21 — spec Step 19, size M (`docs/specs/v1_release_stories.md` §4, Phase 3)
 - **Spec:** `docs/specs/v1_release_spec.md` — R26 all (Group L — Utilities and observability primitives) · R30-AC6 (Group N — Documentation)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; observability primitives
@@ -47,6 +47,17 @@ Closes findings: H17, M11, M20-part.
   against. The unit isolated is the caller's request, which is the unit H17 is about.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`411ca2f`](https://github.com/ajyadav013/asyncio-gateway/commit/411ca2f), [`483fb26`](https://github.com/ajyadav013/asyncio-gateway/commit/483fb26); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 - **Implementation** (`411ca2f`) — `utils/request_tracer.py` rewritten; `logic/http_client.py`
   wired to bind a per-call scope. All 800 pre-existing tests stayed green, which is the evidence

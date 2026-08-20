@@ -75,6 +75,17 @@ download to an existing path previously succeeded and now raises `ConfigurationE
 
 ## Work Log
 
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`9ba11d5`](https://github.com/ajyadav013/asyncio-gateway/commit/9ba11d5), [`741b9c0`](https://github.com/ajyadav013/asyncio-gateway/commit/741b9c0); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
+
 ### 2026-08-17 — implemented on `lane/s29`
 
 `README.md` rewritten from scratch (1,126 → ~1,100 lines, but the length is not

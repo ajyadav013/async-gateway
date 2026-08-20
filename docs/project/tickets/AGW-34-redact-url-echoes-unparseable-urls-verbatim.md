@@ -1,6 +1,6 @@
 # AGW-34: `redact_url` returns unparseable URLs verbatim (S8-L1)
 
-- **Status:** OPEN
+- **Status:** DONE
 - **Story:** none — a residual finding from S8's review, held open for adjudication at the
   **security gate** (pipeline stage 5.4, `security-clear`).
 - **Spec:** `docs/specs/v1_release_spec.md` — E9 (the redaction invariant) and its documented bound
@@ -74,5 +74,16 @@ when a classifier fails open twice you delete it, not tighten it.
   which is why this stays Low rather than being escalated.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`0e223d2`](https://github.com/ajyadav013/asyncio-gateway/commit/0e223d2), [`82b6e44`](https://github.com/ajyadav013/asyncio-gateway/commit/82b6e44), [`a061629`](https://github.com/ajyadav013/asyncio-gateway/commit/a061629); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 _Empty — opened when the finding was routed to the security gate._

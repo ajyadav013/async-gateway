@@ -55,6 +55,17 @@ AGW-24 → AGW-25.
 
 ## Work Log
 
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`e3a90fe`](https://github.com/ajyadav013/asyncio-gateway/commit/e3a90fe), [`615a22d`](https://github.com/ajyadav013/asyncio-gateway/commit/615a22d), [`8492927`](https://github.com/ajyadav013/asyncio-gateway/commit/8492927), [`50ebf3e`](https://github.com/ajyadav013/asyncio-gateway/commit/50ebf3e); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
+
 - **e3a90fe** `docs(modules)` — the four module docstrings R30 names as failing decisively: the
   three 0-byte `__init__.py` files (`utils/`, `helpers/`, `helpers/common/`) and
   `utils/constants.py`'s `"""Constants."""`. flake8 19 → 16 (three D104s).

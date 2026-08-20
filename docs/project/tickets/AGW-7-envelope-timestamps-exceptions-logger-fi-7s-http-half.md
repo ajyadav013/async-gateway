@@ -1,6 +1,6 @@
 # AGW-7: Envelope · timestamps · exceptions · logger · FI-7's HTTP half
 
-- **Status:** IN PROGRESS
+- **Status:** DONE
 - **Story:** S7 — spec Step 5, size **XL** — 13 files, cannot be split (`docs/specs/v1_release_stories.md` §4, Phase 1; sizing exception §12)
 - **Spec:** `docs/specs/v1_release_spec.md` — R8 (all but AC2, AC12), R9 all, R10 (all but AC3) (Group C — The public response contract and the error model) · R6-AC2 (Group B — Dependency upgrades and the resilience-library decision) · Part B invariants **E1–E11**
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; Architecture overview, the envelope contract
@@ -74,6 +74,17 @@ Closes findings: C2, H7, H27, H29, M20, MG3, L3, L4, L11, L12. Discharges FI-3 a
   from and fails the very run that set it (verified — see the Work Log).
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`af16cf6`](https://github.com/ajyadav013/asyncio-gateway/commit/af16cf6); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 ### 2026-08-16 — implementation (S7 / Step 5)
 

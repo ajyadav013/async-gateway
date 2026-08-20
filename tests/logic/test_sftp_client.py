@@ -39,11 +39,13 @@ and ``recurse=True`` was written into the caller's own
 sharing that ``protocol_info`` (M28).
 """
 
+import asyncio
 import errno
 import logging
 import re
 import socket
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator, Optional, Text
 
 from aiohttp import BasicAuth
@@ -419,33 +421,34 @@ async def test_r16_ac4_the_bypass_warns_on_every_single_use(
 
 
 @pytest.mark.parametrize(
-    'info',
+    'info, rejected',
     [
-        pytest.param({'verify_ssl': False}, id='verify_ssl-false'),
-        pytest.param({'verify_ssl': 0}, id='verify_ssl-zero'),
-        pytest.param({'verify_ssl': None}, id='verify_ssl-none'),
+        pytest.param({'verify_ssl': False}, True, id='verify_ssl-false'),
+        pytest.param({'verify_ssl': 0}, True, id='verify_ssl-zero'),
+        pytest.param({'verify_ssl': None}, True, id='verify_ssl-none'),
         pytest.param(
-            {'insecure_skip_host_key_check': False},
+            {'insecure_skip_host_key_check': False}, False,
             id='the-flag-explicitly-off'),
         pytest.param(
-            {'insecure_skip_host_key_check': 'false'},
+            {'insecure_skip_host_key_check': 'false'}, False,
             id='the-flag-as-the-string-false'),
         pytest.param(
-            {'insecure_skip_host_key_check': 'no'},
+            {'insecure_skip_host_key_check': 'no'}, False,
             id='the-flag-as-the-string-no'),
         pytest.param(
-            {'insecure_skip_host_key_check': 'off'},
+            {'insecure_skip_host_key_check': 'off'}, False,
             id='the-flag-as-the-string-off'),
         pytest.param(
-            {'insecure_skip_host_key_check': [0]},
+            {'insecure_skip_host_key_check': [0]}, False,
             id='the-flag-as-a-truthy-non-boolean'),
-        pytest.param({}, id='nothing-at-all'),
+        pytest.param({}, False, id='nothing-at-all'),
     ],
 )
 async def test_r16_ac4_nothing_but_the_named_keyword_enables_the_bypass(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     info: dict[str, Any],
+    rejected: bool,
 ) -> None:
     """Only the one keyword turns verification off (R16-AC4b).
 
@@ -472,9 +475,13 @@ async def test_r16_ac4_nothing_but_the_named_keyword_enables_the_bypass(
     double.install(monkeypatch)
     caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
 
-    await sftp_call(**info)
-
-    assert 'known_hosts' not in double.options
+    if rejected:
+        with pytest.raises(ConfigurationError, match='verify_ssl'):
+            await sftp_call(**info)
+        assert double.connections == []
+    else:
+        await sftp_call(**info)
+        assert 'known_hosts' not in double.options
     assert sftp_warnings(caplog) == []
 
 
@@ -635,6 +642,245 @@ async def test_r16_a_password_and_client_keys_are_both_offered(
     assert double.options['client_keys'] == ['/keys/id_ed25519']
     assert double.options['password'] == AUTH.password
     assert double.options['username'] == AUTH.login
+
+
+@pytest.mark.parametrize(
+    'password, client_keys',
+    [
+        pytest.param('secret', None, id='password-only'),
+        pytest.param(None, ['/keys/id_ed25519'], id='key-only'),
+        pytest.param('secret', ['/keys/id_ed25519'], id='password-and-key'),
+    ],
+)
+async def test_agw43_typed_sftp_auth_supports_each_explicit_credential_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    password: Optional[str],
+    client_keys: Optional[list[str]],
+) -> None:
+    """The SFTP model accepts password, key, or both without FTP coupling."""
+    from asyncio_gateway import SFTPAuth
+
+    double = SSHTransportDouble()
+    double.install(monkeypatch)
+
+    await request(
+        HOST,
+        auth=SFTPAuth(
+            username='deploy',
+            password=password,
+            client_keys=client_keys,
+        ),
+        protocol='SFTP',
+        protocol_info={'mode': 'get', 'remote_path': REMOTE_PATH},
+    )
+
+    assert double.options['username'] == 'deploy'
+    assert double.options['password'] == password
+    assert double.options['client_keys'] == client_keys
+    assert double.options['agent_path'] is None
+
+
+@pytest.mark.parametrize(
+    'username, password, client_keys',
+    [
+        pytest.param('', 'secret', None, id='empty-username'),
+        pytest.param(None, 'secret', None, id='non-string-username'),
+        pytest.param('deploy', None, None, id='no-credential'),
+        pytest.param('deploy', None, '', id='empty-key-path'),
+        pytest.param('deploy', None, b'', id='empty-key-bytes'),
+        pytest.param('deploy', None, [], id='empty-key-list'),
+        pytest.param('deploy', 42, None, id='non-string-password'),
+    ],
+)
+async def test_agw43_typed_sftp_auth_rejects_incomplete_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    username: Any,
+    password: Any,
+    client_keys: Any,
+) -> None:
+    """Invalid typed credentials fail before asyncssh sees a connection."""
+    from asyncio_gateway import SFTPAuth
+
+    double = SSHTransportDouble()
+    double.install(monkeypatch)
+
+    with pytest.raises(ConfigurationError):
+        await request(
+            HOST,
+            auth=SFTPAuth(
+                username=username,
+                password=password,
+                client_keys=client_keys,
+            ),
+            protocol='SFTP',
+            protocol_info={'mode': 'get', 'remote_path': REMOTE_PATH},
+        )
+
+    assert double.connections == []
+
+
+@pytest.mark.parametrize(
+    'field, value',
+    [
+        pytest.param('key_passphrase', 42, id='non-string-passphrase'),
+        pytest.param('use_ssh_agent', 'yes', id='non-boolean-agent-opt-in'),
+    ],
+)
+async def test_agw43_typed_sftp_auth_validates_optional_key_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: Any,
+) -> None:
+    """Malformed key controls fail before asyncssh sees a connection."""
+    from asyncio_gateway import SFTPAuth
+
+    double = SSHTransportDouble()
+    double.install(monkeypatch)
+    auth_options = {
+        'username': 'deploy',
+        'client_keys': ['/keys/id_ed25519'],
+        field: value,
+    }
+
+    with pytest.raises(ConfigurationError):
+        await request(
+            HOST,
+            auth=SFTPAuth(**auth_options),
+            protocol='SFTP',
+            protocol_info={'mode': 'get', 'remote_path': REMOTE_PATH},
+        )
+
+    assert double.connections == []
+
+
+async def test_agw43_key_passphrase_requires_an_explicit_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A passphrase is rejected when no configured key can consume it."""
+    from asyncio_gateway import SFTPAuth
+
+    double = SSHTransportDouble()
+    double.install(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match='requires explicit'):
+        await request(
+            HOST,
+            auth=SFTPAuth(
+                username='deploy',
+                password='secret',
+                key_passphrase='unused-secret',
+            ),
+            protocol='SFTP',
+            protocol_info={'mode': 'get', 'remote_path': REMOTE_PATH},
+        )
+
+    assert double.connections == []
+
+
+async def test_agw43_legacy_key_only_auth_remains_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy login plus protocol_info client key remains a valid call."""
+    double = SSHTransportDouble()
+    double.install(monkeypatch)
+
+    await request(
+        HOST,
+        auth=SimpleNamespace(login='deploy', password=None),
+        protocol='SFTP',
+        protocol_info={
+            'mode': 'get',
+            'remote_path': REMOTE_PATH,
+            'client_keys': ['/keys/id_ed25519'],
+        },
+    )
+
+    assert double.options['username'] == 'deploy'
+    assert double.options['password'] is None
+    assert double.options['client_keys'] == ['/keys/id_ed25519']
+    assert double.options['agent_path'] is None
+
+
+async def test_agw43_key_passphrase_and_explicit_agent_opt_in_are_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two optional key-auth controls are explicit and unrenamed."""
+    from asyncio_gateway import SFTPAuth
+
+    double = SSHTransportDouble()
+    double.install(monkeypatch)
+
+    await request(
+        HOST,
+        auth=SFTPAuth(
+            username='deploy',
+            client_keys=['/keys/id_ed25519'],
+            key_passphrase='key-secret',
+            use_ssh_agent=True,
+        ),
+        protocol='SFTP',
+        protocol_info={'mode': 'get', 'remote_path': REMOTE_PATH},
+    )
+
+    assert double.options['passphrase'] == 'key-secret'
+    assert 'agent_path' not in double.options
+
+
+async def test_agw43_typed_and_legacy_key_sources_cannot_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two explicit key sources fail instead of relying on precedence."""
+    from asyncio_gateway import SFTPAuth
+
+    double = SSHTransportDouble()
+    double.install(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match='client_keys'):
+        await request(
+            HOST,
+            auth=SFTPAuth(
+                username='deploy', client_keys=['/keys/model-key']),
+            protocol='SFTP',
+            protocol_info={
+                'mode': 'get',
+                'remote_path': REMOTE_PATH,
+                'client_keys': ['/keys/info-key'],
+            },
+        )
+
+    assert double.connections == []
+
+
+async def test_agw43_sftp_cancellation_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation is task control, not an SFTP transport failure."""
+    from asyncio_gateway import SFTPAuth
+
+    class CancelledConnect:
+        """Cancel while entering the SSH connection context."""
+
+        async def __aenter__(self) -> None:
+            """Raise the cancellation injected by the scheduler."""
+            raise asyncio.CancelledError
+
+        async def __aexit__(self, *args: Any) -> None:
+            """Leave the unused context."""
+
+    monkeypatch.setattr(
+        asyncssh, 'connect', lambda **kwargs: CancelledConnect())
+
+    with pytest.raises(asyncio.CancelledError):
+        await request(
+            HOST,
+            auth=SFTPAuth(username='deploy', password='secret'),
+            protocol='SFTP',
+            protocol_info={
+                'mode': 'get',
+                'remote_path': REMOTE_PATH,
+                'host_key': SERVER_HOST_KEY,
+            },
+        )
 
 
 # --- R17-AC1: the operation that succeeded is reported as a success --------

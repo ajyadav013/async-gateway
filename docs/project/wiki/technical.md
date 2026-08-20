@@ -52,3 +52,9 @@ file.
 ## Architecture decisions
 
 See [`decisions.md`](decisions.md).
+
+## Post-1.0 contract correction
+
+[`docs/specs/p0_contract_corrections_spec.md`](../../specs/p0_contract_corrections_spec.md)
+maps each P0 requirement to its code, tests, and documentation. It deliberately
+changes no response schema, protocol registry, dependency, or CI workflow.

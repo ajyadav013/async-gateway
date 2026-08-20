@@ -1,6 +1,6 @@
 # AGW-4: CI
 
-- **Status:** IN PROGRESS
+- **Status:** DONE
 - **Story:** S4 — spec Step 3, size S (`docs/specs/v1_release_stories.md` §4, Phase 0)
 - **Spec:** `docs/specs/v1_release_spec.md` — R1-AC1…9,11 (Group A), R28-AC7 (job) (Group M)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation
@@ -58,6 +58,17 @@ Closes findings: H21.
   `continue-on-error`.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`d6ff2a3`](https://github.com/ajyadav013/asyncio-gateway/commit/d6ff2a3); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 **2026-08-16 — implemented, self-verified, committed.**
 

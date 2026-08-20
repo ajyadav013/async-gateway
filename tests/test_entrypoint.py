@@ -643,15 +643,15 @@ async def test_fi14_a_pre_processor_cannot_downgrade_an_https_call(
         response['url'] = 'http://evil/p'
         return 'ran'
 
-    result = await request(
-        'host/p',
-        protocol='HTTPS',
-        protocol_info={'request_type': 'GET'},
-        pre_processor_config={'function': downgrade},
-    )
+    with pytest.raises(ProcessorError, match='url'):
+        await request(
+            'host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={'function': downgrade},
+        )
 
-    assert result['pre_processor_response'] == 'ran'
-    assert dispatched[0].url == 'https://host/p'
+    assert dispatched == []
 
 
 def test_fi14_the_checked_url_is_the_value_handed_to_the_protocol() -> None:
@@ -1455,12 +1455,11 @@ async def test_new2_a_post_processor_emptying_the_envelope_is_refused(
 async def test_new2_a_processor_may_still_change_what_the_envelope_holds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The guard refuses *removal* only, never a rewritten value.
+    """The guard permits non-routing values to be rewritten.
 
-    Mutating the envelope is the point of the hook -- FI-14 depends on a
-    pre-processor being able to rewrite ``response['url']`` -- so a guard
-    that froze the envelope would break the documented use while fixing
-    the crash. This is the control row that says it did not.
+    Mutating request metadata is the point of the hook. AGW-43 freezes URL
+    and protocol because they describe dispatch, while payload remains a
+    supported pre-dispatch edit.
     """
     capture_dispatch(monkeypatch)
 
@@ -1473,7 +1472,6 @@ async def test_new2_a_processor_may_still_change_what_the_envelope_holds(
         Returns:
             A marker proving the callback ran.
         """
-        response['url'] = 'http://rewritten/p'
         response['payload'] = {'replaced': True}
         return 'annotated'
 
@@ -1486,6 +1484,7 @@ async def test_new2_a_processor_may_still_change_what_the_envelope_holds(
 
     assert result['pre_processor_response'] == 'annotated'
     assert result['ok'] is True
+    assert result['payload'] == {'replaced': True}
 
 
 async def test_new2_the_documented_processor_call_still_works(
@@ -1608,22 +1607,16 @@ async def test_a_pre_processor_may_not_rewrite_the_dispatch_protocol(
     assert 'pre_processor_config' in str(raised.value)
 
 
-async def test_a_pre_processor_may_still_rewrite_the_reported_url(
+async def test_a_pre_processor_may_not_rewrite_the_dispatch_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FI-14's decision stands: ``url`` is writable, and safely so.
+    """A URL edit fails instead of pretending it retargeted the request.
 
-    The freeze is scoped to what this library *routes on*, and ``url``
-    is deliberately not in that set even though it looks like the most
-    dangerous key on the envelope. The reason is structural rather than
-    a judgement call: ``request()`` overwrites ``response['url']`` from
-    ``target_url`` a few lines after the processor returns, and the
-    scheme guard runs against that same variable -- which is precisely
-    what FI-14 established. The processor's write reaches no dispatch
-    decision, so freezing it would cost a documented use for no safety.
-
-    This row is the control that says the NEW-3 fix did not quietly
-    widen into FI-14's territory.
+    Before AGW-43, the callback's edit was accepted and then overwritten
+    from the original function argument. That silent discard made the live
+    envelope look like a request-construction API while dispatching to a
+    different destination. The failure must precede protocol dispatch and
+    must not echo either credential-bearing URL.
 
     Args:
         monkeypatch: The patcher, for the doubled dispatch.
@@ -1634,7 +1627,7 @@ async def test_a_pre_processor_may_still_rewrite_the_reported_url(
     dispatched = capture_dispatch(monkeypatch)
 
     async def rewrite(response: GatewayResponse) -> str:
-        """Rewrite every writable field a caller might reasonably touch.
+        """Try to replace the request's network destination.
 
         Args:
             response: The envelope, mutated in place.
@@ -1642,25 +1635,49 @@ async def test_a_pre_processor_may_still_rewrite_the_reported_url(
         Returns:
             A marker proving the callback ran to completion.
         """
-        response['url'] = 'http://rewritten.invalid/x'
+        response['url'] = 'https://mallory:replacement-secret@other/p'
+        return 'retargeted'
+
+    with pytest.raises(ProcessorError) as raised:
+        await request(
+            'https://alice:original-secret@host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={'function': rewrite},
+        )
+
+    message = str(raised.value)
+    assert "rewrote ['url']" in message
+    assert 'original-secret' not in message
+    assert 'replacement-secret' not in message
+    assert dispatched == []
+
+
+async def test_a_pre_processor_may_rewrite_non_routing_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Payload, annotation fields, and caller metadata remain writable."""
+    dispatched = capture_dispatch(monkeypatch)
+
+    async def annotate(response: GatewayResponse) -> str:
+        """Enrich request data without changing where it is sent."""
         response['payload'] = {'replaced': True}
         response['headers'] = {'x-annotation': 'mine'}
         response['protocol_details'] = {'caller': 'state'}
+        response['caller_metadata'] = {'trace': 'caller-owned'}
         return 'annotated'
 
     result = await request(
         'https://host/p',
         protocol='HTTPS',
         protocol_info={'request_type': 'GET'},
-        pre_processor_config={'function': rewrite},
+        pre_processor_config={'function': annotate},
     )
 
     assert result['pre_processor_response'] == 'annotated'
-    assert result['ok'] is True
-    # The rewrite did not reach dispatch: the call still went to the
-    # caller's own URL, under the caller's own protocol.
+    assert result['payload'] == {'replaced': True}
+    assert result['caller_metadata'] == {'trace': 'caller-owned'}
     assert dispatched[0].url == 'https://host/p'
-    assert result['protocol'] == 'HTTPS'
 
 
 async def test_a_post_processor_may_rewrite_anything_it_likes(
@@ -1695,6 +1712,7 @@ async def test_a_post_processor_may_rewrite_anything_it_likes(
             A marker proving the callback ran.
         """
         response['protocol'] = 'RELABELLED'
+        response['url'] = 'reported://after-dispatch'
         return 'relabelled'
 
     result = await request(
@@ -1706,6 +1724,7 @@ async def test_a_post_processor_may_rewrite_anything_it_likes(
 
     assert result['post_processor_response'] == 'relabelled'
     assert result['protocol'] == 'RELABELLED'
+    assert result['url'] == 'reported://after-dispatch'
 
 
 def test_every_dispatch_controlling_key_is_a_real_envelope_key() -> None:
@@ -1721,3 +1740,132 @@ def test_every_dispatch_controlling_key_is_a_real_envelope_key() -> None:
         GatewayResponse.__annotations__)
     # And it is non-empty, or the guard is silently inert.
     assert DISPATCH_CONTROLLING_KEYS
+    assert DISPATCH_CONTROLLING_KEYS == frozenset({'protocol', 'url'})
+
+
+@pytest.mark.parametrize(
+    'unknown',
+    [
+        pytest.param('protcol_info', id='protocol-info-typo'),
+        pytest.param('preprocesor_config', id='pre-processor-typo'),
+        pytest.param('timeuot', id='timeout-in-the-wrong-location'),
+    ],
+)
+async def test_unknown_top_level_keywords_fail_before_processors_or_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    unknown: str,
+) -> None:
+    """A misspelled option cannot turn into an ignored no-op."""
+    dispatched = capture_dispatch(monkeypatch)
+    processor_ran = False
+
+    async def processor(response: GatewayResponse) -> None:
+        """Record whether boundary validation happened too late."""
+        nonlocal processor_ran
+        processor_ran = True
+
+    with pytest.raises(ConfigurationError) as raised:
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET'},
+            pre_processor_config={'function': processor},
+            **{unknown: object()},
+        )
+
+    message = str(raised.value)
+    assert unknown in message
+    assert 'accepted top-level arguments' in message
+    assert 'protocol_info' in message
+    assert 'processor' in message
+    assert processor_ran is False
+    assert dispatched == []
+
+
+async def test_a_security_sensitive_unknown_protocol_option_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A misspelled TLS control is rejected, never warned and ignored."""
+    dispatched = capture_dispatch(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match='verify_sll'):
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET', 'verify_sll': False},
+        )
+
+    assert dispatched == []
+
+
+async def test_a_non_string_protocol_option_name_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protocol option names are keywords and therefore strings."""
+    dispatched = capture_dispatch(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match='unknown key'):
+        await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={'request_type': 'GET', 7: 'not-a-keyword'},
+        )
+
+    assert dispatched == []
+
+
+async def test_an_ordinary_unknown_protocol_option_warns_during_1_x(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compatibility window is visible and keeps the call working."""
+    dispatched = capture_dispatch(monkeypatch)
+
+    with pytest.warns(DeprecationWarning, match='future_transport_hint'):
+        result = await request(
+            'https://host/p',
+            protocol='HTTPS',
+            protocol_info={
+                'request_type': 'GET',
+                'future_transport_hint': 'legacy-value',
+            },
+        )
+
+    assert result['ok'] is True
+    assert len(dispatched) == 1
+
+
+def test_each_protocol_declares_its_complete_accepted_option_set() -> None:
+    """The boundary and documented per-protocol tables share one census."""
+    common = {
+        'certificate', 'circuit_breaker_config', 'port',
+        'redact_query_params', 'timeout',
+    }
+    expected = {
+        HttpRequest: common | {
+            'allow_redirects', 'allowed_schemes', 'cookies',
+            'cross_origin_headers', 'headers',
+            'http_file_download_config', 'http_file_upload_config',
+            'max_redirects', 'max_response_bytes', 'request_type',
+            'serialization', 'session', 'trace_config', 'verify_ssl',
+        },
+        FTPRequest: common | {
+            'client_path', 'command', 'max_response_bytes', 'overwrite',
+            'server_path', 'verify_ssl',
+        },
+        SFTPRequest: common | {
+            'additional_arguments', 'client_keys', 'host_key',
+            'insecure_skip_host_key_check', 'known_hosts', 'local_path',
+            'max_response_bytes', 'mode', 'overwrite', 'remote_path',
+        },
+        SoapRequest: common | {
+            'allow_redirects', 'allowed_schemes', 'cookies',
+            'cross_origin_headers', 'headers',
+            'http_file_download_config', 'http_file_upload_config',
+            'max_redirects', 'max_response_bytes', 'request_type',
+            'serialization', 'session', 'soap_action', 'soap_headers',
+            'soap_version', 'trace_config', 'verify_ssl',
+        },
+    }
+
+    for protocol_class, accepted in expected.items():
+        assert protocol_class.ACCEPTED_INFO_KEYS == frozenset(accepted)

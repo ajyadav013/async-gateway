@@ -13,8 +13,9 @@ this class acts on configuration that has already been validated.
 """
 
 import abc
+import warnings
 from collections.abc import Collection, Mapping
-from typing import Any, ClassVar, Optional, Tuple
+from typing import Any, ClassVar, Final, Optional, Tuple
 from urllib.parse import urlsplit
 
 from asyncio_gateway.helpers.common.date_helper import monotonic_now
@@ -31,10 +32,70 @@ from asyncio_gateway.utils.http_file_config import resolve_verb
 from asyncio_gateway.utils.redaction import redact_url
 
 
+#: Options shared by the protocol strategies through ``BaseRequestClass``.
+#: Subclasses union their own keys with this set, giving the public boundary
+#: one exhaustive census instead of a second hand-maintained routing table.
+COMMON_PROTOCOL_INFO_KEYS: Final[frozenset[str]] = frozenset({
+    'certificate',
+    'circuit_breaker_config',
+    'port',
+    'redact_query_params',
+    'timeout',
+})
+
+#: Fragments which make an unknown option unsafe to ignore during the 1.x
+#: compatibility window. Misspelling one can disable a credential, TLS,
+#: redirect, or host-verification control while making the call look valid.
+SECURITY_SENSITIVE_OPTION_FRAGMENTS: Final[frozenset[str]] = frozenset({
+    'agent',
+    'api_key',
+    'auth',
+    'cert',
+    'cookie',
+    'credential',
+    'header',
+    'host_key',
+    'client_key',
+    'key_passphrase',
+    'known_host',
+    'password',
+    'private_key',
+    'public_key',
+    'redirect',
+    'scheme',
+    'secret',
+    'ssl',
+    'tls',
+    'token',
+    'verify',
+})
+
+
+def _is_security_sensitive_option(name: object) -> bool:
+    """Return whether an unknown option is unsafe to ignore.
+
+    Args:
+        name: One caller-supplied ``protocol_info`` key.
+
+    Returns:
+        True for non-string keys and names containing a security-control
+        fragment, matched case-insensitively with hyphens normalised.
+    """
+    if not isinstance(name, str):
+        return True
+    normalised = name.lower().replace('-', '_')
+    return any(
+        fragment in normalised
+        for fragment in SECURITY_SENSITIVE_OPTION_FRAGMENTS
+    )
+
+
 def validated_protocol_info(
     info: Optional[Mapping[str, Any]],
     *,
     required: Collection[str] = (),
+    accepted: Optional[Collection[str]] = None,
+    protocol: str = 'selected',
 ) -> dict[str, Any]:
     """Return ``protocol_info`` as a dict once its shape is known good.
 
@@ -57,14 +118,19 @@ def validated_protocol_info(
         info: ``protocol_info`` exactly as the caller supplied it, or None.
         required: Key names this protocol cannot run without, from the
             protocol class's own :attr:`BaseRequestClass.REQUIRED_INFO_KEYS`.
+        accepted: Every key the chosen protocol recognises. None retains the
+            shape-only behavior for internal callers which do not select a
+            protocol.
+        protocol: Normalised protocol name used in diagnostics.
 
     Returns:
         A new dict of the caller's configuration, empty when they supplied
         nothing.
 
     Raises:
-        ConfigurationError: If ``info`` is neither None nor a mapping, or if
-            any required key is absent. Both are the caller's own
+        ConfigurationError: If ``info`` is neither None nor a mapping, if
+            any required key is absent, or if an unknown key controls a
+            security-sensitive behavior. These are the caller's own
             configuration failing to form a valid call, so both are reported
             as configuration rather than as an ``AttributeError`` or a
             ``KeyError`` from somewhere further in.
@@ -79,6 +145,25 @@ def validated_protocol_info(
     if missing:
         raise ConfigurationError(
             f'protocol_info is missing required key(s) {missing}')
+    if accepted is not None:
+        accepted_names = frozenset(accepted)
+        unknown = [name for name in info if name not in accepted_names]
+        if unknown:
+            displayed = ', '.join(sorted(repr(name) for name in unknown))
+            accepted_display = sorted(accepted_names)
+            message = (
+                f'{protocol} protocol_info contains unknown key(s) '
+                f'[{displayed}]; accepted keys are {accepted_display}')
+            if any(_is_security_sensitive_option(name) for name in unknown):
+                raise ConfigurationError(
+                    f'{message}. At least one unknown key resembles a '
+                    f'security control and cannot be ignored')
+            warnings.warn(
+                f'{message}. Unknown protocol_info keys are deprecated in '
+                f'1.x and will raise ConfigurationError in 2.0',
+                DeprecationWarning,
+                stacklevel=3,
+            )
     return dict(info)
 
 
@@ -282,6 +367,9 @@ class BaseRequestClass(abc.ABC):
     #: Keys this protocol cannot run without. The default requires nothing,
     #: so a protocol whose every key has a default inherits it untouched.
     REQUIRED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset()
+
+    #: Every option the base strategy reads. Subclasses add their own keys.
+    ACCEPTED_INFO_KEYS: ClassVar[frozenset[str]] = COMMON_PROTOCOL_INFO_KEYS
 
     def __init__(
         self, url: str,
