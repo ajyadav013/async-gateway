@@ -104,3 +104,13 @@ recursively enumerating a bucket, or disclosing caller tokens (GCS-06).
   remains IN PROGRESS. Files: `asyncio_gateway/logic/gcs_client.py`,
   `tests/logic/test_gcs_client.py`, this ticket, and
   `docs/project/tickets/index.json`.
+- 2026-08-22 — Added the accepted deterministic coverage tranche without
+  changing its frozen test content, then removed the unreachable provider-
+  drain fallback: after retained cancellation is handled, the lifecycle state
+  can only represent result-acceptance timeout. All 471 focused GCS/blocking-
+  I/O cases pass; focused `gcs_client.py` coverage now has only the untouched
+  future signed-URL placeholder missing (710/711 statements and 245/246
+  branches). The ticket remains IN PROGRESS pending its contribution audit and
+  AGW-50 owns replacement and coverage of that placeholder. Files:
+  `asyncio_gateway/logic/gcs_client.py`, `tests/logic/test_gcs_client.py`, this
+  ticket, and `docs/project/tickets/index.json`.

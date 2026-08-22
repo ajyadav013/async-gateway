@@ -815,7 +815,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-48"], "blocks": ["AGW-50"]},
       "commits": [],
-      "note": "Lifecycle GREEN preserves the first accepted head/list body outcome through retained client cleanup: all 451 focused and 276 entrypoint cases pass with clean scoped flake8 and full-package mypy. Focused gcs_client branch coverage is 95.64% combined (96.36% statements, 93.55% branches), with residual gaps reported for a later tests-only tranche. Status remains IN PROGRESS."
+      "note": "Coverage defect-loop GREEN adds the accepted deterministic tranche and removes the unreachable provider-drain fallback without changing frozen test content. All 471 focused GCS/blocking-I/O cases pass; focused gcs_client coverage now misses only the untouched future AGW-50 signed-URL placeholder (710/711 statements and 245/246 branches). Status remains IN PROGRESS pending the AGW-49 contribution audit."
     },
     {
       "id": "AGW-50",

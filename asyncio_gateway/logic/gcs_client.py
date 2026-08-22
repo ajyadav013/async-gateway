@@ -255,7 +255,6 @@ class _GcsLease:
             future = loop.run_in_executor(
                 _GCS_EXECUTOR, invoke)
             cancellation: Optional[asyncio.CancelledError] = None
-            timed_out = False
             try:
                 while not started.is_set() and not future.done():
                     await asyncio.sleep(0)
@@ -275,11 +274,10 @@ class _GcsLease:
                     if completed:
                         return cast(_ResultT, payload)
                     raise cast(BaseException, payload)
-                timed_out = True
             except asyncio.CancelledError as error:
                 cancellation = error
             except (asyncio.TimeoutError, TimeoutError):
-                timed_out = True
+                pass
 
             drain_started = loop.time()
             logger.debug('gcs_drain_started')
@@ -319,10 +317,8 @@ class _GcsLease:
 
             if cancellation is not None:
                 raise cancellation
-            if timed_out:
-                raise GatewayTimeoutError(
-                    'GCS provider result acceptance deadline expired')
-            raise TransportError('GCS provider operation failed')
+            raise GatewayTimeoutError(
+                'GCS provider result acceptance deadline expired')
 
     async def release(self) -> None:
         """Release this lease once all serialized provider work has drained."""

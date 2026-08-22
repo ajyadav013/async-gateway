@@ -23,6 +23,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, NoReturn
 
+from failsafe import CircuitOpen, RetriesExhausted
+
 from google import auth as google_auth
 from google.auth import exceptions as google_auth_exceptions
 from google.cloud import storage
@@ -43,7 +45,7 @@ from asyncio_gateway.utils.constants import (
     MAX_RESPONSE_BYTES,
     UNKNOWN_PORT,
 )
-from asyncio_gateway.utils.envelope import new_envelope
+from asyncio_gateway.utils.envelope import GatewayResponse, new_envelope
 from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
     ConnectError,
@@ -736,6 +738,7 @@ def test_valid_targets_preserve_object_text_and_normalize_bucket(
 @pytest.mark.parametrize(
     ('url', 'command'),
     [
+        ('https://bucket/key', 'head'),
         ('gs:///key', 'head'),
         ('gs://user@bucket/key', 'head'),
         ('gs://user:password@bucket/key', 'head'),
@@ -5215,3 +5218,443 @@ async def test_drain_telemetry_is_cardinal_finite_and_secret_safe(
         await asyncio.gather(task, return_exceptions=True)
         await _release_isolated_lease(lease)
         executor.close_test_executor()
+
+
+# --- AGW-49 focused coverage defect loop --------------------------------
+
+
+async def test_drain_retains_first_of_repeated_cancellations() -> None:
+    """Repeated waiter cancellation preserves the first cancellation."""
+    future: asyncio.Future[str] = (
+        asyncio.get_running_loop().create_future())
+    task = asyncio.create_task(
+        getattr(gcs_client, '_drain_provider_future')(future, None))
+    await asyncio.sleep(0)
+
+    task.cancel('first-drain-cancellation')
+    await asyncio.sleep(0)
+    assert not task.done()
+    task.cancel('repeated-drain-cancellation')
+    await asyncio.sleep(0)
+    assert not task.done()
+    future.set_result('late-result')
+
+    outcome, cancellation = await task
+
+    assert outcome == 'late-result'
+    assert cancellation is not None
+    assert cancellation.args == ('first-drain-cancellation',)
+
+
+async def test_drain_consumes_exceptional_underlying_future() -> None:
+    """An exceptional worker future is drained into the private sentinel."""
+    future: asyncio.Future[str] = (
+        asyncio.get_running_loop().create_future())
+    task = asyncio.create_task(
+        getattr(gcs_client, '_drain_provider_future')(future, None))
+    await asyncio.sleep(0)
+    failure = RuntimeError('drained-provider-failure')
+
+    future.set_exception(failure)
+    outcome, cancellation = await task
+
+    assert outcome is getattr(gcs_client, '_NO_RESULT')
+    assert cancellation is None
+
+
+async def test_released_lease_rejects_further_provider_work() -> None:
+    """A released lease refuses execution without invoking the callable."""
+    lease = getattr(gcs_client, '_acquire_gcs_lease')()
+    calls: list[str] = []
+    await _release_lease(lease)
+
+    with pytest.raises(GcsCapacityError):
+        await lease.run(
+            lambda: calls.append('unexpected'),
+            timeout=1,
+        )
+
+    assert calls == []
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
+class _ScriptedLoopClock:
+    """Proxy the real loop while returning exact production clock samples."""
+
+    def __init__(self, loop: Any, samples: list[float]) -> None:
+        """Retain the real executor seam and ordered monotonic samples."""
+        self.loop = loop
+        self.samples = list(samples)
+
+    def time(self) -> float:
+        """Return the next deterministic result-acceptance clock sample."""
+        assert self.samples
+        return self.samples.pop(0)
+
+    def run_in_executor(
+        self,
+        executor: object,
+        function: Any,
+        *args: object,
+    ) -> Any:
+        """Delegate provider submission to the real running loop."""
+        return self.loop.run_in_executor(executor, function, *args)
+
+
+class _AsyncioClockProxy:
+    """Override only ``get_running_loop`` for deterministic clock control."""
+
+    def __init__(self, clock: _ScriptedLoopClock) -> None:
+        """Retain one scripted loop-clock facade."""
+        self.clock = clock
+
+    def get_running_loop(self) -> _ScriptedLoopClock:
+        """Return the deterministic facade used by the provider lease."""
+        return self.clock
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate every non-clock asyncio primitive unchanged."""
+        return getattr(asyncio, name)
+
+
+async def test_post_wait_deadline_and_nonfinite_drain_are_fail_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A late accepted result times out and infinite telemetry becomes zero."""
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    module, executor = _fresh_gcs_lifecycle_module()
+    real_loop = asyncio.get_running_loop()
+    clock = _ScriptedLoopClock(real_loop, [10.0, 10.0, 11.0, 20.0,
+                                           math.inf])
+    setattr(module, 'asyncio', _AsyncioClockProxy(clock))
+    lease = getattr(module, '_acquire_gcs_lease')()
+    try:
+        with pytest.raises(GatewayTimeoutError):
+            await lease.run(lambda: 'completed-at-deadline', timeout=1)
+
+        drain_events = [
+            fields
+            for event, fields in _capacity_events(caplog)
+            if event == 'gcs_drain_finished'
+        ]
+        assert drain_events == [{
+            'active_leases': 1,
+            'duration_seconds': 0.0,
+        }]
+        assert clock.samples == []
+    finally:
+        await _release_isolated_lease(lease)
+        executor.close_test_executor()
+
+
+async def test_list_missing_server_token_attribute_fails_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page iterator without its token attribute is malformed success."""
+    provider = _HeadListProvider()
+    page = provider.iterator.page
+
+    class IteratorWithoutToken:
+        """Expose one valid page but omit ``next_page_token`` entirely."""
+
+        @property
+        def pages(self) -> Any:
+            """Return exactly one deterministic page."""
+            return iter((page,))
+
+    provider.iterator = IteratorWithoutToken()  # type: ignore[assignment]
+    _install_head_list_provider(monkeypatch, provider)
+
+    result = await request(
+        'gs://head-list-bucket/prefix/',
+        protocol='GCS',
+        protocol_info={'command': 'list', 'max_items': 1},
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert provider.client.close_calls == 1
+
+
+def test_foreign_provider_fields_are_never_stringified() -> None:
+    """Foreign code, message, and request-ID objects normalize to None."""
+
+    class HostileText:
+        """Fail loudly if normalization tries to stringify provider state."""
+
+        def __str__(self) -> NoReturn:
+            """Reject accidental provider-object stringification."""
+            raise AssertionError('foreign provider value was stringified')
+
+    hostile = HostileText()
+    error = _FakeServiceError(403)
+    error.code = hostile  # type: ignore[assignment]
+    error.message = hostile  # type: ignore[assignment]
+    error.response['headers']['x-goog-request-id'] = hostile
+
+    failure = getattr(gcs_client, '_service_failure_for')(
+        error,
+        command='head',
+        bucket='bucket',
+        target='object',
+    )
+
+    assert failure.details['gcs_error_code'] is None
+    assert failure.details['gcs_error_message'] is None
+    assert failure.details['response_metadata']['request_id'] is None
+
+
+def test_service_response_object_headers_are_normalized() -> None:
+    """Non-mapping response objects supply status and request-ID headers."""
+
+    class Response:
+        """Model the attribute-based SDK response shape."""
+
+        status_code = 429
+        headers = {'x-goog-request-id': 'attribute-request-id'}
+
+    error = _FakeServiceError(502)
+    error.response = Response()
+
+    failure = getattr(gcs_client, '_service_failure_for')(
+        error,
+        command='list',
+        bucket='bucket',
+        target='prefix/',
+    )
+
+    assert failure.status_code == 429
+    assert failure.details['response_metadata'] == {
+        'http_status_code': 429,
+        'request_id': 'attribute-request-id',
+    }
+
+
+class _OrdinaryCommandBreaker:
+    """Raise one exact breaker wrapper without invoking provider work."""
+
+    def __init__(self, outcome: str, sentinel: str) -> None:
+        """Retain the requested refusal and one hostile private value."""
+        self.outcome = outcome
+        self.sentinel = sentinel
+        self.calls = 0
+
+    async def run(self, call: Any, *args: Any, **kwargs: Any) -> Any:
+        """Refuse before invoking the supplied ordinary-command attempt."""
+        del call, args, kwargs
+        self.calls += 1
+        if self.outcome == 'open':
+            raise CircuitOpen()
+        try:
+            raise RuntimeError(self.sentinel)
+        except RuntimeError as cause:
+            raise RetriesExhausted() from cause
+
+
+def _ordinary_command_case(command: str) -> tuple[str, dict[str, object]]:
+    """Return one valid target and options mapping for an ordinary command."""
+    target = 'object.bin'
+    info: dict[str, object] = {'command': command}
+    if command == 'upload':
+        info.update({'local_path': '/caller/upload.bin',
+                     'max_upload_bytes': 1})
+    elif command == 'download':
+        info.update({'local_path': '/caller/download.bin',
+                     'max_response_bytes': 1})
+    elif command == 'list':
+        target = 'prefix/'
+        info['max_items'] = 1
+    return target, info
+
+
+@pytest.mark.parametrize('command', ['upload', 'download', 'head', 'list'])
+@pytest.mark.parametrize(
+    ('outcome', 'expected_code', 'expected_status'),
+    [
+        pytest.param('open', 'CIRCUIT_OPEN', 503, id='circuit-open'),
+        pytest.param('unknown', 'TRANSPORT', 502,
+                     id='unknown-retries-exhausted-cause'),
+    ],
+)
+async def test_ordinary_command_breaker_refusals_are_stable_and_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    outcome: str,
+    expected_code: str,
+    expected_status: int,
+) -> None:
+    """All ordinary commands map open/unknown breaker wrappers exactly."""
+    sentinel = f'{command}-{outcome}-breaker-private'
+    breaker = _OrdinaryCommandBreaker(outcome, sentinel)
+    provider_calls: list[str] = []
+    read_calls: list[object] = []
+
+    def forbidden_adc(*args: object, **kwargs: object) -> NoReturn:
+        """Reject any provider call after a breaker refusal."""
+        del args, kwargs
+        provider_calls.append('adc')
+        raise AssertionError('provider must not run after breaker refusal')
+
+    async def guarded_read(
+        path: object,
+        *,
+        max_bytes: int,
+        chunk_size: int = 65536,
+    ) -> bytes:
+        """Supply the upload's allowed pre-breaker guarded body."""
+        del max_bytes, chunk_size
+        read_calls.append(path)
+        return b'x'
+
+    monkeypatch.setattr(
+        base, 'get_breaker', lambda *args, **kwargs: breaker)
+    monkeypatch.setattr(google_auth, 'default', forbidden_adc)
+    monkeypatch.setattr(gcs_client, 'read_guarded_file', guarded_read)
+    target, info = _ordinary_command_case(command)
+
+    result = await request(
+        f'gs://ordinary-command-bucket/{target}',
+        protocol='GCS',
+        protocol_info=info,
+    )
+
+    assert set(result) == set(GatewayResponse.__annotations__)
+    assert result['ok'] is False
+    assert result['status_code'] == expected_status
+    assert result['error']['code'] == expected_code
+    assert result['protocol_details'] == {}
+    assert sentinel not in repr(result)
+    assert breaker.calls == 1
+    assert provider_calls == []
+    assert read_calls == (
+        ['/caller/upload.bin'] if command == 'upload' else [])
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
+@pytest.mark.parametrize('command', ['head', 'list'])
+async def test_head_list_cleanup_repeated_cancellation_preserves_first(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """Cleanup-only repeated cancellation wins before detail publication."""
+    provider = _HeadListLifecycleProvider('no-body-block')
+    _install_head_list_provider(monkeypatch, provider)
+    target = 'object.txt' if command == 'head' else 'prefix/'
+    info: dict[str, object] = {'command': command, 'timeout': 1}
+    if command == 'list':
+        info['max_items'] = 1
+    url = f'gs://head-list-cleanup-bucket/{target}'
+    response = _response(url)
+    built = GcsRequest(
+        url,
+        None,
+        response,
+        info=_validate(info),
+        redact_params=frozenset(),
+    )
+    task = asyncio.create_task(built.handle_request())
+    try:
+        await _wait_for_thread_event(provider.close_started)
+        assert response['protocol_details'] == {}
+        task.cancel('first-cleanup-cancellation')
+        await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel('repeated-cleanup-cancellation')
+        await asyncio.sleep(0)
+        assert not task.done()
+        provider.close_release.set()
+
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+
+        assert caught.value.args == ('first-cleanup-cancellation',)
+        assert response['protocol_details'] == {}
+        assert provider.close_sentinel not in ''.join(
+            traceback.format_exception(caught.value))
+        assert getattr(gcs_client, '_active_gcs_leases')() == 0
+    finally:
+        provider.close_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_download_writer_underreport_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A writer count below the immutable pin is malformed provider success."""
+    provider = _DownloadProvider(b'raw')
+    target = tmp_path / 'underreported.bin'
+
+    async def underreporting_writer(
+        path: object,
+        chunks: Any,
+        **kwargs: object,
+    ) -> int:
+        """Consume the exact raw stream but under-report its final count."""
+        del path, kwargs
+        observed = b''.join([chunk async for chunk in chunks])
+        assert observed == b'raw'
+        return len(observed) - 1
+
+    monkeypatch.setattr(
+        gcs_client, 'stream_to_path', underreporting_writer)
+
+    result, breaker = await _public_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=3,
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert breaker.calls == 1
+    assert provider.client.close_calls == 1
+    assert not target.exists()
+
+
+async def test_download_unknown_cleanup_defect_preserves_exact_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A close-time programming defect escapes with identity and cause."""
+    provider = _DownloadProvider(b'raw')
+    cause = ValueError('download-cleanup-cause')
+    cleanup_error = RuntimeError('download-cleanup-defect')
+    cleanup_error.__cause__ = cause
+    cleanup_error.__suppress_context__ = True
+    provider.script_close(cleanup_error)
+    target = tmp_path / 'committed-before-close-defect.bin'
+    breaker = _UploadBreaker(provider.timeline)
+    monkeypatch.setattr(
+        base, 'get_breaker', lambda *args, **kwargs: breaker)
+    _install_download_provider(monkeypatch, provider)
+    url = 'gs://download-bucket/object.bin'
+    response = _response(url)
+    built = GcsRequest(
+        url,
+        None,
+        response,
+        info=_validate({
+            'command': 'download',
+            'local_path': str(target),
+            'max_response_bytes': 3,
+        }),
+        redact_params=frozenset(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await built.handle_request()
+
+    assert caught.value is cleanup_error
+    assert caught.value.args == ('download-cleanup-defect',)
+    assert caught.value.__cause__ is cause
+    assert caught.value.__suppress_context__ is True
+    assert target.read_bytes() == b'raw'
+    assert response['protocol_details'] == {}
+    assert provider.client.close_calls == 1
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
