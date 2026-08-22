@@ -1,6 +1,6 @@
 # AGW-45: Establish strict GCS selector boundary
 
-- **Status:** DONE
+- **Status:** IN PROGRESS
 - **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-02 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -56,3 +56,7 @@ their mandated boundary before any cloud or local side effect (GCS-02).
   Scoped flake8, mypy, and `git diff --check` passed. No ADC, provider,
   signing, operation, capacity, push, deployment, or live-GCP work was done.
   Implementation commits: `c8281ab`, `053a836`.
+- 2026-08-22 — Administrative correction after independent validation:
+  restored status from `DONE` to `IN PROGRESS`. Implementation completion
+  does not advance the ticket past the implementation-stage workflow gate;
+  review and PR-stage transitions remain pending.

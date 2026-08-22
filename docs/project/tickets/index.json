@@ -762,7 +762,7 @@
     {
       "id": "AGW-45",
       "title": "Establish the strict public selector boundary",
-      "status": "DONE",
+      "status": "IN PROGRESS",
       "story": "GCS-02",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-45-establish-strict-gcs-selector-boundary.md",
