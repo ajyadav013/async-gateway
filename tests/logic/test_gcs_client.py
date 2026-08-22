@@ -22,6 +22,7 @@ from types import ModuleType
 from typing import Any, NoReturn
 
 from google import auth as google_auth
+from google.auth import exceptions as google_auth_exceptions
 from google.cloud import storage
 
 import pytest
@@ -1127,6 +1128,10 @@ class _UploadBlob:
             'retry': retry,
             'timeout': timeout,
         }))
+        if self.provider.upload_outcomes:
+            outcome = self.provider.upload_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
 
 
 class _UploadBucket:
@@ -1166,13 +1171,18 @@ class _UploadClient:
 class _UploadCredentials:
     """Already-valid ADC credentials requiring no refresh."""
 
-    valid = True
-    expired = False
+    def __init__(self) -> None:
+        """Start valid with no scripted refresh failure."""
+        self.valid = True
+        self.expired = False
+        self.refresh_error: BaseException | None = None
 
-    def refresh(self, request: object) -> NoReturn:
-        """Fail if valid credentials are refreshed unexpectedly."""
+    def refresh(self, request: object) -> None:
+        """Raise a scripted refresh failure or reject an unexpected call."""
+        if self.refresh_error is not None:
+            raise self.refresh_error
         raise AssertionError(
-            f'valid credentials must not refresh with {request!r}')
+            f'valid credentials must not refresh: {request!r}')
 
 
 class _UploadProvider:
@@ -1183,8 +1193,10 @@ class _UploadProvider:
         self.timeline = timeline
         self.threads: dict[str, tuple[int, str]] = {}
         self.upload_calls: list[tuple[bytes, dict[str, object]]] = []
+        self.upload_outcomes: list[BaseException | None] = []
         self.bucket_names: list[str] = []
         self.blob_keys: list[str] = []
+        self.adc_error: BaseException | None = None
         self.credentials = _UploadCredentials()
         self.blob = _UploadBlob(self)
         self.bucket = _UploadBucket(self)
@@ -1199,12 +1211,18 @@ class _UploadProvider:
     def adc(self, *args: object, **kwargs: object) -> tuple[object, str]:
         """Return valid deterministic ADC credentials and project."""
         self.record_thread('adc')
+        if self.adc_error is not None:
+            raise self.adc_error
         return self.credentials, 'test-project'
 
     def make_client(self, *args: object, **kwargs: object) -> _UploadClient:
         """Return the single observable storage client."""
         self.record_thread('client')
         return self.client
+
+    def script_upload(self, *outcomes: BaseException | None) -> None:
+        """Replace the ordered upload outcomes."""
+        self.upload_outcomes = list(outcomes)
 
 
 def _install_upload_provider(
@@ -1365,13 +1383,21 @@ async def test_upload_replays_guarded_bytes_with_exact_sdk_contract(
 class _FakeServiceError(Exception):
     """Structural Google-like service error with hostile incidental state."""
 
-    def __init__(self, status: object) -> None:
-        super().__init__('safe service refusal')
-        self.code = 'conditionNotMet'
-        self.message = 'safe service refusal'
+    def __init__(
+        self,
+        status: object,
+        *,
+        code: str = 'conditionNotMet',
+        message: str = 'safe service refusal',
+        request_id: str = 'request-7',
+    ) -> None:
+        """Build one structural error without an SDK dependency."""
+        super().__init__(message)
+        self.code = code
+        self.message = message
         self.response = {
             'status_code': status,
-            'headers': {'x-goog-request-id': 'request-7'},
+            'headers': {'x-goog-request-id': request_id},
             'provider_object': object(),
         }
 
@@ -1437,6 +1463,272 @@ def test_transport_failure_mapping_preserves_existing_boundaries(
     mapped = getattr(gcs_client, '_transport_error_for')(error)
 
     assert type(mapped) is expected
+
+
+# --- AGW-48 tranche B1: retry and public failure vocabulary --------------
+
+
+def _gcs_retry_config(
+    retries: int,
+    events: list[str],
+) -> dict[str, Any]:
+    """Build an exact retry budget with observable breaker callbacks."""
+    return {
+        'maximum_failures': 99,
+        'retry_config': {
+            'allowed_retries': retries,
+            'delay': 0,
+            'jitter': False,
+            'on_failed_attempt': lambda: events.append('failed'),
+            'on_retries_exhausted': lambda: events.append('exhausted'),
+            'on_abort': lambda: events.append('abort'),
+        },
+    }
+
+
+async def _public_scripted_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _UploadProvider,
+    *,
+    bucket: str,
+    body: bytes = b'retry-body',
+    generation: int = 11,
+    local_path: str = '/caller/retry-source.bin',
+    breaker_config: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], list[tuple[object, int]]]:
+    """Run one public upload with a deterministic guarded read and SDK."""
+    reads: list[tuple[object, int]] = []
+
+    async def guarded_read(
+        path: object,
+        *,
+        max_bytes: int,
+        chunk_size: int = 65536,
+    ) -> bytes:
+        """Return one caller-independent pre-read bytes object."""
+        del chunk_size
+        reads.append((path, max_bytes))
+        return body
+
+    monkeypatch.setattr(gcs_client, 'read_guarded_file', guarded_read)
+    _install_upload_provider(monkeypatch, provider)
+    result = await request(
+        f'gs://{bucket}/object.bin',
+        protocol='GCS',
+        protocol_info={
+            'command': 'upload',
+            'local_path': local_path,
+            'max_upload_bytes': 41,
+            'if_generation_match': generation,
+            'timeout': 2.5,
+            'circuit_breaker_config': dict(breaker_config),
+        },
+    )
+    return result, reads
+
+
+@pytest.mark.parametrize(
+    'first_failure',
+    [
+        pytest.param(_FakeServiceError(503), id='service'),
+        pytest.param(socket.gaierror('foreign retry text'), id='transport'),
+    ],
+)
+async def test_upload_retry_reuses_one_guarded_body_and_sdk_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    first_failure: BaseException,
+) -> None:
+    """One gateway retry replays identity-stable bytes and controls."""
+    events: list[str] = []
+    provider = _UploadProvider([])
+    provider.script_upload(first_failure, None)
+    body = b'identity-stable-upload'
+
+    result, reads = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket=f'retry-{type(first_failure).__name__.lower()}',
+        body=body,
+        generation=17,
+        breaker_config=_gcs_retry_config(1, events),
+    )
+
+    assert result['ok'] is True
+    assert reads == [('/caller/retry-source.bin', 41)]
+    assert len(provider.upload_calls) == 2
+    assert all(call[0] is body for call in provider.upload_calls)
+    assert [call[1] for call in provider.upload_calls] == [{
+        'if_generation_match': 17,
+        'retry': None,
+        'timeout': 2.5,
+    }] * 2
+    assert events == ['failed']
+
+
+@pytest.mark.parametrize(
+    ('status', 'retryable'),
+    [
+        (408, True), (429, True), (500, True), (502, True),
+        (503, True), (504, True), (400, False), (401, False),
+        (403, False), (404, False), (409, False), (412, False),
+    ],
+)
+async def test_upload_service_status_has_exact_public_retry_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    retryable: bool,
+) -> None:
+    """Service allowlist alone decides count, retry, and public status."""
+    events: list[str] = []
+    provider = _UploadProvider([])
+    attempt_count = 2 if retryable else 1
+    provider.script_upload(*[
+        _FakeServiceError(status) for _ in range(attempt_count)
+    ])
+
+    result, reads = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket=f'service-{status}',
+        breaker_config=_gcs_retry_config(1, events),
+    )
+
+    assert reads == [('/caller/retry-source.bin', 41)]
+    assert len(provider.upload_calls) == attempt_count
+    assert result['ok'] is False
+    assert result['status_code'] == status
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {
+        'command': 'upload',
+        'bucket': f'service-{status}',
+        'target': 'object.bin',
+        'gcs_error_code': 'conditionNotMet',
+        'gcs_error_message': 'safe service refusal',
+        'response_metadata': {
+            'http_status_code': status,
+            'request_id': 'request-7',
+        },
+    }
+    assert 'provider_object' not in repr(result)
+    assert events == (
+        ['failed', 'failed', 'exhausted'] if retryable else ['abort'])
+
+
+@pytest.mark.parametrize(
+    ('failure', 'code', 'status'),
+    [
+        (socket.gaierror('foreign-dns-secret'), 'DNS', 502),
+        (ssl.SSLError('foreign-tls-secret'), 'TLS', 502),
+        (ConnectionError('foreign-connect-secret'), 'CONNECT', 502),
+        (TimeoutError('foreign-timeout-secret'), 'TIMEOUT', 504),
+        (OSError('foreign-transport-secret'), 'TRANSPORT', 502),
+    ],
+)
+async def test_upload_transport_types_map_safely_and_count_once(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    code: str,
+    status: int,
+) -> None:
+    """Provider transport prose never crosses the stable error boundary."""
+    events: list[str] = []
+    provider = _UploadProvider([])
+    provider.script_upload(failure)
+
+    result, _ = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket=f'transport-{code.lower()}',
+        breaker_config=_gcs_retry_config(0, events),
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == status
+    assert result['error']['code'] == code
+    assert 'foreign-' not in repr(result)
+    assert len(provider.upload_calls) == 1
+    assert events == ['failed', 'exhausted']
+
+
+@pytest.mark.parametrize('credential_stage', ['adc', 'refresh'])
+async def test_upload_credential_failure_is_config_and_uncounted(
+    monkeypatch: pytest.MonkeyPatch,
+    credential_stage: str,
+) -> None:
+    """Missing or unusable ADC is local configuration, never a retry."""
+    secret = f'credential-{credential_stage}-secret'
+    events: list[str] = []
+    provider = _UploadProvider([])
+    if credential_stage == 'adc':
+        provider.adc_error = google_auth_exceptions.DefaultCredentialsError(
+            secret)
+    else:
+        provider.credentials.valid = False
+        provider.credentials.refresh_error = (
+            google_auth_exceptions.RefreshError(secret))
+
+    result, reads = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket=f'credential-{credential_stage}',
+        breaker_config=_gcs_retry_config(2, events),
+    )
+
+    assert reads == [('/caller/retry-source.bin', 41)]
+    assert result['ok'] is False
+    assert result['status_code'] == 400
+    assert result['error']['code'] == 'CONFIG'
+    assert secret not in repr(result)
+    assert provider.upload_calls == []
+    assert events == ['abort']
+
+
+def _logged_gcs_surfaces(caplog: pytest.LogCaptureFixture) -> str:
+    """Render captured log records for cross-surface leak assertions."""
+    return ''.join(str(record.__dict__) for record in caplog.records)
+
+
+async def test_upload_failure_never_leaks_any_private_input_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Credential, body, path, precondition, and SDK text stay private."""
+    sentinels = {
+        'credential': 'credential-private-b1',
+        'error': 'error-private-b1',
+        'body': 'body-private-b1',
+        'path': 'path-private-b1',
+        'precondition': '987654321047',
+    }
+    events: list[str] = []
+    provider = _UploadProvider([])
+    provider.credentials.__repr__ = lambda: sentinels['credential']
+    hostile_text = ' '.join(sentinels.values())
+    provider.script_upload(_FakeServiceError(
+        403,
+        code=f'authorization=Bearer {hostile_text}',
+        message=f'authorization=Bearer {hostile_text}',
+        request_id=f'authorization=Bearer {hostile_text}',
+    ))
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, _ = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket='private-surface',
+        body=sentinels['body'].encode(),
+        generation=int(sentinels['precondition']),
+        local_path=f"/caller/{sentinels['path']}.bin",
+        breaker_config=_gcs_retry_config(1, events),
+    )
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog) + repr(events)
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert set(result['protocol_details']) == {
+        'command', 'bucket', 'target', 'gcs_error_code',
+        'gcs_error_message', 'response_metadata',
+    }
+    assert all(secret not in surfaces for secret in sentinels.values())
 
 
 # --- GCS-04 tranche B: shutdown, telemetry, and outcome precedence -------

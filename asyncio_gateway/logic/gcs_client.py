@@ -22,7 +22,11 @@ from typing import (
 )
 from urllib.parse import urlsplit
 
+from failsafe import CircuitOpen, RetriesExhausted
+
 from google import auth as google_auth
+from google.api_core import exceptions as google_api_exceptions
+from google.auth import exceptions as google_auth_exceptions
 from google.auth.transport.requests import Request as GoogleAuthRequest
 # google-cloud-storage does not publish a py.typed marker.
 from google.cloud import storage  # type: ignore[import-untyped]
@@ -35,11 +39,13 @@ from asyncio_gateway.utils.constants import (HTTP_TIMEOUT, MAX_RESPONSE_BYTES)
 from asyncio_gateway.utils.envelope import GatewayResponse, finalise_ok
 from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
+    CircuitOpenError,
     ConfigurationError,
     ConnectError,
     DnsError,
     GatewayTimeoutError,
     GcsCapacityError,
+    GcsStatusError,
     TlsError,
     TransportError,
 )
@@ -87,6 +93,22 @@ _SIGNING_ACCOUNT_PATTERN: Final[re.Pattern[str]] = re.compile(
 _GCS_RETRYABLE_STATUSES: Final[frozenset[int]] = frozenset({
     408, 429, 500, 502, 503, 504,
 })
+_GCS_PROVIDER_SECRET_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
+    r'(?:authorization|credential|password|secret|token|api[_-]?key)\s*[:=]',
+    re.IGNORECASE,
+)
+_GCS_TRANSPORT_FAILURES: Final[Tuple[type[BaseException], ...]] = (
+    socket.gaierror,
+    ssl.SSLError,
+    asyncio.TimeoutError,
+    TimeoutError,
+    ConnectionError,
+    OSError,
+)
+_GCS_CREDENTIAL_FAILURES: Final[Tuple[type[BaseException], ...]] = (
+    google_auth_exceptions.DefaultCredentialsError,
+    google_auth_exceptions.RefreshError,
+)
 _GCS_MAX_LEASES: Final[int] = 4
 _GCS_EXECUTOR: Final[ThreadPoolExecutor] = ThreadPoolExecutor(
     max_workers=_GCS_MAX_LEASES,
@@ -351,6 +373,8 @@ def _safe_provider_text(value: object) -> Optional[str]:
     """Return redacted provider text without stringifying foreign objects."""
     if not isinstance(value, str):
         return None
+    if _GCS_PROVIDER_SECRET_ASSIGNMENT.search(value) is not None:
+        return None
     return redact_text(value)
 
 
@@ -365,6 +389,10 @@ def _service_failure_for(
     response = getattr(error, 'response', None)
     response_mapping = response if isinstance(response, Mapping) else {}
     raw_status = response_mapping.get('status_code')
+    if raw_status is None and response is not None:
+        raw_status = getattr(response, 'status_code', None)
+    if raw_status is None:
+        raw_status = getattr(error, 'code', None)
     status = (
         raw_status
         if isinstance(raw_status, int)
@@ -373,6 +401,8 @@ def _service_failure_for(
         else 502
     )
     headers = response_mapping.get('headers')
+    if headers is None and response is not None:
+        headers = getattr(response, 'headers', None)
     header_mapping = headers if isinstance(headers, Mapping) else {}
     details = {
         'command': command,
@@ -407,6 +437,14 @@ def _transport_error_for(error: BaseException) -> TransportError:
     if isinstance(error, ConnectionError):
         return ConnectError(message)
     return TransportError(message)
+
+
+def _is_service_failure(error: BaseException) -> bool:
+    """Recognize one provider service exception without parsing its prose."""
+    return (
+        isinstance(error, google_api_exceptions.GoogleAPICallError)
+        or isinstance(getattr(error, 'response', None), Mapping)
+    )
 
 
 def _nonempty_string(value: object, *, setting: str) -> str:
@@ -786,12 +824,29 @@ class GcsRequest(BaseRequestClass):
                 local_path,
                 max_bytes=cast(int, self.info['max_upload_bytes']),
             )
-            metadata = await self.circuit_breaker.run(
-                self._upload_attempt,
-                lease,
-                upload_body,
-                cast(int, self.info['if_generation_match']),
-            )
+            failure: Optional[AsyncGatewayError] = None
+            try:
+                metadata = await self.circuit_breaker.run(
+                    self._upload_attempt,
+                    lease,
+                    upload_body,
+                    cast(int, self.info['if_generation_match']),
+                )
+            except CircuitOpen:
+                failure = CircuitOpenError('GCS provider circuit is open')
+            except _AbortableGcsServiceFailure as error:
+                failure = self._public_service_error(error)
+            except RetriesExhausted as error:
+                cause = error.__cause__
+                if isinstance(cause, _GcsServiceFailure):
+                    failure = self._public_service_error(cause)
+                elif isinstance(cause, AsyncGatewayError):
+                    failure = cause
+                else:
+                    failure = TransportError(
+                        'GCS provider operation failed')
+            if failure is not None:
+                raise failure from None
             self.response['protocol_details'] = {
                 'command': self.command,
                 'bucket': self.bucket,
@@ -804,6 +859,15 @@ class GcsRequest(BaseRequestClass):
                 self.response, status_code=200, started=self.start_time)
         finally:
             await lease.release()
+
+    def _public_service_error(
+        self,
+        error: _GcsServiceFailure | _AbortableGcsServiceFailure,
+    ) -> GcsStatusError:
+        """Populate exact safe details and build the public GCS failure."""
+        self.response['protocol_details'] = dict(error.details)
+        return GcsStatusError(
+            'GCS provider service request failed', error.status_code)
 
     async def _upload_attempt(
         self,
@@ -821,21 +885,23 @@ class GcsRequest(BaseRequestClass):
         Returns:
             The upload blob's success metadata snapshot.
         """
-        credentials, project = await lease.run(
-            google_auth.default, timeout=self.timeout)
-        await lease.run(
-            _refresh_credentials_if_needed,
-            credentials,
-            timeout=self.timeout,
-        )
-        client = await lease.run(
-            storage.Client,
-            credentials=credentials,
-            project=project,
-            timeout=self.timeout,
-            close_result=_close_storage_client,
-        )
+        client: Any = None
+        failure: Optional[AsyncGatewayError] = None
         try:
+            credentials, project = await lease.run(
+                google_auth.default, timeout=self.timeout)
+            await lease.run(
+                _refresh_credentials_if_needed,
+                credentials,
+                timeout=self.timeout,
+            )
+            client = await lease.run(
+                storage.Client,
+                credentials=credentials,
+                project=project,
+                timeout=self.timeout,
+                close_result=_close_storage_client,
+            )
             bucket = await lease.run(
                 client.bucket, self.bucket, timeout=self.timeout)
             blob = await lease.run(
@@ -848,6 +914,26 @@ class GcsRequest(BaseRequestClass):
                 sdk_timeout=self.timeout,
                 timeout=self.timeout,
             )
+        except _GCS_CREDENTIAL_FAILURES as error:
+            error.args = ('GCS credential resolution failed',)
+            failure = ConfigurationError(
+                'GCS application default credentials are unavailable')
+        except _GCS_TRANSPORT_FAILURES as error:
+            error.args = ('GCS provider transport failure',)
+            failure = _transport_error_for(error)
+        except BaseException as error:
+            if not _is_service_failure(error):
+                raise
+            failure = _service_failure_for(
+                error,
+                command=self.command,
+                bucket=self.bucket,
+                target=self.key,
+            )
+            error.args = ('GCS provider service response',)
         finally:
-            await lease.run(
-                _close_storage_client, client, timeout=self.timeout)
+            if client is not None:
+                await lease.run(
+                    _close_storage_client, client, timeout=self.timeout)
+        assert failure is not None
+        raise failure from None

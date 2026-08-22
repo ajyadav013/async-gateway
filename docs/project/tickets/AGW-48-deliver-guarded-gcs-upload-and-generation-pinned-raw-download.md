@@ -34,6 +34,19 @@ beyond the cap (GCS-05).
 
 ## Work Log
 
+- 2026-08-22 — Upload hardening B1 GREEN added gateway-owned retry and
+  public failure conversion for upload service, transport, and ADC/refresh
+  failures while preserving one guarded read and exact replay controls. The
+  exact 223-test scoped command passed in 38.08s; scoped flake8, mypy, diff,
+  and JSON checks passed. Status remains IN PROGRESS for the remaining
+  GCS-05 work.
+- 2026-08-22 — Upload hardening B1 RED added 22 deterministic public-path
+  cases for gateway-owned replay, exact service-status classification,
+  transport vocabulary, ADC/refresh refusal, breaker observations, and
+  cross-surface secret safety. Scoped result: 223 collected, 202 passed, and
+  21 expected failures from missing service/transport/credential
+  normalization; zero collection, syntax, fixture, network, or flaky
+  failures. Status remains IN PROGRESS.
 - 2026-08-22 — Upload-foundation GREEN implemented the guarded upload path
   only: one lifecycle-held local read before breaker/provider work, exact byte
   replay with the frozen generation precondition and SDK retry disabled, all
