@@ -113,3 +113,18 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   log, and breaker surfaces. The exact focused GCS/no-blocking run passes
   520/520. AGW-50 remains IN PROGRESS for the separately bounded successful
   bearer-surface/telemetry tranche.
+- 2026-08-22 — S3B3 tests-first capacity and bearer-containment probe adds
+  four deterministic public-request rows. Saturated four-permit and safely
+  restored closing admission both return `GCS_CAPACITY`/503 before ADC,
+  client, signing, close, or breaker execution; exact rejection telemetry is
+  secret-safe and all four permits are reusable afterward. Successful GET and
+  PUT each expose one realistic V4 bearer exactly once, only at
+  `protocol_details.signed_url`, while the original `gs://` target, exact
+  method/expiry/PUT required-header contract, one signing invocation, zero
+  breaker execution, and close-before-publication remain intact. Capacity,
+  drain, log, error/cause, and breaker surfaces contain no signature or
+  credential-query fragment. All four rows pass on the unchanged product and
+  the exact focused GCS/no-blocking run passes 524/524. Caller-configured
+  postprocessors remain explicitly outside this tranche under the approved
+  processor trust boundary. AGW-50 remains IN PROGRESS pending review and its
+  contribution audit.

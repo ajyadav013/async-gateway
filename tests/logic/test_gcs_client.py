@@ -2742,6 +2742,382 @@ async def test_signed_url_generation_and_close_drain_never_publish_bearer(
             await _release_lease(lease)
 
 
+# --- AGW-50 tranche S3B3: public capacity and bearer containment ---------
+
+
+_GCS_CAPACITY_EVENT_NAMES = frozenset({
+    'gcs_capacity_state',
+    'gcs_capacity_rejected',
+    'gcs_capacity_closing',
+    'gcs_drain_started',
+    'gcs_drain_finished',
+})
+
+
+def _capacity_records(
+    caplog: pytest.LogCaptureFixture,
+) -> list[logging.LogRecord]:
+    """Return only private GCS capacity and drain telemetry records."""
+    return [
+        record for record in caplog.records
+        if record.name == gcs_client.__name__
+        and record.getMessage() in _GCS_CAPACITY_EVENT_NAMES
+    ]
+
+
+def _surface_leaves(
+    value: object,
+    path: tuple[object, ...] = (),
+) -> list[tuple[tuple[object, ...], object]]:
+    """Return every structural leaf and its path from one public surface."""
+    if isinstance(value, Mapping):
+        leaves: list[tuple[tuple[object, ...], object]] = []
+        for key, child in value.items():
+            leaves.extend(_surface_leaves(child, (*path, key)))
+        return leaves
+    if isinstance(value, (list, tuple)):
+        leaves = []
+        for index, child in enumerate(value):
+            leaves.extend(_surface_leaves(child, (*path, index)))
+        return leaves
+    return [(path, value)]
+
+
+async def test_public_signed_url_saturation_is_safe_and_recovers_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A fifth public request fails locally and leaves all permits reusable."""
+    provider = _SignedUrlProvider()
+    provider.signed_url = (
+        'https://storage.googleapis.com/capacity-bucket/object.bin'
+        '?X-Goog-Credential=capacity-private-credential'
+        '&X-Goog-Signature=capacity-private-signature')
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    breaker_lookups: list[tuple[object, ...]] = []
+
+    def record_breaker(*args: object, **kwargs: object) -> object:
+        """Capture bucket identity without executing the returned breaker."""
+        breaker_lookups.append((*args, kwargs))
+        return breaker
+
+    monkeypatch.setattr(base, 'get_breaker', record_breaker)
+    captured: list[GatewayResponse] = []
+
+    async def capture_response(*, response: GatewayResponse) -> str:
+        """Expose the live envelope to the deterministic provider double."""
+        captured.append(response)
+        provider.response = response
+        return 'captured-before-capacity-admission'
+
+    target = 'gs://capacity-bucket/capacity-private-target'
+    signing_target = (
+        'capacity-signer@example-project.iam.gserviceaccount.com')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    leases = [acquire() for _ in range(4)]
+    try:
+        result = await request(
+            target,
+            protocol='GCS',
+            protocol_info={
+                'command': 'signed_url',
+                'method': 'GET',
+                'signing_service_account': signing_target,
+                'timeout': 2.5,
+            },
+            pre_processor_config={'function': capture_response},
+        )
+
+        assert result['ok'] is False
+        assert result['status_code'] == 503
+        assert result['error']['code'] == 'GCS_CAPACITY'
+        assert result['protocol_details'] == {}
+        assert result['url'] == target
+        assert getattr(gcs_client, '_active_gcs_leases')() == 4
+        assert provider.timeline == []
+        assert provider.client_calls == []
+        assert provider.generate_calls == []
+        assert provider.client.close_calls == 0
+        assert breaker.calls == 0
+        assert len(breaker_lookups) == 1
+
+        rejections = [
+            record for record in _capacity_records(caplog)
+            if record.getMessage() == 'gcs_capacity_rejected'
+        ]
+        assert [
+            (record.active_leases, record.reason)
+            for record in rejections
+        ] == [(4, 'saturated')]
+        safe_error = repr(result['error']) + repr(
+            result['protocol_details'])
+        telemetry = ''.join(
+            repr(record.__dict__) for record in _capacity_records(caplog))
+        for secret in (
+            'capacity-private-target',
+            signing_target,
+            provider.signed_url,
+            'capacity-private-credential',
+            'capacity-private-signature',
+        ):
+            assert secret not in safe_error
+            assert secret not in telemetry
+    finally:
+        for lease in leases:
+            await _release_lease(lease)
+
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+    recovered = await request(
+        target,
+        protocol='GCS',
+        protocol_info={
+            'command': 'signed_url',
+            'method': 'GET',
+            'timeout': 2.5,
+        },
+        pre_processor_config={'function': capture_response},
+    )
+    assert recovered['ok'] is True
+    assert recovered['protocol_details']['signed_url'] == provider.signed_url
+    assert provider.timeline.count('generate') == 1
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 0
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+    reprobe = [acquire() for _ in range(4)]
+    try:
+        with pytest.raises(GcsCapacityError):
+            acquire()
+    finally:
+        for lease in reprobe:
+            await _release_lease(lease)
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
+async def test_public_signed_url_closing_refusal_is_safe_and_restorable(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A reversible admission-close probe refuses before provider work."""
+    provider = _SignedUrlProvider()
+    provider.signed_url = (
+        'https://storage.googleapis.com/closing-bucket/object.bin'
+        '?X-Goog-Credential=closing-private-credential'
+        '&X-Goog-Signature=closing-private-signature')
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    signing_target = (
+        'closing-signer@example-project.iam.gserviceaccount.com')
+    target = 'gs://closing-bucket/closing-private-target'
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    state_lock = getattr(gcs_client, '_GCS_STATE_LOCK')
+    with state_lock:
+        original_closing = getattr(gcs_client, '_GCS_ADMISSION_CLOSING')
+        original_shutdown = getattr(gcs_client, '_GCS_EXECUTOR_SHUTDOWN')
+        assert original_closing is False
+        assert original_shutdown is False
+        setattr(gcs_client, '_GCS_ADMISSION_CLOSING', True)
+    try:
+        result = await request(
+            target,
+            protocol='GCS',
+            protocol_info={
+                'command': 'signed_url',
+                'method': 'GET',
+                'signing_service_account': signing_target,
+                'timeout': 2.5,
+            },
+        )
+    finally:
+        with state_lock:
+            setattr(
+                gcs_client, '_GCS_ADMISSION_CLOSING', original_closing)
+
+    assert result['ok'] is False
+    assert result['status_code'] == 503
+    assert result['error']['code'] == 'GCS_CAPACITY'
+    assert result['protocol_details'] == {}
+    assert result['url'] == target
+    assert provider.timeline == []
+    assert provider.client_calls == []
+    assert provider.generate_calls == []
+    assert provider.client.close_calls == 0
+    assert breaker.calls == 0
+    assert getattr(gcs_client, '_GCS_EXECUTOR_SHUTDOWN') is original_shutdown
+
+    rejections = [
+        record for record in _capacity_records(caplog)
+        if record.getMessage() == 'gcs_capacity_rejected'
+    ]
+    assert [
+        (record.active_leases, record.reason)
+        for record in rejections
+    ] == [(0, 'closing')]
+    telemetry = ''.join(
+        repr(record.__dict__) for record in _capacity_records(caplog))
+    for secret in (
+        'closing-private-target',
+        signing_target,
+        provider.signed_url,
+        'closing-private-credential',
+        'closing-private-signature',
+    ):
+        assert secret not in repr(result['error'])
+        assert secret not in telemetry
+
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    reprobe = [acquire() for _ in range(4)]
+    try:
+        with pytest.raises(GcsCapacityError):
+            acquire()
+    finally:
+        for lease in reprobe:
+            await _release_lease(lease)
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
+@pytest.mark.parametrize(
+    ('method', 'expiry', 'put_options', 'expected_required_headers'),
+    [
+        pytest.param('GET', 3600, {}, None, id='get'),
+        pytest.param(
+            'PUT',
+            321,
+            {
+                'content_type': 'application/octet-stream',
+                'max_upload_bytes': 17,
+                'if_generation_match': 7,
+            },
+            {
+                'content-type': 'application/octet-stream',
+                'x-goog-content-length-range': '1,17',
+                'x-goog-if-generation-match': '7',
+            },
+            id='put',
+        ),
+    ],
+)
+async def test_successful_public_signed_url_has_one_bearer_surface_only(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    expiry: int,
+    put_options: dict[str, object],
+    expected_required_headers: dict[str, str] | None,
+) -> None:
+    """GET and PUT publish one bearer leaf and no diagnostic copy."""
+    provider = _SignedUrlProvider()
+    credential_fragment = (
+        f'surface-{method.lower()}%40example-project.iam.gserviceaccount.com'
+        '%2F20260822%2Fauto%2Fstorage%2Fgoog4_request')
+    signature_fragment = f'0123456789abcdef-{method.lower()}-signature'
+    provider.signed_url = (
+        'https://storage.googleapis.com/bearer-surface-bucket/'
+        'folder/object.bin?X-Goog-Algorithm=GOOG4-RSA-SHA256'
+        f'&X-Goog-Credential={credential_fragment}'
+        '&X-Goog-Date=20260822T120000Z'
+        f'&X-Goog-Expires={expiry}'
+        '&X-Goog-SignedHeaders=host'
+        f'&X-Goog-Signature={signature_fragment}')
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    breaker_lookups: list[tuple[object, ...]] = []
+
+    def record_breaker(*args: object, **kwargs: object) -> object:
+        """Capture the bucket-only lookup for secret-surface inspection."""
+        breaker_lookups.append((*args, kwargs))
+        return breaker
+
+    monkeypatch.setattr(base, 'get_breaker', record_breaker)
+
+    async def capture_response(*, response: GatewayResponse) -> str:
+        """Expose pre-publication state to the deterministic SDK double."""
+        provider.response = response
+        return 'captured-before-bearer-publication'
+
+    target = 'gs://bearer-surface-bucket/folder/object.bin'
+    info: dict[str, object] = {
+        'command': 'signed_url',
+        'method': method,
+        'expires_in_seconds': expiry,
+        'timeout': 2.5,
+        **put_options,
+    }
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    result = await request(
+        target,
+        protocol='GCS',
+        protocol_info=info,
+        pre_processor_config={'function': capture_response},
+    )
+
+    expected_details: dict[str, object] = {
+        'command': 'signed_url',
+        'method': method,
+        'bucket': 'bearer-surface-bucket',
+        'key': 'folder/object.bin',
+        'expires_in_seconds': expiry,
+        'signed_url': provider.signed_url,
+    }
+    if method == 'PUT':
+        expected_details.update(put_options)
+        expected_details['required_headers'] = expected_required_headers
+
+    assert result['ok'] is True
+    assert result['status_code'] == 200
+    assert result['url'] == target
+    assert result['error'] is None
+    assert result['protocol_details'] == expected_details
+    assert [
+        path for path, value in _surface_leaves(result)
+        if value == provider.signed_url
+    ] == [('protocol_details', 'signed_url')]
+    assert repr(result).count(provider.signed_url) == 1
+    assert len(provider.generate_calls) == 1
+    assert provider.generate_calls[0]['method'] == method
+    assert provider.generate_calls[0]['expiration'] == timedelta(
+        seconds=expiry)
+    assert provider.client_open_during_generate == [True]
+    assert provider.details_during_generate == [{}]
+    assert provider.details_during_close == [{}]
+    assert provider.client.close_calls == 1
+    assert provider.client.closed is True
+    assert provider.timeline.count('generate') == 1
+    assert provider.timeline.index('generate') < provider.timeline.index(
+        'client-close')
+    assert breaker.calls == 0
+    assert breaker_lookups == [(
+        'gs', 'bearer-surface-bucket', UNKNOWN_PORT, {}, {})]
+    assert not [
+        record for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
+    assert not [
+        record for record in _capacity_records(caplog)
+        if record.getMessage() in {'gcs_drain_started', 'gcs_drain_finished'}
+    ]
+
+    non_bearer_leaves = [
+        (path, value) for path, value in _surface_leaves(result)
+        if path != ('protocol_details', 'signed_url')
+    ]
+    other_surfaces = ''.join((
+        repr(non_bearer_leaves),
+        _logged_gcs_surfaces(caplog),
+        repr(breaker_lookups),
+        repr(breaker.__dict__),
+        repr(result['error']),
+    ))
+    for secret in (
+        provider.signed_url,
+        credential_fragment,
+        signature_fragment,
+        'X-Goog-Credential=',
+        'X-Goog-Signature=',
+    ):
+        assert secret not in other_surfaces
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
 # --- AGW-49 foundation: normalized head and one-page list ----------------
 
 
