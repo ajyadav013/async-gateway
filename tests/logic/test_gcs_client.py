@@ -2294,6 +2294,306 @@ async def test_list_failure_contains_tokens_credentials_and_sdk_values(
     assert all(secret not in surfaces for secret in sentinels.values())
 
 
+# --- AGW-49 lifecycle hardening: retained head/list drains ---------------
+
+
+class _HeadListLifecycleBlob(_HeadListBlob):
+    """Head blob whose reload can remain live beyond waiter acceptance."""
+
+    def reload(self, **kwargs: object) -> None:
+        """Block reload and expose late metadata only privately."""
+        self.provider.record_thread('reload')
+        self.provider.reload_calls.append(dict(kwargs))
+        provider = self.provider
+        assert isinstance(provider, _HeadListLifecycleProvider)
+        provider.block_selected('head-reload')
+
+
+class _HeadListLifecyclePage(_HeadListPage):
+    """One list page whose iteration is an independently blocked seam."""
+
+    def __iter__(self) -> Any:
+        """Block iteration before returning the late service objects."""
+        self.provider.record_thread('page-iteration')
+        self.provider.page_iteration_count += 1
+        provider = self.provider
+        assert isinstance(provider, _HeadListLifecycleProvider)
+        provider.block_selected('list-iteration')
+        return iter(self.items)
+
+
+class _HeadListLifecycleCursor:
+    """Single-page cursor with an event-controlled fetch boundary."""
+
+    def __init__(self, iterator: '_HeadListLifecycleIterator') -> None:
+        """Retain the one iterator whose first page is fetched."""
+        self.iterator = iterator
+
+    def __iter__(self) -> '_HeadListLifecycleCursor':
+        """Return this one-shot cursor."""
+        return self
+
+    def __next__(self) -> _HeadListLifecyclePage:
+        """Block the page fetch and then return exactly one late page."""
+        provider = self.iterator.provider
+        provider.record_thread('page-fetch')
+        provider.page_fetch_count += 1
+        provider.block_selected('list-page-fetch')
+        self.iterator.next_page_token = provider.server_token
+        return self.iterator.page
+
+
+class _HeadListLifecycleIterator:
+    """One bounded iterator exposing separately controlled list seams."""
+
+    def __init__(self, provider: '_HeadListLifecycleProvider') -> None:
+        """Create one page containing only the late sentinel item."""
+        self.provider = provider
+        self.next_page_token: str | None = None
+        self.page = _HeadListLifecyclePage(provider, provider.list_items)
+
+    @property
+    def pages(self) -> _HeadListLifecycleCursor:
+        """Expose one cursor without fetching a second service page."""
+        self.provider.record_thread('pages')
+        self.provider.pages_access_count += 1
+        return _HeadListLifecycleCursor(self)
+
+
+class _HeadListLifecycleClient:
+    """Attempt-owned client with blocked list construction and cleanup."""
+
+    def __init__(self, provider: '_HeadListLifecycleProvider') -> None:
+        """Retain the provider and one exact cleanup counter."""
+        self.provider = provider
+        self.close_calls = 0
+
+    def bucket(self, name: str) -> _HeadListBucket:
+        """Return the deterministic bucket on the provider worker."""
+        self.provider.record_thread('bucket')
+        self.provider.bucket_names.append(name)
+        return self.provider.bucket
+
+    def list_blobs(
+        self,
+        bucket: object,
+        **kwargs: object,
+    ) -> _HeadListLifecycleIterator:
+        """Block construction before returning one private late iterator."""
+        self.provider.record_thread('list-construction')
+        self.provider.list_calls.append((bucket, dict(kwargs)))
+        self.provider.block_selected('list-construction')
+        return _HeadListLifecycleIterator(self.provider)
+
+    def close(self) -> None:
+        """Block exact off-loop cleanup and then raise its hostile sentinel."""
+        self.provider.record_thread('client-close')
+        self.close_calls += 1
+        self.provider.close_started.set()
+        assert self.provider.close_release.wait(timeout=1)
+        raise RuntimeError(self.provider.close_sentinel)
+
+
+class _HeadListLifecycleProvider(_HeadListProvider):
+    """Event-driven head/list provider for retained-lifecycle assertions."""
+
+    def __init__(self, blocked_seam: str) -> None:
+        """Create one blocked command seam and one blocked cleanup seam."""
+        super().__init__()
+        self.blocked_seam = blocked_seam
+        self.operation_started = threading.Event()
+        self.operation_release = threading.Event()
+        self.operation_started_async = asyncio.Event()
+        self.event_loop = asyncio.get_running_loop()
+        self.close_started = threading.Event()
+        self.close_release = threading.Event()
+        self.late_sentinel = f'{blocked_seam}-late-result-private-agw49'
+        self.server_token = f'{blocked_seam}-server-token-private-agw49'
+        self.close_sentinel = f'{blocked_seam}-close-private-agw49'
+        self.head_blob = _HeadListLifecycleBlob(self)
+        self.head_blob.etag = self.late_sentinel
+        late_item = _HeadListBlob(self)
+        late_item.etag = self.late_sentinel
+        self.list_items = [late_item]
+        self.bucket = _HeadListBucket(self)
+        self.returned_clients: list[_HeadListLifecycleClient] = []
+
+    def block_selected(self, seam: str) -> None:
+        """Signal and block only the lifecycle seam selected by the case."""
+        if seam != self.blocked_seam:
+            return
+        self.operation_started.set()
+        self.event_loop.call_soon_threadsafe(self.operation_started_async.set)
+        assert self.operation_release.wait(timeout=1)
+
+    def make_client(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> _HeadListLifecycleClient:
+        """Return one new client for the single command attempt."""
+        self.record_thread('client')
+        client = _HeadListLifecycleClient(self)
+        self.returned_clients.append(client)
+        return client
+
+
+async def _public_head_list_lifecycle(
+    *,
+    command: str,
+    caller_token: str,
+) -> dict[str, Any]:
+    """Drive one public head/list call through the installed provider."""
+    info: dict[str, object] = {'command': command, 'timeout': 1}
+    target = 'object.txt'
+    if command == 'list':
+        target = 'prefix/'
+        info.update({'max_items': 1, 'page_token': caller_token})
+    return await request(
+        f'gs://Head-List-Lifecycle-Bucket/{target}',
+        protocol='GCS',
+        protocol_info=info,
+    )
+
+
+@pytest.mark.parametrize(
+    ('command', 'blocked_seam'),
+    [
+        pytest.param('head', 'head-reload', id='head-reload'),
+        pytest.param(
+            'list', 'list-construction', id='list-construction'),
+        pytest.param('list', 'list-page-fetch', id='list-page-fetch'),
+        pytest.param('list', 'list-iteration', id='list-iteration'),
+    ],
+)
+@pytest.mark.parametrize('outcome', ['cancel', 'timeout'])
+async def test_head_list_drain_retains_capacity_and_first_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    command: str,
+    blocked_seam: str,
+    outcome: str,
+) -> None:
+    """Late work and hostile cleanup cannot replace cancellation or timeout."""
+    provider = _HeadListLifecycleProvider(blocked_seam)
+    caller_token = f'{blocked_seam}-caller-token-private-agw49'
+    expiry_injected = asyncio.Event()
+    if outcome == 'timeout':
+        real_wait_for = asyncio.wait_for
+        expired = False
+
+        async def expire_selected_provider_wait_once(
+            awaitable: Any,
+            *,
+            timeout: int | float,
+        ) -> Any:
+            """Expire only after the selected sync provider seam has begun."""
+            nonlocal expired
+            if expired:
+                return await real_wait_for(awaitable, timeout=timeout)
+            operation = asyncio.ensure_future(awaitable)
+            started = asyncio.create_task(
+                provider.operation_started_async.wait())
+            done, _ = await asyncio.wait(
+                {operation, started},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if operation in done:
+                started.cancel()
+                await asyncio.gather(started, return_exceptions=True)
+                return operation.result()
+            expired = True
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            expiry_injected.set()
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            gcs_client.asyncio, 'wait_for', expire_selected_provider_wait_once)
+
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    loop_thread = threading.get_ident()
+    breaker = _install_head_list_provider(monkeypatch, provider)
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    companion_leases = [acquire() for _ in range(3)]
+    task = asyncio.create_task(_public_head_list_lifecycle(
+        command=command,
+        caller_token=caller_token,
+    ))
+    admitted_after: Any = None
+    try:
+        await _wait_for_thread_event(provider.operation_started)
+        if outcome == 'cancel':
+            task.cancel('first-head-list-cancellation')
+            task.cancel('repeated-head-list-cancellation')
+        else:
+            await expiry_injected.wait()
+        with pytest.raises(GcsCapacityError):
+            acquire()
+
+        provider.operation_release.set()
+        await _wait_for_thread_event(provider.close_started)
+        with pytest.raises(GcsCapacityError):
+            acquire()
+        task.cancel('cancellation-during-head-list-close')
+        provider.close_release.set()
+
+        if outcome == 'cancel':
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert caught.value.args == ('first-head-list-cancellation',)
+            surfaces = ''.join((
+                ''.join(traceback.format_exception(caught.value)),
+                repr(caught.value.__cause__),
+                repr(caught.value.__context__),
+            ))
+        else:
+            result = await task
+            assert result['ok'] is False
+            assert result['error']['code'] == 'TIMEOUT'
+            assert result['protocol_details'] == {}
+            surfaces = repr(result)
+        surfaces += (
+            repr(breaker.__dict__) + _logged_gcs_surfaces(caplog))
+
+        assert provider.late_sentinel not in surfaces
+        assert provider.server_token not in surfaces
+        assert caller_token not in surfaces
+        assert provider.close_sentinel not in surfaces
+        assert sum(
+            client.close_calls for client in provider.returned_clients) == 1
+        assert provider.timeline[-1] == 'client-close'
+        recorded_seam = {
+            'head-reload': 'reload',
+            'list-construction': 'list-construction',
+            'list-page-fetch': 'page-fetch',
+            'list-iteration': 'page-iteration',
+        }[blocked_seam]
+        assert provider.timeline.index(
+            recorded_seam) < provider.timeline.index('client-close')
+        close_threads = [
+            (thread_id, thread_name)
+            for seam, thread_id, thread_name in provider.threads
+            if seam == 'client-close'
+        ]
+        assert len(close_threads) == 1
+        assert close_threads[0][0] != loop_thread
+        assert close_threads[0][1].startswith('asyncio-gateway-gcs')
+        assert getattr(gcs_client, '_active_gcs_leases')() == 3
+
+        admitted_after = acquire()
+        with pytest.raises(GcsCapacityError):
+            acquire()
+    finally:
+        provider.operation_release.set()
+        provider.close_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if admitted_after is not None:
+            await _release_lease(admitted_after)
+        for lease in companion_leases:
+            await _release_lease(lease)
+
+
 # --- AGW-48 tranche A: guarded upload foundation -------------------------
 
 

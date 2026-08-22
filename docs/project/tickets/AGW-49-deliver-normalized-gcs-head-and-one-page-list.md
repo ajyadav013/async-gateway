@@ -82,3 +82,25 @@ recursively enumerating a bucket, or disclosing caller tokens (GCS-06).
   exact three-file test/evidence scope. The passing tranche remains tests-only;
   AGW-49 stays IN PROGRESS. Files: `tests/logic/test_gcs_client.py`, this
   ticket, and `docs/project/tickets/index.json`.
+- 2026-08-22 — Added eight event-driven retained-lifecycle cases spanning head
+  reload and list construction/page-fetch/iteration under repeated cancellation
+  or injected result-acceptance expiry. The exact suite now collects 451 cases:
+  447 pass and four timeout cases expose one genuine precedence gap where a
+  cancellation delivered during hostile client cleanup replaces the earlier
+  accepted `TIMEOUT`. Three repeated focused runs reproduce four pass/four fail
+  with no sleep, micro-timeout, collection, fixture, or network failure.
+  Production/config stayed untouched and the ticket remains IN PROGRESS. Files:
+  `tests/logic/test_gcs_client.py`, this ticket, and
+  `docs/project/tickets/index.json`.
+- 2026-08-22 — Preserved the first accepted head/list body outcome through
+  retained client cleanup: a known result-acceptance timeout now wins over a
+  later cleanup cancellation, while body-first cancellation and cleanup-only
+  typing retain their existing behavior. The immutable lifecycle suite passes
+  all 451 cases, the entrypoint suite passes 276, and scoped flake8 plus
+  full-package mypy pass. Focused branch coverage for `gcs_client.py` is
+  95.64% combined (96.36% statements, 93.55% branches; 26 missing lines and
+  16 missing branches), so the residual gaps are reported for a later
+  tests-only tranche rather than changing accepted tests in GREEN. Status
+  remains IN PROGRESS. Files: `asyncio_gateway/logic/gcs_client.py`,
+  `tests/logic/test_gcs_client.py`, this ticket, and
+  `docs/project/tickets/index.json`.

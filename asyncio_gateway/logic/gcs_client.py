@@ -1294,26 +1294,13 @@ class GcsRequest(BaseRequestClass):
                 cleanup_error = error
                 cleanup_state = _capture_exception_state(error)
 
-        pending_cancellation = (
-            body_error
-            if isinstance(body_error, asyncio.CancelledError)
-            else cleanup_error
-            if isinstance(cleanup_error, asyncio.CancelledError)
-            else None
-        )
-        if pending_cancellation is not None:
-            state = (
-                body_state
-                if pending_cancellation is body_error
-                else cleanup_state
-            )
-            assert state is not None
-            _raise_exact(pending_cancellation, state)
         if body_error is not None:
             assert body_state is not None
             _raise_exact(body_error, body_state)
         if cleanup_error is not None:
             assert cleanup_state is not None
+            if isinstance(cleanup_error, asyncio.CancelledError):
+                _raise_exact(cleanup_error, cleanup_state)
             if isinstance(cleanup_error, _GCS_CREDENTIAL_FAILURES):
                 cleanup_error.args = ('GCS credential cleanup failed',)
                 raise ConfigurationError(
