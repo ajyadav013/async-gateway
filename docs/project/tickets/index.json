@@ -1,6 +1,6 @@
 {
   "prefix": "AGW",
-  "next": 53,
+  "next": 54,
   "spec": "docs/specs/v1_release_spec.md",
   "stories": "docs/specs/v1_release_stories.md",
   "note": "AGW-1 through AGW-32 map positionally to release stories S1-S32; later IDs are defect or work-package records. AGW-39 through AGW-41 each had two historical commit uses, preserved in reconstructed collision records. IDs are never reused going forward. Relations use depends_on = blockedBy and its inverse blocks.",
@@ -852,6 +852,17 @@
       "relations": {"depends_on": ["AGW-44", "AGW-51"], "blocks": []},
       "commits": ["a768c8f806ecec4fedf120136f8806c3689c3707"],
       "note": "IN REVIEW. Current AGW-52 join: 357 passed / 2 existing skips; scoped lint, example compile, diff, and ticket JSON checks are green. The corrected import sentinel first refroze packaging at SHA-256 ac9dd62493642004a9f8986bb618b92f8522ff8fce6258635f3fae5cd8f58be1. Review iteration 1 reported 0 Critical / 2 High / 1 Medium; the docs oracle now rejects 18/18 reversed-claim mutations and passes 243/243 at SHA-256 2954334537979a54826ace9b7b14ed26e07efc740398b8ec3bbdc2b3459556eb, while the public-request shadow now fails and packaging passes 114 / 2 existing skips at SHA-256 68a98582b2e81f8f28ec96d24d9877b27ab4701a8b3af25f9d317b33619c7c12. Final targeted re-review is VERIFIED with 0 Critical / 0 High / 0 Medium / 0 Low: 10/10 truthful nodes passed, 18/18 documentation mutations and 3/3 public-request-binding attacks were rejected, and the runtime sentinel observed six public request awaits with zero ADC, storage-client, GCS-lease, DNS, or socket calls. At that checkpoint, the ticket and index remained IN PROGRESS, AGW-32 remained OPEN, the index diff affected only AGW-52, and the seven-file candidate remained uncommitted; no live GCP, network, CI, deployment, tag, or release action occurred. Product commit a768c8f806ecec4fedf120136f8806c3689c3707 is clean. The contribution audit maps 11/11 obligations PASS with 0 missing and 0 Critical / 0 High / 0 Medium findings. OPEN-GLOBAL before feature acceptance: wheel/sdist build plus clean install/import verification; full suite, shuffled-order, and Python 3.10–3.14 interpreter runs; repo-wide and every changed production module at 100% statement and branch coverage with explicit behavioral matrices; and the downstream code-review, contract, test, security, pipeline, observability, and acceptance gates. AGW-32 remains OPEN."
+    },
+    {
+      "id": "AGW-53",
+      "title": "Fix stale envelope protocol count",
+      "status": "OPEN",
+      "story": "Stage 5 discovered Low-severity fast-track defect",
+      "step": "GCS selector Stage 5 defect",
+      "file": "docs/project/tickets/AGW-53-fix-stale-envelope-protocol-count.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": [], "blocks": []},
+      "commits": []
     }
   ]
 }
