@@ -1,6 +1,6 @@
 # AGW-52: Publish documented example and artifact-verified GCS contract
 
-- **Status:** IN PROGRESS
+- **Status:** IN REVIEW
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-09 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -106,3 +106,13 @@ packaging/documentation remain synchronized (GCS-09).
   357 passed with 2 existing skips. The ticket and index remain IN PROGRESS,
   AGW-32 remains OPEN, and the index diff affects only AGW-52. Files: this
   ticket and the local ticket index.
+- 2026-08-23 — Moved to IN REVIEW after product commit
+  `a768c8f806ecec4fedf120136f8806c3689c3707` and an independent contribution
+  audit mapped all 11/11 obligations PASS with 0 missing and 0 Critical, 0 High,
+  and 0 Medium findings. OPEN-GLOBAL before feature acceptance: build wheel and
+  sdist artifacts and verify clean install/import; run the full suite, shuffled
+  order, and Python 3.10–3.14 interpreter matrix; prove repo-wide and every
+  changed production module at 100% statement and branch coverage with the
+  required behavioral matrices; and complete code-review, contract, test,
+  security, pipeline, observability, and acceptance gates. Files: this ticket
+  and the local ticket index.
