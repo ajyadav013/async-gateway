@@ -756,6 +756,8 @@ def _safe_provider_text(value: object) -> Optional[str]:
         return None
     if _GCS_PROVIDER_SECRET_ASSIGNMENT.search(value) is not None:
         return None
+    if _SIGNING_ACCOUNT_PATTERN.search(value) is not None:
+        return None
     return redact_text(value)
 
 

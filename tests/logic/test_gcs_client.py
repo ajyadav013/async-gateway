@@ -8148,3 +8148,155 @@ async def test_signed_url_unknown_close_defect_scrubs_live_bearer_state(
         'exception_state': [],
         'traceback_locals': [],
     }
+
+
+# --- AGW-50 security defect: signing-principal containment ---------------
+
+
+@pytest.mark.parametrize(
+    'signer_path',
+    [
+        pytest.param('direct', id='direct-signer'),
+        pytest.param('impersonated', id='configured-impersonation'),
+    ],
+)
+async def test_public_signing_forbidden_never_exposes_signer_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    signer_path: str,
+) -> None:
+    """A plain IAM principal in signing prose stays private everywhere."""
+    info: dict[str, object] = {
+        'command': 'signed_url',
+        'method': 'GET',
+        'timeout': 2.5,
+    }
+    if signer_path == 'direct':
+        provider: _SignedUrlProvider = _SignedUrlProvider()
+        principal = (
+            'direct-signer@example-project.iam.gserviceaccount.com')
+        selected_credentials = provider.credentials
+        expected_project = 'signed-url-project'
+        breaker = _install_signed_url_provider(monkeypatch, provider)
+    else:
+        provider = _ImpersonationProvider(source_valid=True)
+        principal = provider.signing_target
+        selected_credentials = provider.target_credentials
+        expected_project = 'source-adc-project'
+        info['signing_service_account'] = principal
+        breaker = _install_impersonation_provider(monkeypatch, provider)
+
+    provider_message = (
+        'Permission iam.serviceAccounts.signBlob denied for '
+        f'{principal}')
+    provider_error = google_api_exceptions.Forbidden(provider_message)
+    assert '=' not in provider_message
+    assert '://' not in provider_message
+
+    def refuse_signing(**kwargs: object) -> str:
+        """Raise one real Google IAM refusal from the provider boundary."""
+        provider.record_thread('generate')
+        provider.generate_calls.append(dict(kwargs))
+        provider.client_open_during_generate.append(
+            not provider.client.closed)
+        assert provider.response is not None
+        provider.details_during_generate.append(dict(
+            provider.response['protocol_details']))
+        raise provider_error
+
+    monkeypatch.setattr(
+        provider.blob, 'generate_signed_url', refuse_signing)
+
+    async def capture_response(*, response: GatewayResponse) -> str:
+        """Expose only the live envelope to deterministic test doubles."""
+        provider.response = response
+        return 'captured-before-signing-refusal'
+
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    result = await request(
+        'gs://signer-containment-bucket/folder/object.bin',
+        protocol='GCS',
+        protocol_info=info,
+        pre_processor_config={'function': capture_response},
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == 403
+    assert result['error'] is not None
+    assert result['error']['code'] == 'GCS_STATUS'
+    details = result['protocol_details']
+    assert {
+        key: value for key, value in details.items()
+        if key != 'gcs_error_message'
+    } == {
+        'command': 'signed_url',
+        'bucket': 'signer-containment-bucket',
+        'target': 'folder/object.bin',
+        'gcs_error_code': None,
+        'response_metadata': {
+            'http_status_code': 403,
+            'request_id': None,
+        },
+    }
+    assert isinstance(details['gcs_error_message'], (str, type(None)))
+
+    assert provider.generate_calls == [{
+        'version': 'v4',
+        'expiration': timedelta(seconds=900),
+        'method': 'GET',
+        'credentials': selected_credentials,
+    }]
+    assert provider.client_calls == [(
+        (),
+        {
+            'credentials': selected_credentials,
+            'project': expected_project,
+        },
+    )]
+    assert provider.client_open_during_generate == [True]
+    assert provider.details_during_generate == [{}]
+    assert provider.details_during_close == [{}]
+    assert provider.timeline.count('generate') == 1
+    assert provider.timeline.index('generate') < provider.timeline.index(
+        'client-close')
+    assert provider.client.close_calls == 1
+    assert provider.client.closed is True
+    assert breaker.calls == 0
+    assert not {
+        'method', 'expires_in_seconds', 'signed_url', 'content_type',
+        'max_upload_bytes', 'if_generation_match', 'required_headers',
+    }.intersection(details)
+    assert provider.signed_url not in repr(result)
+
+    capacity_records = _capacity_records(caplog)
+    assert [
+        (
+            record.getMessage(),
+            record.active_leases,
+            record.max_leases,
+        )
+        for record in capacity_records
+    ] == [
+        ('gcs_capacity_state', 1, 4),
+        ('gcs_capacity_state', 0, 4),
+    ]
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+    leaks = {
+        'envelope_leaves': [
+            path for path, value in _surface_leaves(result)
+            if isinstance(value, str) and principal in value
+        ],
+        'result_repr': principal in repr(result),
+        'caplog': principal in _logged_gcs_surfaces(caplog),
+        'breaker': principal in repr(breaker.__dict__),
+        'capacity_telemetry': principal in ''.join(
+            repr(record.__dict__) for record in capacity_records),
+    }
+    assert leaks == {
+        'envelope_leaves': [],
+        'result_repr': False,
+        'caplog': False,
+        'breaker': False,
+        'capacity_telemetry': False,
+    }

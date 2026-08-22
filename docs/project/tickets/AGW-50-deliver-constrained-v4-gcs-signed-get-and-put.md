@@ -1,6 +1,6 @@
 # AGW-50: Deliver constrained V4 GCS signed GET and PUT
 
-- **Status:** IN REVIEW
+- **Status:** IN PROGRESS
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-07 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -157,3 +157,26 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
   the nonblocking stale internal protocol-count docstring. Downstream tester,
   security, operability, acceptance, and PR stages remain open.
+- 2026-08-23 — Final test-gate Devil's Advocate defect-loop RED adds two
+  deterministic public-request rows for direct signing and configured IAM
+  impersonation. Each raises a real Google `Forbidden` whose otherwise-safe
+  `iam.serviceAccounts.signBlob` prose contains only a plain signer principal,
+  and each preserves `GCS_STATUS`/403, one generation call, exact-once client
+  close, zero breaker calls, empty pre-publication details, and safe capacity
+  telemetry. The exact selector collects 2 rows and fails 2/2; the full GCS
+  file collects 524 with 522 prior cases passing and exactly the 2 new rows
+  failing because the principal reaches the gateway-owned
+  `gcs_error_message` and returned-result representation. Retained
+  third-party exception internals are deliberately outside this oracle.
+  Production is unchanged; AGW-50 returns to IN PROGRESS for the minimal
+  sanitization GREEN.
+- 2026-08-23 — Signer-identity defect-loop GREEN omits provider diagnostic
+  strings containing a service-account principal by reusing the existing
+  signing-account pattern in `_safe_provider_text()`. The immutable two-row
+  oracle now passes 2/2 and the full GCS suite passes 524/524 while preserving
+  safe provider prose, `GCS_STATUS`/403, one generation attempt, exact-once
+  close, zero breaker calls, empty pre-publication details, and capacity/lease
+  behavior. Scoped flake8, package mypy, and suppression checks pass; the RED
+  test SHA-256 remains
+  `b447a5417e726c70d0864abf13f57980de133c5caf7886751ffc66ef312753a3`.
+  AGW-50 remains IN PROGRESS pending independent review.
