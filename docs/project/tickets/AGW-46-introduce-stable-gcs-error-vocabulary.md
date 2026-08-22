@@ -1,7 +1,7 @@
 # AGW-46: Introduce stable GCS error vocabulary
 
-- **Status:** OPEN
-- **Branch:** `codex/gcs-selector`
+- **Status:** IN PROGRESS
+- **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-03 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
 - **Decisions:** Bounded GCS decisions of record in [the GCS selector specification](../../specs/gcs_selector_spec.md); no ADR is required.
@@ -30,3 +30,11 @@ Later lifecycle and service behavior needs stable, safe `GCS_STATUS` and
 - 2026-08-22 — Opened from approved GCS-03 planning before implementation;
   recorded its three-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-22 — Implementation started in the isolated backend worktree at
+  planning commit `057bc367`; loaded the approved specification, story plan,
+  repository rules, and requested implementation skills before the RED step.
+- 2026-08-22 — RED: `pytest tests/test_exceptions.py -k 'gcs_status_error or
+  gcs_capacity_error' -q --no-cov` failed 2 tests because both error classes
+  were absent. GREEN: after adding only the two typed errors and their central
+  status classifications, the same command passed 2 tests with 67 deselected;
+  the complete exception module passed all 69 tests without coverage.

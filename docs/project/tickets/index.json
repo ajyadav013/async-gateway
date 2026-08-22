@@ -751,13 +751,13 @@
     {
       "id": "AGW-44",
       "title": "Package the supported Google Storage dependency",
-      "status": "OPEN",
+      "status": "IN PROGRESS",
       "story": "GCS-01",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-44-package-supported-google-storage-dependency.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": [], "blocks": ["AGW-45", "AGW-52"]},
-      "commits": []
+      "commits": ["60f5074"]
     },
     {
       "id": "AGW-45",
@@ -773,7 +773,7 @@
     {
       "id": "AGW-46",
       "title": "Introduce stable typed GCS error vocabulary",
-      "status": "OPEN",
+      "status": "IN PROGRESS",
       "story": "GCS-03",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-46-introduce-stable-gcs-error-vocabulary.md",

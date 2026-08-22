@@ -1,7 +1,7 @@
 # AGW-44: Package the supported Google Storage dependency
 
-- **Status:** OPEN
-- **Branch:** `codex/gcs-selector`
+- **Status:** IN PROGRESS
+- **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-01 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
 - **Decisions:** Bounded GCS decisions of record in [the GCS selector specification](../../specs/gcs_selector_spec.md); no ADR is required.
@@ -31,3 +31,11 @@ AC12.1, AC12.3, AC12.4).
 - 2026-08-22 — Opened from approved GCS-01 planning before implementation;
   recorded the frozen two-file boundary, acceptance criteria, RED-first proof,
   and dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-22 — Implementation started in the isolated backend worktree at
+  planning commit `057bc367`; loaded the approved specification, story plan,
+  repository rules, and requested implementation skills before the RED step.
+- 2026-08-22 — RED: `pytest tests/test_packaging.py -k 'gcs_runtime'
+  -q --no-cov` failed 2 tests because the source and installed metadata had no
+  `google-cloud-storage` requirement. GREEN: after adding only
+  `google-cloud-storage>=3,<4` and reinstalling the editable project, the same
+  command passed 2 tests with 104 deselected. Product commit: `60f5074`.

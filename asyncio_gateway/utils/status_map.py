@@ -50,6 +50,7 @@ STATUS_BY_CODE: Final[Mapping[str, int]] = MappingProxyType({
     'RESPONSE_TOO_DEEP': 502,
     'CIRCUIT_OPEN': 503,
     'STACK_EXHAUSTED': 502,
+    'GCS_CAPACITY': 503,
 
     # A protocol error always carries the real remote status, so these
     # defaults apply only when the remote side supplied none.
@@ -59,6 +60,7 @@ STATUS_BY_CODE: Final[Mapping[str, int]] = MappingProxyType({
     'GRAPHQL_ERROR': 502,
     'GRAPHQL_PROTOCOL': 502,
     'S3_STATUS': 502,
+    'GCS_STATUS': 502,
     'GRPC_STATUS': 502,
     'FTP_STATUS': 500,
     'SFTP_STATUS': 500,
@@ -73,6 +75,7 @@ WARNING_CODES: Final[frozenset[str]] = frozenset({
     'JSONRPC_ERROR',
     'GRAPHQL_ERROR',
     'S3_STATUS',
+    'GCS_STATUS',
     'GRPC_STATUS',
     'FTP_STATUS',
     'SFTP_STATUS',

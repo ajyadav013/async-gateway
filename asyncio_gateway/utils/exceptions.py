@@ -103,7 +103,7 @@ class AsyncGatewayError(Exception):
         self.status_code: int = status_for(self.code, override=status_code)
 
     def __reduce__(self) -> tuple[type['AsyncGatewayError'],
-                                  tuple[str, int]]:
+                                  tuple[object, ...]]:
         """Rebuild this exception after pickling, status included.
 
         ``Exception.__reduce__`` would replay ``args`` alone and lose a
@@ -316,6 +316,33 @@ class StackExhaustedError(AsyncGatewayError):
     code: ClassVar[str] = 'STACK_EXHAUSTED'
 
 
+class GcsCapacityError(AsyncGatewayError):
+    """Raised when the private GCS execution capacity cannot admit work."""
+
+    code: ClassVar[str] = 'GCS_CAPACITY'
+
+    def __init__(
+        self,
+        message: str = 'GCS execution capacity is unavailable',
+    ) -> None:
+        """Build a local GCS admission refusal with a safe default message.
+
+        Args:
+            message: Constant diagnostic text that contains no target or
+                secret-bearing values.
+        """
+        super().__init__(message)
+
+    def __reduce__(self) -> tuple[type['AsyncGatewayError'],
+                                  tuple[object, ...]]:
+        """Rebuild the fixed-status capacity error after pickling.
+
+        Returns:
+            The class and safe message needed to reconstruct the error.
+        """
+        return self.__class__, (str(self),)
+
+
 class ProtocolError(AsyncGatewayError):
     """Base for a remote side that answered, and answered with a failure.
 
@@ -361,6 +388,12 @@ class S3StatusError(ProtocolError):
     """Raised for a normalized AWS S3 service error response."""
 
     code: ClassVar[str] = 'S3_STATUS'
+
+
+class GcsStatusError(ProtocolError):
+    """Raised for a normalized Google Cloud Storage service response."""
+
+    code: ClassVar[str] = 'GCS_STATUS'
 
 
 class GrpcStatusError(ProtocolError):
