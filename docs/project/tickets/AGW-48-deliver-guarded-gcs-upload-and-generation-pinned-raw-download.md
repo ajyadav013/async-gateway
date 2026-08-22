@@ -34,6 +34,31 @@ beyond the cap (GCS-05).
 
 ## Work Log
 
+- 2026-08-23 — Formal-review defect-loop GREEN removes only the duplicate
+  cleanup-cancellation priority blocks from upload and download. An already
+  captured body, service, transport, or malformed-success outcome now wins
+  after the owned client is fully drained; cleanup cancellation and failure
+  remain authoritative when no body outcome exists. The exact six-row
+  selector passes 6/6, the full GCS module passes 522/522, entrypoint
+  regression passes 290/290, and focused `gcs_client.py` statement and branch
+  coverage is 100%. Scoped flake8, the exact CI format selector, mypy, secret
+  containment assertions, diff, JSON, hash, and scope checks pass. Status
+  remains IN PROGRESS for independent formal-review recheck.
+- 2026-08-23 — Independent RED-oracle review corrected only the expected DNS
+  envelope cause to the repository's existing safe transport-cause spelling;
+  service and malformed-success rows still expect no cause. No scenario,
+  helper, lifecycle assertion, status, or production file changed. The six
+  rows remain intentionally RED solely at cleanup-cancellation precedence.
+- 2026-08-23 — Formal-review defect-loop RED added one deterministic
+  public-request matrix covering upload and download across service,
+  recognized transport, and malformed nominal-success body outcomes. Each of
+  the six rows blocks owned-client close, injects cancellation only after
+  close begins, and freezes body-over-cleanup precedence, exact public
+  mapping, breaker behavior, path safety, retained capacity, one drained
+  close, and secret containment. The 516-test baseline passed; the exact new
+  selector collected six tests and all six failed at the reviewed defect
+  because the later cleanup `CancelledError` replaced the established body
+  outcome. Production remains untouched and status remains IN PROGRESS.
 - 2026-08-23 — VALIDATE reproduced the exact CI format-selector failure as
   one `E126` in the cleanup-only download parametrization, then corrected only
   that line's hanging indentation. The normalized test-module AST remained

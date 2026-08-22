@@ -6656,6 +6656,229 @@ async def test_download_body_failure_wins_over_hostile_client_close(
 
 
 @pytest.mark.parametrize(
+    ('command', 'body_kind', 'expected_code', 'expected_status',
+     'expected_events'),
+    [
+        pytest.param(
+            'upload', 'service', 'GCS_STATUS', 403, ['abort'],
+            id='upload-service',
+        ),
+        pytest.param(
+            'upload', 'transport', 'DNS', 502,
+            ['failed', 'exhausted'], id='upload-transport',
+        ),
+        pytest.param(
+            'upload', 'malformed', 'GCS_STATUS', 502, ['abort'],
+            id='upload-malformed-success',
+        ),
+        pytest.param(
+            'download', 'service', 'GCS_STATUS', 403, ['abort'],
+            id='download-service',
+        ),
+        pytest.param(
+            'download', 'transport', 'DNS', 502,
+            ['failed', 'exhausted'], id='download-transport',
+        ),
+        pytest.param(
+            'download', 'malformed', 'GCS_STATUS', 502, ['abort'],
+            id='download-malformed-success',
+        ),
+    ],
+)
+async def test_body_failure_precedes_cancellation_during_blocked_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    command: str,
+    body_kind: str,
+    expected_code: str,
+    expected_status: int,
+    expected_events: list[str],
+) -> None:
+    """A later close cancellation cannot replace an established body result."""
+    body_secret = f'body-private-{command}-{body_kind}-review-1'
+    cleanup_secret = f'cleanup-private-{command}-{body_kind}-review-1'
+    payload_secret = f'payload-private-{command}-{body_kind}-review-1'
+    events: list[str] = []
+    breaker_config = _gcs_retry_config(0, events)
+    breaker = CircuitBreakerHelper(
+        **validated_breaker_config(breaker_config))
+    monkeypatch.setattr(base, 'get_breaker', lambda *args, **kwargs: breaker)
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+
+    close_started = threading.Event()
+    close_release = threading.Event()
+    body_failure: BaseException | None = None
+    reads: list[tuple[object, int]] = []
+    source = tmp_path / f'{command}-{body_kind}-source.bin'
+    original_path_bytes = b'caller-path-must-remain-unchanged'
+    source.write_bytes(original_path_bytes)
+
+    if command == 'upload':
+        provider: _UploadProvider | _DownloadProvider = _UploadProvider([])
+        if body_kind == 'service':
+            body_failure = _FakeServiceError(
+                403,
+                code=f'secret={body_secret}',
+                message=f'secret={body_secret}',
+                request_id=f'secret={body_secret}',
+            )
+            provider.script_upload(body_failure)
+        elif body_kind == 'transport':
+            body_failure = socket.gaierror(body_secret)
+            provider.script_upload(body_failure)
+        else:
+            provider.blob.generation = _HostileUploadMetadata(body_secret)
+        provider.close_started = close_started
+        provider.close_release = close_release
+
+        async def guarded_read(
+            path: object,
+            *,
+            max_bytes: int,
+            chunk_size: int = 65536,
+        ) -> bytes:
+            """Return fixed bytes while recording the caller's safe path."""
+            del chunk_size
+            reads.append((path, max_bytes))
+            return payload_secret.encode()
+
+        monkeypatch.setattr(gcs_client, 'read_guarded_file', guarded_read)
+        _install_upload_provider(monkeypatch, provider)
+        operation = request(
+            'gs://precedence-upload/object.bin',
+            protocol='GCS',
+            protocol_info={
+                'command': 'upload',
+                'local_path': str(source),
+                'max_upload_bytes': 128,
+                'timeout': 2.5,
+                'circuit_breaker_config': breaker_config,
+            },
+        )
+    else:
+        provider = _DownloadProvider(payload_secret.encode())
+        if body_kind == 'service':
+            body_failure = _FakeServiceError(
+                403,
+                code=f'secret={body_secret}',
+                message=f'secret={body_secret}',
+                request_id=f'secret={body_secret}',
+            )
+            provider.script_ranges(body_failure)
+        elif body_kind == 'transport':
+            body_failure = socket.gaierror(body_secret)
+            provider.script_ranges(body_failure)
+        else:
+            provider.blob.generation = _HostileUploadMetadata(body_secret)
+        provider.close_started = close_started
+        provider.close_release = close_release
+        _install_download_provider(monkeypatch, provider)
+        operation = request(
+            'gs://precedence-download/folder/object.bin',
+            protocol='GCS',
+            protocol_info={
+                'command': 'download',
+                'local_path': str(source),
+                'max_response_bytes': 128,
+                'timeout': 2.5,
+                'circuit_breaker_config': breaker_config,
+            },
+        )
+
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    companion_leases = [acquire() for _ in range(3)]
+    task = asyncio.create_task(operation)
+    admitted_after: Any = None
+    try:
+        await _wait_for_thread_event(close_started)
+        assert getattr(gcs_client, '_active_gcs_leases')() == 4
+        task.cancel(cleanup_secret)
+        await asyncio.sleep(0)
+        assert task.done() is False
+        with pytest.raises(GcsCapacityError):
+            acquire()
+
+        close_release.set()
+        result = await task
+        assert task.exception() is None
+        assert getattr(gcs_client, '_active_gcs_leases')() == 3
+        admitted_after = acquire()
+        with pytest.raises(GcsCapacityError):
+            acquire()
+
+        expected_type = (
+            'DnsError' if expected_code == 'DNS' else 'GcsStatusError')
+        expected_message = (
+            'GCS provider transport failed'
+            if expected_code == 'DNS'
+            else 'GCS provider service request failed'
+        )
+        assert result['ok'] is False
+        assert result['status_code'] == expected_status
+        assert result['error'] == {
+            'type': expected_type,
+            'code': expected_code,
+            'message': expected_message,
+            'cause': (
+                'gaierror: GCS provider transport failure'
+                if expected_code == 'DNS'
+                else None
+            ),
+        }
+        if body_kind == 'service':
+            assert result['protocol_details'] == {
+                'command': command,
+                'bucket': f'precedence-{command}',
+                'target': (
+                    'object.bin'
+                    if command == 'upload'
+                    else 'folder/object.bin'
+                ),
+                'gcs_error_code': None,
+                'gcs_error_message': None,
+                'response_metadata': {
+                    'http_status_code': 403,
+                    'request_id': None,
+                },
+            }
+        else:
+            assert result['protocol_details'] == {}
+        assert events == expected_events
+        assert breaker.failures == (1 if body_kind == 'transport' else 0)
+        assert provider.client.close_calls == 1
+        assert source.read_bytes() == original_path_bytes
+        if command == 'upload':
+            assert reads == [(str(source), 128)]
+            assert len(provider.upload_calls) == 1
+        else:
+            assert len(provider.reload_calls) == 1
+            assert len(provider.range_calls) == (
+                0 if body_kind == 'malformed' else 1)
+        exception_surface = (
+            ''.join(traceback.format_exception(body_failure))
+            if body_failure is not None
+            else ''
+        )
+        surfaces = (
+            repr(result)
+            + _logged_gcs_surfaces(caplog)
+            + repr(events)
+            + exception_surface
+        )
+        assert all(secret not in surfaces for secret in (
+            body_secret, cleanup_secret, payload_secret,
+        ))
+    finally:
+        close_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if admitted_after is not None:
+            await _release_lease(admitted_after)
+        for lease in companion_leases:
+            await _release_lease(lease)
+
+
+@pytest.mark.parametrize(
     ('cleanup_error', 'expected_code', 'expected_status'),
     [
         pytest.param(socket.gaierror('cleanup-dns-private-d2b1'),

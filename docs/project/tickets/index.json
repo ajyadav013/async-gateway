@@ -803,7 +803,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-47"], "blocks": ["AGW-49"]},
       "commits": [],
-      "note": "Pinned raw-download D2b2: three deterministic cancellation/timeout retained-cleanup cases passed the existing implementation; all 322 focused tests, ten owner repeats, and three independent repeats pass with production untouched and clean flake8/diff/JSON/scope validation. VALIDATE later reproduced one E126 in the cleanup-only parametrization and fixed only its hanging indentation; the normalized AST stayed unchanged, the exact CI selector and full flake8 pass, and all three affected cases pass. Status remains IN PROGRESS for the GCS-05 acceptance-map audit."
+      "note": "Formal-review defect-loop GREEN preserves established upload/download service, transport, and malformed-success body outcomes over later cleanup cancellation while retaining fully drained cleanup and cleanup-only precedence. The six-row selector, all 522 GCS tests, 290 entrypoint regressions, focused 100% gcs_client statement/branch coverage, scoped flake8/CI-format, mypy, secret, diff, JSON, hash, and scope checks pass. Status remains IN PROGRESS for independent formal-review recheck."
     },
     {
       "id": "AGW-49",
