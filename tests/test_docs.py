@@ -2627,6 +2627,34 @@ def _module_doc(path: Path) -> Optional[str]:
     return ast.get_docstring(parse(path))
 
 
+def test_envelope_docstring_tracks_registry_without_hardcoded_count() -> None:
+    """Bind the shared-envelope claim to the registry, not a stale count."""
+    doc = _module_doc(PACKAGE_ROOT / 'utils' / 'envelope.py')
+    assert doc is not None
+    prose = ' '.join(doc.lower().split())
+    registered_count = len(protocol_mapping)
+
+    assert (
+        'makes the key set invariant across all registered protocols'
+        in prose
+    ), (
+        'the envelope docstring must describe its invariant across all '
+        f'registered protocols ({registered_count} currently) without '
+        'freezing that count in prose'
+    )
+    hardcoded_count = re.search(
+        r'\b(?:all|across)\s+(?:all\s+)?'
+        r'(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|'
+        r'eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|'
+        r'eighteen|nineteen|twenty)\s+(?:registered\s+)?protocols?\b',
+        prose,
+    )
+    assert hardcoded_count is None, (
+        'the envelope docstring must not hardcode a protocol count: '
+        f'{hardcoded_count.group(0)!r}'
+    )
+
+
 @pytest.mark.parametrize(
     'path', module_paths(), ids=relative)
 def test_every_public_definition_has_a_docstring(path: Path) -> None:

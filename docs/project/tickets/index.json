@@ -856,13 +856,14 @@
     {
       "id": "AGW-53",
       "title": "Fix stale envelope protocol count",
-      "status": "OPEN",
+      "status": "IN PROGRESS",
       "story": "Stage 5 discovered Low-severity fast-track defect",
       "step": "GCS selector Stage 5 defect",
       "file": "docs/project/tickets/AGW-53-fix-stale-envelope-protocol-count.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": [], "blocks": []},
-      "commits": []
+      "commits": [],
+      "note": "RED began from a 243/243 focused docs-test baseline. Oracle review narrowed the numeric matcher to census claims introduced by all or across (including across all), with optional registered before protocol(s), so ordinary singular prose is accepted. A five-row simulation rejects all nine protocols, across all nine protocols, and across 10 registered protocols while accepting one protocol used to build a fresh dict and the exact count-independent target phrase. The corrected suite remained genuine RED at 243 passed and exactly one stale-wording failure. GREEN replaced only all nine protocols with all registered protocols. The targeted node passes 1/1, docs pass 244/244, and the full repository passes 5,928 tests with 20 declared skips and 100% statement and branch coverage. The docstring-stripped normalized AST matches HEAD; static, byte-compilation, JSON, diff, and scope checks pass. Accepted test SHA-256 remains 8b494848cddc66abf9dc41fe545d7dc22d5663d4b55acff0fed94769b30e2851. Status remains IN PROGRESS pending independent review."
     }
   ]
 }
