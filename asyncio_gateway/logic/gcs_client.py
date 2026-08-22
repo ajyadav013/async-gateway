@@ -104,6 +104,7 @@ _GCS_PROVIDER_SECRET_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 _GCS_TRANSPORT_FAILURES: Final[Tuple[type[BaseException], ...]] = (
+    google_auth_exceptions.TransportError,
     socket.gaierror,
     ssl.SSLError,
     asyncio.TimeoutError,
@@ -1219,15 +1220,23 @@ class GcsRequest(BaseRequestClass):
         """Generate one private selected-signer URL with the client open."""
         client: Any = None
         signed_url: object = _NO_RESULT
+        body_error: Optional[BaseException] = None
+        body_state: Optional[_ExceptionState] = None
         try:
             try:
-                credentials, project = await lease.run(
-                    google_auth.default, timeout=self.timeout)
-                await lease.run(
-                    _refresh_credentials_if_needed,
-                    credentials,
-                    timeout=self.timeout,
-                )
+                try:
+                    credentials, project = await lease.run(
+                        google_auth.default, timeout=self.timeout)
+                    await lease.run(
+                        _refresh_credentials_if_needed,
+                        credentials,
+                        timeout=self.timeout,
+                    )
+                except _GCS_CREDENTIAL_FAILURES as error:
+                    error.args = ('GCS credential resolution failed',)
+                    raise ConfigurationError(
+                        'GCS application default credentials are unavailable'
+                    ) from None
                 if 'signing_service_account' in self.info:
                     source_credentials = credentials
                     try:
@@ -1302,15 +1311,75 @@ class GcsRequest(BaseRequestClass):
                         credentials=credentials,
                         timeout=self.timeout,
                     )
-            except _GCS_CREDENTIAL_FAILURES as error:
-                error.args = ('GCS credential resolution failed',)
+            except google_auth_exceptions.DefaultCredentialsError as error:
+                error.args = ('GCS signing credential resolution failed',)
                 raise ConfigurationError(
                     'GCS application default credentials are unavailable'
                 ) from None
-        finally:
-            if client is not None:
+            except google_auth_exceptions.RefreshError as error:
+                error.args = ('GCS signing credential refresh failed',)
+                raise GcsStatusError(
+                    'GCS signing credential refresh failed', 502
+                ) from None
+            except _GCS_TRANSPORT_FAILURES as error:
+                error.args = ('GCS provider transport failure',)
+                raise _transport_error_for(error) from None
+            except BaseException as error:
+                if not _is_service_failure(error):
+                    raise
+                failure = _service_failure_for(
+                    error,
+                    command=self.command,
+                    bucket=self.bucket,
+                    target=self.key,
+                )
+                error.args = ('GCS provider service response',)
+                raise failure from None
+        except BaseException as error:
+            body_error = error
+            body_state = _capture_exception_state(error)
+
+        cleanup_error: Optional[BaseException] = None
+        cleanup_state: Optional[_ExceptionState] = None
+        if client is not None:
+            try:
                 await lease.run(
                     _close_storage_client, client, timeout=self.timeout)
+            except BaseException as error:
+                cleanup_error = error
+                cleanup_state = _capture_exception_state(error)
+
+        if body_error is not None:
+            if isinstance(
+                body_error,
+                (_GcsServiceFailure, _AbortableGcsServiceFailure),
+            ):
+                raise self._public_service_error(body_error) from None
+            assert body_state is not None
+            _raise_exact(body_error, body_state)
+        if cleanup_error is not None:
+            assert cleanup_state is not None
+            if isinstance(cleanup_error, _GCS_CREDENTIAL_FAILURES):
+                cleanup_error.args = ('GCS credential cleanup failed',)
+                raise ConfigurationError(
+                    'GCS application default credentials are unavailable'
+                ) from None
+            if isinstance(cleanup_error, _GCS_TRANSPORT_FAILURES):
+                cleanup_error.args = ('GCS provider cleanup failed',)
+                raise _transport_error_for(cleanup_error) from None
+            if _is_service_failure(cleanup_error):
+                status_failure = _service_failure_for(
+                    cleanup_error,
+                    command=self.command,
+                    bucket=self.bucket,
+                    target=self.key,
+                )
+                cleanup_error.args = ('GCS provider cleanup response',)
+                raise GcsStatusError(
+                    'GCS provider cleanup failed',
+                    status_failure.status_code,
+                ) from None
+            _raise_exact(cleanup_error, cleanup_state)
         return cast(str, signed_url)
 
     async def _handle_head_or_list(

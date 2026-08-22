@@ -827,7 +827,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-49"], "blocks": ["AGW-51"]},
       "commits": [],
-      "note": "S2 GREEN adds fixed-scope IAM impersonation after sanitized source ADC refresh, private-worker target construction/refresh, and safe target-refresh GCS_STATUS/502 mapping. All 486 focused GCS/blocking-I/O cases and 276 entrypoint cases pass; focused coverage is 764/764 statements and 257/258 branches, with only the S3 cleanup branch open. Status remains IN PROGRESS for hostile lifecycle and bearer containment."
+      "note": "S3A GREEN normalizes recognized signed-URL client-construction, signing, and cleanup failures while preserving source CONFIG handling, body-over-cleanup precedence, one signing invocation, zero breaker calls, and private bearer discard. The immutable focused suite passes 504/504 with gcs_client.py at 809/809 statements and 272/272 branches; entrypoint passes 276/276; scoped flake8 and mypy pass. Status remains IN PROGRESS for bounded S3B cancellation/timeout/bearer containment."
     },
     {
       "id": "AGW-51",

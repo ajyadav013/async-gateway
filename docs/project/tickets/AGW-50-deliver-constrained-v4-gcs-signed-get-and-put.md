@@ -64,3 +64,26 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   Focused coverage has 764/764 statements and 257/258 branches; the sole
   `1311->1314` cleanup branch remains owned by S3. AGW-50 remains IN PROGRESS
   for the hostile lifecycle and bearer-containment tranche.
+- 2026-08-22 — S3A RED adds 18 deterministic signed-URL failure and cleanup
+  cases without changing production: client-construction failure before
+  ownership, Google service/IAM/transport generation failures, exact
+  body-over-cleanup precedence, cleanup-only typed outcomes, one gateway
+  generation invocation, zero breaker use, and private bearer discard. The
+  exact focused run collects 504 cases: all 486 prior cases plus three new
+  already-supported behaviors pass, while 15 new cases fail only in the
+  missing signed-URL normalization/precedence paths. Scoped flake8 passes;
+  the accepted test SHA-256 is
+  `4a1ffc89af7835b9b3b6cc800f91978746bece7304266c6fcbbed6ad1264d784`.
+  AGW-50 remains IN PROGRESS for S3A GREEN and the separately bounded S3B
+  cancellation/timeout/bearer-surface tranche.
+- 2026-08-22 — S3A GREEN normalizes recognized storage-client construction,
+  signing, and cleanup failures without entering the breaker or retry path.
+  Source ADC failures remain `CONFIG`; signing-stage service/IAM/transport
+  failures use their safe public types; an existing body failure wins over a
+  later hostile close; and a cleanup-only failure discards the private bearer
+  before conversion. The immutable 504-case focused suite passes in full,
+  including exactly one signing invocation and zero breaker calls. Focused
+  `gcs_client.py` coverage is 809/809 statements and 272/272 branches;
+  entrypoint regression passes 276/276; scoped flake8 and full-package mypy
+  pass. AGW-50 remains IN PROGRESS for the separately bounded S3B
+  cancellation/timeout/bearer-surface tranche.

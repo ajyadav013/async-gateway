@@ -26,6 +26,7 @@ from typing import Any, NoReturn
 from failsafe import CircuitOpen, RetriesExhausted
 
 from google import auth as google_auth
+from google.api_core import exceptions as google_api_exceptions
 from google.auth import credentials as google_auth_credentials
 from google.auth import exceptions as google_auth_exceptions
 from google.auth import impersonated_credentials
@@ -1846,6 +1847,370 @@ async def test_impersonation_target_refresh_error_is_safe_gcs_status(
     assert breaker.calls == 0
     assert secret not in repr(result)
     assert provider.signing_target not in repr(result)
+
+
+# --- AGW-50 tranche S3A: signed URL failure and cleanup precedence -------
+
+
+class _SignedUrlFailureBlob(_SignedUrlBlob):
+    """Signed-URL boundary double with one scripted generation outcome."""
+
+    def generate_signed_url(self, **kwargs: object) -> str:
+        """Capture one gateway invocation, then return or raise its outcome."""
+        provider = self.provider
+        assert isinstance(provider, _SignedUrlFailureProvider)
+        provider.record_thread('generate')
+        provider.generate_calls.append(dict(kwargs))
+        provider.client_open_during_generate.append(
+            not provider.client.closed)
+        if isinstance(provider.generation_outcome, BaseException):
+            raise provider.generation_outcome
+        return provider.generation_outcome
+
+
+class _SignedUrlFailureClient(_SignedUrlClient):
+    """Owned storage client with one deterministic cleanup outcome."""
+
+    def close(self) -> None:
+        """Record exactly one close before raising any scripted failure."""
+        provider = self.provider
+        assert isinstance(provider, _SignedUrlFailureProvider)
+        provider.record_thread('client-close')
+        self.close_calls += 1
+        self.closed = True
+        if provider.close_error is not None:
+            raise provider.close_error
+
+
+class _SignedUrlFailureProvider(_SignedUrlProvider):
+    """No-network provider tree for signed-URL failure semantics."""
+
+    def __init__(
+        self,
+        *,
+        generation_outcome: str | BaseException | None = None,
+        client_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+    ) -> None:
+        """Configure independent client, generation, and cleanup outcomes."""
+        super().__init__()
+        self.generation_outcome = (
+            self.signed_url
+            if generation_outcome is None else generation_outcome
+        )
+        self.client_error = client_error
+        self.close_error = close_error
+        self.blob = _SignedUrlFailureBlob(self)
+        self.client = _SignedUrlFailureClient(self)
+
+    def make_client(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> _SignedUrlFailureClient:
+        """Return one owned client or fail before ownership transfers."""
+        self.record_thread('client')
+        self.client_calls.append((args, dict(kwargs)))
+        if self.client_error is not None:
+            raise self.client_error
+        return self.client
+
+
+def _google_service_failure(
+    status: int,
+    secret: str,
+) -> google_api_exceptions.GoogleAPICallError:
+    """Build one real Google error with hostile safe-to-drop text."""
+    error_type: type[google_api_exceptions.GoogleAPICallError] = (
+        google_api_exceptions.Forbidden
+        if status == 403
+        else google_api_exceptions.ServiceUnavailable
+    )
+    return error_type(f'authorization=Bearer {secret}')
+
+
+async def _public_signed_url_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _SignedUrlFailureProvider,
+) -> tuple[dict[str, Any], '_UploadBreaker']:
+    """Drive one GET through the public request conversion boundary."""
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    result = await request(
+        'gs://Signed-Url-Failure-Bucket/folder/object.bin',
+        protocol='GCS',
+        protocol_info={
+            'command': 'signed_url',
+            'method': 'GET',
+            'timeout': 2.5,
+        },
+    )
+    return result, breaker
+
+
+def _expected_signed_service_details(status: int) -> dict[str, object]:
+    """Return the exact safe public details for one signing refusal."""
+    return {
+        'command': 'signed_url',
+        'bucket': 'signed-url-failure-bucket',
+        'target': 'folder/object.bin',
+        'gcs_error_code': None,
+        'gcs_error_message': None,
+        'response_metadata': {
+            'http_status_code': status,
+            'request_id': None,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ('failure_kind', 'expected_code', 'expected_status'),
+    [
+        pytest.param('credential', 'CONFIG', 400, id='credential'),
+        pytest.param('service', 'GCS_STATUS', 403, id='google-service'),
+        pytest.param('transport', 'DNS', 502, id='transport'),
+    ],
+)
+async def test_signed_url_client_failure_never_closes_unowned_client(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
+    expected_code: str,
+    expected_status: int,
+) -> None:
+    """Client construction failures are typed without fabricated cleanup."""
+    secret = f'client-construction-private-s3a-{failure_kind}'
+    failures: dict[str, BaseException] = {
+        'credential': google_auth_exceptions.DefaultCredentialsError(secret),
+        'service': _google_service_failure(403, secret),
+        'transport': socket.gaierror(secret),
+    }
+    provider = _SignedUrlFailureProvider(
+        client_error=failures[failure_kind])
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, breaker = await _public_signed_url_failure(
+        monkeypatch, provider)
+
+    assert result['ok'] is False
+    assert result['status_code'] == expected_status
+    assert result['error']['code'] == expected_code
+    assert result['protocol_details'] == (
+        _expected_signed_service_details(403)
+        if failure_kind == 'service' else {}
+    )
+    assert provider.timeline.count('client') == 1
+    assert provider.generate_calls == []
+    assert provider.client.close_calls == 0
+    assert breaker.calls == 0
+    assert secret not in repr(result) + _logged_gcs_surfaces(caplog)
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
+@pytest.mark.parametrize(
+    ('failure_kind', 'expected_code', 'expected_status', 'service_status'),
+    [
+        pytest.param('forbidden', 'GCS_STATUS', 403, 403,
+                     id='google-service-403'),
+        pytest.param('unavailable', 'GCS_STATUS', 503, 503,
+                     id='google-service-503-no-retry'),
+        pytest.param('auth-refresh', 'GCS_STATUS', 502, None,
+                     id='iam-refresh'),
+        pytest.param('auth-transport', 'TRANSPORT', 502, None,
+                     id='google-auth-transport'),
+        pytest.param('dns', 'DNS', 502, None, id='dns'),
+        pytest.param('tls', 'TLS', 502, None, id='tls'),
+        pytest.param('connect', 'CONNECT', 502, None, id='connect'),
+        pytest.param('timeout', 'TIMEOUT', 504, None, id='timeout'),
+        pytest.param('transport', 'TRANSPORT', 502, None, id='transport'),
+    ],
+)
+async def test_signed_url_generation_failure_is_typed_once_and_uncounted(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
+    expected_code: str,
+    expected_status: int,
+    service_status: int | None,
+) -> None:
+    """Signing service, IAM, and transport failures never retry or leak."""
+    secret = f'generation-private-s3a-{failure_kind}'
+    failures: dict[str, BaseException] = {
+        'forbidden': _google_service_failure(403, secret),
+        'unavailable': _google_service_failure(503, secret),
+        'auth-refresh': google_auth_exceptions.RefreshError(secret),
+        'auth-transport': google_auth_exceptions.TransportError(secret),
+        'dns': socket.gaierror(secret),
+        'tls': ssl.SSLError(secret),
+        'connect': ConnectionError(secret),
+        'timeout': TimeoutError(secret),
+        'transport': OSError(secret),
+    }
+    provider = _SignedUrlFailureProvider(
+        generation_outcome=failures[failure_kind])
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, breaker = await _public_signed_url_failure(
+        monkeypatch, provider)
+
+    assert result['ok'] is False
+    assert result['status_code'] == expected_status
+    assert result['error']['code'] == expected_code
+    assert result['protocol_details'] == (
+        _expected_signed_service_details(service_status)
+        if service_status is not None else {}
+    )
+    assert len(provider.generate_calls) == 1
+    assert provider.timeline.count('generate') == 1
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 0
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert secret not in surfaces
+    assert provider.signed_url not in surfaces
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
+async def test_signed_url_service_failure_wins_over_hostile_close(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A known signing refusal remains the body outcome after close fails."""
+    body_secret = 'signed-body-private-s3a'
+    close_secret = 'signed-close-private-s3a'
+    provider = _SignedUrlFailureProvider(
+        generation_outcome=_google_service_failure(403, body_secret),
+        close_error=RuntimeError(close_secret),
+    )
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, breaker = await _public_signed_url_failure(
+        monkeypatch, provider)
+
+    assert result['ok'] is False
+    assert result['status_code'] == 403
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == _expected_signed_service_details(403)
+    assert len(provider.generate_calls) == 1
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 0
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert body_secret not in surfaces
+    assert close_secret not in surfaces
+    assert provider.signed_url not in surfaces
+
+
+async def test_signed_url_programming_body_identity_wins_over_close_defect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first unknown body defect retains identity and exception state."""
+    cause = ValueError('signed-body-programming-cause-s3a')
+    body_error = RuntimeError('signed-body-programming-defect-s3a')
+    body_error.__cause__ = cause
+    body_error.__suppress_context__ = True
+    close_error = RuntimeError('signed-close-programming-defect-s3a')
+    provider = _SignedUrlFailureProvider(
+        generation_outcome=body_error,
+        close_error=close_error,
+    )
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    response = _response(
+        'gs://signed-url-failure-bucket/folder/object.bin')
+    strategy = GcsRequest(
+        'gs://signed-url-failure-bucket/folder/object.bin',
+        None,
+        response,
+        _validate({'command': 'signed_url', 'method': 'GET'}),
+        redact_params=frozenset(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await strategy.handle_request()
+
+    assert caught.value is body_error
+    assert caught.value.__cause__ is cause
+    assert caught.value.__suppress_context__ is True
+    assert response['protocol_details'] == {}
+    assert len(provider.generate_calls) == 1
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 0
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
+@pytest.mark.parametrize(
+    ('failure_kind', 'expected_code', 'expected_status'),
+    [
+        pytest.param('credential', 'CONFIG', 400, id='credential'),
+        pytest.param('service', 'GCS_STATUS', 503, id='google-service'),
+        pytest.param('transport', 'DNS', 502, id='transport'),
+    ],
+)
+async def test_signed_url_close_failure_discards_generated_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
+    expected_code: str,
+    expected_status: int,
+) -> None:
+    """Recognized cleanup failure is stable and cannot publish its URL."""
+    secret = f'cleanup-private-s3a-{failure_kind}'
+    failures: dict[str, BaseException] = {
+        'credential': google_auth_exceptions.DefaultCredentialsError(secret),
+        'service': _google_service_failure(503, secret),
+        'transport': socket.gaierror(secret),
+    }
+    provider = _SignedUrlFailureProvider(
+        close_error=failures[failure_kind])
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, breaker = await _public_signed_url_failure(
+        monkeypatch, provider)
+
+    assert result['ok'] is False
+    assert result['status_code'] == expected_status
+    assert result['error']['code'] == expected_code
+    assert result['protocol_details'] == {}
+    assert len(provider.generate_calls) == 1
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 0
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert provider.signed_url not in surfaces
+    assert secret not in surfaces
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
+async def test_signed_url_unknown_close_defect_preserves_identity_without_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown cleanup defects escape unchanged without publishing a URL."""
+    cause = ValueError('signed-cleanup-programming-cause-s3a')
+    cleanup_error = RuntimeError('signed-cleanup-programming-defect-s3a')
+    cleanup_error.__cause__ = cause
+    cleanup_error.__suppress_context__ = True
+    provider = _SignedUrlFailureProvider(close_error=cleanup_error)
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    response = _response(
+        'gs://signed-url-failure-bucket/folder/object.bin')
+    strategy = GcsRequest(
+        'gs://signed-url-failure-bucket/folder/object.bin',
+        None,
+        response,
+        _validate({'command': 'signed_url', 'method': 'GET'}),
+        redact_params=frozenset(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await strategy.handle_request()
+
+    assert caught.value is cleanup_error
+    assert caught.value.__cause__ is cause
+    assert caught.value.__suppress_context__ is True
+    assert response['protocol_details'] == {}
+    assert len(provider.generate_calls) == 1
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 0
+    failure_surfaces = repr(response) + ''.join(
+        traceback.format_exception(caught.value))
+    assert provider.signed_url not in failure_surfaces
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
 
 
 # --- AGW-49 foundation: normalized head and one-page list ----------------
