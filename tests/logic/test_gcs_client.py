@@ -8158,6 +8158,7 @@ async def test_signed_url_unknown_close_defect_scrubs_live_bearer_state(
     [
         pytest.param('direct', id='direct-signer'),
         pytest.param('impersonated', id='configured-impersonation'),
+        pytest.param('direct-compute', id='direct-compute-signer'),
     ],
 )
 async def test_public_signing_forbidden_never_exposes_signer_identity(
@@ -8171,10 +8172,26 @@ async def test_public_signing_forbidden_never_exposes_signer_identity(
         'method': 'GET',
         'timeout': 2.5,
     }
-    if signer_path == 'direct':
+    if signer_path in {'direct', 'direct-compute'}:
         provider: _SignedUrlProvider = _SignedUrlProvider()
-        principal = (
-            'direct-signer@example-project.iam.gserviceaccount.com')
+        if signer_path == 'direct':
+            principal = (
+                'direct-signer@example-project.iam.gserviceaccount.com')
+        else:
+            principal = (
+                '123456789012-compute@developer.gserviceaccount.com')
+
+            def compute_signer_email(credentials: object) -> str:
+                """Expose the canonical Compute Engine ADC signer email."""
+                assert credentials is provider.credentials
+                provider.record_thread('signer-identity')
+                return principal
+
+            monkeypatch.setattr(
+                _DirectSigningCredentials,
+                'signer_email',
+                property(compute_signer_email),
+            )
         selected_credentials = provider.credentials
         expected_project = 'signed-url-project'
         breaker = _install_signed_url_provider(monkeypatch, provider)
@@ -8257,6 +8274,8 @@ async def test_public_signing_forbidden_never_exposes_signer_identity(
     assert provider.details_during_generate == [{}]
     assert provider.details_during_close == [{}]
     assert provider.timeline.count('generate') == 1
+    if signer_path == 'direct-compute':
+        assert provider.timeline.count('signer-identity') == 1
     assert provider.timeline.index('generate') < provider.timeline.index(
         'client-close')
     assert provider.client.close_calls == 1

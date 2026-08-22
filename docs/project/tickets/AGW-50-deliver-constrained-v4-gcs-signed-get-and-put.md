@@ -180,3 +180,24 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   test SHA-256 remains
   `b447a5417e726c70d0864abf13f57980de133c5caf7886751ffc66ef312753a3`.
   AGW-50 remains IN PROGRESS pending independent review.
+- 2026-08-23 — Code-review Iteration 1 RED extension adds exactly one
+  canonical direct-ADC Compute Engine signer,
+  `123456789012-compute@developer.gserviceaccount.com`, through the existing
+  direct credential's signer-email property. The original direct-IAM and
+  configured-impersonation public rows still pass; the selected matrix now
+  collects 3 with exactly the Compute identity row failing, and the full GCS
+  file collects 525 with 524 passing and that one row failing solely because
+  the principal reaches gateway-owned `gcs_error_message` and returned-result
+  representation. Status, generation, close, breaker, empty pre-publication
+  details, caplog, and capacity assertions all remain green. Production stays
+  unchanged; AGW-50 remains IN PROGRESS for a suffix-independent GREEN.
+- 2026-08-23 — Code-review Iteration 1 GREEN separates provider-output
+  service-account detection from the narrower AC9.4 caller-input validator.
+  `_safe_provider_text()` now omits email-shaped principals under any
+  `*.gserviceaccount.com` domain while preserving ordinary email addresses and
+  unrelated safe provider prose. The immutable three-row selector passes 3/3
+  and the full GCS suite passes 525/525; no-blocking and entrypoint regressions,
+  scoped flake8, package mypy, and suppression checks pass. The RED test
+  SHA-256 remains
+  `f5e7f40f8bc89104004c4b448ae914942c5864be0a3d6db1288efe10abd7c1ad`.
+  AGW-50 remains IN PROGRESS pending independent review.

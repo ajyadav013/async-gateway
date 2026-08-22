@@ -105,6 +105,12 @@ _GCS_PROVIDER_SECRET_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
     r'(?:authorization|credential|password|secret|token|api[_-]?key)\s*[:=]',
     re.IGNORECASE,
 )
+_GCS_PROVIDER_SERVICE_ACCOUNT: Final[re.Pattern[str]] = re.compile(
+    r'(?<![a-z0-9._%+-])[a-z0-9._%+-]+@'
+    r'(?:[a-z0-9-]+\.)+gserviceaccount\.com'
+    r'(?![a-z0-9-]|\.[a-z0-9])',
+    re.IGNORECASE,
+)
 _GCS_TRANSPORT_FAILURES: Final[Tuple[type[BaseException], ...]] = (
     google_auth_exceptions.TransportError,
     socket.gaierror,
@@ -756,7 +762,7 @@ def _safe_provider_text(value: object) -> Optional[str]:
         return None
     if _GCS_PROVIDER_SECRET_ASSIGNMENT.search(value) is not None:
         return None
-    if _SIGNING_ACCOUNT_PATTERN.search(value) is not None:
+    if _GCS_PROVIDER_SERVICE_ACCOUNT.search(value) is not None:
         return None
     return redact_text(value)
 
