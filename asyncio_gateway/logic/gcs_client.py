@@ -1081,15 +1081,19 @@ class GcsRequest(BaseRequestClass):
         offset = 0
         while offset < pin['size']:
             end = min(offset + _GCS_DOWNLOAD_CHUNK_SIZE, pin['size']) - 1
-            chunk = await lease.run(
-                _download_blob_range,
-                blob,
-                start=offset,
-                end=end,
-                generation=pin['generation'],
-                sdk_timeout=self.timeout,
-                timeout=self.timeout,
-            )
+            try:
+                chunk = await lease.run(
+                    _download_blob_range,
+                    blob,
+                    start=offset,
+                    end=end,
+                    generation=pin['generation'],
+                    sdk_timeout=self.timeout,
+                    timeout=self.timeout,
+                )
+            except _GCS_TRANSPORT_FAILURES as error:
+                error.args = ('GCS provider transport failure',)
+                raise _transport_error_for(error) from None
             yield chunk
             offset = end + 1
 

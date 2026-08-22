@@ -2254,6 +2254,10 @@ class _DownloadClient:
         """Record one deterministic off-loop cleanup."""
         self.provider.record_thread('client-close')
         self.close_calls += 1
+        if self.provider.close_outcomes:
+            outcome = self.provider.close_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
 
 
 class _DownloadProvider:
@@ -2268,10 +2272,12 @@ class _DownloadProvider:
         self.range_calls: list[dict[str, object]] = []
         self.reload_outcomes: list[object] = []
         self.range_outcomes: list[object] = []
+        self.close_outcomes: list[object] = []
         self.range_handler: Any = None
         self.bucket_names: list[str] = []
         self.blob_keys: list[str] = []
         self.credentials = _UploadCredentials()
+        self.adc_error: BaseException | None = None
         self.blob = _DownloadBlob(self)
         self.bucket = _DownloadBucket(self)
         self.client = _DownloadClient(self)
@@ -2285,6 +2291,8 @@ class _DownloadProvider:
     def adc(self, *args: object, **kwargs: object) -> tuple[object, str]:
         """Return valid local ADC without contacting a metadata server."""
         self.record_thread('adc')
+        if self.adc_error is not None:
+            raise self.adc_error
         return self.credentials, 'download-project'
 
     def make_client(self, *args: object, **kwargs: object) -> _DownloadClient:
@@ -2299,6 +2307,10 @@ class _DownloadProvider:
     def script_ranges(self, *outcomes: object) -> None:
         """Queue deterministic raw-range outcomes in call order."""
         self.range_outcomes.extend(outcomes)
+
+    def script_close(self, *outcomes: object) -> None:
+        """Queue deterministic owned-client cleanup outcomes."""
+        self.close_outcomes.extend(outcomes)
 
 
 def _install_download_provider(
@@ -2867,6 +2879,321 @@ async def test_download_malformed_range_fails_closed_without_partial_publish(
     assert breaker.failures == 0
     assert 'hostile-download-range-secret-d2a' not in surfaces
     assert 'verified' not in surfaces.lower()
+
+
+# --- AGW-48 tranche D2b1: download errors and cleanup ownership ----------
+
+
+@pytest.mark.parametrize('credential_stage', ['adc', 'refresh'])
+async def test_download_credential_failure_is_config_before_counting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    credential_stage: str,
+) -> None:
+    """ADC discovery and refresh failures are safe local configuration."""
+    secret = f'download-{credential_stage}-credential-private-d2b1'
+    events: list[str] = []
+    provider = _DownloadProvider(b'provider-body')
+    if credential_stage == 'adc':
+        provider.adc_error = google_auth_exceptions.DefaultCredentialsError(
+            secret)
+    else:
+        provider.credentials.valid = False
+        provider.credentials.refresh_error = (
+            google_auth_exceptions.RefreshError(secret))
+    target = tmp_path / 'credential-target.bin'
+    target.write_bytes(b'existing-target')
+
+    result, breaker = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=32,
+        retries=2,
+        events=events,
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == 400
+    assert result['error']['code'] == 'CONFIG'
+    assert secret not in repr(result)
+    assert target.read_bytes() == b'existing-target'
+    assert provider.reload_calls == []
+    assert provider.range_calls == []
+    assert provider.client.close_calls == 0
+    assert events == ['abort']
+    assert breaker.failures == 0
+
+
+@pytest.mark.parametrize('stage', ['pin', 'range'])
+@pytest.mark.parametrize(
+    ('failure_type', 'expected_code', 'expected_status'),
+    [
+        pytest.param(socket.gaierror, 'DNS', 502, id='dns'),
+        pytest.param(ssl.SSLError, 'TLS', 502, id='tls'),
+        pytest.param(ConnectionError, 'CONNECT', 502, id='connect'),
+        pytest.param(TimeoutError, 'TIMEOUT', 504, id='timeout'),
+        pytest.param(OSError, 'TRANSPORT', 502, id='transport'),
+    ],
+)
+async def test_download_transport_failure_is_typed_and_breaker_owned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stage: str,
+    failure_type: type[BaseException],
+    expected_code: str,
+    expected_status: int,
+) -> None:
+    """Each transport class at pin and range has one stable public result."""
+    events: list[str] = []
+    provider = _DownloadProvider(b'x')
+    failure = failure_type(f'{expected_code.lower()}-private-d2b1')
+    if stage == 'pin':
+        provider.script_reload(failure)
+    else:
+        provider.script_ranges(failure)
+    target = tmp_path / 'transport-target.bin'
+    target.write_bytes(b'existing-target')
+
+    result, breaker = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+        retries=0,
+        events=events,
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == expected_status
+    assert result['error']['code'] == expected_code
+    assert 'private-d2b1' not in repr(result)
+    assert target.read_bytes() == b'existing-target'
+    assert len(provider.reload_calls) == 1
+    assert len(provider.range_calls) == (0 if stage == 'pin' else 1)
+    assert provider.client.close_calls == 1
+    assert events == ['failed', 'exhausted']
+    assert breaker.failures == 1
+
+
+@pytest.mark.parametrize('stage', ['pin', 'range'])
+@pytest.mark.parametrize(
+    ('status', 'retryable'),
+    [
+        (408, True), (429, True), (500, True), (502, True),
+        (503, True), (504, True), (400, False), (401, False),
+        (403, False), (404, False), (409, False), (412, False),
+    ],
+)
+async def test_download_service_status_has_exact_retry_and_cleanup_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stage: str,
+    status: int,
+    retryable: bool,
+) -> None:
+    """Pin and range service statuses share the frozen gateway policy."""
+    events: list[str] = []
+    provider = _DownloadProvider(b'x')
+    failures = [_FakeServiceError(status) for _ in range(
+        2 if retryable else 1)]
+    if stage == 'pin':
+        provider.script_reload(*failures)
+    else:
+        provider.script_ranges(*failures)
+    target = tmp_path / 'service-target.bin'
+    target.write_bytes(b'existing-target')
+
+    result, breaker = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+        retries=1,
+        events=events,
+    )
+
+    attempts = 2 if retryable else 1
+    assert result['ok'] is False
+    assert result['status_code'] == status
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {
+        'command': 'download',
+        'bucket': 'download-retry-bucket',
+        'target': 'folder/object.bin',
+        'gcs_error_code': 'conditionNotMet',
+        'gcs_error_message': 'safe service refusal',
+        'response_metadata': {
+            'http_status_code': status,
+            'request_id': 'request-7',
+        },
+    }
+    assert target.read_bytes() == b'existing-target'
+    assert len(provider.reload_calls) == (attempts if stage == 'pin' else 1)
+    assert len(provider.range_calls) == (0 if stage == 'pin' else attempts)
+    assert provider.client.close_calls == attempts
+    assert events == (
+        ['failed', 'failed', 'exhausted'] if retryable else ['abort'])
+    assert breaker.failures == (attempts if retryable else 0)
+
+
+async def test_download_hostile_pin_metadata_is_safe_gcs_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A hostile nominal metadata value cannot escape normalization."""
+    provider = _DownloadProvider(b'x')
+    provider.blob.generation = _HostileUploadMetadata(
+        'hostile-download-pin-private-d2b1')
+    target = tmp_path / 'metadata-target.bin'
+    target.write_bytes(b'existing-target')
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, _ = await _public_download(
+        monkeypatch, provider, target, max_response_bytes=1)
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert 'hostile-download-pin-private-d2b1' not in surfaces
+    assert target.read_bytes() == b'existing-target'
+    assert provider.range_calls == []
+    assert provider.client.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ('body_kind', 'expected_code'),
+    [
+        pytest.param('service', 'GCS_STATUS', id='service'),
+        pytest.param('transport', 'DNS', id='transport'),
+        pytest.param('metadata', 'GCS_STATUS', id='metadata'),
+    ],
+)
+async def test_download_body_failure_wins_over_hostile_client_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    body_kind: str,
+    expected_code: str,
+) -> None:
+    """A later cleanup defect cannot replace a known download failure."""
+    close_secret = f'download-close-{body_kind}-private-d2b1'
+    provider = _DownloadProvider(b'x')
+    if body_kind == 'service':
+        provider.script_ranges(_FakeServiceError(403))
+    elif body_kind == 'transport':
+        provider.script_ranges(socket.gaierror('range-private-d2b1'))
+    else:
+        provider.blob.size = -1
+    provider.script_close(RuntimeError(close_secret))
+    target = tmp_path / 'body-precedence.bin'
+    target.write_bytes(b'existing-target')
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, _ = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+        retries=0,
+        events=[],
+    )
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert result['error']['code'] == expected_code
+    assert close_secret not in surfaces
+    assert target.read_bytes() == b'existing-target'
+    assert provider.client.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ('cleanup_error', 'expected_code', 'expected_status'),
+    [
+        pytest.param(socket.gaierror('cleanup-dns-private-d2b1'),
+                     'DNS', 502, id='transport'),
+        pytest.param(google_auth_exceptions.DefaultCredentialsError(
+            'cleanup-credential-private-d2b1'), 'CONFIG', 400,
+                     id='credential'),
+        pytest.param(_FakeServiceError(503), 'GCS_STATUS', 503,
+                     id='service'),
+    ],
+)
+async def test_download_cleanup_only_failure_has_stable_public_type(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cleanup_error: BaseException,
+    expected_code: str,
+    expected_status: int,
+) -> None:
+    """Owned-client cleanup alone maps to the stable public vocabulary."""
+    events: list[str] = []
+    provider = _DownloadProvider(b'x')
+    provider.script_close(cleanup_error)
+    target = tmp_path / 'cleanup-only.bin'
+    target.write_bytes(b'existing-target')
+
+    result, _ = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+        retries=0,
+        events=events,
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == expected_status
+    assert result['error']['code'] == expected_code
+    assert result['protocol_details'] == {}
+    assert provider.client.close_calls == 1
+    assert events == (
+        ['failed', 'exhausted']
+        if expected_code == 'DNS'
+        else ['abort']
+    )
+
+
+async def test_download_failure_redacts_provider_credential_and_local_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Failure surfaces retain no provider, credential, or local-path prose."""
+    sentinels = {
+        'credential': 'download-credential-private-d2b1',
+        'provider': 'download-provider-private-d2b1',
+        'target': 'download-local-target-private-d2b1',
+        'bearer': 'download-bearer-private-d2b1',
+    }
+    events: list[str] = []
+    provider = _DownloadProvider(b'x')
+    provider.credentials.__repr__ = lambda: sentinels['credential']
+    hostile = ' authorization=Bearer '.join(sentinels.values())
+    provider.script_ranges(_FakeServiceError(
+        403,
+        code=hostile,
+        message=hostile,
+        request_id=hostile,
+    ))
+    target = tmp_path / sentinels['target']
+    target.write_bytes(b'existing-target')
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, _ = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+        retries=1,
+        events=events,
+    )
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog) + repr(events)
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert target.read_bytes() == b'existing-target'
+    assert all(secret not in surfaces for secret in sentinels.values())
 
 
 # --- GCS-04 tranche B: shutdown, telemetry, and outcome precedence -------

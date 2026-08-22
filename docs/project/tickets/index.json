@@ -803,7 +803,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-47"], "blocks": ["AGW-49"]},
       "commits": [],
-      "note": "Pinned raw-download D2a coverage: nine deterministic retry/pin-reuse/replacement/raw-gzip/malformed-range cases were added; all 275 focused tests pass, so no production edit is warranted. Independent validation reproduced 275/275 plus clean flake8, diff, JSON, and production-untouched scope. Status remains IN PROGRESS for D2b lifecycle/error hardening."
+      "note": "Pinned raw-download D2b1 GREEN: provider transport exceptions are translated at the GCS range boundary before the unchanged atomic path writer; all 319 focused and 276 entrypoint tests pass with scoped flake8/mypy clean. Status remains IN PROGRESS for remaining GCS-05 download lifecycle hardening."
     },
     {
       "id": "AGW-49",

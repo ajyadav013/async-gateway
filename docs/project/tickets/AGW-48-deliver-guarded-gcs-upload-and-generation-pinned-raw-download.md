@@ -34,6 +34,26 @@ beyond the cap (GCS-05).
 
 ## Work Log
 
+- 2026-08-22 — Pinned raw-download D2b1 GREEN translates transport
+  exceptions at the GCS range-provider boundary before the unchanged atomic
+  path writer can classify local filesystem failures. This preserves the
+  exact DNS/TLS/connect/timeout/transport vocabulary, breaker ownership, and
+  body-over-hostile-close precedence without broadening local `OSError`
+  handling. The fixed 319-test focused suite and 276 entrypoint tests pass;
+  scoped flake8 and mypy checks pass. Status remains IN PROGRESS for the
+  remaining GCS-05 download lifecycle hardening.
+- 2026-08-22 — Pinned raw-download D2b1 RED added 44 deterministic
+  public-path cases for ADC/refresh refusal, all five transport classes at
+  both pin and range, the complete service-status retry/abort matrix at both
+  stages, hostile pin metadata, body-over-close precedence, cleanup-only
+  typing, atomic target preservation, and secret-safe failure surfaces. The
+  exact 319-test focused suite produced 314 passes and five genuine failures:
+  DNS, TLS, connect, and generic transport exceptions raised by a range were
+  misclassified as `PATH`/400, and the same range-transport defect displaced
+  the expected `DNS` body outcome when a later hostile close also failed.
+  Timeout, service, credential, metadata, cleanup-only, redaction, pin-stage
+  transport, and all prior cases passed. Production remained untouched and
+  scoped flake8, diff, and JSON checks passed. Status remains IN PROGRESS.
 - 2026-08-22 — Pinned raw-download D2a added nine deterministic adversarial
   public-path cases for transient pin retry, immutable pin reuse with
   byte-zero replay after a later-range failure, latest-object replacement,
