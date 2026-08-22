@@ -9,19 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added the typed `SFTPAuth` model for password, explicit client-key, or mixed
-  SFTP authentication, including optional encrypted-key passphrases and an
-  explicit SSH-agent opt-in.
-- Added Documentation, Source, Issues, Changelog, and Security project links
-  to package metadata, plus the repository security policy.
+- First-class JSON-RPC 2.0, GraphQL, guarded S3, and raw unary-unary gRPC
+  selectors, all using the common response envelope, validation, redaction,
+  retry, circuit-breaker, cancellation, and bounded-response contracts.
+- Explicit FTP `tls_mode` support for verified implicit and explicit FTPS,
+  while preserving the legacy omitted-mode behavior.
+- Runnable loopback or deterministic-double examples for every new selector.
+- Typed `SFTPAuth` for password, explicit client-key, or mixed SFTP
+  authentication, with encrypted-key passphrases and explicit SSH-agent
+  opt-in.
+- Documentation, Source, Issues, Changelog, and Security project links in
+  package metadata, plus the repository security policy.
 
 ### Changed
 
 - Pre-processors may still enrich payload and metadata, but now raise
   `ProcessorError` if they change `url` or `protocol`; post-processors retain
   report-field editability.
-- Unknown ordinary `protocol_info` keys emit `DeprecationWarning` in 1.x and
-  will become errors in 2.0. Unknown security-sensitive keys fail immediately.
+- Unknown ordinary legacy `protocol_info` keys emit `DeprecationWarning` in
+  1.x and will become errors in 2.0. Unknown security-sensitive keys fail
+  immediately; the four new selector contracts reject every unknown key.
 
 ### Fixed
 
@@ -29,12 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   processors or network code instead of being silently ignored.
 - SFTP key-only authentication no longer passes through the FTP validator that
   required a password.
-- Package metadata now describes HTTP, HTTPS, SOAP, FTP, and SFTP rather than
-  claiming unsupported Redis/XML protocols.
+- Package metadata now names all supported protocols rather than claiming
+  unsupported Redis/XML protocols.
 
 ### Security
 
-- SFTP now passes `agent_path=None` unless `SFTPAuth.use_ssh_agent=True`, so
+- SFTP passes `agent_path=None` unless `SFTPAuth.use_ssh_agent=True`, so
   explicit client keys cannot implicitly activate `SSH_AUTH_SOCK`.
 
 ## [1.0.0] — 2026-08-19

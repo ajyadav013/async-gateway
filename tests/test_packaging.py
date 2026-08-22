@@ -31,10 +31,13 @@ import sys
 import tarfile
 import zipfile
 from importlib.metadata import metadata
+from importlib.metadata import requires as metadata_requires
 from importlib.metadata import version as metadata_version
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Final, Iterator, List, Tuple
+
+from packaging.requirements import Requirement
 
 import pytest
 
@@ -68,7 +71,7 @@ REPOSITORY_URL = f'https://github.com/{REPOSITORY_OWNER}/{REPOSITORY_NAME}'
 _DISTRIBUTION_METADATA = metadata('asyncio-gateway')
 EXAMPLES = REPO_ROOT / 'examples'
 
-#: The five scripts R35 requires, named rather than globbed. A glob would
+#: The nine scripts PE-80 requires, named rather than globbed. A glob would
 #: keep passing after one of them was deleted, which is the drift this
 #: list exists to catch.
 EXAMPLE_NAMES: Tuple[str, ...] = (
@@ -76,7 +79,17 @@ EXAMPLE_NAMES: Tuple[str, ...] = (
     'ftp_example.py',
     'sftp_example.py',
     'soap_example.py',
+    'jsonrpc_example.py',
+    'graphql_example.py',
+    's3_example.py',
+    'grpc_example.py',
     'error_handling_example.py',
+)
+NEW_PROTOCOL_EXAMPLE_NAMES: Tuple[str, ...] = (
+    'jsonrpc_example.py',
+    'graphql_example.py',
+    's3_example.py',
+    'grpc_example.py',
 )
 
 #: R35-AC5's "≤ ~40 lines", applied to the code rather than to the file:
@@ -700,7 +713,10 @@ def test_project_description_names_only_the_supported_protocols() -> None:
     assert matched is not None, 'pyproject declares no literal description'
     description = matched['description']
 
-    for protocol in ('HTTP', 'HTTPS', 'SOAP', 'FTP', 'SFTP'):
+    for protocol in (
+        'HTTP', 'HTTPS', 'SOAP', 'FTP', 'FTPS', 'SFTP', 'JSON-RPC',
+        'GraphQL', 'S3', 'gRPC',
+    ):
         assert protocol in description
     assert 'redis' not in description.lower()
     assert 'XML' not in description
@@ -1075,7 +1091,48 @@ async def running_server() -> Iterator[RecordingHTTPServer]:
 def test_every_required_example_exists(name: str) -> None:
     """R35-AC1: one runnable script per protocol, plus error handling."""
     assert (EXAMPLES / name).is_file(), (
-        f'examples/{name} is missing; R35-AC1 names all five scripts')
+        f'examples/{name} is missing; PE-80 names all nine scripts')
+
+
+def test_pe80_example_inventory_is_exact() -> None:
+    """The example directory has exactly one script for each public topic."""
+    found = tuple(path.name for path in sorted(EXAMPLES.glob('*.py')))
+    assert set(found) == set(EXAMPLE_NAMES)
+
+
+def test_pe80_new_examples_pass_the_suppression_policy() -> None:
+    """Every new example's lint/type suppression is fully accountable."""
+    checker = REPO_ROOT / '.github' / 'scripts' / 'check_suppressions.py'
+    checked = subprocess.run(  # nosec B603 - fixed repository checker/paths
+        [
+            sys.executable,
+            str(checker),
+            *(str(EXAMPLES / name) for name in NEW_PROTOCOL_EXAMPLE_NAMES),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+
+
+@pytest.mark.parametrize('name', NEW_PROTOCOL_EXAMPLE_NAMES)
+def test_pe80_new_example_call_docstrings_state_the_public_contract(
+    name: str,
+) -> None:
+    """New example calls document arguments, returns, and cancellation."""
+    tree = ast.parse((EXAMPLES / name).read_text(encoding='utf-8'))
+    call = next(
+        node for node in tree.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == 'call'
+    )
+    docstring = ast.get_docstring(call) or ''
+    if call.args.args:
+        assert '\nArgs:' in docstring
+    assert '\nReturns:' in docstring
+    assert '\nRaises:' in docstring
 
 
 @pytest.mark.parametrize('name', EXAMPLE_NAMES)
@@ -1181,6 +1238,73 @@ async def test_the_soap_example_runs_against_a_real_server(
     body = result['protocol_details']['soap_body']
     assert body is not None and body.tag == '{urn:rates}GetRateResponse'
     assert [request.method for request in running_server.requests] == ['POST']
+
+
+async def test_pe80_jsonrpc_example_runs_against_a_real_server(
+    running_server: RecordingHTTPServer,
+) -> None:
+    """The JSON-RPC example sends one POST and reads semantic details."""
+    running_server.respond(
+        '/rpc',
+        method='POST',
+        body=b'{"jsonrpc":"2.0","id":1,"result":4}',
+        headers={'Content-Type': 'application/json'},
+    )
+    example = _load_example('jsonrpc_example.py')
+
+    result: Dict[str, Any] = await example.call(
+        running_server.url_for('/rpc'))
+
+    assert result['ok'] is True
+    assert result['protocol_details'] == {'id': 1, 'result': 4}
+    assert [request.method for request in running_server.requests] == ['POST']
+
+
+async def test_pe80_graphql_example_runs_against_a_real_server(
+    running_server: RecordingHTTPServer,
+) -> None:
+    """The GraphQL example sends one POST and reads normalized data."""
+    running_server.respond(
+        '/graphql',
+        method='POST',
+        body=b'{"data":{"widget":{"id":"w-1"}}}',
+        headers={'Content-Type': 'application/graphql-response+json'},
+    )
+    example = _load_example('graphql_example.py')
+
+    result: Dict[str, Any] = await example.call(
+        running_server.url_for('/graphql'))
+
+    assert result['ok'] is True
+    assert result['protocol_details']['data'] == {
+        'widget': {'id': 'w-1'},
+    }
+    assert [request.method for request in running_server.requests] == ['POST']
+
+
+async def test_pe80_s3_example_uses_only_its_deterministic_sdk_double(
+) -> None:
+    """The S3 script runs without credentials, AWS config, or network I/O."""
+    example = _load_example('s3_example.py')
+
+    result: Dict[str, Any] = await example.call()
+
+    assert result['ok'] is True
+    assert result['protocol_details']['command'] == 'head'
+    assert result['protocol_details']['bucket'] == 'example-bucket'
+    assert result['protocol_details']['key'] == 'report.csv'
+
+
+async def test_pe80_grpc_example_runs_on_a_local_generic_server() -> None:
+    """The gRPC script starts, calls, and closes its own loopback server."""
+    example = _load_example('grpc_example.py')
+
+    result: Dict[str, Any] = await example.call()
+
+    assert result['ok'] is True
+    assert result['status_code'] == 200
+    assert result['protocol_details']['grpc_status'] == 'OK'
+    assert result['text'] == 'cG9uZw=='
 
 
 async def test_the_error_handling_example_reports_a_remote_failure(
@@ -1326,6 +1450,92 @@ def test_the_readme_states_where_the_examples_live() -> None:
             f'{name} exists in examples/ but the README does not name '
             f'it, so it is unreachable for a consumer reading only the '
             f'installed documentation')
+
+
+def test_pe80_grpcio_runtime_dependency_is_exact() -> None:
+    """Packaging pins the supported grpcio major without adding protobuf."""
+    project = PYPROJECT.read_text(encoding='utf-8')
+    dependencies = re.findall(
+        r'^[ \t]*[\'\"](?P<requirement>[^\'\"]+)[\'\"],?[ \t]*$',
+        project,
+        re.MULTILINE,
+    )
+    grpc_requirements = [
+        requirement for requirement in dependencies
+        if requirement.lower().startswith('grpcio')
+    ]
+    assert grpc_requirements == ['grpcio>=1.83.0,<2']
+    assert not [
+        requirement for requirement in dependencies
+        if requirement.lower().startswith('protobuf')
+    ]
+
+
+def test_pe80_installed_metadata_requires_exact_grpcio_runtime() -> None:
+    """The installed distribution exposes the gRPC runtime to resolvers."""
+    installed = [
+        Requirement(requirement)
+        for requirement in metadata_requires(DISTRIBUTION) or ()
+    ]
+    grpcio = [item for item in installed if item.name.lower() == 'grpcio']
+    assert len(grpcio) == 1
+    assert grpcio[0].marker is None
+    assert str(grpcio[0].specifier) == '<2,>=1.83.0'
+    assert not [
+        item for item in installed if item.name.lower() == 'protobuf'
+    ]
+
+
+def test_pe80_public_request_data_type_checks_new_selector_shapes(
+    tmp_path: Path,
+) -> None:
+    """Typed consumers can pass bytes, list params, and serializer input."""
+    probe = tmp_path / 'typed_protocol_consumer.py'
+    probe.write_text(
+        'from asyncio_gateway.asyncio_gateway import request\n\n'
+        'class Payload:\n'
+        '    pass\n\n'
+        'def serialize(value: object) -> bytes:\n'
+        "    return b'ping'\n\n"
+        'async def call() -> None:\n'
+        '    await request(\n'
+        "        url='grpc://127.0.0.1:50051',\n"
+        "        data=b'ping',\n"
+        "        protocol='GRPC',\n"
+        "        protocol_info={'method': '/demo.Echo/Ping'},\n"
+        '    )\n'
+        '    await request(\n'
+        "        url='http://127.0.0.1:8080/rpc',\n"
+        '        data=[1, 2],\n'
+        "        protocol='JSONRPC',\n"
+        "        protocol_info={'method': 'demo.sum', 'request_id': 1},\n"
+        '    )\n'
+        '    await request(\n'
+        "        url='grpc://127.0.0.1:50051',\n"
+        '        data=Payload(),\n'
+        "        protocol='GRPC',\n"
+        '        protocol_info={\n'
+        "            'method': '/demo.Echo/Ping',\n"
+        "            'request_serializer': serialize,\n"
+        '        },\n'
+        '    )\n',
+        encoding='utf-8',
+    )
+    checked = subprocess.run(  # nosec B603 - fixed mypy module/probe path
+        [
+            sys.executable,
+            '-m',
+            'mypy',
+            '--no-incremental',
+            '--cache-dir=/dev/null',
+            str(probe),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checked.returncode == 0, checked.stdout + checked.stderr
 
 
 def test_py_typed_ships_in_both_artifacts(tmp_path: Path) -> None:

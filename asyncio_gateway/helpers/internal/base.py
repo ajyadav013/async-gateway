@@ -71,18 +71,16 @@ SECURITY_SENSITIVE_OPTION_FRAGMENTS: Final[frozenset[str]] = frozenset({
 })
 
 
-def _is_security_sensitive_option(name: object) -> bool:
+def _is_security_sensitive_option(name: str) -> bool:
     """Return whether an unknown option is unsafe to ignore.
 
     Args:
-        name: One caller-supplied ``protocol_info`` key.
+        name: One string key, after the boundary rejects non-string keys.
 
     Returns:
-        True for non-string keys and names containing a security-control
-        fragment, matched case-insensitively with hyphens normalised.
+        True for names containing a security-control fragment, matched
+        case-insensitively with hyphens normalised.
     """
-    if not isinstance(name, str):
-        return True
     normalised = name.lower().replace('-', '_')
     return any(
         fragment in normalised
@@ -94,6 +92,7 @@ def validated_protocol_info(
     info: Optional[Mapping[str, Any]],
     *,
     required: Collection[str] = (),
+    allowed: Optional[Collection[str]] = None,
     accepted: Optional[Collection[str]] = None,
     protocol: str = 'selected',
 ) -> dict[str, Any]:
@@ -118,22 +117,23 @@ def validated_protocol_info(
         info: ``protocol_info`` exactly as the caller supplied it, or None.
         required: Key names this protocol cannot run without, from the
             protocol class's own :attr:`BaseRequestClass.REQUIRED_INFO_KEYS`.
-        accepted: Every key the chosen protocol recognises. None retains the
-            shape-only behavior for internal callers which do not select a
-            protocol.
-        protocol: Normalised protocol name used in diagnostics.
+        allowed: The exact accepted keys for a closed new-selector contract.
+            Any unknown key is rejected.
+        accepted: Every key a legacy selector recognises. Unknown ordinary
+            keys warn during the 1.x compatibility window, while unknown
+            security-like keys fail closed. Ignored when ``allowed`` is set.
+        protocol: Strategy name used only in safe diagnostics.
 
     Returns:
         A new dict of the caller's configuration, empty when they supplied
         nothing.
 
     Raises:
-        ConfigurationError: If ``info`` is neither None nor a mapping, if
-            any required key is absent, or if an unknown key controls a
-            security-sensitive behavior. These are the caller's own
-            configuration failing to form a valid call, so both are reported
-            as configuration rather than as an ``AttributeError`` or a
-            ``KeyError`` from somewhere further in.
+        ConfigurationError: If ``info`` is neither None nor a mapping, a key
+            is not a string, any required key is absent, a closed allowlist
+            excludes a key, or a legacy unknown key resembles a security
+            control. All are caller configuration failures rather than
+            ``AttributeError`` or ``KeyError`` failures deeper in dispatch.
     """
     if info is None:
         info = {}
@@ -141,19 +141,27 @@ def validated_protocol_info(
         raise ConfigurationError(
             f'protocol_info must be a mapping or None, got '
             f'{type(info).__name__}')
+    if any(not isinstance(key, str) for key in info):
+        raise ConfigurationError(
+            'protocol_info keys must be strings for this protocol')
     missing = sorted(set(required) - set(info))
     if missing:
         raise ConfigurationError(
             f'protocol_info is missing required key(s) {missing}')
-    if accepted is not None:
-        accepted_names = frozenset(accepted)
-        unknown = [name for name in info if name not in accepted_names]
+    if allowed is not None:
+        allowed_names = frozenset(allowed)
+        unknown = sorted(set(info) - allowed_names)
         if unknown:
-            displayed = ', '.join(sorted(repr(name) for name in unknown))
-            accepted_display = sorted(accepted_names)
+            raise ConfigurationError(
+                f'{protocol} protocol_info has unknown key(s) {unknown}; '
+                f'accepted keys are {sorted(allowed_names)}')
+    elif accepted is not None:
+        accepted_names = frozenset(accepted)
+        unknown = sorted(set(info) - accepted_names)
+        if unknown:
             message = (
                 f'{protocol} protocol_info contains unknown key(s) '
-                f'[{displayed}]; accepted keys are {accepted_display}')
+                f'{unknown}; accepted keys are {sorted(accepted_names)}')
             if any(_is_security_sensitive_option(name) for name in unknown):
                 raise ConfigurationError(
                     f'{message}. At least one unknown key resembles a '
@@ -368,8 +376,55 @@ class BaseRequestClass(abc.ABC):
     #: so a protocol whose every key has a default inherits it untouched.
     REQUIRED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset()
 
-    #: Every option the base strategy reads. Subclasses add their own keys.
+    #: Complete option inventory used by legacy selectors during the 1.x
+    #: compatibility window. Unknown ordinary keys warn; security-like keys
+    #: fail closed. Legacy subclasses union their strategy-specific keys.
     ACCEPTED_INFO_KEYS: ClassVar[frozenset[str]] = COMMON_PROTOCOL_INFO_KEYS
+
+    #: Exact keys a new selector accepts, or None for the legacy warning
+    #: policy. The new protocol contracts are closed and reject every typo.
+    ALLOWED_INFO_KEYS: ClassVar[Optional[frozenset[str]]] = None
+
+    @classmethod
+    def validate_protocol_info(
+        cls,
+        info: Optional[Mapping[str, Any]],
+        *,
+        protocol: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Validate and copy this strategy's public ``protocol_info``.
+
+        This is the single protocol-specific extension point at the public
+        boundary. The default applies the class-declared required inventory,
+        the strict allowlist for new selectors, or the 1.x accepted-key
+        warning policy for legacy selectors. A strategy with command-dependent
+        contracts may override it, delegate here first, and return a further
+        normalized copy. :func:`asyncio_gateway.request` invokes the hook once,
+        before either caller processor runs, and the constructor receives that
+        returned mapping unchanged.
+
+        Args:
+            info: Caller-supplied mapping or None.
+            protocol: Normalized public selector for diagnostics. Internal
+                callers may omit it and use the strategy class name.
+
+        Returns:
+            A fresh validated mapping for construction and dispatch.
+
+        Raises:
+            ConfigurationError: If the mapping violates this strategy's
+            required/allowed inventory or an override's narrower contract.
+        """
+        return validated_protocol_info(
+            info,
+            required=cls.REQUIRED_INFO_KEYS,
+            allowed=cls.ALLOWED_INFO_KEYS,
+            accepted=cls.ACCEPTED_INFO_KEYS,
+            protocol=(
+                protocol
+                or cls.__name__.removesuffix('Request').upper()
+            ),
+        )
 
     def __init__(
         self, url: str,

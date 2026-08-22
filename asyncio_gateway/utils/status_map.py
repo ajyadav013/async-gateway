@@ -54,6 +54,12 @@ STATUS_BY_CODE: Final[Mapping[str, int]] = MappingProxyType({
     # A protocol error always carries the real remote status, so these
     # defaults apply only when the remote side supplied none.
     'HTTP_STATUS': 502,
+    'JSONRPC_ERROR': 502,
+    'JSONRPC_PROTOCOL': 502,
+    'GRAPHQL_ERROR': 502,
+    'GRAPHQL_PROTOCOL': 502,
+    'S3_STATUS': 502,
+    'GRPC_STATUS': 502,
     'FTP_STATUS': 500,
     'SFTP_STATUS': 500,
     'SOAP_FAULT': 502,
@@ -64,6 +70,10 @@ STATUS_BY_CODE: Final[Mapping[str, int]] = MappingProxyType({
 # at `warning`; everything else logs at `error`.
 WARNING_CODES: Final[frozenset[str]] = frozenset({
     'HTTP_STATUS',
+    'JSONRPC_ERROR',
+    'GRAPHQL_ERROR',
+    'S3_STATUS',
+    'GRPC_STATUS',
     'FTP_STATUS',
     'SFTP_STATUS',
     'SOAP_FAULT',

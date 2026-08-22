@@ -37,8 +37,8 @@ from asyncio_gateway.helpers.internal.breaker_registry import (
     get_breaker, registry_size, reset)
 from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
     BACKOFF_NAMES, BreakerState, CircuitBreakerHelper,
-    DEFAULT_ABORTABLE_EXCEPTIONS, RETRIABLE_FAILURES, get_retry_policy,
-    validated_breaker_config)
+    DEFAULT_ABORTABLE_EXCEPTIONS, RETRIABLE_FAILURES,
+    _GrpcAbortableStatusFailure, get_retry_policy, validated_breaker_config)
 from asyncio_gateway.utils.constants import (BREAKER_REGISTRY_MAX,
                                              CIRCUIT_BREAKER_DELAY,
                                              CIRCUIT_BREAKER_JITTER,
@@ -247,6 +247,23 @@ async def test_behaviour_2_a_caller_named_abortable_also_aborts() -> None:
         await subject.run(call)
 
     assert subject.failures == 0
+
+
+async def test_grpc_status_marker_aborts_without_counting() -> None:
+    """The gRPC adapter's private permanent-status marker is uncounted."""
+    error = _GrpcAbortableStatusFailure({'grpc_status': 'NOT_FOUND'})
+    subject = breaker(
+        maximum_failures=1,
+        retry_config={'name': 'r', 'allowed_retries': 5, 'delay': 0.1},
+    )
+
+    with pytest.raises(_GrpcAbortableStatusFailure) as raised:
+        await subject.run(failing(error))
+
+    assert raised.value is error
+    assert error.status == {'grpc_status': 'NOT_FOUND'}
+    assert subject.failures == 0
+    assert subject.state is BreakerState.CLOSED
 
 
 async def test_behaviour_1_a_caller_named_retriable_list_excludes_others(

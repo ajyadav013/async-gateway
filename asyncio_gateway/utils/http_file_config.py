@@ -18,8 +18,15 @@ what the other refuses, which is the whole defect (M25) reopened under a
 different name.
 """
 
-from collections.abc import AsyncIterator, Collection, Mapping
-from typing import Any, Final, Optional
+import asyncio
+import inspect
+from collections.abc import (
+    AsyncIterable,
+    AsyncIterator,
+    Collection,
+    Mapping,
+)
+from typing import Any, Final, Optional, TypedDict
 
 import aioboto3
 
@@ -38,9 +45,17 @@ from .exceptions import (
     HttpStatusError,
     ResponseTooDeepError,
     ResponseTooLargeError,
+    SerializationError,
+    TransportError,
     UnsupportedVerbError,
 )
-from .paths import resolve_caller_path, safe_unlink, safe_writer
+from .paths import (
+    _await_shielded_operation,
+    resolve_caller_path,
+    safe_unlink,
+    safe_writer,
+    stream_to_path,
+)
 
 #: The HTTP methods this library will dispatch on, and the whole of what
 #: ``request_type`` may name. Every one is a method ``aiohttp.ClientSession``
@@ -329,6 +344,303 @@ async def iter_capped(
         yield chunk
 
 
+async def _close_s3_body(
+    body: Any,
+) -> None:
+    """Close an S3 streaming body, supporting sync and async doubles.
+
+    Args:
+        body: SDK streaming body carrying a ``close`` method.
+
+    Returns:
+        None after cleanup completes.
+    """
+    try:
+        close = getattr(body, 'close', None)
+    except Exception as exc:
+        raise SerializationError(
+            'S3 returned a malformed streaming body') from exc
+    if not callable(close):
+        raise SerializationError(
+            'S3 returned a streaming body without a close operation')
+    try:
+        result = close()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise TransportError(
+            'S3 response body cleanup failed') from exc
+    if not inspect.isawaitable(result):
+        return
+    closing = asyncio.ensure_future(result)
+    try:
+        await _await_shielded_operation(closing)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise TransportError(
+            'S3 response body cleanup failed') from exc
+
+
+class _S3BodyCloser:
+    """Idempotently own one provider body until cleanup has completed."""
+
+    def __init__(self, body: Any) -> None:
+        """Store the body whose close operation this instance owns.
+
+        Args:
+            body: Provider streaming body to close exactly once.
+        """
+        self.body = body
+        self.closed = False
+
+    async def close(self) -> None:
+        """Close the body exactly once, including on failure/cancellation."""
+        if self.closed:
+            return
+        self.closed = True
+        await _close_s3_body(self.body)
+
+
+def _positive_transfer_value(value: object, *, setting: str) -> int:
+    """Validate one positive byte/chunk option.
+
+    Args:
+        value: Proposed value.
+        setting: Public setting name for the refusal.
+
+    Returns:
+        The positive integer.
+
+    Raises:
+        ConfigurationError: If the value is not a positive non-bool int.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigurationError(
+            f'{setting} must be a positive int, got {value!r}')
+    return value
+
+
+class S3DownloadResult(TypedDict):
+    """One streamed S3 download result for the first-class strategy.
+
+    Attributes:
+        response: The SDK response mapping, retained for safe metadata
+            normalization by the strategy.
+        bytes_written: Observed body bytes committed locally.
+    """
+
+    response: Mapping[str, Any]
+    bytes_written: int
+
+
+def _s3_response_body(
+    response: Any,
+) -> tuple[Mapping[str, Any], Any]:
+    """Extract one body while retaining the validated response mapping.
+
+    Args:
+        response: SDK value returned by ``get_object``.
+
+    Returns:
+        The response mapping and its streaming body.
+
+    Raises:
+        SerializationError: If the mapping has no safely retrievable body.
+    """
+    if not isinstance(response, Mapping):
+        raise SerializationError(
+            'S3 get_object returned a malformed response mapping')
+    try:
+        body = response['Body']
+    except Exception as exc:
+        raise SerializationError(
+            'S3 get_object returned a malformed response mapping') from exc
+    return response, body
+
+
+def _s3_response_parts(
+    response: Mapping[str, Any],
+    body: Any,
+) -> Optional[int]:
+    """Validate body operations and return an optional declared length.
+
+    Args:
+        response: Validated SDK response mapping.
+        body: Its already-extracted body, which the caller now owns and closes.
+
+    Returns:
+        The non-negative declared length, or None when absent.
+
+    Raises:
+        SerializationError: If body operations or length are malformed.
+    """
+    try:
+        advertised = response.get('ContentLength')
+    except Exception as exc:
+        raise SerializationError(
+            'S3 get_object returned a malformed response mapping') from exc
+    try:
+        close = getattr(body, 'close', None)
+        iterator = getattr(body, 'iter_chunks', None)
+    except Exception as exc:
+        raise SerializationError(
+            'S3 returned a malformed streaming body') from exc
+    if not callable(close):
+        raise SerializationError(
+            'S3 returned a streaming body without a close operation')
+    if not callable(iterator):
+        raise SerializationError(
+            'S3 returned a streaming body without an async chunk iterator')
+    if advertised is not None and (
+        isinstance(advertised, bool)
+        or not isinstance(advertised, int)
+        or advertised < 0
+    ):
+        raise SerializationError(
+            'S3 get_object returned an invalid ContentLength')
+    return advertised
+
+
+async def _s3_body_chunks(
+    body: Any,
+    closer: _S3BodyCloser,
+    *,
+    chunk_size: int,
+) -> AsyncIterator[Any]:
+    """Yield SDK chunks and close their body before finalization returns.
+
+    Args:
+        body: Validated S3 streaming body.
+        closer: Idempotent owner used by this iterable and the outer fallback.
+        chunk_size: Positive read size.
+
+    Yields:
+        Each provider chunk. The path primitive validates bytes-like values.
+
+    Raises:
+        SerializationError: If the iterator itself is malformed.
+        TransportError: If a provider iterator fails while streaming.
+        asyncio.CancelledError: Unchanged.
+    """
+    failure: Optional[BaseException] = None
+    try:
+        try:
+            chunks = body.iter_chunks(chunk_size=chunk_size)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise SerializationError(
+                'S3 response body could not create its chunk iterator') \
+                from exc
+        if not isinstance(chunks, AsyncIterable):
+            raise SerializationError(
+                'S3 response body returned a non-async chunk iterator')
+        try:
+            async for chunk in chunks:
+                yield chunk
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise TransportError(
+                'S3 response body streaming failed') from exc
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            await closer.close()
+        except BaseException:
+            if failure is None:
+                raise
+
+
+async def stream_s3_download(
+    client: Any,
+    *,
+    bucket_name: str,
+    s3_filepath: str,
+    local_filepath: str,
+    overwrite: bool,
+    max_response_bytes: Optional[int],
+    chunk_size: int = CHUNK_SIZE_CONSTANT,
+) -> S3DownloadResult:
+    """Get and stream one S3 object through the shared path primitive.
+
+    This seam owns both SDK actions that must never drift apart: obtaining the
+    streaming body and closing it on every success/failure/cancellation path.
+    Filesystem policy and atomicity remain in :func:`stream_to_path`.
+
+    Args:
+        client: Open aioboto3 S3 client.
+        bucket_name: Bucket holding the object.
+        s3_filepath: Object key.
+        local_filepath: Final caller-named destination.
+        overwrite: False for strategy exclusive creation, True for the
+            compatibility helper's atomic replacement.
+        max_response_bytes: Positive observed-byte cap, or None only for the
+            legacy helper's uncapped compatibility mode.
+        chunk_size: Positive bytes requested from the body per iteration.
+
+    Returns:
+        The SDK response and observed committed byte count.
+
+    Raises:
+        BaseException: SDK, stream, path, cap, or cancellation failures after
+            body/temp cleanup.
+    """
+    read_size = _positive_transfer_value(chunk_size, setting='chunk_size')
+    if not isinstance(overwrite, bool):
+        raise ConfigurationError(
+            f'overwrite must be a bool, got {type(overwrite).__name__}')
+    limit = (
+        None
+        if max_response_bytes is None
+        else _positive_transfer_value(
+            max_response_bytes, setting='max_response_bytes')
+    )
+    target = await resolve_caller_path(local_filepath)
+    raw_response = await client.get_object(
+        Bucket=bucket_name,
+        Key=s3_filepath,
+    )
+    response, body = _s3_response_body(raw_response)
+    closer = _S3BodyCloser(body)
+    failed: Optional[BaseException] = None
+    try:
+        advertised = _s3_response_parts(response, body)
+        written = await stream_to_path(
+            target,
+            _s3_body_chunks(body, closer, chunk_size=read_size),
+            overwrite=overwrite,
+            max_bytes=limit,
+            advertised_bytes=advertised,
+        )
+        return S3DownloadResult(
+            response=response,
+            bytes_written=written,
+        )
+    except BaseException as exc:
+        failed = exc
+        raise
+    finally:
+        try:
+            await closer.close()
+        except BaseException:
+            if failed is not None:
+                raise failed
+            raise
+
+
+def _sanitize_credential_error(error: BaseException) -> None:
+    """Remove provider-controlled credential details from a caught error."""
+    error.args = ()
+    setattr(error, 'kwargs', {})
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+
+
 async def download_file_from_s3(
     *,
     bucket_name: str,
@@ -337,6 +649,8 @@ async def download_file_from_s3(
     access_key: Optional[str] = None,
     secret_key: Optional[str] = None,
     region: Optional[str] = None,
+    overwrite: bool = True,
+    max_response_bytes: Optional[int] = None,
     **kwargs: Any,
 ) -> None:
     """Download an object from AWS S3 to a local path.
@@ -367,6 +681,10 @@ async def download_file_from_s3(
             instance metadata).
         secret_key: AWS secret access key, paired with ``access_key``.
         region: AWS region name, or None to take it from the same chain.
+        overwrite: Whether to atomically replace an existing target. True
+            preserves the historical helper behavior.
+        max_response_bytes: Optional positive cap. None preserves the
+            historical uncapped helper behavior.
         **kwargs: Ignored. Accepted because the README documents this
             function as a ``pre_processor_config`` callable, which is
             invoked with the caller's whole parameter mapping.
@@ -388,15 +706,18 @@ async def download_file_from_s3(
     )
     try:
         async with session.client('s3') as s3_client:
-            await s3_client.download_file(
-                Bucket=bucket_name,
-                Key=s3_filepath,
-                Filename=local_filepath,
+            await stream_s3_download(
+                s3_client,
+                bucket_name=bucket_name,
+                s3_filepath=s3_filepath,
+                local_filepath=local_filepath,
+                overwrite=overwrite,
+                max_response_bytes=max_response_bytes,
             )
     except (NoCredentialsError, PartialCredentialsError) as exc:
+        _sanitize_credential_error(exc)
         raise ConfigurationError(
-            f'S3 credentials could not be resolved for bucket '
-            f'{bucket_name!r}: {exc}') from exc
+            'S3 credentials could not be resolved') from None
 
 
 async def download_file_from_url(

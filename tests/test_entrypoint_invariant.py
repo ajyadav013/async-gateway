@@ -106,11 +106,14 @@ from typing import Any, Final
 import pytest
 
 from asyncio_gateway.asyncio_gateway import request
+from asyncio_gateway.logic import protocol_mapping
 from asyncio_gateway.utils.exceptions import AsyncGatewayError
 
 from tests.fixtures.http_server import RecordingHTTPServer
 from tests.fixtures.protocol_transports import (
     CONTRACT_CALL,
+    GRAPHQL_BODY,
+    JSONRPC_BODY,
     SOAP_BODY,
     contract_call,
     install_transport,
@@ -126,7 +129,8 @@ PROTOCOLS: Final[tuple[str, ...]] = tuple(CONTRACT_CALL)
 #: reason the module docstring gives: their refusal lives inside
 #: ``aiohttp``'s header serialiser, which a doubled transport never
 #: reaches.
-LIVE_PROTOCOLS: Final[tuple[str, ...]] = ('HTTP', 'SOAP')
+LIVE_PROTOCOLS: Final[tuple[str, ...]] = (
+    'HTTP', 'SOAP', 'JSONRPC', 'GRAPHQL')
 
 #: The path the loopback server answers on for every live row.
 LIVE_PATH: Final[str] = '/invariant'
@@ -298,7 +302,7 @@ HOSTILE_PROTOCOL_INFO: Final[tuple[Any, ...]] = (
     # **unhashable** port is the shape that actually crashed:
     # `_BREAKERS.get(key)` raised `TypeError: cannot use 'tuple' as a
     # dict key (unhashable type: 'list')` out of `request()`
-    # un-enveloped, on all five protocols.
+    # un-enveloped, on every then-registered protocol.
     #
     # All three unhashable builtins, because it is the container-ness
     # and not the list-ness that does it, and a guard written against
@@ -589,7 +593,7 @@ HOSTILE_PAIRS: Final[tuple[tuple[str, Any, str, Any], ...]] = tuple(
             ('auth', None),
             ('headers', {'X-Injected': 'value\r\nX-Smuggled: 1'}),
             ('cookies', {'session': 'value\x00null'}),
-            ('request_type', 'close'),
+            ('operation', 'close'),
             ('protocol_info', 'a bare string'),
         )
     ] + [
@@ -621,7 +625,7 @@ HOSTILE_PAIRS: Final[tuple[tuple[str, Any, str, Any], ...]] = tuple(
         for second, value in (
             ('url', None),
             ('data', object()),
-            ('request_type', 'close'),
+            ('operation', 'close'),
             ('headers', {'X-Injected': 'value\r\nX-Smuggled: 1'}),
         )
     ] + [
@@ -671,7 +675,7 @@ COVERING_FAMILY: Final[dict[str, str]] = {
 #: then name both levels, and the pair test merges each row at the right
 #: depth without a per-row branch.
 _INFO_KEYS: Final[frozenset[str]] = frozenset(
-    {'headers', 'cookies', 'request_type', 'command', 'mode'})
+    {'headers', 'cookies', 'operation'})
 
 
 def _prepare(
@@ -706,8 +710,13 @@ def _prepare(
     """
     call = contract_call(protocol)
     if protocol in LIVE_PROTOCOLS:
-        body = SOAP_BODY if protocol == 'SOAP' else b'{"value": 1}'
-        media = 'text/xml' if protocol == 'SOAP' else 'application/json'
+        body, media = {
+            'HTTP': (b'{"value": 1}', 'application/json'),
+            'SOAP': (SOAP_BODY, 'text/xml'),
+            'JSONRPC': (JSONRPC_BODY, 'application/json'),
+            'GRAPHQL': (
+                GRAPHQL_BODY, 'application/graphql-response+json'),
+        }[protocol]
         http_server.respond(
             LIVE_PATH, body=body, headers={'Content-Type': media})
         call['url'] = http_server.url_for(LIVE_PATH)
@@ -827,8 +836,9 @@ async def test_no_verb_escapes_the_entry_point(
         None.
     """
     call = _prepare(monkeypatch, protocol, http_server)
-    call['protocol_info'].update(
-        request_type=verb, command=verb, mode=verb)
+    operation_key = CONTRACT_CALL[protocol]['operation_key']
+    if operation_key is not None:
+        call['protocol_info'][operation_key] = verb
     await _assert_only_typed_escapes(**call)
 
 
@@ -1043,7 +1053,11 @@ async def test_no_pair_of_parameters_escapes_the_entry_point(
     """
     call = _prepare(monkeypatch, protocol, http_server)
     for name, value in ((first, first_value), (second, second_value)):
-        if name in _INFO_KEYS:
+        if name == 'operation':
+            operation_key = CONTRACT_CALL[protocol]['operation_key']
+            if operation_key is not None:
+                call['protocol_info'][operation_key] = value
+        elif name in _INFO_KEYS:
             call['protocol_info'][name] = value
         else:
             call[name] = value
@@ -1095,6 +1109,11 @@ def test_every_public_parameter_of_request_is_covered() -> None:
         f'COVERING_FAMILY names {missing}, which this module does not '
         f'define. The binding has to point at a family that exists or it '
         f'proves nothing.')
+
+
+def test_contract_selector_inventory_matches_the_production_registry() -> None:
+    """The hostile matrix cannot silently omit a registered selector."""
+    assert set(PROTOCOLS) == set(protocol_mapping)
 
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)

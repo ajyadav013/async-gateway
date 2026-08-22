@@ -20,7 +20,11 @@ from typing import Final
 
 from asyncio_gateway.helpers.internal.base import BaseRequestClass
 from asyncio_gateway.logic.ftp_client import FTPRequest
+from asyncio_gateway.logic.graphql_client import GraphqlRequest
+from asyncio_gateway.logic.grpc_client import GrpcRequest
 from asyncio_gateway.logic.http_client import HttpRequest
+from asyncio_gateway.logic.jsonrpc_client import JsonRpcRequest
+from asyncio_gateway.logic.s3_client import S3Request
 from asyncio_gateway.logic.sftp_client import SFTPRequest
 from asyncio_gateway.logic.soap_client import SoapRequest
 
@@ -30,4 +34,8 @@ protocol_mapping: Final[dict[str, type[BaseRequestClass]]] = {
     'FTP': FTPRequest,
     'SFTP': SFTPRequest,
     'SOAP': SoapRequest,
+    'JSONRPC': JsonRpcRequest,
+    'GRAPHQL': GraphqlRequest,
+    'S3': S3Request,
+    'GRPC': GrpcRequest,
 }

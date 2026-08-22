@@ -73,6 +73,42 @@ Sleep = Callable[[float], Awaitable[None]]
 #: What a retried call looks like to :meth:`CircuitBreakerHelper.run`.
 Call = Callable[..., Awaitable[Any]]
 
+
+class AbortableServiceError(AsyncGatewayError):
+    """Internal marker for a remote response that retries cannot heal.
+
+    Protocol adapters use a private subclass while a response crosses the
+    breaker seam, then convert it to their public protocol error afterward.
+    Keeping the marker here avoids importing a protocol module into this
+    shared helper (and the circular import that would create) while making
+    the uncounted classification explicit and independent of message text.
+
+    This type must never reach a public response directly. Its inherited
+    wire code is therefore intentionally irrelevant; the owning adapter is
+    responsible for the stable public conversion.
+    """
+
+
+class _GrpcAbortableStatusFailure(AsyncGatewayError):
+    """Private gRPC status snapshot that must not retry or count.
+
+    The shared breaker owns exception classification, while the gRPC adapter
+    owns normalization and public conversion.  Retaining the already-safe
+    snapshot here keeps that boundary explicit without importing the protocol
+    implementation into this helper.
+    """
+
+    def __init__(self, status: object) -> None:
+        """Store one normalized status snapshot for the adapter.
+
+        Args:
+            status: Private, normalized status data.  It is never stringified
+                or exposed by this marker.
+        """
+        super().__init__('abortable gRPC status')
+        self.status = status
+
+
 #: The failures a retry is *for*: a transport that did not answer, or
 #: answered with something the next attempt might not see.
 #:
@@ -131,6 +167,8 @@ RETRIABLE_FAILURES: Final[tuple[type[BaseException], ...]] = (
 #: ``CIRCUIT_OPEN``. Neither is evidence about the remote side, which is
 #: the whole of what a breaker exists to measure.
 DEFAULT_ABORTABLE_EXCEPTIONS: Final[tuple[type[BaseException], ...]] = (
+    AbortableServiceError,
+    _GrpcAbortableStatusFailure,
     ConfigurationError,
     ResponseTooLargeError,
     LocalWriteError,

@@ -34,6 +34,11 @@ What is banned inside an ``async def``:
   this machine) and the ``load_*`` calls read the files they are handed.
   ``aiofiles.os.remove`` resolves to a dotted name
   beginning ``aiofiles.``, so the async form passes;
+* ``aioftp.Client.context(upgrade_to_tls=True)``. That third-party
+  convenience path hides a synchronous ``ssl.create_default_context()``
+  call after ``AUTH TLS``. Explicit FTPS instead builds the verified context
+  through ``FTPRequest._tls_value`` off-loop, then its private session context
+  passes that exact object to ``client.upgrade_to_tls(context)`` before login;
 * a filesystem method called on a freshly constructed ``Path(...)`` --
   ``Path(p).read_bytes()`` and friends, in any spelling of the
   constructor: the match is on its *trailing* name, so ``Path(p)``,
@@ -90,7 +95,9 @@ correct by anything in this module:
 * ``filters_helper.build_client_ssl_context`` -- ``get_ssl_config``
   reaches it through ``asyncio.to_thread``.
 * ``logic/ftp_client.tls_context_for`` -- ``_tls_value`` reaches it
-  through ``asyncio.to_thread``. Until ticket **AGW-37** it did not:
+  through ``asyncio.to_thread`` for implicit **and explicit** FTPS. Explicit
+  mode injects that result into its private lifecycle context rather than
+  asking aioftp to manufacture another one. Until ticket **AGW-37** it did not:
   the function was awaited straight from that coroutine, so the
   CA-bundle read the ``ssl.`` entry above describes landed on the loop
   while this scan reported the package clean.
@@ -263,6 +270,25 @@ def _banned_call_name(node: ast.Call) -> str:
         return ''
 
     dotted = _dotted_name(node.func)
+    if dotted == 'aioftp.Client.context':
+        unsafe_upgrade = any(
+            isinstance(argument, ast.Starred) for argument in node.args)
+        if len(node.args) >= 6:
+            upgrade = node.args[5]
+            unsafe_upgrade = unsafe_upgrade or not (
+                isinstance(upgrade, ast.Constant)
+                and upgrade.value is False
+            )
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                unsafe_upgrade = True
+            elif keyword.arg == 'upgrade_to_tls':
+                unsafe_upgrade = unsafe_upgrade or not (
+                    isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is False
+                )
+        if unsafe_upgrade:
+            return 'aioftp.Client.context(unsafe upgrade_to_tls)'
     if dotted.startswith(BLOCKING_MODULE_PREFIXES):
         return '' if dotted in PURE_PATH_HELPERS else dotted
 
@@ -535,6 +561,84 @@ def test_the_scan_permits_the_async_and_pure_equivalents() -> None:
         '        await fh.write(b"")\n'
         '    await aiofiles.os.remove(p)\n'
         '    return PurePath(p).name, os.path.basename(p)\n'
+    )
+
+    assert blocking_calls_in_async_defs(source, 'synthetic.py') == []
+
+
+@pytest.mark.parametrize(
+    'call',
+    [
+        pytest.param(
+            'aioftp.Client.context("host", upgrade_to_tls=True)',
+            id='keyword-true',
+        ),
+        pytest.param(
+            'aioftp.Client.context("host", upgrade_to_tls=setting)',
+            id='keyword-dynamic',
+        ),
+        pytest.param(
+            'aioftp.Client.context("host", 21, "u", "p", "", True)',
+            id='sixth-positional-true',
+        ),
+        pytest.param(
+            'aioftp.Client.context("host", 21, "u", "p", "", setting)',
+            id='sixth-positional-dynamic',
+        ),
+        pytest.param(
+            'aioftp.Client.context("host", **options)',
+            id='expanded-keywords',
+        ),
+        pytest.param(
+            'aioftp.Client.context(*options)',
+            id='expanded-positionals',
+        ),
+    ],
+)
+def test_the_scan_rejects_aioftp_explicit_tls_context_construction(
+    call: str,
+) -> None:
+    """The third-party helper's hidden synchronous CA read is banned.
+
+    ``aioftp.Client.context(upgrade_to_tls=True)`` eventually calls
+    ``ssl.create_default_context()`` without leaving the event-loop thread.
+    Naming the outer call here prevents that hidden read from returning even
+    though the generic AST scan cannot follow third-party call graphs.
+    """
+    source = (
+        'async def request():\n'
+        f'    async with {call}:\n'
+        '        pass\n'
+    )
+
+    assert blocking_calls_in_async_defs(source, 'synthetic.py') == [
+        'synthetic.py:2: aioftp.Client.context(unsafe upgrade_to_tls) '
+        '(in request)',
+    ]
+
+
+@pytest.mark.parametrize(
+    'call',
+    [
+        pytest.param('aioftp.Client.context("host")', id='default-false'),
+        pytest.param(
+            'aioftp.Client.context("host", upgrade_to_tls=False)',
+            id='keyword-false',
+        ),
+        pytest.param(
+            'aioftp.Client.context("host", 21, "u", "p", "", False)',
+            id='sixth-positional-false',
+        ),
+    ],
+)
+def test_the_scan_allows_aioftp_context_with_explicit_upgrade_disabled(
+    call: str,
+) -> None:
+    """Literal false and the false default keep the implicit seam usable."""
+    source = (
+        'async def request():\n'
+        f'    async with {call}:\n'
+        '        pass\n'
     )
 
     assert blocking_calls_in_async_defs(source, 'synthetic.py') == []

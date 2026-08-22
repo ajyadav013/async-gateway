@@ -11,13 +11,12 @@ failed network call.
 import logging
 import traceback
 from collections.abc import Callable, Collection, Mapping
-from typing import Any, Dict, Final, Optional, Tuple, Union
+from typing import Any, Dict, Final, Optional, Tuple
 from urllib.parse import urlsplit
 
 from asyncio_gateway.helpers.internal.base import (
     BaseRequestClass,
     validated_port,
-    validated_protocol_info,
 )
 from asyncio_gateway.logic import protocol_mapping
 from asyncio_gateway.utils.envelope import (
@@ -51,6 +50,18 @@ logger = logging.getLogger(__name__)
 HTTP_FAMILY_SCHEMES: Final[dict[str, frozenset[str]]] = {
     'HTTP': frozenset({'http', 'https'}),
     'HTTPS': frozenset({'https'}),
+}
+
+# Closed scheme allowlists for every selector whose target is a URL. The
+# original public constant above is retained because callers and contract
+# tests import it; these additive rows extend dispatch without relabelling the
+# HTTP family.
+PROTOCOL_SCHEME_ALLOWLISTS: Final[dict[str, frozenset[str]]] = {
+    **HTTP_FAMILY_SCHEMES,
+    'JSONRPC': frozenset({'http', 'https'}),
+    'GRAPHQL': frozenset({'http', 'https'}),
+    'S3': frozenset({'s3'}),
+    'GRPC': frozenset({'grpc', 'grpcs'}),
 }
 
 # Every protocol whose `url` is dispatched as a URL, rather than read as
@@ -507,18 +518,18 @@ def dispatch_url_for(
 
     Returns:
         The URL to dispatch, upgraded to ``https://`` where that was the
-        only reading. Protocols outside the HTTP family get theirs back
-        unchanged.
+        only legacy HTTP-family reading. Protocols outside the URL-backed
+        selector table get theirs back unchanged.
 
     Raises:
         ConfigurationError: If the URL's scheme is one this protocol will
-            not dispatch on, if it is a protocol-relative reference
-            carrying an authority but no scheme, or if the URL cannot be
-            parsed at all. The URL's *type* is checked earlier, in
-            ``request()``, because the envelope is built from it before
-            this function is reached.
+            not dispatch on, if a new selector's explicit scheme is absent,
+            if it is a protocol-relative reference carrying an authority but
+            no scheme, or if the URL cannot be parsed at all. The URL's
+            *type* is checked earlier, in ``request()``, because the envelope
+            is built from it before this function is reached.
     """
-    allowed = HTTP_FAMILY_SCHEMES.get(protocol)
+    allowed = PROTOCOL_SCHEME_ALLOWLISTS.get(protocol)
     if allowed is None and protocol not in URL_DISPATCHED_PROTOCOLS:
         return url
 
@@ -545,6 +556,11 @@ def dispatch_url_for(
         return url
 
     if not scheme:
+        if protocol not in HTTP_FAMILY_SCHEMES:
+            raise ConfigurationError(
+                f'protocol {protocol!r} requires an explicit scheme from '
+                f'{sorted(allowed)}: '
+                f'{redact_url(url, extra_params=redact_params)}')
         return f'https://{url}' if protocol == 'HTTPS' else url
     if scheme not in allowed:
         raise ConfigurationError(
@@ -622,7 +638,7 @@ def log_failure(
 
 async def request(
         url: str,
-        data: Optional[Union[Dict, str]] = None,
+        data: object = None,
         auth: object = None,
         protocol: str = '',
         protocol_info: Optional[Dict[str, Any]] = None,
@@ -634,19 +650,26 @@ async def request(
 
      calls with pre-processor, post processor and retry support.
     :param url: URL to call
-    :param data: Data to be sent in calls
+    :param data: Selector-owned request data. JSONRPC accepts a mapping, list,
+        or None for optional params; GRAPHQL accepts a mapping or None for
+        optional variables; GRPC accepts bytes-like data without a serializer
+        and arbitrary input when ``request_serializer`` is supplied; SOAP
+        accepts XML text or an Element. S3 does not use this argument. Legacy
+        selectors retain their existing payload behavior.
     :param protocol: one of the names registered in
         ``asyncio_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP,
-        SFTP. Matched with surrounding whitespace stripped and without
-        regard to case, so 'http', ' HTTP ' and 'Http' are the same
-        protocol. HTTPS additionally requires that the call go out over
-        TLS; see :raises: below
-    :param auth: aiohttp.BasicAuth(username, password), or any auth
-        object aiohttp accepts. Optional for the HTTP family and SOAP,
-        where None means "send no credentials" and is the common case.
-        **Required for FTP**, which reads ``.login`` and ``.password``.
-        SFTP accepts ``SFTPAuth`` (password, explicit client key, or both)
-        and retains legacy ``.login``/``.password`` objects.
+        SFTP, SOAP, JSONRPC, GRAPHQL, S3, or GRPC. Matched with surrounding
+        whitespace stripped and without regard to case, so 'http', ' HTTP '
+        and 'Http' are the same protocol. HTTPS additionally requires that
+        the call go out over TLS; see :raises: below
+    :param auth: Optional aiohttp-compatible authentication for HTTP, HTTPS,
+        SOAP, JSONRPC, and GRAPHQL, where None sends no credentials. FTP
+        requires the legacy non-empty ``.login``/``.password`` fields. SFTP
+        accepts ``SFTPAuth`` with a password, explicit client key, or both,
+        and retains legacy ``.login``/``.password`` objects. For S3, None
+        selects the normal AWS credential chain and a supplied object provides
+        non-empty string ``.login``/``.password`` access and secret keys.
+        GRPC requires None; request credentials use bounded metadata.
     :param protocol_info: {
         "request_type": "GET", #required
         "timeout": int, #Optional
@@ -737,11 +760,14 @@ async def request(
         (``UnsupportedVerbError``, a subclass); an
         "http_file_upload_config" combined with a GET, which has no body
         to carry it; every other malformed value the HTTP and SOAP
-        constructors check; and an ``auth`` carrying no string ``login``
-        and ``password`` on FTP or SFTP, which cannot form a connect at
-        all -- note that ``auth`` is optional in this signature but
-        **required by those two protocols**. These are programming
-        errors on the caller's side and are not retryable, so they
+        constructors check; malformed FTP credentials or SFTP password/key
+        credentials which cannot form a connect; malformed JSONRPC
+        method/id/params, GRAPHQL query/variables,
+        S3 target/auth/command/path/cap, or GRPC target/auth/payload/hooks;
+        and unknown or missing required options on any new selector. Note
+        that ``auth`` is optional in this signature but **required by FTP
+        and SFTP**, with their distinct credential shapes. These are
+        programming errors on the caller's side and are not retryable, so they
         escape synchronously rather than becoming an envelope a retry
         loop would re-attempt forever -- and, escaping, they are
         reported to the caller exactly once and are not also logged.
@@ -758,15 +784,13 @@ async def request(
         and is logged, because every envelope-producing failure is. The
         list above is the escaping set, not the whole set.
 
-        The configuration errors that arrive the second way are exactly
-        the ones a protocol defers by contract, and they are the whole
-        of that set: FTP's ``command`` and ``server_path``, and SFTP's
-        ``mode`` and ``remote_path`` -- absent, malformed, or outside
-        the R21 allowlist. They are checked once the protocol object is
-        running because ``protocol_info`` is optional for those two
-        protocols at this boundary, so the object must stay
-        constructible without one and the keys cannot be checked in the
-        constructor with everything else.
+        The four deferred FTP/SFTP option checks are FTP's ``command``
+        and ``server_path``, plus SFTP's ``mode`` and ``remote_path`` --
+        absent, malformed, or outside the R21 allowlist. They are checked
+        once the protocol object is running because ``protocol_info`` is
+        optional for those two protocols at this boundary, so the object
+        must stay constructible without one and the keys cannot be
+        checked in the constructor with everything else.
 
         All four are nonetheless checked *before* their protocol opens a
         connection, so an unreachable host cannot answer for a caller's
@@ -774,6 +798,13 @@ async def request(
         ``command`` report ``CONNECT``/502 and an unknown SFTP ``mode``
         report ``HOST_KEY``/495: transport verdicts, carrying a retry
         recommendation, for calls that could never have run.
+
+        S3 credential-provider discovery is a separate runtime case. The
+        ambient AWS provider chain can confirm missing or partial
+        credentials only during the operation, after construction. That
+        failure therefore becomes an ``ok=False`` envelope carrying
+        ``error['code'] == 'CONFIG'`` and status 400; it is not one of the
+        four deferred FTP/SFTP option checks.
 
         A caller who wants to handle both alike should catch
         ``ConfigurationError`` *and* branch on
@@ -831,12 +862,8 @@ async def request(
             f'url must be a str, got {type(url).__name__}')
 
     protocol_name, protocol_class = resolve_protocol(protocol)
-    info: Dict[str, Any] = validated_protocol_info(
-        protocol_info,
-        required=protocol_class.REQUIRED_INFO_KEYS,
-        accepted=protocol_class.ACCEPTED_INFO_KEYS,
-        protocol=protocol_name,
-    )
+    info: Dict[str, Any] = protocol_class.validate_protocol_info(
+        protocol_info, protocol=protocol_name)
 
     # `port` is checked here, at the boundary, with the rest of the
     # `validated_*` family and *outside* the one conversion `try` -- the
@@ -873,7 +900,7 @@ async def request(
             post_processor_config, setting='post_processor_config')
         if post_processor_config else None)
 
-    if data is None:
+    if data is None and protocol_name not in {'JSONRPC', 'GRAPHQL'}:
         data = {}
 
     # The one place caller-supplied redaction config is read, so the one
@@ -971,7 +998,8 @@ async def request(
             response, exc, started=started,
             redact_query_params=redact_query_params)
         log_failure(
-            protocol_name, target_url, response, exc, redact_query_params)
+            protocol_name, response['url'], response, exc,
+            redact_query_params)
 
     if post_processor is not None:
         response['post_processor_response'] = await run_processor(
