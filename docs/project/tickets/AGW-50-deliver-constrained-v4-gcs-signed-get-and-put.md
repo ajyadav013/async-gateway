@@ -128,3 +128,26 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   postprocessors remain explicitly outside this tranche under the approved
   processor trust boundary. AGW-50 remains IN PROGRESS pending review and its
   contribution audit.
+- 2026-08-22 — Contribution-audit defect-loop RED adds 12 deterministic
+  tests for the three independent High findings while preserving all 524
+  prior focused cases. The exact 536-case GCS/no-blocking run reports 526
+  pass and 10 product-gap failures: exact-object validation has two passing
+  controls and three missing prefix/glob refusals; all six malformed nominal
+  signed-URL results are accepted instead of failing closed; and the one
+  unknown-close case preserves exception identity but retains its realistic
+  bearer in exception state and live `_signed_url_attempt` frame locals.
+  Production remains byte-identical; scoped flake8, diff checks, and the
+  no-live-I/O boundary pass. Accepted RED test SHA-256:
+  `8721f3d482939dabac81f132d97307248711ed0cf9776ae8729e9d43a1ed9aba`.
+  AGW-50 remains IN PROGRESS for the minimal GREEN defect correction.
+- 2026-08-22 — Defect-loop GREEN closes the three contribution-audit Highs
+  at their existing seams: signed URLs now reject trailing-prefix and frozen
+  glob target shapes before breaker lookup, accept only a non-empty string
+  from URL generation, and scrub a private bearer from direct exception-graph
+  strings and live strategy state before any failed cleanup propagates. The
+  immutable 536-case focused suite passes in full; focused `gcs_client.py`
+  coverage is 826/826 statements and 280/280 branches; entrypoint regression
+  passes 276/276; scoped flake8 and full-package mypy pass. Accepted RED test
+  SHA-256 remains
+  `8721f3d482939dabac81f132d97307248711ed0cf9776ae8729e9d43a1ed9aba`.
+  AGW-50 remains IN PROGRESS pending independent contribution re-audit.

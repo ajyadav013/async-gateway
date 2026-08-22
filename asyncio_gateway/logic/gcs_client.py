@@ -96,6 +96,8 @@ GCS_ALLOWED_INFO_KEYS: Final[frozenset[str]] = frozenset().union(
 _SIGNING_ACCOUNT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r'[a-z][a-z0-9-]{4,28}[a-z0-9]@'
     r'[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com')
+_SIGNED_URL_GLOB_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r'\*|\[[^]]*\]')
 _GCS_RETRYABLE_STATUSES: Final[frozenset[int]] = frozenset({
     408, 429, 500, 502, 503, 504,
 })
@@ -204,6 +206,32 @@ def _raise_exact(error: BaseException, state: _ExceptionState) -> NoReturn:
         raise error.with_traceback(state['traceback'])
     finally:
         _restore_exception_state(error, state)
+
+
+def _scrub_exception_bearer(
+    error: BaseException,
+    state: _ExceptionState,
+    bearer: str,
+) -> None:
+    """Remove one bearer from direct strings in an exception graph."""
+    graph = {id(error): error}
+    previous_size = -1
+    while len(graph) != previous_size:
+        previous_size = len(graph)
+        graph.update({
+            id(linked): linked
+            for current in tuple(graph.values())
+            for linked in (current.__cause__, current.__context__)
+            if isinstance(linked, BaseException)
+        })
+    for current in graph.values():
+        current.args = tuple(
+            'GCS provider failure'
+            if isinstance(argument, str) and bearer in argument
+            else argument
+            for argument in current.args
+        )
+    state['args'] = error.args
 
 
 async def _drain_provider_future(
@@ -1113,6 +1141,15 @@ class GcsRequest(BaseRequestClass):
         if command != 'list' and not key:
             raise ConfigurationError(
                 f'GCS {command} requires a non-empty object key')
+        if (
+            command == 'signed_url'
+            and (
+                key.endswith('/')
+                or _SIGNED_URL_GLOB_PATTERN.search(key) is not None
+            )
+        ):
+            raise ConfigurationError(
+                'GCS signed_url requires an exact object key')
 
         super().__init__(
             url, auth, response, info=info, redact_params=redact_params)
@@ -1311,6 +1348,9 @@ class GcsRequest(BaseRequestClass):
                         credentials=credentials,
                         timeout=self.timeout,
                     )
+                if not isinstance(signed_url, str) or not signed_url:
+                    raise GcsStatusError(
+                        'GCS provider returned a malformed signed URL', 502)
             except google_auth_exceptions.DefaultCredentialsError as error:
                 error.args = ('GCS signing credential resolution failed',)
                 raise ConfigurationError(
@@ -1350,6 +1390,7 @@ class GcsRequest(BaseRequestClass):
                 cleanup_state = _capture_exception_state(error)
 
         if body_error is not None:
+            signed_url = _NO_RESULT
             if isinstance(
                 body_error,
                 (_GcsServiceFailure, _AbortableGcsServiceFailure),
@@ -1359,6 +1400,9 @@ class GcsRequest(BaseRequestClass):
             _raise_exact(body_error, body_state)
         if cleanup_error is not None:
             assert cleanup_state is not None
+            _scrub_exception_bearer(
+                cleanup_error, cleanup_state, cast(str, signed_url))
+            signed_url = _NO_RESULT
             if isinstance(cleanup_error, _GCS_CREDENTIAL_FAILURES):
                 cleanup_error.args = ('GCS credential cleanup failed',)
                 raise ConfigurationError(

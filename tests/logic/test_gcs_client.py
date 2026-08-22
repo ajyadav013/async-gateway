@@ -7684,3 +7684,241 @@ async def test_download_unknown_cleanup_defect_preserves_exact_state(
     assert response['protocol_details'] == {}
     assert provider.client.close_calls == 1
     assert getattr(gcs_client, '_active_gcs_leases')() == 0
+
+
+# --- AGW-50 contribution-audit defect loop: exact bearer boundary -------
+
+
+@pytest.mark.parametrize(
+    ('url', 'private_target_text'),
+    [
+        pytest.param(
+            'gs://bucket/private-prefix-sentinel-agw50/',
+            'private-prefix-sentinel-agw50',
+            id='trailing-prefix',
+        ),
+        pytest.param(
+            'gs://bucket/private-star-sentinel-agw50/*.txt',
+            'private-star-sentinel-agw50',
+            id='star-wildcard',
+        ),
+        pytest.param(
+            'gs://bucket/private-question-sentinel-agw50?.txt',
+            'private-question-sentinel-agw50',
+            id='question-wildcard',
+        ),
+        pytest.param(
+            'gs://bucket/private-bracket-sentinel-agw50/[ab].txt',
+            'private-bracket-sentinel-agw50',
+            id='bracket-class',
+        ),
+    ],
+)
+def test_signed_url_rejects_prefix_and_glob_targets_before_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+    private_target_text: str,
+) -> None:
+    """Signed grants reject prefix/glob shapes before any side effect."""
+    def unexpected_side_effect(
+        *args: object,
+        **kwargs: object,
+    ) -> NoReturn:
+        """Fail if hostile target data reaches a later boundary."""
+        del args, kwargs
+        raise AssertionError(
+            'breaker, ADC, and provider work must not run')
+
+    monkeypatch.setattr(base, 'get_breaker', unexpected_side_effect)
+    monkeypatch.setattr(google_auth, 'default', unexpected_side_effect)
+    monkeypatch.setattr(storage, 'Client', unexpected_side_effect)
+
+    with pytest.raises(ConfigurationError) as caught:
+        GcsRequest(
+            url,
+            None,
+            _response(url),
+            info=_validate({
+                'command': 'signed_url',
+                'method': 'GET',
+            }),
+            redact_params=frozenset(),
+        )
+
+    assert private_target_text not in str(caught.value)
+
+
+def test_signed_url_accepts_exact_nested_object_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Path separators remain valid inside one exact object name."""
+    calls: list[tuple[object, ...]] = []
+    breaker = object()
+
+    def record_breaker(*args: object, **kwargs: object) -> object:
+        """Capture the sole allowed constructor-side interaction."""
+        calls.append((*args, kwargs))
+        return breaker
+
+    monkeypatch.setattr(base, 'get_breaker', record_breaker)
+    url = 'gs://Exact-Object-Bucket/folder/nested/object.bin'
+
+    built = GcsRequest(
+        url,
+        None,
+        _response(url),
+        info=_validate({'command': 'signed_url', 'method': 'GET'}),
+        redact_params=frozenset(),
+    )
+
+    assert built.key == 'folder/nested/object.bin'
+    assert built.circuit_breaker is breaker
+    assert calls == [(
+        'gs', 'exact-object-bucket', UNKNOWN_PORT, {}, {})]
+
+
+@pytest.mark.parametrize(
+    ('generation_outcome', 'private_marker'),
+    [
+        pytest.param(None, None, id='none'),
+        pytest.param(
+            {'opaque': 'malformed-url-private-agw50'},
+            'malformed-url-private-agw50',
+            id='mapping',
+        ),
+        pytest.param(
+            ['malformed-url-private-agw50'],
+            'malformed-url-private-agw50',
+            id='list',
+        ),
+        pytest.param(
+            b'malformed-url-private-agw50',
+            'malformed-url-private-agw50',
+            id='bytes',
+        ),
+        pytest.param(9283746501, '9283746501', id='integer'),
+        pytest.param('', None, id='empty-string'),
+    ],
+)
+async def test_signed_url_malformed_nominal_success_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    generation_outcome: object,
+    private_marker: str | None,
+) -> None:
+    """Only a non-empty string may cross the signing success boundary."""
+    provider = _SignedUrlFailureProvider()
+    provider.generation_outcome = generation_outcome
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, breaker = await _public_signed_url_failure(
+        monkeypatch, provider)
+
+    assert provider.timeline.count('generate') == 1
+    assert len(provider.generate_calls) == 1
+    assert provider.client.close_calls == 1
+    assert provider.client.closed is True
+    assert breaker.calls == 0
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    if private_marker is not None:
+        assert private_marker not in surfaces
+
+
+def _exception_direct_strings(error: BaseException) -> list[str]:
+    """Collect direct string args across a bounded exception graph."""
+    strings: list[str] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        strings.extend(
+            arg for arg in current.args if isinstance(arg, str))
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return strings
+
+
+def _traceback_direct_string_leaks(
+    error: BaseException,
+    secret: str,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Inspect live traceback frames without rendering foreign objects."""
+    frame_names: list[str] = []
+    leaks: list[tuple[str, str]] = []
+    current = error.__traceback__
+    while current is not None:
+        frame_name = current.tb_frame.f_code.co_name
+        frame_names.append(frame_name)
+        for local_name, value in dict(
+            current.tb_frame.f_locals
+        ).items():
+            if isinstance(value, str) and secret in value:
+                leaks.append((frame_name, local_name))
+        current = current.tb_next
+    return frame_names, leaks
+
+
+async def test_signed_url_unknown_close_defect_scrubs_live_bearer_state(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unchanged programming defect identity retains no bearer state."""
+    provider = _SignedUrlFailureProvider()
+    provider.signed_url = (
+        'https://storage.googleapis.com/private-close-bucket/object.bin'
+        '?X-Goog-Algorithm=GOOG4-RSA-SHA256'
+        '&X-Goog-Credential=private-close-credential-agw50'
+        '&X-Goog-Signature=private-close-signature-agw50')
+    provider.generation_outcome = provider.signed_url
+    cause = ValueError(provider.signed_url)
+    context = LookupError(provider.signed_url)
+    cleanup_error = RuntimeError(provider.signed_url)
+    cleanup_error.__cause__ = cause
+    cleanup_error.__context__ = context
+    cleanup_error.__suppress_context__ = True
+    provider.close_error = cleanup_error
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    response = _response(
+        'gs://private-close-bucket/object.bin')
+    strategy = GcsRequest(
+        'gs://private-close-bucket/object.bin',
+        None,
+        response,
+        _validate({'command': 'signed_url', 'method': 'GET'}),
+        redact_params=frozenset(),
+    )
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    with pytest.raises(RuntimeError) as caught:
+        await strategy.handle_request()
+
+    frame_names, traceback_leaks = _traceback_direct_string_leaks(
+        caught.value, provider.signed_url)
+    exception_leaks = [
+        value for value in _exception_direct_strings(caught.value)
+        if provider.signed_url in value
+    ]
+    assert caught.value is cleanup_error
+    assert '_signed_url_attempt' in frame_names
+    assert response['protocol_details'] == {}
+    assert provider.timeline.count('generate') == 1
+    assert len(provider.generate_calls) == 1
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 0
+    assert provider.signed_url not in (
+        repr(response) + _logged_gcs_surfaces(caplog))
+    assert {
+        'exception_state': exception_leaks,
+        'traceback_locals': traceback_leaks,
+    } == {
+        'exception_state': [],
+        'traceback_locals': [],
+    }
