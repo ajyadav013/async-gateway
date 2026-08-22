@@ -34,6 +34,25 @@ beyond the cap (GCS-05).
 
 ## Work Log
 
+- 2026-08-22 — Upload hardening B2 GREEN validates the exact optional
+  metadata schema before publication, fails malformed provider success closed,
+  and preserves body/cancellation/timeout precedence while shield-draining one
+  owned client close. Cleanup-only credential, transport, and service failures
+  now use the stable public vocabulary; unknown cleanup defects retain exact
+  identity and state. The fixed 254-test suite and 276 entrypoint tests passed;
+  scoped flake8, mypy, diff, and JSON checks passed. Status remains IN
+  PROGRESS for pinned raw download.
+- 2026-08-22 — Upload hardening B2 RED added 31 deterministic public-path
+  cases for exact optional metadata normalization, malformed-success refusal,
+  per-attempt client ownership, cleanup outcome precedence/typing, repeated
+  cancellation, retained capacity, and late-client disposal. The exact scoped
+  command collected 254 tests: 233 passed and 21 expected failures in the
+  missing metadata-normalization and cleanup-precedence/typing contracts. The
+  late-client deadline uses an event-driven injected expiry after constructor
+  start; both late-client cancellation and timeout cases pass without a
+  wall-clock timing oracle. Scoped flake8, diff, and JSON checks passed, with
+  zero collection, syntax, fixture, or network failures. Status remains IN
+  PROGRESS.
 - 2026-08-22 — Upload hardening B1 GREEN added gateway-owned retry and
   public failure conversion for upload service, transport, and ADC/refresh
   failures while preserving one guarded read and exact replay controls. The

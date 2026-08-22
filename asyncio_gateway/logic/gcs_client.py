@@ -9,15 +9,17 @@ import ssl
 import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from types import TracebackType
 from typing import (
     Any,
     Callable,
     ClassVar,
     Final,
+    NoReturn,
     Optional,
     Tuple,
     TypeVar,
+    TypedDict,
     cast,
 )
 from urllib.parse import urlsplit
@@ -127,6 +129,16 @@ _ResultT = TypeVar('_ResultT')
 _NO_RESULT: Final[object] = object()
 
 
+class _ExceptionState(TypedDict):
+    """Exception attributes cleanup must not be allowed to replace."""
+
+    args: Tuple[Any, ...]
+    cause: Optional[BaseException]
+    context: Optional[BaseException]
+    suppress_context: bool
+    traceback: Optional[TracebackType]
+
+
 class _GcsServiceFailure(AsyncGatewayError):
     """Retain one safe retryable GCS service-failure snapshot."""
 
@@ -143,6 +155,37 @@ class _AbortableGcsServiceFailure(AbortableServiceError):
         """Store only normalized service fields for later conversion."""
         super().__init__('abortable GCS service response', status_code)
         self.details = dict(details)
+
+
+def _capture_exception_state(error: BaseException) -> _ExceptionState:
+    """Capture exception identity-adjacent state before client cleanup."""
+    return {
+        'args': error.args,
+        'cause': error.__cause__,
+        'context': error.__context__,
+        'suppress_context': error.__suppress_context__,
+        'traceback': error.__traceback__,
+    }
+
+
+def _restore_exception_state(
+    error: BaseException,
+    state: _ExceptionState,
+) -> None:
+    """Restore exception state that foreign cleanup could have disturbed."""
+    error.args = state['args']
+    error.__cause__ = state['cause']
+    error.__context__ = state['context']
+    error.__suppress_context__ = state['suppress_context']
+
+
+def _raise_exact(error: BaseException, state: _ExceptionState) -> NoReturn:
+    """Raise one captured failure with its original identity and state."""
+    _restore_exception_state(error, state)
+    try:
+        raise error.with_traceback(state['traceback'])
+    finally:
+        _restore_exception_state(error, state)
 
 
 async def _drain_provider_future(
@@ -187,34 +230,67 @@ class _GcsLease:
                 raise GcsCapacityError()
 
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + float(accepted_timeout)
+            started = threading.Event()
+
+            def invoke() -> tuple[bool, object]:
+                """Mark provider execution started before calling it."""
+                started.set()
+                try:
+                    return True, function(*args, **kwargs)
+                except BaseException as error:
+                    return False, error
+
             future = loop.run_in_executor(
-                _GCS_EXECUTOR, partial(function, *args, **kwargs))
+                _GCS_EXECUTOR, invoke)
             cancellation: Optional[asyncio.CancelledError] = None
             timed_out = False
             try:
-                result = await asyncio.wait_for(
+                while not started.is_set() and not future.done():
+                    await asyncio.sleep(0)
+                if accepted_timeout < 0.001:
+                    await asyncio.sleep(0)
+                    if future.done():
+                        completed, payload = future.result()
+                        if completed:
+                            return cast(_ResultT, payload)
+                        raise cast(BaseException, payload)
+                deadline = loop.time() + float(accepted_timeout)
+                completed, payload = await asyncio.wait_for(
                     asyncio.shield(future),
                     timeout=max(0.0, deadline - loop.time()),
                 )
                 if loop.time() < deadline:
-                    return result
+                    if completed:
+                        return cast(_ResultT, payload)
+                    raise cast(BaseException, payload)
                 timed_out = True
             except asyncio.CancelledError as error:
                 cancellation = error
             except (asyncio.TimeoutError, TimeoutError):
-                if future.done() and loop.time() < deadline:
-                    return future.result()
                 timed_out = True
 
             drain_started = loop.time()
             logger.debug('gcs_drain_started')
-            late_result, cancellation = await _drain_provider_future(
+            late_outcome, cancellation = await _drain_provider_future(
                 future, cancellation)
-            if late_result is not _NO_RESULT and close_result is not None:
+            if (
+                late_outcome is not _NO_RESULT
+                and cast(tuple[bool, object], late_outcome)[0]
+                and close_result is not None
+            ):
+                late_result = cast(tuple[bool, object], late_outcome)[1]
+
+                def cleanup_invoke() -> tuple[bool, object]:
+                    """Turn late-resource cleanup failure into task data."""
+                    try:
+                        close_result(cast(_ResultT, late_result))
+                    except BaseException as error:
+                        return False, error
+                    return True, None
+
                 cleanup = loop.run_in_executor(
                     _GCS_EXECUTOR,
-                    partial(close_result, cast(_ResultT, late_result)),
+                    cleanup_invoke,
                 )
                 _, cancellation = await _drain_provider_future(
                     cleanup, cancellation)
@@ -361,12 +437,29 @@ def _upload_blob(
         if_generation_match=if_generation_match,
         **_operational_sdk_kwargs(sdk_timeout),
     )
-    return {
+    metadata = {
         'etag': blob.etag,
         'generation': blob.generation,
         'metageneration': blob.metageneration,
         'crc32c': blob.crc32c,
     }
+    if any(
+        value is not None and (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        )
+        for value in (
+            metadata['generation'], metadata['metageneration'],
+        )
+    ):
+        raise _AbortableGcsServiceFailure(502, {})
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in (metadata['etag'], metadata['crc32c'])
+    ):
+        raise _AbortableGcsServiceFailure(502, {})
+    return metadata
 
 
 def _safe_provider_text(value: object) -> Optional[str]:
@@ -886,54 +979,108 @@ class GcsRequest(BaseRequestClass):
             The upload blob's success metadata snapshot.
         """
         client: Any = None
-        failure: Optional[AsyncGatewayError] = None
+        metadata: Optional[dict[str, Any]] = None
+        body_error: Optional[BaseException] = None
+        body_state: Optional[_ExceptionState] = None
         try:
-            credentials, project = await lease.run(
-                google_auth.default, timeout=self.timeout)
-            await lease.run(
-                _refresh_credentials_if_needed,
-                credentials,
-                timeout=self.timeout,
-            )
-            client = await lease.run(
-                storage.Client,
-                credentials=credentials,
-                project=project,
-                timeout=self.timeout,
-                close_result=_close_storage_client,
-            )
-            bucket = await lease.run(
-                client.bucket, self.bucket, timeout=self.timeout)
-            blob = await lease.run(
-                bucket.blob, self.key, timeout=self.timeout)
-            return await lease.run(
-                _upload_blob,
-                blob,
-                upload_body,
-                if_generation_match=if_generation_match,
-                sdk_timeout=self.timeout,
-                timeout=self.timeout,
-            )
-        except _GCS_CREDENTIAL_FAILURES as error:
-            error.args = ('GCS credential resolution failed',)
-            failure = ConfigurationError(
-                'GCS application default credentials are unavailable')
-        except _GCS_TRANSPORT_FAILURES as error:
-            error.args = ('GCS provider transport failure',)
-            failure = _transport_error_for(error)
+            try:
+                credentials, project = await lease.run(
+                    google_auth.default, timeout=self.timeout)
+                await lease.run(
+                    _refresh_credentials_if_needed,
+                    credentials,
+                    timeout=self.timeout,
+                )
+                client = await lease.run(
+                    storage.Client,
+                    credentials=credentials,
+                    project=project,
+                    timeout=self.timeout,
+                    close_result=_close_storage_client,
+                )
+                bucket = await lease.run(
+                    client.bucket, self.bucket, timeout=self.timeout)
+                blob = await lease.run(
+                    bucket.blob, self.key, timeout=self.timeout)
+                metadata = await lease.run(
+                    _upload_blob,
+                    blob,
+                    upload_body,
+                    if_generation_match=if_generation_match,
+                    sdk_timeout=self.timeout,
+                    timeout=self.timeout,
+                )
+            except _GCS_CREDENTIAL_FAILURES as error:
+                error.args = ('GCS credential resolution failed',)
+                raise ConfigurationError(
+                    'GCS application default credentials are unavailable'
+                ) from None
+            except _GCS_TRANSPORT_FAILURES as error:
+                error.args = ('GCS provider transport failure',)
+                raise _transport_error_for(error) from None
+            except BaseException as error:
+                if not _is_service_failure(error):
+                    raise
+                failure = _service_failure_for(
+                    error,
+                    command=self.command,
+                    bucket=self.bucket,
+                    target=self.key,
+                )
+                error.args = ('GCS provider service response',)
+                raise failure from None
         except BaseException as error:
-            if not _is_service_failure(error):
-                raise
-            failure = _service_failure_for(
-                error,
-                command=self.command,
-                bucket=self.bucket,
-                target=self.key,
-            )
-            error.args = ('GCS provider service response',)
-        finally:
-            if client is not None:
+            body_error = error
+            body_state = _capture_exception_state(error)
+
+        cleanup_error: Optional[BaseException] = None
+        cleanup_state: Optional[_ExceptionState] = None
+        if client is not None:
+            try:
                 await lease.run(
                     _close_storage_client, client, timeout=self.timeout)
-        assert failure is not None
-        raise failure from None
+            except BaseException as error:
+                cleanup_error = error
+                cleanup_state = _capture_exception_state(error)
+
+        pending_cancellation = (
+            body_error
+            if isinstance(body_error, asyncio.CancelledError)
+            else cleanup_error
+            if isinstance(cleanup_error, asyncio.CancelledError)
+            else None
+        )
+        if pending_cancellation is not None:
+            state = (
+                body_state
+                if pending_cancellation is body_error
+                else cleanup_state
+            )
+            assert state is not None
+            _raise_exact(pending_cancellation, state)
+        if body_error is not None:
+            assert body_state is not None
+            _raise_exact(body_error, body_state)
+        if cleanup_error is not None:
+            assert cleanup_state is not None
+            if isinstance(cleanup_error, _GCS_CREDENTIAL_FAILURES):
+                cleanup_error.args = ('GCS credential cleanup failed',)
+                raise ConfigurationError(
+                    'GCS application default credentials are unavailable'
+                ) from None
+            if isinstance(cleanup_error, _GCS_TRANSPORT_FAILURES):
+                cleanup_error.args = ('GCS provider cleanup failed',)
+                raise _transport_error_for(cleanup_error) from None
+            if _is_service_failure(cleanup_error):
+                status_failure = _service_failure_for(
+                    cleanup_error,
+                    command=self.command,
+                    bucket=self.bucket,
+                    target=self.key,
+                )
+                cleanup_error.args = ('GCS provider cleanup response',)
+                raise _AbortableGcsServiceFailure(
+                    status_failure.status_code, {}) from None
+            _raise_exact(cleanup_error, cleanup_state)
+        assert metadata is not None
+        return metadata

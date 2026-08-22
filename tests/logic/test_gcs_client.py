@@ -16,6 +16,7 @@ import socket
 import ssl
 import sys
 import threading
+import traceback
 from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
@@ -1128,6 +1129,10 @@ class _UploadBlob:
             'retry': retry,
             'timeout': timeout,
         }))
+        if self.provider.upload_started is not None:
+            self.provider.upload_started.set()
+        if self.provider.upload_release is not None:
+            assert self.provider.upload_release.wait(timeout=1)
         if self.provider.upload_outcomes:
             outcome = self.provider.upload_outcomes.pop(0)
             if isinstance(outcome, BaseException):
@@ -1155,6 +1160,7 @@ class _UploadClient:
         """Retain the provider recorder."""
         self.provider = provider
         self.closed = False
+        self.close_calls = 0
 
     def bucket(self, name: str) -> _UploadBucket:
         """Record the caller's normalized bucket name."""
@@ -1165,6 +1171,15 @@ class _UploadClient:
     def close(self) -> None:
         """Record deterministic client cleanup."""
         self.provider.record_thread('client-close')
+        self.close_calls += 1
+        if self.provider.close_started is not None:
+            self.provider.close_started.set()
+        if self.provider.close_release is not None:
+            assert self.provider.close_release.wait(timeout=1)
+        if self.provider.close_outcomes:
+            outcome = self.provider.close_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
         self.closed = True
 
 
@@ -1194,6 +1209,14 @@ class _UploadProvider:
         self.threads: dict[str, tuple[int, str]] = {}
         self.upload_calls: list[tuple[bytes, dict[str, object]]] = []
         self.upload_outcomes: list[BaseException | None] = []
+        self.upload_started: threading.Event | None = None
+        self.upload_release: threading.Event | None = None
+        self.close_started: threading.Event | None = None
+        self.close_release: threading.Event | None = None
+        self.close_outcomes: list[BaseException | None] = []
+        self.client_started: threading.Event | None = None
+        self.client_release: threading.Event | None = None
+        self.fresh_client_per_attempt = False
         self.bucket_names: list[str] = []
         self.blob_keys: list[str] = []
         self.adc_error: BaseException | None = None
@@ -1201,6 +1224,7 @@ class _UploadProvider:
         self.blob = _UploadBlob(self)
         self.bucket = _UploadBucket(self)
         self.client = _UploadClient(self)
+        self.returned_clients: list[_UploadClient] = []
 
     def record_thread(self, seam: str) -> None:
         """Record one provider seam and its executing thread."""
@@ -1218,11 +1242,24 @@ class _UploadProvider:
     def make_client(self, *args: object, **kwargs: object) -> _UploadClient:
         """Return the single observable storage client."""
         self.record_thread('client')
-        return self.client
+        if self.client_started is not None:
+            self.client_started.set()
+        if self.client_release is not None:
+            assert self.client_release.wait(timeout=1)
+        client = (
+            _UploadClient(self)
+            if self.fresh_client_per_attempt else self.client
+        )
+        self.returned_clients.append(client)
+        return client
 
     def script_upload(self, *outcomes: BaseException | None) -> None:
         """Replace the ordered upload outcomes."""
         self.upload_outcomes = list(outcomes)
+
+    def script_close(self, *outcomes: BaseException | None) -> None:
+        """Replace the ordered client-cleanup outcomes."""
+        self.close_outcomes = list(outcomes)
 
 
 def _install_upload_provider(
@@ -1494,6 +1531,7 @@ async def _public_scripted_upload(
     body: bytes = b'retry-body',
     generation: int = 11,
     local_path: str = '/caller/retry-source.bin',
+    timeout: int | float = 2.5,
     breaker_config: Mapping[str, Any],
 ) -> tuple[Mapping[str, Any], list[tuple[object, int]]]:
     """Run one public upload with a deterministic guarded read and SDK."""
@@ -1520,7 +1558,7 @@ async def _public_scripted_upload(
             'local_path': local_path,
             'max_upload_bytes': 41,
             'if_generation_match': generation,
-            'timeout': 2.5,
+            'timeout': timeout,
             'circuit_breaker_config': dict(breaker_config),
         },
     )
@@ -1729,6 +1767,415 @@ async def test_upload_failure_never_leaks_any_private_input_surface(
         'gcs_error_message', 'response_metadata',
     }
     assert all(secret not in surfaces for secret in sentinels.values())
+
+
+# --- AGW-48 tranche B2: normalized upload and cleanup ownership ----------
+
+
+@pytest.mark.parametrize(
+    ('generation', 'metageneration', 'etag', 'crc32c'),
+    [
+        pytest.param(None, None, None, None, id='all-optional-none'),
+        pytest.param(0, 0, '', '', id='zero-and-empty-strings'),
+        pytest.param(2**63, 2**31, 'etag-value', 'crc-value', id='integers'),
+    ],
+)
+async def test_upload_success_normalizes_exact_optional_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    generation: int | None,
+    metageneration: int | None,
+    etag: str | None,
+    crc32c: str | None,
+) -> None:
+    """Valid optional provider scalars publish only the frozen schema."""
+    provider = _UploadProvider([])
+    provider.blob.generation = generation
+    provider.blob.metageneration = metageneration
+    provider.blob.etag = etag
+    provider.blob.crc32c = crc32c
+
+    result, _ = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket='normalized-upload',
+        breaker_config={},
+    )
+
+    assert result['protocol_details'] == {
+        'command': 'upload',
+        'bucket': 'normalized-upload',
+        'key': 'object.bin',
+        'local_path': '/caller/retry-source.bin',
+        'bytes_read': len(b'retry-body'),
+        'etag': etag,
+        'generation': generation,
+        'metageneration': metageneration,
+        'crc32c': crc32c,
+    }
+    assert provider.client.close_calls == 1
+
+
+class _HostileUploadMetadata:
+    """Foreign SDK value whose representation is a leak sentinel."""
+
+    def __init__(self, sentinel: str) -> None:
+        """Retain the value that must never cross a public surface."""
+        self.sentinel = sentinel
+
+    def __repr__(self) -> str:
+        """Expose a deterministic marker if code retains this object."""
+        return self.sentinel
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        pytest.param('generation', True, id='generation-bool'),
+        pytest.param('generation', -1, id='generation-negative'),
+        pytest.param('generation', '19', id='generation-string'),
+        pytest.param('generation', _HostileUploadMetadata(
+            'generation-foreign-b2'), id='generation-foreign'),
+        pytest.param('metageneration', False, id='metageneration-bool'),
+        pytest.param('metageneration', -1, id='metageneration-negative'),
+        pytest.param('metageneration', '2', id='metageneration-string'),
+        pytest.param('metageneration', _HostileUploadMetadata(
+            'metageneration-foreign-b2'), id='metageneration-foreign'),
+        pytest.param('etag', 7, id='etag-integer'),
+        pytest.param('etag', _HostileUploadMetadata(
+            'etag-foreign-b2'), id='etag-foreign'),
+        pytest.param('crc32c', True, id='crc32c-bool'),
+        pytest.param('crc32c', _HostileUploadMetadata(
+            'crc32c-foreign-b2'), id='crc32c-foreign'),
+    ],
+)
+async def test_malformed_upload_success_is_closed_gcs_status_without_leak(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    value: object,
+) -> None:
+    """Malformed nominal success is 502 and never partially published."""
+    provider = _UploadProvider([])
+    setattr(provider.blob, field, value)
+    events: list[str] = []
+    caplog.set_level(logging.ERROR, logger='asyncio_gateway')
+
+    result, _ = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket='malformed-upload',
+        breaker_config=_gcs_retry_config(1, events),
+    )
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog) + repr(events)
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert provider.client.close_calls == 1
+    if isinstance(value, _HostileUploadMetadata):
+        assert value.sentinel not in surfaces
+
+
+@pytest.mark.parametrize(
+    ('failure', 'expected_code'),
+    [
+        pytest.param(_FakeServiceError(403), 'GCS_STATUS', id='abortable'),
+        pytest.param(_FakeServiceError(503), 'GCS_STATUS', id='retryable'),
+        pytest.param(socket.gaierror('transport-private-b2'), 'DNS',
+                     id='exhausted-transport'),
+    ],
+)
+async def test_upload_failure_closes_its_owned_client_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    expected_code: str,
+) -> None:
+    """Abortable and exhausted operations close their attempt resource."""
+    provider = _UploadProvider([])
+    provider.script_upload(failure)
+
+    result, _ = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket='failed-close-once',
+        breaker_config=_gcs_retry_config(0, []),
+    )
+
+    assert result['error']['code'] == expected_code
+    assert provider.client.close_calls == 1
+
+
+async def test_upload_retry_closes_each_attempt_client_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every retry owns and closes a distinct storage client."""
+    provider = _UploadProvider([])
+    provider.fresh_client_per_attempt = True
+    provider.script_upload(_FakeServiceError(503), None)
+
+    result, _ = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket='per-attempt-cleanup',
+        breaker_config=_gcs_retry_config(1, []),
+    )
+
+    assert result['ok'] is True
+    assert len(provider.returned_clients) == 2
+    assert provider.returned_clients[0] is not provider.returned_clients[1]
+    assert [client.close_calls for client in provider.returned_clients] == [
+        1, 1,
+    ]
+
+
+@pytest.mark.parametrize(
+    ('body_kind', 'expected_code'),
+    [
+        pytest.param('service', 'GCS_STATUS', id='service'),
+        pytest.param('transport', 'DNS', id='transport'),
+        pytest.param('metadata', 'GCS_STATUS', id='malformed-metadata'),
+    ],
+)
+async def test_upload_body_failure_wins_over_later_hostile_close(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    body_kind: str,
+    expected_code: str,
+) -> None:
+    """Cleanup cannot replace or leak an already-known upload failure."""
+    close_sentinel = f'hostile-close-{body_kind}-b2'
+    provider = _UploadProvider([])
+    if body_kind == 'service':
+        provider.script_upload(_FakeServiceError(403))
+    elif body_kind == 'transport':
+        provider.script_upload(socket.gaierror('body-transport-private-b2'))
+    else:
+        provider.blob.generation = -1
+    provider.script_close(RuntimeError(close_sentinel))
+    caplog.set_level(logging.ERROR, logger='asyncio_gateway')
+
+    result, _ = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket='body-precedence',
+        breaker_config=_gcs_retry_config(0, []),
+    )
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert result['error']['code'] == expected_code
+    assert close_sentinel not in surfaces
+    assert provider.client.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ('cleanup_error', 'expected_code'),
+    [
+        pytest.param(socket.gaierror('close-dns-private-b2'), 'DNS', id='dns'),
+        pytest.param(
+            google_auth_exceptions.DefaultCredentialsError(
+                'close-credential-private-b2'),
+            'CONFIG', id='credential'),
+        pytest.param(_FakeServiceError(403), 'GCS_STATUS', id='service'),
+    ],
+)
+async def test_upload_cleanup_only_failure_has_stable_typed_result(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_error: BaseException,
+    expected_code: str,
+) -> None:
+    """A provider cleanup failure is typed when no body failure exists."""
+    provider = _UploadProvider([])
+    provider.script_close(cleanup_error)
+
+    result, _ = await _public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket='cleanup-only',
+        breaker_config=_gcs_retry_config(0, []),
+    )
+
+    assert result['ok'] is False
+    assert result['error']['code'] == expected_code
+    assert result['protocol_details'] == {}
+    assert provider.client.close_calls == 1
+
+
+async def test_upload_cleanup_only_programming_defect_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown cleanup defect propagates with identity and state intact."""
+    provider = _UploadProvider([])
+    failure = RuntimeError('exact-cleanup-programming-defect-b2')
+    cause = ValueError('exact-cleanup-cause-b2')
+    failure.__cause__ = cause
+    provider.script_close(failure)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _public_scripted_upload(
+            monkeypatch,
+            provider,
+            bucket='cleanup-programming-defect',
+            breaker_config=_gcs_retry_config(0, []),
+        )
+
+    assert caught.value is failure
+    assert caught.value.__cause__ is cause
+    assert provider.client.close_calls == 1
+
+
+@pytest.mark.parametrize('blocked_seam', ['upload', 'close'])
+async def test_upload_cancellation_drains_cleanup_and_retains_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    blocked_seam: str,
+) -> None:
+    """Repeated cancellation retains its lease through upload or close."""
+    provider = _UploadProvider([])
+    close_sentinel = f'cancel-close-private-{blocked_seam}-b2'
+    provider.script_close(RuntimeError(close_sentinel))
+    caplog.set_level(logging.ERROR, logger='asyncio_gateway')
+    started = threading.Event()
+    release = threading.Event()
+    if blocked_seam == 'upload':
+        provider.upload_started = started
+        provider.upload_release = release
+    else:
+        provider.close_started = started
+        provider.close_release = release
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    other_leases = [acquire() for _ in range(3)]
+    task = asyncio.create_task(_public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket=f'cancel-{blocked_seam}',
+        breaker_config={},
+    ))
+    admitted_after: Any = None
+    try:
+        await _wait_for_thread_event(started)
+        task.cancel('first-upload-cancellation')
+        task.cancel('repeated-upload-cancellation')
+        with pytest.raises(GcsCapacityError):
+            acquire()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.value.args == ('first-upload-cancellation',)
+        cancellation_surfaces = (
+            ''.join(traceback.format_exception(caught.value))
+            + _logged_gcs_surfaces(caplog)
+        )
+        assert close_sentinel not in cancellation_surfaces
+        assert provider.client.close_calls == 1
+        admitted_after = acquire()
+        with pytest.raises(GcsCapacityError):
+            acquire()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if admitted_after is not None:
+            await _release_lease(admitted_after)
+        for lease in other_leases:
+            await _release_lease(lease)
+
+
+async def test_upload_timeout_wins_over_hostile_close_after_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acceptance timeout remains the outcome after cleanup completes."""
+    provider = _UploadProvider([])
+    provider.upload_started = threading.Event()
+    provider.upload_release = threading.Event()
+    provider.script_close(RuntimeError('timeout-close-private-b2'))
+    task = asyncio.create_task(_public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket='timeout-cleanup-precedence',
+        timeout=1e-6,
+        breaker_config=_gcs_retry_config(0, []),
+    ))
+    try:
+        await _wait_for_thread_event(provider.upload_started)
+        provider.upload_release.set()
+        result, _ = await task
+    finally:
+        provider.upload_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert result['error']['code'] == 'TIMEOUT'
+    assert provider.client.close_calls == 1
+
+
+@pytest.mark.parametrize('outcome', ['cancel', 'timeout'])
+async def test_late_created_upload_client_closes_under_retained_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """A rejected late constructor result is closed before lease release."""
+    provider = _UploadProvider([])
+    provider.client_started = threading.Event()
+    provider.client_release = threading.Event()
+    timeout = 1
+    if outcome == 'timeout':
+        async def timeout_after_client_starts(
+            awaitable: Any,
+            *,
+            timeout: int | float,
+        ) -> Any:
+            """Inject expiry only after the client constructor has begun."""
+            del timeout
+
+            async def wait_for_client_start() -> None:
+                while not provider.client_started.is_set():
+                    await asyncio.sleep(0)
+
+            operation = asyncio.ensure_future(awaitable)
+            client_start = asyncio.create_task(wait_for_client_start())
+            done, _ = await asyncio.wait(
+                {operation, client_start},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if operation in done:
+                client_start.cancel()
+                await asyncio.gather(client_start, return_exceptions=True)
+                return operation.result()
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            gcs_client.asyncio, 'wait_for', timeout_after_client_starts)
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    other_leases = [acquire() for _ in range(3)]
+    task = asyncio.create_task(_public_scripted_upload(
+        monkeypatch,
+        provider,
+        bucket=f'late-client-{outcome}',
+        timeout=timeout,
+        breaker_config=_gcs_retry_config(0, []),
+    ))
+    try:
+        await _wait_for_thread_event(provider.client_started)
+        if outcome == 'cancel':
+            task.cancel('late-client-cancellation')
+            task.cancel('repeated-late-client-cancellation')
+        with pytest.raises(GcsCapacityError):
+            acquire()
+        provider.client_release.set()
+        if outcome == 'cancel':
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert caught.value.args == ('late-client-cancellation',)
+        else:
+            result, _ = await task
+            assert result['error']['code'] == 'TIMEOUT'
+        assert provider.client.close_calls == 1
+    finally:
+        provider.client_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        for lease in other_leases:
+            await _release_lease(lease)
 
 
 # --- GCS-04 tranche B: shutdown, telemetry, and outcome precedence -------
