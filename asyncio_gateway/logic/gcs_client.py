@@ -22,12 +22,17 @@ from typing import (
 )
 from urllib.parse import urlsplit
 
+from google import auth as google_auth
+from google.auth.transport.requests import Request as GoogleAuthRequest
+# google-cloud-storage does not publish a py.typed marker.
+from google.cloud import storage  # type: ignore[import-untyped]
+
 from asyncio_gateway.helpers.internal.base import BaseRequestClass
 from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
     AbortableServiceError,
 )
 from asyncio_gateway.utils.constants import (HTTP_TIMEOUT, MAX_RESPONSE_BYTES)
-from asyncio_gateway.utils.envelope import GatewayResponse
+from asyncio_gateway.utils.envelope import GatewayResponse, finalise_ok
 from asyncio_gateway.utils.exceptions import (
     AsyncGatewayError,
     ConfigurationError,
@@ -38,6 +43,7 @@ from asyncio_gateway.utils.exceptions import (
     TlsError,
     TransportError,
 )
+from asyncio_gateway.utils.paths import read_guarded_file
 from asyncio_gateway.utils.redaction import redact_text
 
 
@@ -307,6 +313,38 @@ def _shutdown_gcs_offloader() -> None:
 def _operational_sdk_kwargs(timeout: object) -> dict[str, object]:
     """Return the frozen timeout and retry controls for storage calls."""
     return {'retry': None, 'timeout': _positive_timeout(timeout)}
+
+
+def _refresh_credentials_if_needed(credentials: Any) -> None:
+    """Refresh one invalid ADC credential inside the provider worker."""
+    if not credentials.valid:
+        credentials.refresh(GoogleAuthRequest())
+
+
+def _close_storage_client(client: Any) -> None:
+    """Close one owned synchronous storage client."""
+    client.close()
+
+
+def _upload_blob(
+    blob: Any,
+    data: bytes,
+    *,
+    if_generation_match: int,
+    sdk_timeout: int | float,
+) -> dict[str, Any]:
+    """Upload exact guarded bytes and snapshot the success metadata."""
+    blob.upload_from_string(
+        data,
+        if_generation_match=if_generation_match,
+        **_operational_sdk_kwargs(sdk_timeout),
+    )
+    return {
+        'etag': blob.etag,
+        'generation': blob.generation,
+        'metageneration': blob.metageneration,
+        'crc32c': blob.crc32c,
+    }
 
 
 def _safe_provider_text(value: object) -> Optional[str]:
@@ -729,12 +767,87 @@ class GcsRequest(BaseRequestClass):
         self.command = command
 
     async def handle_request(self) -> GatewayResponse:
-        """Reject execution until a bounded GCS operation is implemented.
+        """Dispatch the implemented bounded GCS operation.
 
         Returns:
-            The shared gateway response after a future bounded operation.
+            The finalized shared response after a guarded upload.
 
         Raises:
-            NotImplementedError: Always in the selector-boundary story.
+            AsyncGatewayError: For a typed local or lifecycle failure.
+            NotImplementedError: If the selected operation is not upload.
         """
-        raise NotImplementedError
+        if self.command != 'upload':
+            raise NotImplementedError
+
+        lease = _acquire_gcs_lease()
+        try:
+            local_path = cast(str, self.info['local_path'])
+            upload_body = await read_guarded_file(
+                local_path,
+                max_bytes=cast(int, self.info['max_upload_bytes']),
+            )
+            metadata = await self.circuit_breaker.run(
+                self._upload_attempt,
+                lease,
+                upload_body,
+                cast(int, self.info['if_generation_match']),
+            )
+            self.response['protocol_details'] = {
+                'command': self.command,
+                'bucket': self.bucket,
+                'key': self.key,
+                'local_path': local_path,
+                'bytes_read': len(upload_body),
+                **metadata,
+            }
+            return finalise_ok(
+                self.response, status_code=200, started=self.start_time)
+        finally:
+            await lease.release()
+
+    async def _upload_attempt(
+        self,
+        lease: _GcsLease,
+        upload_body: bytes,
+        if_generation_match: int,
+    ) -> dict[str, Any]:
+        """Run one replay-safe upload attempt on the private provider pool.
+
+        Args:
+            lease: Retained request lifecycle lease.
+            upload_body: Exact bytes returned by the guarded local read.
+            if_generation_match: Frozen optimistic-write precondition.
+
+        Returns:
+            The upload blob's success metadata snapshot.
+        """
+        credentials, project = await lease.run(
+            google_auth.default, timeout=self.timeout)
+        await lease.run(
+            _refresh_credentials_if_needed,
+            credentials,
+            timeout=self.timeout,
+        )
+        client = await lease.run(
+            storage.Client,
+            credentials=credentials,
+            project=project,
+            timeout=self.timeout,
+            close_result=_close_storage_client,
+        )
+        try:
+            bucket = await lease.run(
+                client.bucket, self.bucket, timeout=self.timeout)
+            blob = await lease.run(
+                bucket.blob, self.key, timeout=self.timeout)
+            return await lease.run(
+                _upload_blob,
+                blob,
+                upload_body,
+                if_generation_match=if_generation_match,
+                sdk_timeout=self.timeout,
+                timeout=self.timeout,
+            )
+        finally:
+            await lease.run(
+                _close_storage_client, client, timeout=self.timeout)

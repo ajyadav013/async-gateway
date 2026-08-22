@@ -796,13 +796,14 @@
     {
       "id": "AGW-48",
       "title": "Deliver guarded upload and generation-pinned raw download",
-      "status": "OPEN",
+      "status": "IN PROGRESS",
       "story": "GCS-05",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-48-deliver-guarded-gcs-upload-and-generation-pinned-raw-download.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-47"], "blocks": ["AGW-49"]},
-      "commits": []
+      "commits": [],
+      "note": "Upload-foundation GREEN: the exact 201-test scoped command passes; scoped flake8, mypy, diff, and JSON checks pass. Status remains IN PROGRESS for the remaining GCS-05 work."
     },
     {
       "id": "AGW-49",

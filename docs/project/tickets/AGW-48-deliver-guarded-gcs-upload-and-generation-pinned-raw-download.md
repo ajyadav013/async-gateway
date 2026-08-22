@@ -1,6 +1,6 @@
 # AGW-48: Deliver guarded GCS upload and generation-pinned raw download
 
-- **Status:** OPEN
+- **Status:** IN PROGRESS
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-05 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -34,6 +34,19 @@ beyond the cap (GCS-05).
 
 ## Work Log
 
+- 2026-08-22 — Upload-foundation GREEN implemented the guarded upload path
+  only: one lifecycle-held local read before breaker/provider work, exact byte
+  replay with the frozen generation precondition and SDK retry disabled, all
+  synchronous GCS seams on the private pool, success cleanup, and the exact
+  status-200 detail schema. Scoped result: 201 passed; scoped flake8, mypy,
+  diff, and JSON checks passed. Status remains IN PROGRESS for the remaining
+  GCS-05 work.
+- 2026-08-22 — Upload-foundation RED added three deterministic public-path
+  cases: guarded-read failure before breaker/ADC/provider work, plus empty and
+  non-empty byte replay with default/explicit generation preconditions,
+  retry/timeout controls, private-thread lifecycle, cleanup, and the exact
+  success schema. Scoped result: 198 passed, 3 expected failures at the
+  unimplemented GCS operation boundary (201 collected).
 - 2026-08-22 — Opened from approved GCS-05 planning before implementation;
   recorded its two-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.

@@ -21,6 +21,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, NoReturn
 
+from google import auth as google_auth
+from google.cloud import storage
+
 import pytest
 
 from asyncio_gateway.asyncio_gateway import request
@@ -1078,6 +1081,285 @@ def test_operational_sdk_controls_are_retry_none_with_finite_timeout() -> None:
     controls = getattr(gcs_client, '_operational_sdk_kwargs')(2.5)
 
     assert controls == {'retry': None, 'timeout': 2.5}
+
+
+# --- AGW-48 tranche A: guarded upload foundation -------------------------
+
+
+class _UploadBreaker:
+    """Record breaker execution while invoking one supplied attempt."""
+
+    def __init__(self, timeline: list[str]) -> None:
+        """Retain the shared operation timeline."""
+        self.timeline = timeline
+        self.calls = 0
+
+    async def run(self, call: Any, *args: Any, **kwargs: Any) -> Any:
+        """Record and invoke one operation attempt."""
+        self.calls += 1
+        self.timeline.append('breaker')
+        return await call(*args, **kwargs)
+
+
+class _UploadBlob:
+    """Synchronous blob double for one bounded upload."""
+
+    def __init__(self, provider: '_UploadProvider') -> None:
+        """Retain the provider recorder and valid upload metadata."""
+        self.provider = provider
+        self.etag = 'upload-etag'
+        self.generation = 19
+        self.metageneration = 2
+        self.crc32c = 'crc32c=='
+
+    def upload_from_string(
+        self,
+        data: bytes,
+        *,
+        if_generation_match: int,
+        retry: object,
+        timeout: int | float,
+    ) -> None:
+        """Record the exact bytes and operational SDK controls."""
+        self.provider.record_thread('upload')
+        self.provider.upload_calls.append((data, {
+            'if_generation_match': if_generation_match,
+            'retry': retry,
+            'timeout': timeout,
+        }))
+
+
+class _UploadBucket:
+    """Bucket double returning one observable blob."""
+
+    def __init__(self, provider: '_UploadProvider') -> None:
+        """Retain the provider recorder."""
+        self.provider = provider
+
+    def blob(self, key: str) -> _UploadBlob:
+        """Record the caller's exact object key."""
+        self.provider.record_thread('blob')
+        self.provider.blob_keys.append(key)
+        return self.provider.blob
+
+
+class _UploadClient:
+    """Storage-client double with observable success cleanup."""
+
+    def __init__(self, provider: '_UploadProvider') -> None:
+        """Retain the provider recorder."""
+        self.provider = provider
+        self.closed = False
+
+    def bucket(self, name: str) -> _UploadBucket:
+        """Record the caller's normalized bucket name."""
+        self.provider.record_thread('bucket')
+        self.provider.bucket_names.append(name)
+        return self.provider.bucket
+
+    def close(self) -> None:
+        """Record deterministic client cleanup."""
+        self.provider.record_thread('client-close')
+        self.closed = True
+
+
+class _UploadCredentials:
+    """Already-valid ADC credentials requiring no refresh."""
+
+    valid = True
+    expired = False
+
+    def refresh(self, request: object) -> NoReturn:
+        """Fail if valid credentials are refreshed unexpectedly."""
+        raise AssertionError(
+            f'valid credentials must not refresh with {request!r}')
+
+
+class _UploadProvider:
+    """ADC and storage SDK boundary recorder with no network behavior."""
+
+    def __init__(self, timeline: list[str]) -> None:
+        """Create one connected tree of deterministic provider doubles."""
+        self.timeline = timeline
+        self.threads: dict[str, tuple[int, str]] = {}
+        self.upload_calls: list[tuple[bytes, dict[str, object]]] = []
+        self.bucket_names: list[str] = []
+        self.blob_keys: list[str] = []
+        self.credentials = _UploadCredentials()
+        self.blob = _UploadBlob(self)
+        self.bucket = _UploadBucket(self)
+        self.client = _UploadClient(self)
+
+    def record_thread(self, seam: str) -> None:
+        """Record one provider seam and its executing thread."""
+        self.timeline.append(seam)
+        self.threads[seam] = (
+            threading.get_ident(), threading.current_thread().name)
+
+    def adc(self, *args: object, **kwargs: object) -> tuple[object, str]:
+        """Return valid deterministic ADC credentials and project."""
+        self.record_thread('adc')
+        return self.credentials, 'test-project'
+
+    def make_client(self, *args: object, **kwargs: object) -> _UploadClient:
+        """Return the single observable storage client."""
+        self.record_thread('client')
+        return self.client
+
+
+def _install_upload_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _UploadProvider,
+) -> None:
+    """Replace ADC and GCS construction with deterministic doubles."""
+    monkeypatch.setattr(google_auth, 'default', provider.adc)
+    monkeypatch.setattr(storage, 'Client', provider.make_client)
+
+
+async def test_upload_read_failure_precedes_adc_breaker_and_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typed guarded-read failure owns a lease but touches no provider."""
+    timeline: list[str] = []
+    reads: list[tuple[object, int, int]] = []
+    breaker = _UploadBreaker(timeline)
+    provider = _UploadProvider(timeline)
+    loop_thread = threading.get_ident()
+
+    async def fail_guarded_read(
+        path: object,
+        *,
+        max_bytes: int,
+        chunk_size: int = 65536,
+    ) -> NoReturn:
+        """Record the held lease and raise one typed local failure."""
+        del chunk_size
+        timeline.append('read')
+        reads.append((
+            path,
+            max_bytes,
+            getattr(gcs_client, '_active_gcs_leases')(),
+        ))
+        raise ConfigurationError('guarded upload read failed')
+
+    monkeypatch.setattr(
+        gcs_client, 'read_guarded_file', fail_guarded_read, raising=False)
+    monkeypatch.setattr(base, 'get_breaker', lambda *args, **kwargs: breaker)
+    _install_upload_provider(monkeypatch, provider)
+
+    result = await request(
+        'gs://upload-bucket/object.bin',
+        protocol='GCS',
+        protocol_info={
+            'command': 'upload',
+            'local_path': '/caller/source.bin',
+            'max_upload_bytes': 23,
+        },
+    )
+
+    assert reads == [('/caller/source.bin', 23, 1)]
+    assert timeline == ['read']
+    assert breaker.calls == 0
+    assert provider.threads == {}
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+    assert threading.get_ident() == loop_thread
+    assert result['ok'] is False
+    assert result['error']['code'] == 'CONFIG'
+
+
+@pytest.mark.parametrize(
+    ('guarded_bytes', 'generation_option', 'expected_generation'),
+    [
+        pytest.param(b'', None, 0, id='empty-default-create-only'),
+        pytest.param(b'bounded-bytes', 7, 7, id='bytes-explicit-generation'),
+    ],
+)
+async def test_upload_replays_guarded_bytes_with_exact_sdk_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    guarded_bytes: bytes,
+    generation_option: int | None,
+    expected_generation: int,
+) -> None:
+    """One guarded body reaches one off-loop upload and closes cleanly."""
+    timeline: list[str] = []
+    provider = _UploadProvider(timeline)
+    breaker = _UploadBreaker(timeline)
+    loop_thread = threading.get_ident()
+    reads: list[tuple[object, int, int, int]] = []
+
+    async def guarded_read(
+        path: object,
+        *,
+        max_bytes: int,
+        chunk_size: int = 65536,
+    ) -> bytes:
+        """Return the exact pre-read bytes while the lease is retained."""
+        del chunk_size
+        timeline.append('read')
+        reads.append((
+            path,
+            max_bytes,
+            getattr(gcs_client, '_active_gcs_leases')(),
+            threading.get_ident(),
+        ))
+        return guarded_bytes
+
+    monkeypatch.setattr(
+        gcs_client, 'read_guarded_file', guarded_read, raising=False)
+    monkeypatch.setattr(base, 'get_breaker', lambda *args, **kwargs: breaker)
+    _install_upload_provider(monkeypatch, provider)
+    info: dict[str, object] = {
+        'command': 'upload',
+        'local_path': '/caller/source.bin',
+        'max_upload_bytes': 23,
+        'timeout': 2.5,
+    }
+    if generation_option is not None:
+        info['if_generation_match'] = generation_option
+
+    result = await request(
+        'gs://Upload-Bucket/folder/object.bin',
+        protocol='GCS',
+        protocol_info=info,
+    )
+
+    assert reads == [('/caller/source.bin', 23, 1, loop_thread)]
+    assert timeline == [
+        'read', 'breaker', 'adc', 'client', 'bucket', 'blob', 'upload',
+        'client-close',
+    ]
+    assert provider.upload_calls == [(guarded_bytes, {
+        'if_generation_match': expected_generation,
+        'retry': None,
+        'timeout': 2.5,
+    })]
+    assert provider.upload_calls[0][0] is guarded_bytes
+    assert provider.bucket_names == ['upload-bucket']
+    assert provider.blob_keys == ['folder/object.bin']
+    assert provider.client.closed is True
+    assert set(provider.threads) == {
+        'adc', 'client', 'bucket', 'blob', 'upload', 'client-close',
+    }
+    assert all(
+        thread_id != loop_thread
+        and thread_name.startswith('asyncio-gateway-gcs')
+        for thread_id, thread_name in provider.threads.values()
+    )
+    assert breaker.calls == 1
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+    assert result['ok'] is True
+    assert result['status_code'] == 200
+    assert result['protocol_details'] == {
+        'command': 'upload',
+        'bucket': 'upload-bucket',
+        'key': 'folder/object.bin',
+        'local_path': '/caller/source.bin',
+        'bytes_read': len(guarded_bytes),
+        'etag': 'upload-etag',
+        'generation': 19,
+        'metageneration': 2,
+        'crc32c': 'crc32c==',
+    }
 
 
 class _FakeServiceError(Exception):
