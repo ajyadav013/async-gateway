@@ -33,7 +33,7 @@ from google.auth import credentials as google_auth_credentials
 from google.auth import exceptions as google_auth_exceptions
 from google.auth import impersonated_credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
-# google-cloud-storage does not publish a py.typed marker.
+# Reason for type: ignore[import-untyped] -- GCS SDK lacks py.typed.
 from google.cloud import storage  # type: ignore[import-untyped]
 
 from asyncio_gateway.helpers.internal.base import BaseRequestClass

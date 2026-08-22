@@ -816,7 +816,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-48"], "blocks": ["AGW-50"]},
       "commits": [],
-      "note": "Coverage defect-loop GREEN adds the accepted deterministic tranche and removes the unreachable provider-drain fallback without changing frozen test content. All 471 focused GCS/blocking-I/O cases pass; focused gcs_client coverage now misses only the untouched future AGW-50 signed-URL placeholder (710/711 statements and 245/246 branches). Status remains IN PROGRESS pending the AGW-49 contribution audit."
+      "note": "Formal-review suppression defect-loop GREEN adds factual justifications for the eight intentional GCS type suppressions: the untyped GCS SDK import and malformed/foreign provider values injected by normalization tests. The suppression checker, all 522 GCS tests, full flake8, CI-format flake8, and package mypy pass; executable suppression counts/categories and both Python ASTs are unchanged. Status remains IN PROGRESS for independent formal-review recheck."
     },
     {
       "id": "AGW-50",

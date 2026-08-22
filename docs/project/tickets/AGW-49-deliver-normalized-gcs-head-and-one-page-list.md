@@ -114,3 +114,11 @@ recursively enumerating a bucket, or disclosing caller tokens (GCS-06).
   AGW-50 owns replacement and coverage of that placeholder. Files:
   `asyncio_gateway/logic/gcs_client.py`, `tests/logic/test_gcs_client.py`, this
   ticket, and `docs/project/tickets/index.json`.
+- 2026-08-23 — Justified the eight intentional GCS type suppressions required
+  by the repository policy: the untyped GCS SDK import and malformed/foreign
+  provider values injected by normalization tests. The suppression checker,
+  all 522 GCS tests, full flake8, CI-format flake8, and package mypy pass;
+  executable suppression counts/categories and both Python ASTs are unchanged.
+  AGW-49 remains IN PROGRESS for independent formal-review recheck. Files:
+  `asyncio_gateway/logic/gcs_client.py`, `tests/logic/test_gcs_client.py`, this
+  ticket, and `docs/project/tickets/index.json`.

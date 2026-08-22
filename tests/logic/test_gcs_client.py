@@ -3804,6 +3804,7 @@ async def test_list_malformed_page_or_iterator_is_safe_gcs_status(
     provider = _HeadListProvider()
     sentinel = f'list-{case_name}-private-agw49'
     max_items = 1
+    # Reason for type: ignore[assignment] -- inject malformed provider shapes.
     if case_name == 'empty-server-token':
         provider.iterator.server_token = ''
     elif case_name == 'non-string-server-token':
@@ -7611,6 +7612,7 @@ async def test_list_missing_server_token_attribute_fails_atomically(
             """Return exactly one deterministic page."""
             return iter((page,))
 
+    # Reason for type: ignore[assignment] -- inject a malformed iterator shape.
     provider.iterator = IteratorWithoutToken()  # type: ignore[assignment]
     _install_head_list_provider(monkeypatch, provider)
 
@@ -7639,6 +7641,7 @@ def test_foreign_provider_fields_are_never_stringified() -> None:
 
     hostile = HostileText()
     error = _FakeServiceError(403)
+    # Reason for type: ignore[assignment] -- inject foreign provider fields.
     error.code = hostile  # type: ignore[assignment]
     error.message = hostile  # type: ignore[assignment]
     error.response['headers']['x-goog-request-id'] = hostile
