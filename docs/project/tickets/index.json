@@ -827,7 +827,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-49"], "blocks": ["AGW-51"]},
       "commits": [],
-      "note": "S3B1 adds ten deterministic public-request cancellation/acceptance-timeout rows across ADC, source refresh, impersonated construction, target refresh, and late storage-client construction. All ten already pass the current implementation and are retained as regression evidence: capacity remains held through drain/late close, one repeated cancellation preserves the first outcome, late clients close off-loop exactly once, and no signer/bearer surface or breaker/signing call appears. The exact focused suite passes 514/514 with production untouched. Status remains IN PROGRESS for later post-generation/close and broader bearer-containment tranches."
+      "note": "S3B2 adds six deterministic public-request rows after signing starts: generation cancellation/acceptance-timeout with a late private URL, and close cancellation/timeout crossed with recognized/unknown hostile failures after exactly one URL generation. All six already pass the unchanged implementation and are retained as regression evidence: the first cancellation or TIMEOUT/504 wins, capacity stays held until exact-once off-loop close, no breaker/retry occurs, and bearer/credential/cleanup sentinels remain absent from every asserted public, exception, log, and breaker surface. The exact focused suite passes 520/520 with production untouched. Status remains IN PROGRESS for the later successful bearer-surface/telemetry tranche."
     },
     {
       "id": "AGW-51",

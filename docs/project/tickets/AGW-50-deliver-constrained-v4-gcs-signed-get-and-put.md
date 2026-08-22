@@ -100,3 +100,16 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   URL sentinel in public/log surfaces. The exact focused GCS/no-blocking run
   passes 514/514 with production untouched. AGW-50 remains IN PROGRESS for
   the later post-generation/close and broader bearer-containment tranches.
+- 2026-08-22 — S3B2 tests-first lifecycle probe adds six deterministic public
+  `request()` rows after signing starts: cancellation and result-acceptance
+  timeout while URL generation is blocked, plus cancellation/timeout crossed
+  with recognized and unknown failures from a blocked client close after one
+  private URL was generated. One close row repeats cancellation during drain.
+  All six are honest passing regression evidence on the unchanged product:
+  the first cancellation or `TIMEOUT`/504 wins, capacity remains retained
+  until exact-once off-loop close completes, generation is invoked exactly
+  once without breaker/retry, and the late bearer plus credential/cleanup
+  sentinels remain absent from the live envelope, result, exception, cause,
+  log, and breaker surfaces. The exact focused GCS/no-blocking run passes
+  520/520. AGW-50 remains IN PROGRESS for the separately bounded successful
+  bearer-surface/telemetry tranche.

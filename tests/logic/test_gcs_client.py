@@ -2452,6 +2452,296 @@ async def test_signed_url_pre_signing_drain_retains_capacity_and_outcome(
             await _release_lease(lease)
 
 
+# --- AGW-50 tranche S3B2: generation and close lifecycle drains ---------
+
+
+class _PostSigningLifecycleBlob(_SignedUrlBlob):
+    """Event-driven URL generator for post-signing lifecycle races."""
+
+    def generate_signed_url(self, **kwargs: object) -> str:
+        """Generate exactly once, optionally blocking until cancellation."""
+        provider = self.provider
+        assert isinstance(provider, _PostSigningLifecycleProvider)
+        provider.record_thread('generate')
+        provider.generate_calls.append(dict(kwargs))
+        provider.client_open_during_generate.append(
+            not provider.client.closed)
+        assert provider.response is not None
+        provider.details_during_generate.append(dict(
+            provider.response['protocol_details']))
+        provider.generate_started.set()
+        if provider.blocked_phase == 'generate':
+            provider.mark_outcome_started()
+            assert provider.generate_release.wait(timeout=1)
+        return provider.signed_url
+
+
+class _PostSigningLifecycleClient(_SignedUrlClient):
+    """Owned client whose close remains observable until externally freed."""
+
+    def close(self) -> None:
+        """Block off-loop, then finish or raise one hostile late failure."""
+        provider = self.provider
+        assert isinstance(provider, _PostSigningLifecycleProvider)
+        provider.record_thread('client-close')
+        assert provider.response is not None
+        provider.details_during_close.append(dict(
+            provider.response['protocol_details']))
+        self.close_calls += 1
+        provider.close_started.set()
+        if provider.blocked_phase == 'client-close':
+            provider.mark_outcome_started()
+        assert provider.close_release.wait(timeout=1)
+        self.closed = True
+        if provider.close_error is not None:
+            raise provider.close_error
+
+
+class _PostSigningLifecycleProvider(_SignedUrlProvider):
+    """No-network signing tree with generation and close event controls."""
+
+    def __init__(
+        self,
+        blocked_phase: str,
+        close_failure_kind: str,
+    ) -> None:
+        """Configure the selected race and any later cleanup failure."""
+        self.blocked_phase = blocked_phase
+        self.event_loop = asyncio.get_running_loop()
+        self.outcome_started = threading.Event()
+        self.outcome_started_async = asyncio.Event()
+        self.generate_started = threading.Event()
+        self.generate_release = threading.Event()
+        self.close_started = threading.Event()
+        self.close_release = threading.Event()
+        super().__init__()
+        self.credential_sentinel = (
+            f'{blocked_phase}-{close_failure_kind}-credential-private-s3b2')
+        self.bearer_sentinel = (
+            f'{blocked_phase}-{close_failure_kind}-bearer-private-s3b2')
+        self.close_sentinel = (
+            f'{blocked_phase}-{close_failure_kind}-close-private-s3b2')
+        self.signed_url = (
+            'https://storage.googleapis.com/private-s3b2/object.bin'
+            f'?X-Goog-Credential={self.credential_sentinel}'
+            f'&X-Goog-Signature={self.bearer_sentinel}')
+        self.credentials.private_token = self.credential_sentinel
+        self.close_error: BaseException | None = None
+        if close_failure_kind == 'recognized':
+            self.close_error = google_auth_exceptions.DefaultCredentialsError(
+                self.close_sentinel)
+        elif close_failure_kind == 'unknown':
+            self.close_error = RuntimeError(self.close_sentinel)
+        self.blob = _PostSigningLifecycleBlob(self)
+        self.client = _PostSigningLifecycleClient(self)
+
+    def mark_outcome_started(self) -> None:
+        """Signal both worker and event-loop observers of the selected race."""
+        self.outcome_started.set()
+        self.event_loop.call_soon_threadsafe(
+            self.outcome_started_async.set)
+
+
+def _inject_post_signing_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _PostSigningLifecycleProvider,
+) -> asyncio.Event:
+    """Expire exactly the provider wait blocked at the selected phase."""
+    real_wait_for = asyncio.wait_for
+    expiry_injected = asyncio.Event()
+    expired = False
+
+    async def expire_selected_wait_once(
+        awaitable: Any,
+        *,
+        timeout: int | float,
+    ) -> Any:
+        """Reject only the result whose selected worker seam has started."""
+        nonlocal expired
+        if expired:
+            return await real_wait_for(awaitable, timeout=timeout)
+        operation = asyncio.ensure_future(awaitable)
+        started = asyncio.create_task(
+            provider.outcome_started_async.wait())
+        done, _ = await asyncio.wait(
+            {operation, started},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation in done:
+            started.cancel()
+            await asyncio.gather(started, return_exceptions=True)
+            return operation.result()
+        expired = True
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        expiry_injected.set()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(
+        gcs_client.asyncio, 'wait_for', expire_selected_wait_once)
+    return expiry_injected
+
+
+@pytest.mark.parametrize(
+    (
+        'blocked_phase', 'outcome', 'close_failure_kind',
+        'repeat_cancellation',
+    ),
+    [
+        pytest.param(
+            'generate', 'cancel', 'success', False,
+            id='generate-cancel-late-url'),
+        pytest.param(
+            'generate', 'timeout', 'success', False,
+            id='generate-timeout-late-url'),
+        pytest.param(
+            'client-close', 'cancel', 'recognized', False,
+            id='close-cancel-recognized-failure'),
+        pytest.param(
+            'client-close', 'cancel', 'unknown', True,
+            id='close-repeated-cancel-unknown-failure'),
+        pytest.param(
+            'client-close', 'timeout', 'recognized', False,
+            id='close-timeout-recognized-failure'),
+        pytest.param(
+            'client-close', 'timeout', 'unknown', False,
+            id='close-timeout-unknown-failure'),
+    ],
+)
+async def test_signed_url_generation_and_close_drain_never_publish_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    blocked_phase: str,
+    outcome: str,
+    close_failure_kind: str,
+    repeat_cancellation: bool,
+) -> None:
+    """First cancel/deadline wins while private URL work drains and closes."""
+    provider = _PostSigningLifecycleProvider(
+        blocked_phase, close_failure_kind)
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    expiry_injected = (
+        _inject_post_signing_timeout(monkeypatch, provider)
+        if outcome == 'timeout' else None
+    )
+    captured_responses: list[GatewayResponse] = []
+
+    async def capture_response(*, response: GatewayResponse) -> str:
+        """Retain the live envelope to detect any late URL publication."""
+        captured_responses.append(response)
+        provider.response = response
+        return 'captured-before-post-signing-race'
+
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    loop_thread = threading.get_ident()
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    companion_leases = [acquire() for _ in range(3)]
+    target = 'gs://post-signing-lifecycle-bucket/folder/object.bin'
+    task = asyncio.create_task(request(
+        target,
+        protocol='GCS',
+        protocol_info={
+            'command': 'signed_url',
+            'method': 'GET',
+            'timeout': 1,
+        },
+        pre_processor_config={'function': capture_response},
+    ))
+    admitted_after: Any = None
+    try:
+        await _wait_for_thread_event(provider.outcome_started)
+        if outcome == 'cancel':
+            task.cancel('first-post-signing-cancellation')
+            await asyncio.sleep(0)
+            if repeat_cancellation:
+                task.cancel('repeated-post-signing-cancellation')
+                await asyncio.sleep(0)
+        else:
+            assert expiry_injected is not None
+            await expiry_injected.wait()
+
+        assert getattr(gcs_client, '_active_gcs_leases')() == 4
+        with pytest.raises(GcsCapacityError):
+            acquire()
+
+        provider.generate_release.set()
+        await _wait_for_thread_event(provider.close_started)
+        assert captured_responses[0]['protocol_details'] == {}
+        assert getattr(gcs_client, '_active_gcs_leases')() == 4
+        with pytest.raises(GcsCapacityError):
+            acquire()
+
+        provider.close_release.set()
+        if outcome == 'cancel':
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert caught.value.args == (
+                'first-post-signing-cancellation',)
+            outcome_surfaces = ''.join((
+                ''.join(traceback.format_exception(caught.value)),
+                repr(caught.value.__cause__),
+                repr(caught.value.__context__),
+            ))
+        else:
+            result = await task
+            assert result['ok'] is False
+            assert result['status_code'] == 504
+            assert result['error']['code'] == 'TIMEOUT'
+            assert result['protocol_details'] == {}
+            outcome_surfaces = repr(result)
+
+        await asyncio.sleep(0)
+        assert len(captured_responses) == 1
+        captured = captured_responses[0]
+        assert captured['url'] == target
+        assert captured['protocol_details'] == {}
+        assert len(provider.generate_calls) == 1
+        assert provider.timeline.count('generate') == 1
+        assert provider.client_open_during_generate == [True]
+        assert provider.details_during_generate == [{}]
+        assert provider.details_during_close == [{}]
+        assert provider.client.close_calls == 1
+        assert provider.client.closed is True
+        assert provider.timeline.index('generate') < provider.timeline.index(
+            'client-close')
+        assert breaker.calls == 0
+        close_threads = [
+            (thread_id, thread_name)
+            for seam, thread_id, thread_name in provider.threads
+            if seam == 'client-close'
+        ]
+        assert len(close_threads) == 1
+        assert close_threads[0][0] != loop_thread
+        assert close_threads[0][1].startswith('asyncio-gateway-gcs')
+        public_surfaces = ''.join((
+            repr(captured),
+            outcome_surfaces,
+            repr(breaker.__dict__),
+            _logged_gcs_surfaces(caplog),
+        ))
+        for sentinel in (
+            provider.signed_url,
+            provider.bearer_sentinel,
+            provider.credential_sentinel,
+            provider.close_sentinel,
+        ):
+            assert sentinel not in public_surfaces
+        assert task.done()
+        assert getattr(gcs_client, '_active_gcs_leases')() == 3
+
+        admitted_after = acquire()
+        with pytest.raises(GcsCapacityError):
+            acquire()
+    finally:
+        provider.generate_release.set()
+        provider.close_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if admitted_after is not None:
+            await _release_lease(admitted_after)
+        for lease in companion_leases:
+            await _release_lease(lease)
+
+
 # --- AGW-49 foundation: normalized head and one-page list ----------------
 
 
