@@ -163,7 +163,12 @@ class _GcsServiceFailure(AsyncGatewayError):
     """Retain one safe retryable GCS service-failure snapshot."""
 
     def __init__(self, status_code: int, details: Mapping[str, Any]) -> None:
-        """Store only normalized service fields for later conversion."""
+        """Store only normalized service fields for later conversion.
+
+        Args:
+            status_code: Validated provider HTTP status code.
+            details: Safe normalized service details for the public envelope.
+        """
         super().__init__('retryable GCS service response', status_code)
         self.details = dict(details)
 
@@ -172,7 +177,12 @@ class _AbortableGcsServiceFailure(AbortableServiceError):
     """Retain one safe non-retryable GCS service-failure snapshot."""
 
     def __init__(self, status_code: int, details: Mapping[str, Any]) -> None:
-        """Store only normalized service fields for later conversion."""
+        """Store only normalized service fields for later conversion.
+
+        Args:
+            status_code: Validated provider HTTP status code.
+            details: Safe normalized service details for the public envelope.
+        """
         super().__init__('abortable GCS service response', status_code)
         self.details = dict(details)
 
@@ -269,7 +279,25 @@ class _GcsLease:
         close_result: Optional[Callable[[_ResultT], Any]] = None,
         **kwargs: Any,
     ) -> _ResultT:
-        """Run one synchronous provider call with deadline-safe draining."""
+        """Run one synchronous provider call with deadline-safe draining.
+
+        Args:
+            function: Synchronous provider callable to execute privately.
+            *args: Positional arguments forwarded to ``function``.
+            timeout: Finite result-acceptance deadline in seconds.
+            close_result: Optional cleanup callback for an unaccepted result.
+            **kwargs: Keyword arguments forwarded to ``function``.
+
+        Returns:
+            The provider result when accepted before the deadline.
+
+        Raises:
+            GcsCapacityError: If this lease was already released.
+            GatewayTimeoutError: If the result misses its acceptance deadline.
+            asyncio.CancelledError: If the awaiting task is cancelled.
+            BaseException: The provider exception when accepted before
+                deadline.
+        """
         accepted_timeout = _positive_timeout(timeout)
         async with self._operation_lock:
             if self._released:
@@ -279,7 +307,11 @@ class _GcsLease:
             started = threading.Event()
 
             def invoke() -> tuple[bool, object]:
-                """Mark provider execution started before calling it."""
+                """Mark provider execution started before calling it.
+
+                Returns:
+                    A success flag paired with the result or caught exception.
+                """
                 started.set()
                 try:
                     return True, function(*args, **kwargs)
@@ -325,7 +357,12 @@ class _GcsLease:
                 late_result = cast(tuple[bool, object], late_outcome)[1]
 
                 def cleanup_invoke() -> tuple[bool, object]:
-                    """Turn late-resource cleanup failure into task data."""
+                    """Turn late-resource cleanup failure into task data.
+
+                    Returns:
+                        A success flag paired with None or the cleanup
+                        exception.
+                    """
                     try:
                         close_result(cast(_ResultT, late_result))
                     except BaseException as error:

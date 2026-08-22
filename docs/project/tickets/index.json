@@ -791,7 +791,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-45", "AGW-46"], "blocks": ["AGW-48"]},
       "commits": [],
-      "note": "Tranche B RED reproduced 5 expected shutdown/telemetry failures; GREEN passes all 198 focused tests plus scoped flake8, mypy, diff, and JSON checks; status remains IN PROGRESS."
+      "note": "Documentation defect final candidate passes its isolated node and scoped flake8 with an unchanged stripped AST; diff, JSON, and exact-scope checks are green, and the approved product diff remains uncommitted."
     },
     {
       "id": "AGW-48",
