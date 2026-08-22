@@ -7,7 +7,7 @@ import re
 import socket
 import ssl
 import threading
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from types import TracebackType
 from typing import (
@@ -48,10 +48,11 @@ from asyncio_gateway.utils.exceptions import (
     GatewayTimeoutError,
     GcsCapacityError,
     GcsStatusError,
+    ResponseTooLargeError,
     TlsError,
     TransportError,
 )
-from asyncio_gateway.utils.paths import read_guarded_file
+from asyncio_gateway.utils.paths import read_guarded_file, stream_to_path
 from asyncio_gateway.utils.redaction import redact_text
 
 
@@ -112,6 +113,7 @@ _GCS_CREDENTIAL_FAILURES: Final[Tuple[type[BaseException], ...]] = (
     google_auth_exceptions.RefreshError,
 )
 _GCS_MAX_LEASES: Final[int] = 4
+_GCS_DOWNLOAD_CHUNK_SIZE: Final[int] = 64 * 1024
 _GCS_EXECUTOR: Final[ThreadPoolExecutor] = ThreadPoolExecutor(
     max_workers=_GCS_MAX_LEASES,
     thread_name_prefix='asyncio-gateway-gcs',
@@ -137,6 +139,15 @@ class _ExceptionState(TypedDict):
     context: Optional[BaseException]
     suppress_context: bool
     traceback: Optional[TracebackType]
+
+
+class _DownloadPin(TypedDict):
+    """Immutable normalized metadata for one exact object generation."""
+
+    generation: int
+    size: int
+    etag: Optional[str]
+    crc32c: Optional[str]
 
 
 class _GcsServiceFailure(AsyncGatewayError):
@@ -460,6 +471,66 @@ def _upload_blob(
     ):
         raise _AbortableGcsServiceFailure(502, {})
     return metadata
+
+
+def _reload_download_pin(
+    blob: Any,
+    *,
+    if_generation_match: Optional[int],
+    sdk_timeout: int | float,
+) -> _DownloadPin:
+    """Reload and validate one exact stored-object metadata snapshot."""
+    arguments = _operational_sdk_kwargs(sdk_timeout)
+    if if_generation_match is not None:
+        arguments['if_generation_match'] = if_generation_match
+    blob.reload(**arguments)
+
+    generation = blob.generation
+    size = blob.size
+    etag = blob.etag
+    crc32c = blob.crc32c
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or if_generation_match is not None
+        and generation != if_generation_match
+        or etag is not None
+        and not isinstance(etag, str)
+        or crc32c is not None
+        and not isinstance(crc32c, str)
+    ):
+        raise _AbortableGcsServiceFailure(502, {})
+    return {
+        'generation': generation,
+        'size': size,
+        'etag': etag,
+        'crc32c': crc32c,
+    }
+
+
+def _download_blob_range(
+    blob: Any,
+    *,
+    start: int,
+    end: int,
+    generation: int,
+    sdk_timeout: int | float,
+) -> bytes:
+    """Fetch and validate one exact inclusive stored/raw byte range."""
+    data = blob.download_as_bytes(
+        start=start,
+        end=end,
+        if_generation_match=generation,
+        raw_download=True,
+        **_operational_sdk_kwargs(sdk_timeout),
+    )
+    if not isinstance(data, bytes) or len(data) != end - start + 1:
+        raise _AbortableGcsServiceFailure(502, {})
+    return data
 
 
 def _safe_provider_text(value: object) -> Optional[str]:
@@ -896,22 +967,25 @@ class GcsRequest(BaseRequestClass):
         self.bucket = bucket
         self.key = key
         self.command = command
+        self._download_pin: Optional[_DownloadPin] = None
 
     async def handle_request(self) -> GatewayResponse:
         """Dispatch the implemented bounded GCS operation.
 
         Returns:
-            The finalized shared response after a guarded upload.
+            The finalized shared response after a bounded transfer.
 
         Raises:
             AsyncGatewayError: For a typed local or lifecycle failure.
-            NotImplementedError: If the selected operation is not upload.
+            NotImplementedError: If the selected operation is unavailable.
         """
-        if self.command != 'upload':
+        if self.command not in {'download', 'upload'}:
             raise NotImplementedError
 
         lease = _acquire_gcs_lease()
         try:
+            if self.command == 'download':
+                return await self._handle_download(lease)
             local_path = cast(str, self.info['local_path'])
             upload_body = await read_guarded_file(
                 local_path,
@@ -953,6 +1027,41 @@ class GcsRequest(BaseRequestClass):
         finally:
             await lease.release()
 
+    async def _handle_download(self, lease: _GcsLease) -> GatewayResponse:
+        """Run one generation-pinned download under a retained lease."""
+        local_path = cast(str, self.info['local_path'])
+        failure: Optional[AsyncGatewayError] = None
+        try:
+            metadata = await self.circuit_breaker.run(
+                self._download_attempt,
+                lease,
+                local_path,
+                cast(int, self.info['max_response_bytes']),
+            )
+        except CircuitOpen:
+            failure = CircuitOpenError('GCS provider circuit is open')
+        except _AbortableGcsServiceFailure as error:
+            failure = self._public_service_error(error)
+        except RetriesExhausted as error:
+            cause = error.__cause__
+            if isinstance(cause, _GcsServiceFailure):
+                failure = self._public_service_error(cause)
+            elif isinstance(cause, AsyncGatewayError):
+                failure = cause
+            else:
+                failure = TransportError('GCS provider operation failed')
+        if failure is not None:
+            raise failure from None
+        self.response['protocol_details'] = {
+            'command': self.command,
+            'bucket': self.bucket,
+            'key': self.key,
+            'local_path': local_path,
+            **metadata,
+        }
+        return finalise_ok(
+            self.response, status_code=200, started=self.start_time)
+
     def _public_service_error(
         self,
         error: _GcsServiceFailure | _AbortableGcsServiceFailure,
@@ -961,6 +1070,166 @@ class GcsRequest(BaseRequestClass):
         self.response['protocol_details'] = dict(error.details)
         return GcsStatusError(
             'GCS provider service request failed', error.status_code)
+
+    async def _download_chunks(
+        self,
+        lease: _GcsLease,
+        blob: Any,
+        pin: _DownloadPin,
+    ) -> AsyncIterator[bytes]:
+        """Yield sequential exact stored/raw ranges for one frozen pin."""
+        offset = 0
+        while offset < pin['size']:
+            end = min(offset + _GCS_DOWNLOAD_CHUNK_SIZE, pin['size']) - 1
+            chunk = await lease.run(
+                _download_blob_range,
+                blob,
+                start=offset,
+                end=end,
+                generation=pin['generation'],
+                sdk_timeout=self.timeout,
+                timeout=self.timeout,
+            )
+            yield chunk
+            offset = end + 1
+
+    async def _download_attempt(
+        self,
+        lease: _GcsLease,
+        local_path: str,
+        max_response_bytes: int,
+    ) -> dict[str, Any]:
+        """Pin and atomically stream one exact stored object generation."""
+        client: Any = None
+        result: Optional[dict[str, Any]] = None
+        body_error: Optional[BaseException] = None
+        body_state: Optional[_ExceptionState] = None
+        try:
+            try:
+                credentials, project = await lease.run(
+                    google_auth.default, timeout=self.timeout)
+                await lease.run(
+                    _refresh_credentials_if_needed,
+                    credentials,
+                    timeout=self.timeout,
+                )
+                client = await lease.run(
+                    storage.Client,
+                    credentials=credentials,
+                    project=project,
+                    timeout=self.timeout,
+                    close_result=_close_storage_client,
+                )
+                bucket = await lease.run(
+                    client.bucket, self.bucket, timeout=self.timeout)
+                blob = await lease.run(
+                    bucket.blob, self.key, timeout=self.timeout)
+                if self._download_pin is None:
+                    caller_generation = cast(
+                        Optional[int], self.info.get('if_generation_match'))
+                    self._download_pin = await lease.run(
+                        _reload_download_pin,
+                        blob,
+                        if_generation_match=caller_generation,
+                        sdk_timeout=self.timeout,
+                        timeout=self.timeout,
+                    )
+                pin = self._download_pin
+                assert pin is not None
+                if pin['size'] > max_response_bytes:
+                    raise ResponseTooLargeError(
+                        f'response declares {pin["size"]} bytes, which is '
+                        f'over max_response_bytes={max_response_bytes}; '
+                        'the body was not read')
+                bytes_written = await stream_to_path(
+                    local_path,
+                    self._download_chunks(lease, blob, pin),
+                    overwrite=True,
+                    max_bytes=max_response_bytes,
+                    advertised_bytes=pin['size'],
+                )
+                if bytes_written != pin['size']:
+                    raise _AbortableGcsServiceFailure(502, {})
+                result = {
+                    'bytes_written': bytes_written,
+                    'etag': pin['etag'],
+                    'generation': pin['generation'],
+                    'crc32c': pin['crc32c'],
+                }
+            except _GCS_CREDENTIAL_FAILURES as error:
+                error.args = ('GCS credential resolution failed',)
+                raise ConfigurationError(
+                    'GCS application default credentials are unavailable'
+                ) from None
+            except _GCS_TRANSPORT_FAILURES as error:
+                error.args = ('GCS provider transport failure',)
+                raise _transport_error_for(error) from None
+            except BaseException as error:
+                if not _is_service_failure(error):
+                    raise
+                failure = _service_failure_for(
+                    error,
+                    command=self.command,
+                    bucket=self.bucket,
+                    target=self.key,
+                )
+                error.args = ('GCS provider service response',)
+                raise failure from None
+        except BaseException as error:
+            body_error = error
+            body_state = _capture_exception_state(error)
+
+        cleanup_error: Optional[BaseException] = None
+        cleanup_state: Optional[_ExceptionState] = None
+        if client is not None:
+            try:
+                await lease.run(
+                    _close_storage_client, client, timeout=self.timeout)
+            except BaseException as error:
+                cleanup_error = error
+                cleanup_state = _capture_exception_state(error)
+
+        pending_cancellation = (
+            body_error
+            if isinstance(body_error, asyncio.CancelledError)
+            else cleanup_error
+            if isinstance(cleanup_error, asyncio.CancelledError)
+            else None
+        )
+        if pending_cancellation is not None:
+            state = (
+                body_state
+                if pending_cancellation is body_error
+                else cleanup_state
+            )
+            assert state is not None
+            _raise_exact(pending_cancellation, state)
+        if body_error is not None:
+            assert body_state is not None
+            _raise_exact(body_error, body_state)
+        if cleanup_error is not None:
+            assert cleanup_state is not None
+            if isinstance(cleanup_error, _GCS_CREDENTIAL_FAILURES):
+                cleanup_error.args = ('GCS credential cleanup failed',)
+                raise ConfigurationError(
+                    'GCS application default credentials are unavailable'
+                ) from None
+            if isinstance(cleanup_error, _GCS_TRANSPORT_FAILURES):
+                cleanup_error.args = ('GCS provider cleanup failed',)
+                raise _transport_error_for(cleanup_error) from None
+            if _is_service_failure(cleanup_error):
+                status_failure = _service_failure_for(
+                    cleanup_error,
+                    command=self.command,
+                    bucket=self.bucket,
+                    target=self.key,
+                )
+                cleanup_error.args = ('GCS provider cleanup response',)
+                raise _AbortableGcsServiceFailure(
+                    status_failure.status_code, {}) from None
+            _raise_exact(cleanup_error, cleanup_state)
+        assert result is not None
+        return result
 
     async def _upload_attempt(
         self,

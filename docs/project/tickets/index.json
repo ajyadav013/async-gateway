@@ -803,7 +803,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-47"], "blocks": ["AGW-49"]},
       "commits": [],
-      "note": "Upload hardening B2 GREEN: the fixed 254-test suite and 276 entrypoint tests pass; metadata normalization, malformed-success refusal, cleanup typing, and body/cancellation/timeout precedence are implemented. Scoped flake8, mypy, diff, and JSON checks pass. Status remains IN PROGRESS for pinned raw download."
+      "note": "Pinned raw-download D1 GREEN: the immutable 266-test suite and 276 entrypoint tests pass; request-scoped pinning, exact 64-KiB raw ranges, fail-fast cap refusal, atomic publication, and private-pool lifecycle cleanup are implemented. Scoped flake8, mypy, diff, and JSON checks pass. Status remains IN PROGRESS for download hardening."
     },
     {
       "id": "AGW-49",

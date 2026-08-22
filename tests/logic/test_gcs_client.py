@@ -50,6 +50,7 @@ from asyncio_gateway.utils.exceptions import (
     TlsError,
     TransportError,
 )
+from asyncio_gateway.utils.paths import stream_to_path
 
 
 VALID_SIGNING_ACCOUNT = (
@@ -2176,6 +2177,385 @@ async def test_late_created_upload_client_closes_under_retained_capacity(
         await asyncio.gather(task, return_exceptions=True)
         for lease in other_leases:
             await _release_lease(lease)
+
+
+# --- AGW-48 tranche D1: pinned raw-download foundation -------------------
+
+
+class _DownloadBlob:
+    """Synchronous exact-range blob double for one bounded download."""
+
+    def __init__(self, provider: '_DownloadProvider') -> None:
+        """Retain the provider recorder and one valid metadata pin."""
+        self.provider = provider
+        self.generation: object = 41
+        self.size: object = len(provider.stored_bytes)
+        self.etag: object = 'download-etag'
+        self.crc32c: object = 'download-crc32c=='
+
+    def reload(self, **kwargs: object) -> None:
+        """Record exact pin controls and the provider worker identity."""
+        self.provider.record_thread('reload')
+        self.provider.reload_calls.append(dict(kwargs))
+
+    def download_as_bytes(self, **kwargs: object) -> bytes:
+        """Return one exact inclusive slice of the stored/raw object."""
+        self.provider.record_thread('range')
+        self.provider.range_calls.append(dict(kwargs))
+        start = kwargs['start']
+        end = kwargs['end']
+        assert isinstance(start, int) and not isinstance(start, bool)
+        assert isinstance(end, int) and not isinstance(end, bool)
+        return self.provider.stored_bytes[start:end + 1]
+
+
+class _DownloadBucket:
+    """Bucket double returning one observable download blob."""
+
+    def __init__(self, provider: '_DownloadProvider') -> None:
+        """Retain the provider recorder."""
+        self.provider = provider
+
+    def blob(self, key: str) -> _DownloadBlob:
+        """Record the exact object key selected by the request."""
+        self.provider.record_thread('blob')
+        self.provider.blob_keys.append(key)
+        return self.provider.blob
+
+
+class _DownloadClient:
+    """Storage-client double with observable download cleanup."""
+
+    def __init__(self, provider: '_DownloadProvider') -> None:
+        """Retain the provider recorder."""
+        self.provider = provider
+        self.close_calls = 0
+
+    def bucket(self, name: str) -> _DownloadBucket:
+        """Record the normalized bucket name."""
+        self.provider.record_thread('bucket')
+        self.provider.bucket_names.append(name)
+        return self.provider.bucket
+
+    def close(self) -> None:
+        """Record one deterministic off-loop cleanup."""
+        self.provider.record_thread('client-close')
+        self.close_calls += 1
+
+
+class _DownloadProvider:
+    """Deterministic ADC, metadata, raw-range, and cleanup recorder."""
+
+    def __init__(self, stored_bytes: bytes) -> None:
+        """Create one connected provider tree for the stored bytes."""
+        self.stored_bytes = stored_bytes
+        self.timeline: list[str] = []
+        self.threads: dict[str, list[tuple[int, str]]] = {}
+        self.reload_calls: list[dict[str, object]] = []
+        self.range_calls: list[dict[str, object]] = []
+        self.bucket_names: list[str] = []
+        self.blob_keys: list[str] = []
+        self.credentials = _UploadCredentials()
+        self.blob = _DownloadBlob(self)
+        self.bucket = _DownloadBucket(self)
+        self.client = _DownloadClient(self)
+
+    def record_thread(self, seam: str) -> None:
+        """Record every occurrence of one synchronous provider seam."""
+        self.timeline.append(seam)
+        self.threads.setdefault(seam, []).append((
+            threading.get_ident(), threading.current_thread().name))
+
+    def adc(self, *args: object, **kwargs: object) -> tuple[object, str]:
+        """Return valid local ADC without contacting a metadata server."""
+        self.record_thread('adc')
+        return self.credentials, 'download-project'
+
+    def make_client(self, *args: object, **kwargs: object) -> _DownloadClient:
+        """Return the observable storage client."""
+        self.record_thread('client')
+        return self.client
+
+
+def _install_download_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _DownloadProvider,
+) -> None:
+    """Replace ADC and GCS construction with download-only doubles."""
+    monkeypatch.setattr(google_auth, 'default', provider.adc)
+    monkeypatch.setattr(storage, 'Client', provider.make_client)
+
+
+async def _public_download(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _DownloadProvider,
+    local_path: Path,
+    *,
+    max_response_bytes: int,
+    generation: int | None = None,
+) -> tuple[dict[str, Any], _UploadBreaker]:
+    """Drive one download through the public selector with local doubles."""
+    breaker = _UploadBreaker(provider.timeline)
+    monkeypatch.setattr(base, 'get_breaker', lambda *args, **kwargs: breaker)
+    _install_download_provider(monkeypatch, provider)
+    info: dict[str, object] = {
+        'command': 'download',
+        'local_path': str(local_path),
+        'max_response_bytes': max_response_bytes,
+        'timeout': 2.5,
+    }
+    if generation is not None:
+        info['if_generation_match'] = generation
+    result = await request(
+        'gs://Download-Bucket/folder/object.bin',
+        protocol='GCS',
+        protocol_info=info,
+    )
+    return result, breaker
+
+
+@pytest.mark.parametrize(
+    ('size', 'caller_generation', 'expected_ranges'),
+    [
+        pytest.param(0, None, [], id='empty'),
+        pytest.param(1, 41, [(0, 0)], id='one-byte'),
+        pytest.param(65536, None, [(0, 65535)], id='exact-64-kib'),
+        pytest.param(
+            65537, None, [(0, 65535), (65536, 65536)],
+            id='two-inclusive-ranges',
+        ),
+    ],
+)
+async def test_download_pins_then_streams_exact_raw_ranges_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    size: int,
+    caller_generation: int | None,
+    expected_ranges: list[tuple[int, int]],
+) -> None:
+    """One immutable pin feeds exact raw ranges to the atomic writer."""
+    stored_bytes = bytes(index % 251 for index in range(size))
+    provider = _DownloadProvider(stored_bytes)
+    if size == 0:
+        provider.blob.etag = None
+        provider.blob.crc32c = None
+    target = tmp_path / 'download.bin'
+    target.write_bytes(b'old-target')
+    stream_calls: list[dict[str, object]] = []
+    loop_thread = threading.get_ident()
+
+    async def recording_stream(
+        path: object,
+        chunks: Any,
+        *,
+        overwrite: bool,
+        max_bytes: int | None,
+        advertised_bytes: int | None = None,
+    ) -> int:
+        """Record the held lease and delegate to the real atomic writer."""
+        provider.timeline.append('stream')
+        stream_calls.append({
+            'path': path,
+            'overwrite': overwrite,
+            'max_bytes': max_bytes,
+            'advertised_bytes': advertised_bytes,
+            'active_leases': getattr(gcs_client, '_active_gcs_leases')(),
+        })
+        return await stream_to_path(
+            path,
+            chunks,
+            overwrite=overwrite,
+            max_bytes=max_bytes,
+            advertised_bytes=advertised_bytes,
+        )
+
+    monkeypatch.setattr(
+        gcs_client, 'stream_to_path', recording_stream, raising=False)
+
+    result, breaker = await _public_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=max(size, 1),
+        generation=caller_generation,
+    )
+
+    expected_reload: dict[str, object] = {
+        'retry': None,
+        'timeout': 2.5,
+    }
+    if caller_generation is not None:
+        expected_reload['if_generation_match'] = caller_generation
+    assert provider.reload_calls == [expected_reload]
+    assert provider.range_calls == [
+        {
+            'start': start,
+            'end': end,
+            'if_generation_match': 41,
+            'raw_download': True,
+            'retry': None,
+            'timeout': 2.5,
+        }
+        for start, end in expected_ranges
+    ]
+    assert stream_calls == [{
+        'path': str(target),
+        'overwrite': True,
+        'max_bytes': max(size, 1),
+        'advertised_bytes': size,
+        'active_leases': 1,
+    }]
+    assert provider.timeline.index('reload') < provider.timeline.index(
+        'stream')
+    assert target.read_bytes() == stored_bytes
+    assert provider.client.close_calls == 1
+    assert provider.bucket_names == ['download-bucket']
+    assert provider.blob_keys == ['folder/object.bin']
+    assert breaker.calls == 1
+    assert getattr(gcs_client, '_active_gcs_leases')() == 0
+    for seam in {'adc', 'client', 'bucket', 'blob', 'reload', 'range',
+                 'client-close'}:
+        for thread_id, thread_name in provider.threads.get(seam, []):
+            assert thread_id != loop_thread
+            assert thread_name.startswith('asyncio-gateway-gcs')
+    assert result['status_code'] == 200
+    assert result['protocol_details'] == {
+        'command': 'download',
+        'bucket': 'download-bucket',
+        'key': 'folder/object.bin',
+        'local_path': str(target),
+        'bytes_written': size,
+        'etag': None if size == 0 else 'download-etag',
+        'generation': 41,
+        'crc32c': None if size == 0 else 'download-crc32c==',
+    }
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        pytest.param('generation', True, id='generation-bool'),
+        pytest.param('generation', -1, id='generation-negative'),
+        pytest.param('generation', None, id='generation-missing'),
+        pytest.param('size', False, id='size-bool'),
+        pytest.param('size', -1, id='size-negative'),
+        pytest.param('size', None, id='size-missing'),
+    ],
+)
+async def test_download_rejects_malformed_pin_before_range_or_local_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    """A malformed nominal metadata success fails closed before output."""
+    provider = _DownloadProvider(b'x')
+    setattr(provider.blob, field, value)
+    target = tmp_path / 'download.bin'
+    target.write_bytes(b'existing-target')
+    stream_called = False
+
+    async def forbidden_stream(*args: object, **kwargs: object) -> NoReturn:
+        """Fail if malformed metadata reaches the local writer."""
+        nonlocal stream_called
+        stream_called = True
+        raise AssertionError((args, kwargs))
+
+    monkeypatch.setattr(
+        gcs_client, 'stream_to_path', forbidden_stream, raising=False)
+
+    result, breaker = await _public_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert provider.reload_calls == [{'retry': None, 'timeout': 2.5}]
+    assert provider.range_calls == []
+    assert stream_called is False
+    assert target.read_bytes() == b'existing-target'
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 1
+
+
+async def test_download_caller_generation_is_authoritative_before_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reload cannot silently replace an explicit caller generation pin."""
+    provider = _DownloadProvider(b'x')
+    provider.blob.generation = 42
+    target = tmp_path / 'download.bin'
+    target.write_bytes(b'existing-target')
+    stream_called = False
+
+    async def forbidden_stream(*args: object, **kwargs: object) -> NoReturn:
+        """Fail if a mismatched generation reaches local output."""
+        nonlocal stream_called
+        stream_called = True
+        raise AssertionError((args, kwargs))
+
+    monkeypatch.setattr(
+        gcs_client, 'stream_to_path', forbidden_stream, raising=False)
+
+    result, _ = await _public_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+        generation=41,
+    )
+
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['status_code'] == 502
+    assert provider.reload_calls == [{
+        'retry': None,
+        'timeout': 2.5,
+        'if_generation_match': 41,
+    }]
+    assert provider.range_calls == []
+    assert stream_called is False
+    assert target.read_bytes() == b'existing-target'
+
+
+async def test_download_advertised_cap_precedes_range_and_path_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pinned stored size above the cap is refused before local output."""
+    provider = _DownloadProvider(b'over-cap')
+    target = tmp_path / 'download.bin'
+    target.write_bytes(b'existing-target')
+    stream_called = False
+
+    async def forbidden_stream(*args: object, **kwargs: object) -> NoReturn:
+        """Fail if an advertised oversize reaches the local writer."""
+        nonlocal stream_called
+        stream_called = True
+        raise AssertionError((args, kwargs))
+
+    monkeypatch.setattr(
+        gcs_client, 'stream_to_path', forbidden_stream, raising=False)
+
+    result, _ = await _public_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=7,
+    )
+
+    assert result['ok'] is False
+    assert result['error']['code'] == 'RESPONSE_TOO_LARGE'
+    assert provider.reload_calls == [{'retry': None, 'timeout': 2.5}]
+    assert provider.range_calls == []
+    assert stream_called is False
+    assert target.read_bytes() == b'existing-target'
+    assert provider.client.close_calls == 1
 
 
 # --- GCS-04 tranche B: shutdown, telemetry, and outcome precedence -------

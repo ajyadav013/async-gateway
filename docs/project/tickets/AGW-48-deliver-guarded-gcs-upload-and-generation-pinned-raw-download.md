@@ -34,6 +34,23 @@ beyond the cap (GCS-05).
 
 ## Work Log
 
+- 2026-08-22 — Pinned raw-download D1 GREEN adds request-scoped immutable
+  generation/size metadata, caller-generation authority, fail-fast advertised
+  size refusal, exact sequential 64-KiB raw inclusive ranges, and atomic
+  `stream_to_path` publication under one retained lifecycle lease. Provider
+  lookup, reload, range calls, and owned-client close stay on the private GCS
+  pool with finite timeouts and `retry=None`. The immutable 266-test focused
+  suite, 276 entrypoint tests, scoped flake8/mypy, diff, and JSON checks pass.
+  Status remains IN PROGRESS for download hardening.
+- 2026-08-22 — Pinned raw-download D1 RED added 12 deterministic public-path
+  cases for reload pin controls and caller-generation authority, required
+  non-negative generation/size metadata, advertised-size refusal before range
+  or local mutation, empty/one-byte/exact-64-KiB/multi-range inclusive raw
+  calls, unchanged atomic writer delegation, and the exact normalized success
+  schema. The exact scoped command collected 266 tests: the 254-test baseline
+  passed and all 12 new cases failed only at the intentionally absent download
+  dispatch. Scoped flake8, diff, JSON, and dirty-scope checks passed. Status
+  remains IN PROGRESS.
 - 2026-08-22 — Upload hardening B2 GREEN validates the exact optional
   metadata schema before publication, fails malformed provider success closed,
   and preserves body/cancellation/timeout precedence while shield-draining one
