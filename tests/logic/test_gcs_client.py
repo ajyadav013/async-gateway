@@ -18,7 +18,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any, NoReturn
@@ -26,6 +26,7 @@ from typing import Any, NoReturn
 from failsafe import CircuitOpen, RetriesExhausted
 
 from google import auth as google_auth
+from google.auth import credentials as google_auth_credentials
 from google.auth import exceptions as google_auth_exceptions
 from google.cloud import storage
 
@@ -1090,6 +1091,351 @@ def test_operational_sdk_controls_are_retry_none_with_finite_timeout() -> None:
     controls = getattr(gcs_client, '_operational_sdk_kwargs')(2.5)
 
     assert controls == {'retry': None, 'timeout': 2.5}
+
+
+# --- AGW-50 tranche S1: direct V4 signed URLs ----------------------------
+
+
+class _DirectSigner:
+    """Minimal deterministic signer exposed by direct ADC credentials."""
+
+    @property
+    def key_id(self) -> str:
+        """Return one stable test-only key identifier."""
+        return 'direct-signing-key'
+
+    def sign(self, message: bytes) -> bytes:
+        """Return a deterministic signature without external work."""
+        return b'direct-signature:' + message
+
+
+class _DirectSigningCredentials(google_auth_credentials.Signing):
+    """Valid ADC credentials implementing Google's signing capability."""
+
+    def __init__(self, provider: '_SignedUrlProvider') -> None:
+        """Retain the provider recorder and one usable signer identity."""
+        self.provider = provider
+        self.valid = True
+        self.expired = False
+        self._signer = _DirectSigner()
+
+    def sign_bytes(self, message: bytes) -> bytes:
+        """Delegate deterministic signing to the exposed signer."""
+        return self._signer.sign(message)
+
+    @property
+    def signer_email(self) -> str:
+        """Expose one non-empty identity and record selection off-loop."""
+        self.provider.record_thread('signer-identity')
+        return 'direct-signer@example-project.iam.gserviceaccount.com'
+
+    @property
+    def signer(self) -> _DirectSigner:
+        """Expose the deterministic signer required by the capability."""
+        self.provider.record_thread('signer')
+        return self._signer
+
+    def refresh(self, request: object) -> None:
+        """Reject refresh because this direct credential starts valid."""
+        raise AssertionError(
+            f'valid direct credentials must not refresh: {request!r}')
+
+
+class _BearerOnlyCredentials:
+    """Valid bearer credentials deliberately lacking signing capability."""
+
+    def __init__(self, token: str) -> None:
+        """Retain one sentinel bearer token for safe-refusal proof."""
+        self.valid = True
+        self.expired = False
+        self.token = token
+
+    def refresh(self, request: object) -> None:
+        """Reject refresh because this bearer credential starts valid."""
+        raise AssertionError(
+            f'valid bearer credentials must not refresh: {request!r}')
+
+
+class _SignedUrlBlob:
+    """Exact-call V4 URL-generation double with open-client visibility."""
+
+    def __init__(self, provider: '_SignedUrlProvider') -> None:
+        """Retain the connected provider recorder."""
+        self.provider = provider
+
+    def generate_signed_url(self, **kwargs: object) -> str:
+        """Record one exact generation call without signing or network I/O."""
+        self.provider.record_thread('generate')
+        self.provider.generate_calls.append(dict(kwargs))
+        self.provider.client_open_during_generate.append(
+            not self.provider.client.closed)
+        assert self.provider.response is not None
+        self.provider.details_during_generate.append(dict(
+            self.provider.response['protocol_details']))
+        return self.provider.signed_url
+
+
+class _SignedUrlBucket:
+    """Bucket double returning one exact-object signing target."""
+
+    def __init__(self, provider: '_SignedUrlProvider') -> None:
+        """Retain the connected provider recorder."""
+        self.provider = provider
+
+    def blob(self, key: str) -> _SignedUrlBlob:
+        """Record and return the caller-selected exact object."""
+        self.provider.record_thread('blob')
+        self.provider.blob_keys.append(key)
+        return self.provider.blob
+
+
+class _SignedUrlClient:
+    """Storage client double exposing close-before-publication ordering."""
+
+    def __init__(self, provider: '_SignedUrlProvider') -> None:
+        """Retain the provider recorder and start open."""
+        self.provider = provider
+        self.closed = False
+        self.close_calls = 0
+
+    def bucket(self, name: str) -> _SignedUrlBucket:
+        """Record one normalized bucket lookup while the client is open."""
+        self.provider.record_thread('bucket')
+        self.provider.bucket_names.append(name)
+        return self.provider.bucket
+
+    def close(self) -> None:
+        """Capture unpublished details before closing the owned client."""
+        self.provider.record_thread('client-close')
+        assert self.provider.response is not None
+        self.provider.details_during_close.append(dict(
+            self.provider.response['protocol_details']))
+        self.close_calls += 1
+        self.closed = True
+
+
+class _SignedUrlProvider:
+    """Deterministic direct-signing ADC and storage SDK tree."""
+
+    def __init__(self, credentials: object | None = None) -> None:
+        """Create one observable provider tree with no external I/O."""
+        self.timeline: list[str] = []
+        self.threads: list[tuple[str, int, str]] = []
+        self.generate_calls: list[dict[str, object]] = []
+        self.client_calls: list[
+            tuple[tuple[object, ...], dict[str, object]]
+        ] = []
+        self.bucket_names: list[str] = []
+        self.blob_keys: list[str] = []
+        self.client_open_during_generate: list[bool] = []
+        self.details_during_generate: list[dict[str, object]] = []
+        self.details_during_close: list[dict[str, object]] = []
+        self.response: dict[str, Any] | None = None
+        self.signed_url = (
+            'https://storage.googleapis.com/signed-bucket/folder/object.bin'
+            '?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Signature=s1')
+        self.credentials = (
+            _DirectSigningCredentials(self)
+            if credentials is None else credentials
+        )
+        self.blob = _SignedUrlBlob(self)
+        self.bucket = _SignedUrlBucket(self)
+        self.client = _SignedUrlClient(self)
+
+    def record_thread(self, seam: str) -> None:
+        """Record provider seam ordering and executing thread identity."""
+        self.timeline.append(seam)
+        self.threads.append((
+            seam, threading.get_ident(), threading.current_thread().name))
+
+    def adc(self, *args: object, **kwargs: object) -> tuple[object, str]:
+        """Return deterministic direct ADC without metadata-server work."""
+        self.record_thread('adc')
+        return self.credentials, 'signed-url-project'
+
+    def make_client(self, *args: object, **kwargs: object) -> _SignedUrlClient:
+        """Record exact storage-client construction and return it open."""
+        self.record_thread('client')
+        self.client_calls.append((args, dict(kwargs)))
+        return self.client
+
+
+def _install_signed_url_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _SignedUrlProvider,
+) -> '_UploadBreaker':
+    """Install direct ADC/storage doubles and a non-executed breaker."""
+    breaker = _UploadBreaker(provider.timeline)
+    monkeypatch.setattr(base, 'get_breaker', lambda *args, **kwargs: breaker)
+    monkeypatch.setattr(google_auth, 'default', provider.adc)
+    monkeypatch.setattr(storage, 'Client', provider.make_client)
+    return breaker
+
+
+@pytest.mark.parametrize(
+    (
+        'method', 'expiry_option', 'expected_expiry',
+        'max_upload_bytes', 'generation',
+    ),
+    [
+        pytest.param('GET', 1, 1, None, None, id='get-min-expiry'),
+        pytest.param('GET', None, 900, None, None, id='get-default-expiry'),
+        pytest.param('GET', 3600, 3600, None, None, id='get-max-expiry'),
+        pytest.param('PUT', 1, 1, 1, None, id='put-min-default-gen'),
+        pytest.param('PUT', None, 900, 23, 41, id='put-default-custom-gen'),
+        pytest.param('PUT', 3600, 3600, 64, None, id='put-max-expiry'),
+    ],
+)
+async def test_direct_signer_exact_v4_call_closes_before_publish(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    expiry_option: int | None,
+    expected_expiry: int,
+    max_upload_bytes: int | None,
+    generation: int | None,
+) -> None:
+    """GET and PUT bind exact V4 calls and atomically publish after close."""
+    provider = _SignedUrlProvider()
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    loop_thread = threading.get_ident()
+    info: dict[str, object] = {
+        'command': 'signed_url',
+        'method': method,
+        'timeout': 2.5,
+    }
+    if expiry_option is not None:
+        info['expires_in_seconds'] = expiry_option
+    if method == 'PUT':
+        assert max_upload_bytes is not None
+        info.update({
+            'content_type': 'application/octet-stream',
+            'max_upload_bytes': max_upload_bytes,
+        })
+        if generation is not None:
+            info['if_generation_match'] = generation
+
+    response = _response(
+        'gs://Signed-Bucket/folder/object.bin')
+    provider.response = response
+    strategy = GcsRequest(
+        'gs://Signed-Bucket/folder/object.bin',
+        None,
+        response,
+        _validate(info),
+        redact_params=frozenset(),
+    )
+
+    result = await strategy.handle_request()
+
+    expected_call: dict[str, object] = {
+        'version': 'v4',
+        'expiration': timedelta(seconds=expected_expiry),
+        'method': method,
+        'credentials': provider.credentials,
+    }
+    expected_details: dict[str, object] = {
+        'command': 'signed_url',
+        'method': method,
+        'bucket': 'signed-bucket',
+        'key': 'folder/object.bin',
+        'expires_in_seconds': expected_expiry,
+        'signed_url': provider.signed_url,
+    }
+    if method == 'PUT':
+        assert max_upload_bytes is not None
+        expected_generation = 0 if generation is None else generation
+        sdk_headers = {
+            'x-goog-content-length-range': f'1,{max_upload_bytes}',
+            'x-goog-if-generation-match': str(expected_generation),
+        }
+        expected_call.update({
+            'content_type': 'application/octet-stream',
+            'headers': sdk_headers,
+        })
+        expected_details.update({
+            'content_type': 'application/octet-stream',
+            'max_upload_bytes': max_upload_bytes,
+            'if_generation_match': expected_generation,
+            'required_headers': {
+                'content-type': 'application/octet-stream',
+                **sdk_headers,
+            },
+        })
+
+    assert isinstance(
+        provider.credentials, google_auth_credentials.Signing)
+    assert provider.generate_calls == [expected_call]
+    assert provider.client_calls == [(
+        (),
+        {
+            'credentials': provider.credentials,
+            'project': 'signed-url-project',
+        },
+    )]
+    assert provider.bucket_names == ['signed-bucket']
+    assert provider.blob_keys == ['folder/object.bin']
+    assert provider.client_open_during_generate == [True]
+    assert provider.details_during_generate == [{}]
+    assert provider.details_during_close == [{}]
+    assert provider.client.close_calls == 1
+    assert provider.client.closed is True
+    assert provider.timeline.count('generate') == 1
+    assert provider.timeline.index('generate') < provider.timeline.index(
+        'client-close')
+    assert breaker.calls == 0
+    signer_identity_threads = [
+        (thread_id, thread_name)
+        for seam, thread_id, thread_name in provider.threads
+        if seam == 'signer-identity'
+    ]
+    assert signer_identity_threads
+    assert all(
+        thread_id != loop_thread
+        and thread_name.startswith('asyncio-gateway-gcs')
+        for thread_id, thread_name in signer_identity_threads
+    )
+    provider_threads = [
+        (thread_id, thread_name)
+        for seam, thread_id, thread_name in provider.threads
+        if seam in {'generate', 'client-close'}
+    ]
+    assert len(provider_threads) == 2
+    assert all(
+        thread_id != loop_thread
+        and thread_name.startswith('asyncio-gateway-gcs')
+        for thread_id, thread_name in provider_threads
+    )
+    assert result is response
+    assert result['ok'] is True
+    assert result['status_code'] == 200
+    assert result['protocol_details'] == expected_details
+
+
+async def test_bearer_only_direct_credentials_fail_before_url_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid bearer token without Signing capability fails safely."""
+    secret = 'bearer-only-direct-token-agw50-s1'
+    provider = _SignedUrlProvider(_BearerOnlyCredentials(secret))
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+
+    result = await request(
+        'gs://signed-bucket/folder/object.bin',
+        protocol='GCS',
+        protocol_info={
+            'command': 'signed_url',
+            'method': 'GET',
+            'timeout': 2.5,
+        },
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == 400
+    assert result['error']['code'] == 'CONFIG'
+    assert result['protocol_details'] == {}
+    assert provider.generate_calls == []
+    assert breaker.calls == 0
+    assert secret not in repr(result)
 
 
 # --- AGW-49 foundation: normalized head and one-page list ----------------

@@ -9,7 +9,7 @@ import ssl
 import threading
 from collections.abc import AsyncIterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import TracebackType
 from typing import (
     Any,
@@ -29,6 +29,7 @@ from failsafe import CircuitOpen, RetriesExhausted
 
 from google import auth as google_auth
 from google.api_core import exceptions as google_api_exceptions
+from google.auth import credentials as google_auth_credentials
 from google.auth import exceptions as google_auth_exceptions
 from google.auth.transport.requests import Request as GoogleAuthRequest
 # google-cloud-storage does not publish a py.typed marker.
@@ -430,6 +431,17 @@ def _refresh_credentials_if_needed(credentials: Any) -> None:
 def _close_storage_client(client: Any) -> None:
     """Close one owned synchronous storage client."""
     client.close()
+
+
+def _require_direct_signer(credentials: Any) -> None:
+    """Require direct ADC credentials with one usable signer identity."""
+    if not isinstance(credentials, google_auth_credentials.Signing):
+        raise ConfigurationError(
+            'GCS application default credentials cannot sign URLs')
+    signer_identity = credentials.signer_email
+    if not isinstance(signer_identity, str) or not signer_identity.strip():
+        raise ConfigurationError(
+            'GCS application default credentials cannot sign URLs')
 
 
 def _upload_blob(
@@ -1112,13 +1124,11 @@ class GcsRequest(BaseRequestClass):
 
         Raises:
             AsyncGatewayError: For a typed local or lifecycle failure.
-            NotImplementedError: If the selected operation is unavailable.
         """
-        if self.command not in {'download', 'upload', 'head', 'list'}:
-            raise NotImplementedError
-
         lease = _acquire_gcs_lease()
         try:
+            if self.command == 'signed_url':
+                return await self._handle_signed_url(lease)
             if self.command == 'download':
                 return await self._handle_download(lease)
             if self.command in {'head', 'list'}:
@@ -1163,6 +1173,122 @@ class GcsRequest(BaseRequestClass):
                 self.response, status_code=200, started=self.start_time)
         finally:
             await lease.release()
+
+    async def _handle_signed_url(
+        self,
+        lease: _GcsLease,
+    ) -> GatewayResponse:
+        """Generate one direct-ADC V4 URL and publish it after cleanup."""
+        signed_url = await self._signed_url_attempt(lease)
+        method = cast(str, self.info['method'])
+        expires_in_seconds = cast(int, self.info['expires_in_seconds'])
+        details: dict[str, Any] = {
+            'command': self.command,
+            'method': method,
+            'bucket': self.bucket,
+            'key': self.key,
+            'expires_in_seconds': expires_in_seconds,
+            'signed_url': signed_url,
+        }
+        if method == 'PUT':
+            content_type = cast(str, self.info['content_type'])
+            max_upload_bytes = cast(int, self.info['max_upload_bytes'])
+            if_generation_match = cast(
+                int, self.info['if_generation_match'])
+            details.update({
+                'content_type': content_type,
+                'max_upload_bytes': max_upload_bytes,
+                'if_generation_match': if_generation_match,
+                'required_headers': {
+                    'content-type': content_type,
+                    'x-goog-content-length-range':
+                        f'1,{max_upload_bytes}',
+                    'x-goog-if-generation-match':
+                        str(if_generation_match),
+                },
+            })
+        self.response['protocol_details'] = details
+        return finalise_ok(
+            self.response, status_code=200, started=self.start_time)
+
+    async def _signed_url_attempt(self, lease: _GcsLease) -> str:
+        """Generate one private direct-signer URL while the client is open."""
+        if 'signing_service_account' in self.info:
+            raise ConfigurationError(
+                'GCS signing service-account impersonation is unavailable')
+
+        client: Any = None
+        signed_url: object = _NO_RESULT
+        try:
+            try:
+                credentials, project = await lease.run(
+                    google_auth.default, timeout=self.timeout)
+                await lease.run(
+                    _refresh_credentials_if_needed,
+                    credentials,
+                    timeout=self.timeout,
+                )
+                await lease.run(
+                    _require_direct_signer,
+                    credentials,
+                    timeout=self.timeout,
+                )
+                client = await lease.run(
+                    storage.Client,
+                    credentials=credentials,
+                    project=project,
+                    timeout=self.timeout,
+                    close_result=_close_storage_client,
+                )
+                bucket = await lease.run(
+                    client.bucket, self.bucket, timeout=self.timeout)
+                blob = await lease.run(
+                    bucket.blob, self.key, timeout=self.timeout)
+                method = cast(str, self.info['method'])
+                expires_in_seconds = cast(
+                    int, self.info['expires_in_seconds'])
+                if method == 'PUT':
+                    max_upload_bytes = cast(
+                        int, self.info['max_upload_bytes'])
+                    if_generation_match = cast(
+                        int, self.info['if_generation_match'])
+                    signed_url = await lease.run(
+                        blob.generate_signed_url,
+                        version='v4',
+                        expiration=timedelta(
+                            seconds=expires_in_seconds),
+                        method=method,
+                        credentials=credentials,
+                        content_type=cast(
+                            str, self.info['content_type']),
+                        headers={
+                            'x-goog-content-length-range':
+                                f'1,{max_upload_bytes}',
+                            'x-goog-if-generation-match':
+                                str(if_generation_match),
+                        },
+                        timeout=self.timeout,
+                    )
+                else:
+                    signed_url = await lease.run(
+                        blob.generate_signed_url,
+                        version='v4',
+                        expiration=timedelta(
+                            seconds=expires_in_seconds),
+                        method=method,
+                        credentials=credentials,
+                        timeout=self.timeout,
+                    )
+            except _GCS_CREDENTIAL_FAILURES as error:
+                error.args = ('GCS credential resolution failed',)
+                raise ConfigurationError(
+                    'GCS application default credentials are unavailable'
+                ) from None
+        finally:
+            if client is not None:
+                await lease.run(
+                    _close_storage_client, client, timeout=self.timeout)
+        return cast(str, signed_url)
 
     async def _handle_head_or_list(
         self,

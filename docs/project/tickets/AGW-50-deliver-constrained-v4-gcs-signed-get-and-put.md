@@ -1,6 +1,6 @@
 # AGW-50: Deliver constrained V4 GCS signed GET and PUT
 
-- **Status:** OPEN
+- **Status:** IN PROGRESS
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-07 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -36,3 +36,18 @@ path and must not leak an unpublished URL or credentials (GCS-07).
 - 2026-08-22 — Opened from approved GCS-07 planning before implementation;
   recorded its two-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-22 — S1 RED adds seven deterministic direct-ADC cases: exact V4
+  GET/PUT calls at 1/default-900/3600 seconds, PUT header/generation bounds,
+  signer capability, off-loop generation/close, close-before-publication, and
+  bearer-only refusal. Focused result: 471 pass and all 7 new cases fail only
+  at the untouched signed-URL placeholder (`gcs_client.py:1118`). Production
+  remains byte-identical; no commit was created.
+- 2026-08-22 — S1 GREEN implements only direct sign-capable ADC GET/PUT:
+  signing capability and identity are checked off-loop, exact V4 arguments are
+  generated once without breaker execution, and the client closes before the
+  bearer URL is atomically published. Focused GCS/no-blocking tests pass
+  478/478; entrypoint tests pass 276/276; scoped flake8 and full-package mypy
+  pass. Focused `gcs_client.py` coverage is 99.31%; the remaining blank signer
+  identity case is the next direct-signing RED, impersonation belongs to S2,
+  and credential/cleanup failure paths belong to S2/S3. AGW-50 remains in
+  progress and the frozen S1 test hash is unchanged.

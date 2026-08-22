@@ -820,7 +820,7 @@
     {
       "id": "AGW-50",
       "title": "Deliver constrained V4 signed GET and PUT without bearer leakage",
-      "status": "OPEN",
+      "status": "IN PROGRESS",
       "story": "GCS-07",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-50-deliver-constrained-v4-gcs-signed-get-and-put.md",
