@@ -535,10 +535,10 @@ def _download_blob_range(
 
 
 def _optional_metadata_string(value: object) -> Optional[str]:
-    """Normalize one optional provider string without coercion."""
+    """Normalize one optional meaningful provider string without coercion."""
     if value is None:
         return None
-    if not isinstance(value, str):
+    if not isinstance(value, str) or value == '':
         raise _AbortableGcsServiceFailure(502, {})
     return value
 
@@ -635,9 +635,27 @@ def _list_one_page(
     if page_token is not None:
         arguments['page_token'] = page_token
     iterator = client.list_blobs(bucket, **arguments)
-    page = next(iter(iterator.pages))
-    items = [_normalize_list_item(blob) for blob in page]
-    next_page_token = iterator.next_page_token
+    try:
+        pages = iter(iterator.pages)
+        page = next(pages)
+        page_items = iter(page)
+    except (AttributeError, TypeError):
+        raise _AbortableGcsServiceFailure(502, {}) from None
+
+    items: list[dict[str, Any]] = []
+    while True:
+        try:
+            blob = next(page_items)
+        except StopIteration:
+            break
+        if len(items) >= max_items:
+            raise _AbortableGcsServiceFailure(502, {})
+        items.append(_normalize_list_item(blob))
+
+    try:
+        next_page_token = iterator.next_page_token
+    except AttributeError:
+        raise _AbortableGcsServiceFailure(502, {}) from None
     if (
         next_page_token is not None
         and (

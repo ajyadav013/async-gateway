@@ -51,3 +51,22 @@ recursively enumerating a bucket, or disclosing caller tokens (GCS-06).
   entrypoint cases, scoped flake8, and scoped mypy pass. Files:
   `asyncio_gateway/logic/gcs_client.py`, this ticket, and
   `docs/project/tickets/index.json`.
+- 2026-08-22 — Added the normalization-hardening RED matrix for every frozen
+  head/list scalar family, metadata mapping copies, malformed items/pages,
+  server-token coherence, whole-page atomicity, hostile-value containment, and
+  the `max_items` bound. The exact focused suite collects 380 cases: the 328
+  baseline plus 52 new cases, with 371 passing and nine genuine product gaps
+  (six accepted empty required-meaning scalars, one oversized page, and two
+  malformed page/iterator exceptions escaping instead of `GCS_STATUS`/502).
+  Production stayed untouched; collection, fixtures, network, sleeps, timing
+  oracles, scoped flake8, and diff checks are clean. Files:
+  `tests/logic/test_gcs_client.py`, this ticket, and
+  `docs/project/tickets/index.json`.
+- 2026-08-22 — Closed the nine normalization gaps by rejecting empty optional
+  service scalars, refusing pages larger than `max_items` before publication,
+  and translating only malformed iterator/page shape access into sanitized
+  `GCS_STATUS`/502. The immutable focused suite passes 380 cases and the
+  entrypoint suite passes 276; scoped flake8, mypy, diff, JSON, and exact-scope
+  checks pass. Whitespace-only opaque server tokens remain valid. Files:
+  `asyncio_gateway/logic/gcs_client.py`, `tests/logic/test_gcs_client.py`, this
+  ticket, and `docs/project/tickets/index.json`.

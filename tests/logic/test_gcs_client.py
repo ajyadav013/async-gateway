@@ -1404,18 +1404,23 @@ async def test_head_normalizes_absent_optional_metadata_without_schema_drift(
 
 
 @pytest.mark.parametrize(
-    'caller_token',
+    ('caller_token', 'server_token'),
     [
-        pytest.param('  ', id='whitespace-preserved'),
-        pytest.param('\u00fc' * 2048, id='exact-4096-utf8-bytes'),
+        pytest.param(
+            '  ', 'server-next-page', id='caller-whitespace-preserved'),
+        pytest.param(
+            '\u00fc' * 2048, '  ',
+            id='caller-4096-utf8-bytes-and-server-whitespace',
+        ),
     ],
 )
 async def test_list_fetches_exactly_one_ordered_page_with_opaque_token(
     monkeypatch: pytest.MonkeyPatch,
     caller_token: str,
+    server_token: str,
 ) -> None:
     """List passes the caller token unchanged and never follows the next."""
-    provider = _HeadListProvider(server_token='server-next-page')
+    provider = _HeadListProvider(server_token=server_token)
     first = _HeadListBlob(provider)
     second = _HeadListBlob(provider)
     second.name = 'prefix/second.bin'
@@ -1426,7 +1431,7 @@ async def test_list_fetches_exactly_one_ordered_page_with_opaque_token(
     second.updated = None
     second.crc32c = None
     provider.iterator = _HeadListIterator(
-        provider, [first, second], 'server-next-page')
+        provider, [first, second], server_token)
     breaker = _install_head_list_provider(monkeypatch, provider)
     loop_thread = threading.get_ident()
 
@@ -1493,7 +1498,7 @@ async def test_list_fetches_exactly_one_ordered_page_with_opaque_token(
         ],
         'item_count': 2,
         'is_truncated': True,
-        'next_page_token': 'server-next-page',
+        'next_page_token': server_token,
     }
     assert 'page_token' not in result['protocol_details']
     assert all(
@@ -1536,6 +1541,282 @@ async def test_list_empty_prefix_returns_one_coherent_empty_page(
         'is_truncated': False,
         'next_page_token': None,
     }
+
+
+# --- AGW-49 normalization hardening: hostile nominal successes ----------
+
+
+class _HostileHeadListValue:
+    """Foreign SDK value whose representation is a containment sentinel."""
+
+    def __init__(self, sentinel: str) -> None:
+        """Retain the marker that must not cross a public surface."""
+        self.sentinel = sentinel
+
+    def __repr__(self) -> str:
+        """Expose the marker if production retains or stringifies the value."""
+        return self.sentinel
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        pytest.param('size', True, id='content-length-bool'),
+        pytest.param('size', -1, id='content-length-negative'),
+        pytest.param('size', '17', id='content-length-string'),
+        pytest.param(
+            'size',
+            _HostileHeadListValue('head-content-length-foreign-agw49'),
+            id='content-length-foreign',
+        ),
+        pytest.param('generation', False, id='generation-bool'),
+        pytest.param('generation', -1, id='generation-negative'),
+        pytest.param('generation', '31', id='generation-string'),
+        pytest.param('metageneration', True, id='metageneration-bool'),
+        pytest.param('metageneration', -1, id='metageneration-negative'),
+        pytest.param(
+            'metageneration', '4', id='metageneration-string'),
+        pytest.param('content_type', '', id='content-type-empty'),
+        pytest.param('content_type', 7, id='content-type-non-string'),
+        pytest.param(
+            'content_type',
+            _HostileHeadListValue('head-content-type-foreign-agw49'),
+            id='content-type-foreign',
+        ),
+        pytest.param('etag', '', id='etag-empty'),
+        pytest.param('etag', 7, id='etag-non-string'),
+        pytest.param('crc32c', '', id='crc32c-empty'),
+        pytest.param('crc32c', True, id='crc32c-non-string'),
+        pytest.param(
+            'updated', datetime(2026, 8, 22, 10, 30, 45),
+            id='last-modified-naive',
+        ),
+        pytest.param(
+            'updated', '2026-08-22T10:30:45+00:00',
+            id='last-modified-string',
+        ),
+        pytest.param(
+            'updated',
+            _HostileHeadListValue('head-timestamp-foreign-agw49'),
+            id='last-modified-foreign',
+        ),
+        pytest.param('metadata', [], id='metadata-non-mapping'),
+        pytest.param(
+            'metadata', {7: 'owner'}, id='metadata-non-string-key'),
+        pytest.param(
+            'metadata', {'owner': 7}, id='metadata-non-string-value'),
+        pytest.param(
+            'metadata',
+            _HostileHeadListValue('head-metadata-foreign-agw49'),
+            id='metadata-foreign',
+        ),
+    ],
+)
+async def test_head_malformed_nominal_success_fails_closed_without_leak(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    value: object,
+) -> None:
+    """Every malformed head scalar/map is one safe 502 with no partial data."""
+    provider = _HeadListProvider()
+    setattr(provider.head_blob, field, value)
+    _install_head_list_provider(monkeypatch, provider)
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result = await request(
+        'gs://head-list-bucket/malformed-head.txt',
+        protocol='GCS',
+        protocol_info={'command': 'head', 'timeout': 2.5},
+    )
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert provider.client.close_calls == 1
+    if isinstance(value, _HostileHeadListValue):
+        assert value.sentinel not in surfaces
+
+
+async def test_head_accepts_zero_integer_boundaries_in_exact_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero is valid for every non-negative head integer family."""
+    provider = _HeadListProvider()
+    provider.head_blob.size = 0
+    provider.head_blob.generation = 0
+    provider.head_blob.metageneration = 0
+    _install_head_list_provider(monkeypatch, provider)
+
+    result = await request(
+        'gs://head-list-bucket/zero-head.txt',
+        protocol='GCS',
+        protocol_info={'command': 'head', 'timeout': 2.5},
+    )
+
+    assert result['status_code'] == 200
+    assert result['protocol_details']['content_length'] == 0
+    assert result['protocol_details']['generation'] == 0
+    assert result['protocol_details']['metageneration'] == 0
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        pytest.param('name', '', id='key-empty'),
+        pytest.param('name', 7, id='key-non-string'),
+        pytest.param(
+            'name',
+            _HostileHeadListValue('list-key-foreign-agw49'),
+            id='key-foreign',
+        ),
+        pytest.param('size', True, id='size-bool'),
+        pytest.param('size', -1, id='size-negative'),
+        pytest.param('size', '17', id='size-string'),
+        pytest.param(
+            'size',
+            _HostileHeadListValue('list-size-foreign-agw49'),
+            id='size-foreign',
+        ),
+        pytest.param('content_type', '', id='content-type-empty'),
+        pytest.param('content_type', 7, id='content-type-non-string'),
+        pytest.param(
+            'content_type',
+            _HostileHeadListValue('list-content-type-foreign-agw49'),
+            id='content-type-foreign',
+        ),
+        pytest.param('etag', '', id='etag-empty'),
+        pytest.param('etag', 7, id='etag-non-string'),
+        pytest.param('generation', False, id='generation-bool'),
+        pytest.param('generation', -1, id='generation-negative'),
+        pytest.param('generation', '31', id='generation-string'),
+        pytest.param(
+            'generation',
+            _HostileHeadListValue('list-generation-foreign-agw49'),
+            id='generation-foreign',
+        ),
+        pytest.param(
+            'updated', datetime(2026, 8, 22, 10, 30, 45),
+            id='last-modified-naive',
+        ),
+        pytest.param(
+            'updated', '2026-08-22T10:30:45+00:00',
+            id='last-modified-string',
+        ),
+        pytest.param(
+            'updated',
+            _HostileHeadListValue('list-timestamp-foreign-agw49'),
+            id='last-modified-foreign',
+        ),
+        pytest.param('crc32c', '', id='crc32c-empty'),
+        pytest.param('crc32c', 7, id='crc32c-non-string'),
+    ],
+)
+async def test_list_malformed_item_fails_whole_page_without_leak(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    value: object,
+) -> None:
+    """One malformed item rejects the ordered page without partial output."""
+    provider = _HeadListProvider()
+    valid = _HeadListBlob(provider)
+    valid.name = 'prefix/already-normalized.txt'
+    malformed = _HeadListBlob(provider)
+    malformed.name = 'prefix/malformed.txt'
+    setattr(malformed, field, value)
+    provider.iterator = _HeadListIterator(
+        provider, [valid, malformed], 'server-next-page')
+    _install_head_list_provider(monkeypatch, provider)
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+    caller_token = 'caller-page-private-agw49'
+
+    result = await request(
+        'gs://head-list-bucket/prefix/',
+        protocol='GCS',
+        protocol_info={
+            'command': 'list',
+            'max_items': 2,
+            'page_token': caller_token,
+            'timeout': 2.5,
+        },
+    )
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert provider.client.close_calls == 1
+    assert caller_token not in surfaces
+    if isinstance(value, _HostileHeadListValue):
+        assert value.sentinel not in surfaces
+
+
+@pytest.mark.parametrize(
+    'case_name',
+    [
+        pytest.param('empty-server-token', id='empty-server-token'),
+        pytest.param('non-string-server-token', id='non-string-server-token'),
+        pytest.param('foreign-server-token', id='foreign-server-token'),
+        pytest.param('foreign-iterator', id='foreign-iterator'),
+        pytest.param('foreign-page', id='foreign-page'),
+        pytest.param('oversized-page', id='oversized-page'),
+    ],
+)
+async def test_list_malformed_page_or_iterator_is_safe_gcs_status(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case_name: str,
+) -> None:
+    """Invalid page structure/token and over-limit rows all fail closed."""
+    provider = _HeadListProvider()
+    sentinel = f'list-{case_name}-private-agw49'
+    max_items = 1
+    if case_name == 'empty-server-token':
+        provider.iterator.server_token = ''
+    elif case_name == 'non-string-server-token':
+        provider.iterator.server_token = 7  # type: ignore[assignment]
+    elif case_name == 'foreign-server-token':
+        provider.iterator.server_token = (  # type: ignore[assignment]
+            _HostileHeadListValue(sentinel))
+    elif case_name == 'foreign-iterator':
+        provider.iterator = (  # type: ignore[assignment]
+            _HostileHeadListValue(sentinel))
+    elif case_name == 'foreign-page':
+        provider.iterator.page = (  # type: ignore[assignment]
+            _HostileHeadListValue(sentinel))
+    else:
+        first = _HeadListBlob(provider)
+        second = _HeadListBlob(provider)
+        second.name = 'prefix/extra.txt'
+        provider.iterator = _HeadListIterator(
+            provider, [first, second], 'server-next-page')
+    _install_head_list_provider(monkeypatch, provider)
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+    caller_token = 'caller-structural-private-agw49'
+
+    result = await request(
+        'gs://head-list-bucket/prefix/',
+        protocol='GCS',
+        protocol_info={
+            'command': 'list',
+            'max_items': max_items,
+            'page_token': caller_token,
+            'timeout': 2.5,
+        },
+    )
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert provider.client.close_calls == 1
+    assert caller_token not in surfaces
+    assert sentinel not in surfaces
 
 
 # --- AGW-48 tranche A: guarded upload foundation -------------------------
