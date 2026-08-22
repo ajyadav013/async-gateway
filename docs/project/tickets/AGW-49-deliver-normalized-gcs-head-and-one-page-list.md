@@ -1,6 +1,6 @@
 # AGW-49: Deliver normalized GCS head and one-page list
 
-- **Status:** OPEN
+- **Status:** IN PROGRESS
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-06 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -33,3 +33,21 @@ recursively enumerating a bucket, or disclosing caller tokens (GCS-06).
 - 2026-08-22 — Opened from approved GCS-06 planning before implementation;
   recorded its two-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-22 — Began the head/list foundation RED tranche with deterministic
+  public-path SDK doubles for exact metadata reload, one-page iteration,
+  opaque-token forwarding, service-order normalization, retained lease, and
+  off-loop cleanup behavior. Files: `tests/logic/test_gcs_client.py`, this
+  ticket, and `docs/project/tickets/index.json`.
+- 2026-08-22 — Reproduced the foundation RED: 328 collected, 322 existing
+  cases passed, and six new cases failed only at the intentionally absent
+  `head`/`list` dispatch (`NotImplementedError`). Production stayed untouched;
+  no collection, fixture, network, sleep, or timing-oracle failure occurred.
+  Files: `tests/logic/test_gcs_client.py`, this ticket, and
+  `docs/project/tickets/index.json`.
+- 2026-08-22 — Implemented the head/list foundation on the retained private
+  lease: one exact off-loop head reload or one exact bounded list-page fetch,
+  closed JSON-safe success schemas, opaque caller-token forwarding, and owned
+  client cleanup before publication. The accepted 328-case suite, 276
+  entrypoint cases, scoped flake8, and scoped mypy pass. Files:
+  `asyncio_gateway/logic/gcs_client.py`, this ticket, and
+  `docs/project/tickets/index.json`.

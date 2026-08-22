@@ -18,6 +18,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any, NoReturn
@@ -1086,6 +1087,455 @@ def test_operational_sdk_controls_are_retry_none_with_finite_timeout() -> None:
     controls = getattr(gcs_client, '_operational_sdk_kwargs')(2.5)
 
     assert controls == {'retry': None, 'timeout': 2.5}
+
+
+# --- AGW-49 foundation: normalized head and one-page list ----------------
+
+
+class _HeadListBlob:
+    """Metadata-bearing blob double shared by head and list fixtures."""
+
+    def __init__(self, provider: '_HeadListProvider') -> None:
+        """Retain the recorder and expose one full metadata snapshot."""
+        self.provider = provider
+        self.name: object = 'prefix/first.txt'
+        self.size: object = 17
+        self.content_type: object = 'text/plain'
+        self.etag: object = 'head-list-etag'
+        self.generation: object = 31
+        self.metageneration: object = 4
+        self.updated: object = datetime(
+            2026, 8, 22, 10, 30, 45, tzinfo=timezone.utc)
+        self.crc32c: object = 'head-list-crc32c=='
+        self.metadata: object = {'owner': 'gateway', 'tier': 'sit'}
+
+    def reload(self, **kwargs: object) -> None:
+        """Record one exact metadata fetch and its SDK controls."""
+        self.provider.record_thread('reload')
+        self.provider.reload_calls.append(dict(kwargs))
+
+
+class _HeadListBucket:
+    """Bucket double returning the exact object selected for head."""
+
+    def __init__(self, provider: '_HeadListProvider') -> None:
+        """Retain the shared provider recorder."""
+        self.provider = provider
+        self.name = 'head-list-bucket'
+
+    def blob(self, key: str) -> _HeadListBlob:
+        """Record and return the requested metadata object."""
+        self.provider.record_thread('blob')
+        self.provider.blob_keys.append(key)
+        return self.provider.head_blob
+
+    def list_blobs(self, **kwargs: object) -> '_HeadListIterator':
+        """Support the official bucket convenience method equivalently."""
+        self.provider.record_thread('list-construction')
+        self.provider.list_calls.append((self, dict(kwargs)))
+        return self.provider.iterator
+
+
+class _HeadListPage:
+    """One official-SDK-shaped page preserving service item order."""
+
+    def __init__(
+        self,
+        provider: '_HeadListProvider',
+        items: list[_HeadListBlob],
+    ) -> None:
+        """Retain the exact ordered objects for one page iteration."""
+        self.provider = provider
+        self.items = tuple(items)
+
+    def __iter__(self) -> Any:
+        """Record page iteration and expose only the scripted objects."""
+        self.provider.record_thread('page-iteration')
+        self.provider.page_iteration_count += 1
+        return iter(self.items)
+
+
+class _OnePageCursor:
+    """Pages cursor that rejects any implicit second-page access."""
+
+    def __init__(self, iterator: '_HeadListIterator') -> None:
+        """Retain the owning iterator and start before its only page."""
+        self.iterator = iterator
+        self.page_fetched = False
+
+    def __iter__(self) -> '_OnePageCursor':
+        """Return this one-shot pages cursor."""
+        return self
+
+    def __next__(self) -> _HeadListPage:
+        """Return exactly one page and reject recursive page traversal."""
+        if self.page_fetched:
+            self.iterator.provider.second_page_accesses += 1
+            raise AssertionError('list must not fetch a second service page')
+        self.page_fetched = True
+        self.iterator.provider.record_thread('page-fetch')
+        self.iterator.provider.page_fetch_count += 1
+        self.iterator.next_page_token = self.iterator.server_token
+        return self.iterator.page
+
+
+class _HeadListIterator:
+    """Official iterator-shaped result from ``Client.list_blobs``."""
+
+    def __init__(
+        self,
+        provider: '_HeadListProvider',
+        items: list[_HeadListBlob],
+        server_token: str | None,
+    ) -> None:
+        """Create one page and expose its token after the page is fetched."""
+        self.provider = provider
+        self.server_token = server_token
+        self.next_page_token: str | None = None
+        self.page = _HeadListPage(provider, items)
+        self._pages = _OnePageCursor(self)
+
+    @property
+    def pages(self) -> _OnePageCursor:
+        """Expose the single-page cursor without fetching a page."""
+        self.provider.record_thread('pages')
+        self.provider.pages_access_count += 1
+        return self._pages
+
+
+class _HeadListClient:
+    """Storage client double for one head or list lifecycle."""
+
+    def __init__(self, provider: '_HeadListProvider') -> None:
+        """Retain the provider recorder and cleanup count."""
+        self.provider = provider
+        self.close_calls = 0
+
+    def bucket(self, name: str) -> _HeadListBucket:
+        """Record one normalized bucket lookup."""
+        self.provider.record_thread('bucket')
+        self.provider.bucket_names.append(name)
+        return self.provider.bucket
+
+    def list_blobs(
+        self,
+        bucket: object,
+        **kwargs: object,
+    ) -> _HeadListIterator:
+        """Construct one bounded official-SDK-shaped list iterator."""
+        self.provider.record_thread('list-construction')
+        self.provider.list_calls.append((bucket, dict(kwargs)))
+        return self.provider.iterator
+
+    def close(self) -> None:
+        """Record one owned-client cleanup on the provider worker."""
+        self.provider.record_thread('client-close')
+        self.close_calls += 1
+
+
+class _HeadListProvider:
+    """Deterministic head/list SDK tree with no external I/O."""
+
+    def __init__(
+        self,
+        *,
+        list_items: list[_HeadListBlob] | None = None,
+        server_token: str | None = None,
+    ) -> None:
+        """Create one connected provider tree and page script."""
+        self.timeline: list[str] = []
+        self.threads: list[tuple[str, int, str]] = []
+        self.lease_counts: list[tuple[str, int]] = []
+        self.reload_calls: list[dict[str, object]] = []
+        self.list_calls: list[tuple[object, dict[str, object]]] = []
+        self.bucket_names: list[str] = []
+        self.blob_keys: list[str] = []
+        self.pages_access_count = 0
+        self.page_fetch_count = 0
+        self.page_iteration_count = 0
+        self.second_page_accesses = 0
+        self.credentials = _UploadCredentials()
+        self.head_blob = _HeadListBlob(self)
+        self.bucket = _HeadListBucket(self)
+        self.iterator = _HeadListIterator(
+            self,
+            list_items or [],
+            server_token,
+        )
+        self.client = _HeadListClient(self)
+
+    def record_thread(self, seam: str) -> None:
+        """Record provider thread identity and retained lease count."""
+        self.timeline.append(seam)
+        self.threads.append((
+            seam, threading.get_ident(), threading.current_thread().name))
+        self.lease_counts.append((
+            seam, getattr(gcs_client, '_active_gcs_leases')()))
+
+    def adc(self, *args: object, **kwargs: object) -> tuple[object, str]:
+        """Return valid ADC without network or metadata-server access."""
+        self.record_thread('adc')
+        return self.credentials, 'head-list-project'
+
+    def make_client(self, *args: object, **kwargs: object) -> _HeadListClient:
+        """Return one observable storage client."""
+        self.record_thread('client')
+        return self.client
+
+
+def _install_head_list_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _HeadListProvider,
+) -> '_UploadBreaker':
+    """Install one deterministic provider and direct breaker."""
+    breaker = _UploadBreaker(provider.timeline)
+    monkeypatch.setattr(base, 'get_breaker', lambda *args, **kwargs: breaker)
+    monkeypatch.setattr(google_auth, 'default', provider.adc)
+    monkeypatch.setattr(storage, 'Client', provider.make_client)
+    return breaker
+
+
+@pytest.mark.parametrize(
+    ('generation', 'expected_reload'),
+    [
+        pytest.param(None, {'retry': None, 'timeout': 2.5}, id='latest'),
+        pytest.param(
+            31,
+            {
+                'if_generation_match': 31,
+                'retry': None,
+                'timeout': 2.5,
+            },
+            id='authoritative-generation',
+        ),
+    ],
+)
+async def test_head_fetches_once_off_loop_and_returns_exact_metadata_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    generation: int | None,
+    expected_reload: dict[str, object],
+) -> None:
+    """Head owns one lease, one reload, exact normalization, and cleanup."""
+    provider = _HeadListProvider()
+    breaker = _install_head_list_provider(monkeypatch, provider)
+    loop_thread = threading.get_ident()
+    info: dict[str, object] = {'command': 'head', 'timeout': 2.5}
+    if generation is not None:
+        info['if_generation_match'] = generation
+
+    result = await request(
+        'gs://Head-List-Bucket/folder/object.txt',
+        protocol='GCS',
+        protocol_info=info,
+    )
+
+    assert provider.reload_calls == [expected_reload]
+    assert provider.timeline == [
+        'breaker', 'adc', 'client', 'bucket', 'blob', 'reload',
+        'client-close',
+    ]
+    assert provider.bucket_names == ['head-list-bucket']
+    assert provider.blob_keys == ['folder/object.txt']
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 1
+    assert provider.lease_counts == [
+        (seam, 1) for seam, *_ in provider.threads]
+    assert all(
+        thread_id != loop_thread
+        and thread_name.startswith('asyncio-gateway-gcs')
+        for _, thread_id, thread_name in provider.threads
+    )
+    assert result['ok'] is True
+    assert result['status_code'] == 200
+    assert result['protocol_details'] == {
+        'command': 'head',
+        'bucket': 'head-list-bucket',
+        'key': 'folder/object.txt',
+        'content_length': 17,
+        'content_type': 'text/plain',
+        'etag': 'head-list-etag',
+        'generation': 31,
+        'metageneration': 4,
+        'last_modified': '2026-08-22T10:30:45+00:00',
+        'crc32c': 'head-list-crc32c==',
+        'metadata': {'owner': 'gateway', 'tier': 'sit'},
+    }
+    assert (
+        result['protocol_details']['metadata']
+        is not provider.head_blob.metadata
+    )
+
+
+async def test_head_normalizes_absent_optional_metadata_without_schema_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent optional object metadata becomes None or a fresh empty map."""
+    provider = _HeadListProvider()
+    provider.head_blob.size = None
+    provider.head_blob.content_type = None
+    provider.head_blob.etag = None
+    provider.head_blob.generation = None
+    provider.head_blob.metageneration = None
+    provider.head_blob.updated = None
+    provider.head_blob.crc32c = None
+    provider.head_blob.metadata = None
+    _install_head_list_provider(monkeypatch, provider)
+
+    result = await request(
+        'gs://head-list-bucket/optional.txt',
+        protocol='GCS',
+        protocol_info={'command': 'head', 'timeout': 2.5},
+    )
+
+    assert result['status_code'] == 200
+    assert result['protocol_details'] == {
+        'command': 'head',
+        'bucket': 'head-list-bucket',
+        'key': 'optional.txt',
+        'content_length': None,
+        'content_type': None,
+        'etag': None,
+        'generation': None,
+        'metageneration': None,
+        'last_modified': None,
+        'crc32c': None,
+        'metadata': {},
+    }
+
+
+@pytest.mark.parametrize(
+    'caller_token',
+    [
+        pytest.param('  ', id='whitespace-preserved'),
+        pytest.param('\u00fc' * 2048, id='exact-4096-utf8-bytes'),
+    ],
+)
+async def test_list_fetches_exactly_one_ordered_page_with_opaque_token(
+    monkeypatch: pytest.MonkeyPatch,
+    caller_token: str,
+) -> None:
+    """List passes the caller token unchanged and never follows the next."""
+    provider = _HeadListProvider(server_token='server-next-page')
+    first = _HeadListBlob(provider)
+    second = _HeadListBlob(provider)
+    second.name = 'prefix/second.bin'
+    second.size = 0
+    second.content_type = None
+    second.etag = None
+    second.generation = None
+    second.updated = None
+    second.crc32c = None
+    provider.iterator = _HeadListIterator(
+        provider, [first, second], 'server-next-page')
+    breaker = _install_head_list_provider(monkeypatch, provider)
+    loop_thread = threading.get_ident()
+
+    result = await request(
+        'gs://Head-List-Bucket/prefix/',
+        protocol='GCS',
+        protocol_info={
+            'command': 'list',
+            'max_items': 2,
+            'page_token': caller_token,
+            'timeout': 2.5,
+        },
+    )
+
+    assert provider.list_calls == [(provider.bucket, {
+        'prefix': 'prefix/',
+        'max_results': 2,
+        'page_token': caller_token,
+        'retry': None,
+        'timeout': 2.5,
+    })]
+    assert provider.timeline == [
+        'breaker', 'adc', 'client', 'bucket', 'list-construction',
+        'pages', 'page-fetch', 'page-iteration', 'client-close',
+    ]
+    assert provider.pages_access_count == 1
+    assert provider.page_fetch_count == 1
+    assert provider.page_iteration_count == 1
+    assert provider.second_page_accesses == 0
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 1
+    assert provider.lease_counts == [
+        (seam, 1) for seam, *_ in provider.threads]
+    assert all(
+        thread_id != loop_thread
+        and thread_name.startswith('asyncio-gateway-gcs')
+        for _, thread_id, thread_name in provider.threads
+    )
+    assert result['ok'] is True
+    assert result['status_code'] == 200
+    assert result['protocol_details'] == {
+        'command': 'list',
+        'bucket': 'head-list-bucket',
+        'prefix': 'prefix/',
+        'items': [
+            {
+                'key': 'prefix/first.txt',
+                'size': 17,
+                'content_type': 'text/plain',
+                'etag': 'head-list-etag',
+                'generation': 31,
+                'last_modified': '2026-08-22T10:30:45+00:00',
+                'crc32c': 'head-list-crc32c==',
+            },
+            {
+                'key': 'prefix/second.bin',
+                'size': 0,
+                'content_type': None,
+                'etag': None,
+                'generation': None,
+                'last_modified': None,
+                'crc32c': None,
+            },
+        ],
+        'item_count': 2,
+        'is_truncated': True,
+        'next_page_token': 'server-next-page',
+    }
+    assert 'page_token' not in result['protocol_details']
+    assert all(
+        value != caller_token
+        for value in result['protocol_details'].values()
+    )
+
+
+async def test_list_empty_prefix_returns_one_coherent_empty_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bucket-root listing is bounded, empty, and has no token echo field."""
+    provider = _HeadListProvider()
+    breaker = _install_head_list_provider(monkeypatch, provider)
+
+    result = await request(
+        'gs://Head-List-Bucket',
+        protocol='GCS',
+        protocol_info={'command': 'list', 'timeout': 2.5},
+    )
+
+    assert provider.list_calls == [(provider.bucket, {
+        'prefix': '',
+        'max_results': 1000,
+        'retry': None,
+        'timeout': 2.5,
+    })]
+    assert provider.page_fetch_count == 1
+    assert provider.page_iteration_count == 1
+    assert provider.second_page_accesses == 0
+    assert provider.client.close_calls == 1
+    assert breaker.calls == 1
+    assert result['status_code'] == 200
+    assert result['protocol_details'] == {
+        'command': 'list',
+        'bucket': 'head-list-bucket',
+        'prefix': '',
+        'items': [],
+        'item_count': 0,
+        'is_truncated': False,
+        'next_page_token': None,
+    }
 
 
 # --- AGW-48 tranche A: guarded upload foundation -------------------------

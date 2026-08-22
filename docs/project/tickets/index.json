@@ -808,13 +808,14 @@
     {
       "id": "AGW-49",
       "title": "Deliver normalized head and one-page list",
-      "status": "OPEN",
+      "status": "IN PROGRESS",
       "story": "GCS-06",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-49-deliver-normalized-gcs-head-and-one-page-list.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-48"], "blocks": ["AGW-50"]},
-      "commits": []
+      "commits": [],
+      "note": "Head/list foundation GREEN: 328 focused and 276 entrypoint cases pass; exact off-loop head reload and one-page list normalization retain one lease and close the owned client before success. Status remains IN PROGRESS for later hardening and review."
     },
     {
       "id": "AGW-50",

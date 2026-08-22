@@ -9,6 +9,7 @@ import ssl
 import threading
 from collections.abc import AsyncIterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from types import TracebackType
 from typing import (
     Any,
@@ -533,6 +534,126 @@ def _download_blob_range(
     return data
 
 
+def _optional_metadata_string(value: object) -> Optional[str]:
+    """Normalize one optional provider string without coercion."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _AbortableGcsServiceFailure(502, {})
+    return value
+
+
+def _optional_metadata_int(value: object) -> Optional[int]:
+    """Normalize one optional non-negative provider integer."""
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise _AbortableGcsServiceFailure(502, {})
+    return value
+
+
+def _metadata_timestamp(value: object) -> Optional[str]:
+    """Normalize one optional timezone-aware provider timestamp."""
+    if value is None:
+        return None
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        raise _AbortableGcsServiceFailure(502, {})
+    return value.isoformat()
+
+
+def _reload_head_metadata(
+    blob: Any,
+    *,
+    if_generation_match: Optional[int],
+    sdk_timeout: int | float,
+) -> dict[str, Any]:
+    """Reload and normalize one exact object metadata snapshot."""
+    arguments = _operational_sdk_kwargs(sdk_timeout)
+    if if_generation_match is not None:
+        arguments['if_generation_match'] = if_generation_match
+    blob.reload(**arguments)
+
+    raw_metadata = blob.metadata
+    if raw_metadata is None:
+        metadata: dict[str, str] = {}
+    elif (
+        isinstance(raw_metadata, Mapping)
+        and all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in raw_metadata.items()
+        )
+    ):
+        metadata = dict(raw_metadata)
+    else:
+        raise _AbortableGcsServiceFailure(502, {})
+    return {
+        'content_length': _optional_metadata_int(blob.size),
+        'content_type': _optional_metadata_string(blob.content_type),
+        'etag': _optional_metadata_string(blob.etag),
+        'generation': _optional_metadata_int(blob.generation),
+        'metageneration': _optional_metadata_int(blob.metageneration),
+        'last_modified': _metadata_timestamp(blob.updated),
+        'crc32c': _optional_metadata_string(blob.crc32c),
+        'metadata': metadata,
+    }
+
+
+def _normalize_list_item(blob: Any) -> dict[str, Any]:
+    """Normalize one list item into the closed public item schema."""
+    key = blob.name
+    size = blob.size
+    if not isinstance(key, str) or key == '':
+        raise _AbortableGcsServiceFailure(502, {})
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise _AbortableGcsServiceFailure(502, {})
+    return {
+        'key': key,
+        'size': size,
+        'content_type': _optional_metadata_string(blob.content_type),
+        'etag': _optional_metadata_string(blob.etag),
+        'generation': _optional_metadata_int(blob.generation),
+        'last_modified': _metadata_timestamp(blob.updated),
+        'crc32c': _optional_metadata_string(blob.crc32c),
+    }
+
+
+def _list_one_page(
+    client: Any,
+    bucket: Any,
+    *,
+    prefix: str,
+    max_items: int,
+    page_token: Optional[str],
+    sdk_timeout: int | float,
+) -> dict[str, Any]:
+    """Fetch and normalize exactly one bounded service page."""
+    arguments: dict[str, object] = {
+        'prefix': prefix,
+        'max_results': max_items,
+        **_operational_sdk_kwargs(sdk_timeout),
+    }
+    if page_token is not None:
+        arguments['page_token'] = page_token
+    iterator = client.list_blobs(bucket, **arguments)
+    page = next(iter(iterator.pages))
+    items = [_normalize_list_item(blob) for blob in page]
+    next_page_token = iterator.next_page_token
+    if (
+        next_page_token is not None
+        and (
+            not isinstance(next_page_token, str)
+            or next_page_token == ''
+        )
+    ):
+        raise _AbortableGcsServiceFailure(502, {})
+    return {
+        'items': items,
+        'item_count': len(items),
+        'is_truncated': next_page_token is not None,
+        'next_page_token': next_page_token,
+    }
+
+
 def _safe_provider_text(value: object) -> Optional[str]:
     """Return redacted provider text without stringifying foreign objects."""
     if not isinstance(value, str):
@@ -979,13 +1100,15 @@ class GcsRequest(BaseRequestClass):
             AsyncGatewayError: For a typed local or lifecycle failure.
             NotImplementedError: If the selected operation is unavailable.
         """
-        if self.command not in {'download', 'upload'}:
+        if self.command not in {'download', 'upload', 'head', 'list'}:
             raise NotImplementedError
 
         lease = _acquire_gcs_lease()
         try:
             if self.command == 'download':
                 return await self._handle_download(lease)
+            if self.command in {'head', 'list'}:
+                return await self._handle_head_or_list(lease)
             local_path = cast(str, self.info['local_path'])
             upload_body = await read_guarded_file(
                 local_path,
@@ -1026,6 +1149,174 @@ class GcsRequest(BaseRequestClass):
                 self.response, status_code=200, started=self.start_time)
         finally:
             await lease.release()
+
+    async def _handle_head_or_list(
+        self,
+        lease: _GcsLease,
+    ) -> GatewayResponse:
+        """Run one bounded metadata command under a retained lease."""
+        failure: Optional[AsyncGatewayError] = None
+        try:
+            details = await self.circuit_breaker.run(
+                self._head_or_list_attempt,
+                lease,
+            )
+        except CircuitOpen:
+            failure = CircuitOpenError('GCS provider circuit is open')
+        except _AbortableGcsServiceFailure as error:
+            failure = self._public_service_error(error)
+        except RetriesExhausted as error:
+            cause = error.__cause__
+            if isinstance(cause, _GcsServiceFailure):
+                failure = self._public_service_error(cause)
+            elif isinstance(cause, AsyncGatewayError):
+                failure = cause
+            else:
+                failure = TransportError('GCS provider operation failed')
+        if failure is not None:
+            raise failure from None
+        self.response['protocol_details'] = details
+        return finalise_ok(
+            self.response, status_code=200, started=self.start_time)
+
+    async def _head_or_list_attempt(
+        self,
+        lease: _GcsLease,
+    ) -> dict[str, Any]:
+        """Fetch one normalized head or list result and close its client."""
+        client: Any = None
+        details: Optional[dict[str, Any]] = None
+        body_error: Optional[BaseException] = None
+        body_state: Optional[_ExceptionState] = None
+        try:
+            try:
+                credentials, project = await lease.run(
+                    google_auth.default, timeout=self.timeout)
+                await lease.run(
+                    _refresh_credentials_if_needed,
+                    credentials,
+                    timeout=self.timeout,
+                )
+                client = await lease.run(
+                    storage.Client,
+                    credentials=credentials,
+                    project=project,
+                    timeout=self.timeout,
+                    close_result=_close_storage_client,
+                )
+                bucket = await lease.run(
+                    client.bucket, self.bucket, timeout=self.timeout)
+                if self.command == 'head':
+                    blob = await lease.run(
+                        bucket.blob, self.key, timeout=self.timeout)
+                    metadata = await lease.run(
+                        _reload_head_metadata,
+                        blob,
+                        if_generation_match=cast(
+                            Optional[int],
+                            self.info.get('if_generation_match'),
+                        ),
+                        sdk_timeout=self.timeout,
+                        timeout=self.timeout,
+                    )
+                    details = {
+                        'command': self.command,
+                        'bucket': self.bucket,
+                        'key': self.key,
+                        **metadata,
+                    }
+                else:
+                    page = await lease.run(
+                        _list_one_page,
+                        client,
+                        bucket,
+                        prefix=self.key,
+                        max_items=cast(int, self.info['max_items']),
+                        page_token=cast(
+                            Optional[str], self.info.get('page_token')),
+                        sdk_timeout=self.timeout,
+                        timeout=self.timeout,
+                    )
+                    details = {
+                        'command': self.command,
+                        'bucket': self.bucket,
+                        'prefix': self.key,
+                        **page,
+                    }
+            except _GCS_CREDENTIAL_FAILURES as error:
+                error.args = ('GCS credential resolution failed',)
+                raise ConfigurationError(
+                    'GCS application default credentials are unavailable'
+                ) from None
+            except _GCS_TRANSPORT_FAILURES as error:
+                error.args = ('GCS provider transport failure',)
+                raise _transport_error_for(error) from None
+            except BaseException as error:
+                if not _is_service_failure(error):
+                    raise
+                failure = _service_failure_for(
+                    error,
+                    command=self.command,
+                    bucket=self.bucket,
+                    target=self.key,
+                )
+                error.args = ('GCS provider service response',)
+                raise failure from None
+        except BaseException as error:
+            body_error = error
+            body_state = _capture_exception_state(error)
+
+        cleanup_error: Optional[BaseException] = None
+        cleanup_state: Optional[_ExceptionState] = None
+        if client is not None:
+            try:
+                await lease.run(
+                    _close_storage_client, client, timeout=self.timeout)
+            except BaseException as error:
+                cleanup_error = error
+                cleanup_state = _capture_exception_state(error)
+
+        pending_cancellation = (
+            body_error
+            if isinstance(body_error, asyncio.CancelledError)
+            else cleanup_error
+            if isinstance(cleanup_error, asyncio.CancelledError)
+            else None
+        )
+        if pending_cancellation is not None:
+            state = (
+                body_state
+                if pending_cancellation is body_error
+                else cleanup_state
+            )
+            assert state is not None
+            _raise_exact(pending_cancellation, state)
+        if body_error is not None:
+            assert body_state is not None
+            _raise_exact(body_error, body_state)
+        if cleanup_error is not None:
+            assert cleanup_state is not None
+            if isinstance(cleanup_error, _GCS_CREDENTIAL_FAILURES):
+                cleanup_error.args = ('GCS credential cleanup failed',)
+                raise ConfigurationError(
+                    'GCS application default credentials are unavailable'
+                ) from None
+            if isinstance(cleanup_error, _GCS_TRANSPORT_FAILURES):
+                cleanup_error.args = ('GCS provider cleanup failed',)
+                raise _transport_error_for(cleanup_error) from None
+            if _is_service_failure(cleanup_error):
+                status_failure = _service_failure_for(
+                    cleanup_error,
+                    command=self.command,
+                    bucket=self.bucket,
+                    target=self.key,
+                )
+                cleanup_error.args = ('GCS provider cleanup response',)
+                raise _AbortableGcsServiceFailure(
+                    status_failure.status_code, {}) from None
+            _raise_exact(cleanup_error, cleanup_state)
+        assert details is not None
+        return details
 
     async def _handle_download(self, lease: _GcsLease) -> GatewayResponse:
         """Run one generation-pinned download under a retained lease."""
