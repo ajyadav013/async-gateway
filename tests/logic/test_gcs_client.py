@@ -32,6 +32,8 @@ from asyncio_gateway.asyncio_gateway import request
 from asyncio_gateway.helpers.internal import base
 from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
     AbortableServiceError,
+    CircuitBreakerHelper,
+    validated_breaker_config,
 )
 from asyncio_gateway.logic import gcs_client
 from asyncio_gateway.logic.gcs_client import GcsRequest
@@ -2197,11 +2199,22 @@ class _DownloadBlob:
         """Record exact pin controls and the provider worker identity."""
         self.provider.record_thread('reload')
         self.provider.reload_calls.append(dict(kwargs))
+        if self.provider.reload_outcomes:
+            outcome = self.provider.reload_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
 
-    def download_as_bytes(self, **kwargs: object) -> bytes:
+    def download_as_bytes(self, **kwargs: object) -> object:
         """Return one exact inclusive slice of the stored/raw object."""
         self.provider.record_thread('range')
         self.provider.range_calls.append(dict(kwargs))
+        if self.provider.range_handler is not None:
+            return self.provider.range_handler(dict(kwargs))
+        if self.provider.range_outcomes:
+            outcome = self.provider.range_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
         start = kwargs['start']
         end = kwargs['end']
         assert isinstance(start, int) and not isinstance(start, bool)
@@ -2253,6 +2266,9 @@ class _DownloadProvider:
         self.threads: dict[str, list[tuple[int, str]]] = {}
         self.reload_calls: list[dict[str, object]] = []
         self.range_calls: list[dict[str, object]] = []
+        self.reload_outcomes: list[object] = []
+        self.range_outcomes: list[object] = []
+        self.range_handler: Any = None
         self.bucket_names: list[str] = []
         self.blob_keys: list[str] = []
         self.credentials = _UploadCredentials()
@@ -2275,6 +2291,14 @@ class _DownloadProvider:
         """Return the observable storage client."""
         self.record_thread('client')
         return self.client
+
+    def script_reload(self, *outcomes: object) -> None:
+        """Queue deterministic metadata-pin outcomes in call order."""
+        self.reload_outcomes.extend(outcomes)
+
+    def script_ranges(self, *outcomes: object) -> None:
+        """Queue deterministic raw-range outcomes in call order."""
+        self.range_outcomes.extend(outcomes)
 
 
 def _install_download_provider(
@@ -2310,6 +2334,36 @@ async def _public_download(
         'gs://Download-Bucket/folder/object.bin',
         protocol='GCS',
         protocol_info=info,
+    )
+    return result, breaker
+
+
+async def _public_retrying_download(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _DownloadProvider,
+    local_path: Path,
+    *,
+    max_response_bytes: int,
+    retries: int,
+    events: list[str],
+) -> tuple[dict[str, Any], CircuitBreakerHelper]:
+    """Drive download through one deterministic real retry/breaker loop."""
+    breaker_config = _gcs_retry_config(retries, events)
+    breaker = CircuitBreakerHelper(
+        **validated_breaker_config(breaker_config))
+    monkeypatch.setattr(
+        base, 'get_breaker', lambda *args, **kwargs: breaker)
+    _install_download_provider(monkeypatch, provider)
+    result = await request(
+        'gs://Download-Retry-Bucket/folder/object.bin',
+        protocol='GCS',
+        protocol_info={
+            'command': 'download',
+            'local_path': str(local_path),
+            'max_response_bytes': max_response_bytes,
+            'timeout': 2.5,
+            'circuit_breaker_config': breaker_config,
+        },
     )
     return result, breaker
 
@@ -2556,6 +2610,263 @@ async def test_download_advertised_cap_precedes_range_and_path_mutation(
     assert stream_called is False
     assert target.read_bytes() == b'existing-target'
     assert provider.client.close_calls == 1
+
+
+# --- AGW-48 tranche D2a: immutable retry and raw-shape adversaries -------
+
+
+async def test_download_retries_transient_reload_only_until_pin_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A transient metadata refusal retries before the immutable pin exists."""
+    events: list[str] = []
+    provider = _DownloadProvider(b'pinned-body')
+    provider.script_reload(_FakeServiceError(503), None)
+    target = tmp_path / 'download.bin'
+
+    result, breaker = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=32,
+        retries=1,
+        events=events,
+    )
+
+    assert result['ok'] is True
+    assert target.read_bytes() == b'pinned-body'
+    assert provider.reload_calls == [
+        {'retry': None, 'timeout': 2.5},
+        {'retry': None, 'timeout': 2.5},
+    ]
+    assert len(provider.range_calls) == 1
+    assert provider.client.close_calls == 2
+    assert events == ['failed']
+    assert breaker.failures == 0
+
+
+async def test_download_range_retry_restarts_zero_without_reloading_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A later transient range failure replays byte zero on the same pin."""
+    events: list[str] = []
+    original = bytes(index % 251 for index in range(65537))
+    provider = _DownloadProvider(original)
+    provider.script_ranges(
+        original[:65536],
+        _FakeServiceError(503),
+        original[:65536],
+        original[65536:],
+    )
+    target = tmp_path / 'download.bin'
+    target.write_bytes(b'existing-target')
+    target_before_attempts: list[bytes] = []
+
+    async def observe_atomic_target(
+        path: object,
+        chunks: Any,
+        **kwargs: object,
+    ) -> int:
+        """Prove a failed attempt never publishes before the retry."""
+        target_before_attempts.append(target.read_bytes())
+        return await stream_to_path(path, chunks, **kwargs)
+
+    monkeypatch.setattr(gcs_client, 'stream_to_path', observe_atomic_target)
+
+    result, breaker = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=len(original),
+        retries=1,
+        events=events,
+    )
+
+    assert result['ok'] is True
+    assert target.read_bytes() == original
+    assert provider.reload_calls == [{'retry': None, 'timeout': 2.5}]
+    assert [call['start'] for call in provider.range_calls] == [
+        0, 65536, 0, 65536,
+    ]
+    assert [call['if_generation_match'] for call in provider.range_calls] == [
+        41, 41, 41, 41,
+    ]
+    assert all(call['raw_download'] is True for call in provider.range_calls)
+    assert [
+        (call['retry'], call['timeout'])
+        for call in provider.range_calls
+    ] == [(None, 2.5)] * 4
+    assert target_before_attempts == [b'existing-target'] * 2
+    assert provider.client.close_calls == 2
+    assert events == ['failed']
+    assert breaker.failures == 0
+
+
+async def test_download_latest_replacement_cannot_mix_pinned_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Changing the latest object between chunks still emits pinned bytes."""
+    original = b'a' * 65536 + b'old-tail'
+    replacement = b'b' * 65536 + b'new-tail-which-is-longer'
+    provider = _DownloadProvider(original)
+    latest = {'generation': 41, 'bytes': original}
+
+    def generation_aware_range(arguments: dict[str, object]) -> bytes:
+        start = arguments['start']
+        end = arguments['end']
+        generation = arguments['if_generation_match']
+        assert isinstance(start, int) and isinstance(end, int)
+        if start == 0:
+            latest.update(generation=42, bytes=replacement)
+        source = original if generation == 41 else latest['bytes']
+        assert isinstance(source, bytes)
+        return source[start:end + 1]
+
+    provider.range_handler = generation_aware_range
+    target = tmp_path / 'download.bin'
+
+    result, _ = await _public_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=len(original),
+    )
+
+    assert result['ok'] is True
+    assert latest == {'generation': 42, 'bytes': replacement}
+    assert target.read_bytes() == original
+    assert provider.reload_calls == [{'retry': None, 'timeout': 2.5}]
+    assert [call['if_generation_match'] for call in provider.range_calls] == [
+        41, 41,
+    ]
+    assert [
+        (call['start'], call['end'])
+        for call in provider.range_calls
+    ] == [(0, 65535), (65536, len(original) - 1)]
+
+
+@pytest.mark.parametrize('status', [404, 412])
+async def test_download_pinned_generation_refusal_aborts_without_counting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: int,
+) -> None:
+    """A missing or changed pinned generation cannot retry or mutate output."""
+    events: list[str] = []
+    provider = _DownloadProvider(b'x')
+    provider.script_ranges(_FakeServiceError(status))
+    target = tmp_path / 'download.bin'
+    target.write_bytes(b'existing-target')
+
+    result, breaker = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+        retries=2,
+        events=events,
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == status
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert target.read_bytes() == b'existing-target'
+    assert len(provider.range_calls) == 1
+    assert provider.reload_calls == [{'retry': None, 'timeout': 2.5}]
+    assert provider.client.close_calls == 1
+    assert events == ['abort']
+    assert breaker.failures == 0
+
+
+async def test_download_content_encoding_emits_stored_gzip_bytes_under_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Content-Encoding metadata never expands the stored/raw byte stream."""
+    stored_gzip = b'\x1f\x8b\x08\x00stored-compressed-representation'
+    provider = _DownloadProvider(stored_gzip)
+    provider.blob.content_encoding = 'gzip'
+    target = tmp_path / 'download.bin'
+
+    result, _ = await _public_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=len(stored_gzip),
+    )
+
+    assert result['ok'] is True
+    assert target.read_bytes() == stored_gzip
+    assert provider.range_calls == [{
+        'start': 0,
+        'end': len(stored_gzip) - 1,
+        'if_generation_match': 41,
+        'raw_download': True,
+        'retry': None,
+        'timeout': 2.5,
+    }]
+    assert result['protocol_details']['bytes_written'] == len(stored_gzip)
+    assert result['protocol_details']['crc32c'] == 'download-crc32c=='
+    assert all(
+        'verif' not in key.lower()
+        for key in result['protocol_details']
+    )
+
+
+class _HostileDownloadRange:
+    """Non-bytes provider result whose representation is private."""
+
+    def __repr__(self) -> str:
+        """Return a sentinel that must not enter any public surface."""
+        return 'hostile-download-range-secret-d2a'
+
+
+@pytest.mark.parametrize(
+    'outcome',
+    [
+        pytest.param(b'xy', id='short'),
+        pytest.param(b'transparently-decompressed', id='overlong'),
+        pytest.param(_HostileDownloadRange(), id='non-bytes'),
+    ],
+)
+async def test_download_malformed_range_fails_closed_without_partial_publish(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    outcome: object,
+) -> None:
+    """Malformed nominal range success is safe, abortable, and atomic."""
+    events: list[str] = []
+    provider = _DownloadProvider(b'raw')
+    provider.script_ranges(outcome)
+    target = tmp_path / 'download.bin'
+    target.write_bytes(b'existing-target')
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, breaker = await _public_retrying_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=3,
+        retries=2,
+        events=events,
+    )
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert target.read_bytes() == b'existing-target'
+    assert len(provider.range_calls) == 1
+    assert provider.client.close_calls == 1
+    assert events == ['abort']
+    assert breaker.failures == 0
+    assert 'hostile-download-range-secret-d2a' not in surfaces
+    assert 'verified' not in surfaces.lower()
 
 
 # --- GCS-04 tranche B: shutdown, telemetry, and outcome precedence -------

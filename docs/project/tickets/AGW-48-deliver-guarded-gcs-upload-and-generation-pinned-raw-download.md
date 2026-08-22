@@ -34,6 +34,16 @@ beyond the cap (GCS-05).
 
 ## Work Log
 
+- 2026-08-22 — Pinned raw-download D2a added nine deterministic adversarial
+  public-path cases for transient pin retry, immutable pin reuse with
+  byte-zero replay after a later-range failure, latest-object replacement,
+  generation 404/412 abort classification, stored gzip/raw-byte semantics,
+  and malformed short/overlong/non-bytes range refusal. The 266-test baseline
+  remained green and the exact 275-test focused suite passed, so D2a exposed
+  no missing production behavior and no GREEN edit is warranted. Scoped
+  flake8, diff, JSON, and production-untouched checks passed. Independent
+  validation reproduced all 275 focused passes and the same clean scope/style
+  checks. Status remains IN PROGRESS for D2b lifecycle/error hardening.
 - 2026-08-22 — Pinned raw-download D1 GREEN adds request-scoped immutable
   generation/size metadata, caller-generation authority, fail-fast advertised
   size refusal, exact sequential 64-KiB raw inclusive ranges, and atomic
