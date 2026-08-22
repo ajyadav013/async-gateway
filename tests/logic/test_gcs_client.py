@@ -6662,7 +6662,7 @@ async def test_download_body_failure_wins_over_hostile_client_close(
                      'DNS', 502, id='transport'),
         pytest.param(google_auth_exceptions.DefaultCredentialsError(
             'cleanup-credential-private-d2b1'), 'CONFIG', 400,
-                     id='credential'),
+            id='credential'),
         pytest.param(_FakeServiceError(503), 'GCS_STATUS', 503,
                      id='service'),
     ],

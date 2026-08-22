@@ -34,6 +34,12 @@ beyond the cap (GCS-05).
 
 ## Work Log
 
+- 2026-08-23 — VALIDATE reproduced the exact CI format-selector failure as
+  one `E126` in the cleanup-only download parametrization, then corrected only
+  that line's hanging indentation. The normalized test-module AST remained
+  `853c3d0023d05554a4837acd2c8a8bbbb709c7e482c6c3f86203cbbd81ed52b4`;
+  the exact selector, full flake8, and all three affected cleanup-matrix cases
+  pass. Status remains IN PROGRESS for the GCS-05 acceptance-map audit.
 - 2026-08-22 — Independent D2b2 validation reproduced the exact 322/322
   focused result, passed three additional repeated runs of the new lifecycle
   cases, and confirmed flake8, diff, JSON, exact three-file scope, and
