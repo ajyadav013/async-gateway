@@ -815,7 +815,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-48"], "blocks": ["AGW-50"]},
       "commits": [],
-      "note": "Normalization hardening GREEN: all 380 focused and 276 entrypoint cases pass. Empty required-meaning scalars, oversized pages, and malformed iterator/page shapes fail closed as GCS_STATUS/502 while opaque nonempty whitespace tokens remain unchanged. Scoped flake8, mypy, diff, JSON, and exact-scope checks pass; status stays IN PROGRESS."
+      "note": "Error-hardening test tranche adds 63 deterministic ADC, transport, service-status/retry, cleanup-precedence/type, programming-identity, and secret-containment cases. Owner and independent validation both reproduce all 443 focused passes with clean flake8/diff/JSON and exact tests-only scope; no genuine product gap was found and status stays IN PROGRESS."
     },
     {
       "id": "AGW-50",

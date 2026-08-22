@@ -1819,6 +1819,481 @@ async def test_list_malformed_page_or_iterator_is_safe_gcs_status(
     assert sentinel not in surfaces
 
 
+# --- AGW-49 error, retry, cleanup, and containment hardening ------------
+
+
+class _HeadListErrorBlob(_HeadListBlob):
+    """Head blob whose metadata fetch consumes a fresh scripted outcome."""
+
+    def reload(self, **kwargs: object) -> None:
+        """Record the exact fetch and raise only the current attempt value."""
+        self.provider.record_thread('reload')
+        self.provider.reload_calls.append(dict(kwargs))
+        provider = self.provider
+        if isinstance(provider, _HeadListErrorProvider):
+            provider.raise_next('head')
+
+
+class _HeadListErrorPage(_HeadListPage):
+    """One list page with an independently scripted iteration boundary."""
+
+    def __iter__(self) -> Any:
+        """Raise at page iteration or preserve the exact service order."""
+        self.provider.record_thread('page-iteration')
+        self.provider.page_iteration_count += 1
+        provider = self.provider
+        if isinstance(provider, _HeadListErrorProvider):
+            provider.raise_next('iteration')
+        return iter(self.items)
+
+
+class _HeadListErrorCursor:
+    """Single page cursor with a separately scriptable fetch boundary."""
+
+    def __init__(self, iterator: '_HeadListErrorIterator') -> None:
+        """Retain one fresh iterator for exactly one attempt."""
+        self.iterator = iterator
+
+    def __iter__(self) -> '_HeadListErrorCursor':
+        """Return this deterministic cursor."""
+        return self
+
+    def __next__(self) -> _HeadListErrorPage:
+        """Fetch exactly one page or raise its current scripted outcome."""
+        provider = self.iterator.provider
+        provider.record_thread('page-fetch')
+        provider.page_fetch_count += 1
+        provider.raise_next('page-fetch')
+        self.iterator.next_page_token = provider.server_token
+        return self.iterator.page
+
+
+class _HeadListErrorIterator:
+    """Fresh official-SDK-shaped iterator for one list attempt."""
+
+    def __init__(self, provider: '_HeadListErrorProvider') -> None:
+        """Create a fresh page/cursor so retries never share iterator state."""
+        self.provider = provider
+        self.next_page_token: str | None = None
+        self.page = _HeadListErrorPage(provider, provider.list_items)
+
+    @property
+    def pages(self) -> _HeadListErrorCursor:
+        """Expose one fresh, bounded page cursor."""
+        self.provider.record_thread('pages')
+        self.provider.pages_access_count += 1
+        return _HeadListErrorCursor(self)
+
+
+class _HeadListErrorClient:
+    """Attempt-owned head/list client with scripted construction and close."""
+
+    def __init__(self, provider: '_HeadListErrorProvider') -> None:
+        """Retain the provider and a per-resource cleanup count."""
+        self.provider = provider
+        self.close_calls = 0
+
+    def bucket(self, name: str) -> _HeadListBucket:
+        """Return the deterministic bucket without external I/O."""
+        self.provider.record_thread('bucket')
+        self.provider.bucket_names.append(name)
+        return self.provider.bucket
+
+    def list_blobs(
+        self,
+        bucket: object,
+        **kwargs: object,
+    ) -> _HeadListErrorIterator:
+        """Construct only one bounded iterator under exact SDK controls."""
+        self.provider.record_thread('list-construction')
+        self.provider.list_calls.append((bucket, dict(kwargs)))
+        self.provider.raise_next('list-construction')
+        return _HeadListErrorIterator(self.provider)
+
+    def close(self) -> None:
+        """Close once and consume only this attempt's cleanup outcome."""
+        self.provider.record_thread('client-close')
+        self.close_calls += 1
+        self.provider.raise_next('close')
+
+
+class _HeadListErrorProvider(_HeadListProvider):
+    """Fresh-attempt provider tree for deterministic public failure tests."""
+
+    def __init__(self) -> None:
+        """Create valid defaults and independent scripts for every seam."""
+        super().__init__()
+        self.adc_error: BaseException | None = None
+        self.outcomes: dict[str, list[BaseException | None]] = {
+            'head': [],
+            'list-construction': [],
+            'page-fetch': [],
+            'iteration': [],
+            'close': [],
+        }
+        self.server_token: str | None = None
+        self.head_blob = _HeadListErrorBlob(self)
+        self.bucket = _HeadListBucket(self)
+        self.list_items = [_HeadListBlob(self)]
+        self.returned_clients: list[_HeadListErrorClient] = []
+
+    def adc(self, *args: object, **kwargs: object) -> tuple[object, str]:
+        """Return valid ADC or one fresh local credential failure."""
+        self.record_thread('adc')
+        if self.adc_error is not None:
+            raise self.adc_error
+        return self.credentials, 'head-list-error-project'
+
+    def make_client(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> _HeadListErrorClient:
+        """Return a new owned client for every gateway attempt."""
+        self.record_thread('client')
+        client = _HeadListErrorClient(self)
+        self.returned_clients.append(client)
+        return client
+
+    def script(
+        self,
+        seam: str,
+        *outcomes: BaseException | None,
+    ) -> None:
+        """Replace one seam's ordered attempt outcomes."""
+        self.outcomes[seam] = list(outcomes)
+
+    def raise_next(self, seam: str) -> None:
+        """Raise and consume one independently constructed scripted value."""
+        if self.outcomes[seam]:
+            outcome = self.outcomes[seam].pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+
+
+async def _public_retrying_head_list(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _HeadListErrorProvider,
+    *,
+    command: str,
+    retries: int,
+    events: list[str],
+    caller_token: str | None = None,
+) -> tuple[dict[str, Any], CircuitBreakerHelper]:
+    """Drive one command through the real deterministic breaker contract."""
+    breaker_config = _gcs_retry_config(retries, events)
+    breaker = CircuitBreakerHelper(
+        **validated_breaker_config(breaker_config))
+    monkeypatch.setattr(
+        base, 'get_breaker', lambda *args, **kwargs: breaker)
+    monkeypatch.setattr(google_auth, 'default', provider.adc)
+    monkeypatch.setattr(storage, 'Client', provider.make_client)
+    info: dict[str, object] = {
+        'command': command,
+        'timeout': 2.5,
+        'circuit_breaker_config': breaker_config,
+    }
+    if command == 'list':
+        info['max_items'] = 1
+        if caller_token is not None:
+            info['page_token'] = caller_token
+    target = 'prefix/' if command == 'list' else 'object.txt'
+    result = await request(
+        f'gs://Head-List-Error-Bucket/{target}',
+        protocol='GCS',
+        protocol_info=info,
+    )
+    return result, breaker
+
+
+@pytest.mark.parametrize('command', ['head', 'list'])
+@pytest.mark.parametrize('credential_stage', ['adc', 'refresh'])
+async def test_head_list_credential_failure_is_config_and_uncounted(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    credential_stage: str,
+) -> None:
+    """ADC discovery and refresh fail locally before provider counting."""
+    secret = f'{command}-{credential_stage}-credential-private-agw49'
+    events: list[str] = []
+    provider = _HeadListErrorProvider()
+    if credential_stage == 'adc':
+        provider.adc_error = google_auth_exceptions.DefaultCredentialsError(
+            secret)
+    else:
+        provider.credentials.valid = False
+        provider.credentials.refresh_error = (
+            google_auth_exceptions.RefreshError(secret))
+
+    result, breaker = await _public_retrying_head_list(
+        monkeypatch, provider, command=command, retries=2, events=events)
+
+    assert result['status_code'] == 400
+    assert result['error']['code'] == 'CONFIG'
+    assert result['protocol_details'] == {}
+    assert secret not in repr(result)
+    assert provider.returned_clients == []
+    assert events == ['abort']
+    assert breaker.failures == 0
+
+
+@pytest.mark.parametrize(
+    ('command', 'stage'),
+    [
+        pytest.param('head', 'head', id='head-fetch'),
+        pytest.param('list', 'list-construction', id='list-construction'),
+        pytest.param('list', 'page-fetch', id='list-page-fetch'),
+        pytest.param('list', 'iteration', id='list-page-iteration'),
+    ],
+)
+@pytest.mark.parametrize(
+    ('failure_type', 'expected_code', 'expected_status'),
+    [
+        pytest.param(socket.gaierror, 'DNS', 502, id='dns'),
+        pytest.param(ssl.SSLError, 'TLS', 502, id='tls'),
+        pytest.param(ConnectionError, 'CONNECT', 502, id='connect'),
+        pytest.param(TimeoutError, 'TIMEOUT', 504, id='timeout'),
+        pytest.param(OSError, 'TRANSPORT', 502, id='transport'),
+    ],
+)
+async def test_head_list_transport_stage_is_typed_and_breaker_owned(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    stage: str,
+    failure_type: type[BaseException],
+    expected_code: str,
+    expected_status: int,
+) -> None:
+    """Every provider transport stage has one stable public result."""
+    events: list[str] = []
+    provider = _HeadListErrorProvider()
+    provider.script(
+        stage,
+        failure_type(f'{command}-{stage}-transport-private-agw49'),
+    )
+
+    result, breaker = await _public_retrying_head_list(
+        monkeypatch, provider, command=command, retries=0, events=events)
+
+    assert result['status_code'] == expected_status
+    assert result['error']['code'] == expected_code
+    assert result['protocol_details'] == {}
+    assert 'private-agw49' not in repr(result)
+    assert sum(client.close_calls for client in provider.returned_clients) == 1
+    assert events == ['failed', 'exhausted']
+    assert breaker.failures == 1
+
+
+@pytest.mark.parametrize('command', ['head', 'list'])
+@pytest.mark.parametrize(
+    ('status', 'retryable'),
+    [
+        (408, True), (429, True), (500, True), (502, True),
+        (503, True), (504, True), (400, False), (401, False),
+        (403, False), (404, False), (409, False), (412, False),
+    ],
+)
+async def test_head_list_service_status_has_exact_retry_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    status: int,
+    retryable: bool,
+) -> None:
+    """The frozen service allowlist alone controls retry and counting."""
+    events: list[str] = []
+    provider = _HeadListErrorProvider()
+    attempts = 2 if retryable else 1
+    stage = 'head' if command == 'head' else 'page-fetch'
+    provider.script(
+        stage,
+        *[_FakeServiceError(status) for _ in range(attempts)],
+    )
+
+    result, breaker = await _public_retrying_head_list(
+        monkeypatch, provider, command=command, retries=1, events=events)
+
+    target = 'object.txt' if command == 'head' else 'prefix/'
+    assert result['status_code'] == status
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {
+        'command': command,
+        'bucket': 'head-list-error-bucket',
+        'target': target,
+        'gcs_error_code': 'conditionNotMet',
+        'gcs_error_message': 'safe service refusal',
+        'response_metadata': {
+            'http_status_code': status,
+            'request_id': 'request-7',
+        },
+    }
+    close_calls = sum(
+        client.close_calls for client in provider.returned_clients)
+    assert close_calls == attempts
+    assert events == (
+        ['failed', 'failed', 'exhausted'] if retryable else ['abort'])
+    assert breaker.failures == (attempts if retryable else 0)
+
+
+@pytest.mark.parametrize('command', ['head', 'list'])
+@pytest.mark.parametrize(
+    ('body_kind', 'expected_code'),
+    [
+        pytest.param('service', 'GCS_STATUS', id='service'),
+        pytest.param('transport', 'DNS', id='transport'),
+        pytest.param('malformed', 'GCS_STATUS', id='malformed-success'),
+    ],
+)
+async def test_head_list_body_failure_wins_over_hostile_close(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    command: str,
+    body_kind: str,
+    expected_code: str,
+) -> None:
+    """Known command failure is retained over a later cleanup defect."""
+    provider = _HeadListErrorProvider()
+    stage = 'head' if command == 'head' else 'page-fetch'
+    if body_kind == 'service':
+        provider.script(stage, _FakeServiceError(403))
+    elif body_kind == 'transport':
+        provider.script(stage, socket.gaierror('body-private-agw49'))
+    elif command == 'head':
+        provider.head_blob.size = -1
+    else:
+        provider.list_items[0].name = ''
+    close_secret = f'{command}-{body_kind}-close-private-agw49'
+    provider.script('close', RuntimeError(close_secret))
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, _ = await _public_retrying_head_list(
+        monkeypatch, provider, command=command, retries=0, events=[])
+
+    surfaces = repr(result) + _logged_gcs_surfaces(caplog)
+    assert result['error']['code'] == expected_code
+    assert result['protocol_details'] == (
+        {
+            'command': command,
+            'bucket': 'head-list-error-bucket',
+            'target': 'object.txt' if command == 'head' else 'prefix/',
+            'gcs_error_code': 'conditionNotMet',
+            'gcs_error_message': 'safe service refusal',
+            'response_metadata': {
+                'http_status_code': 403,
+                'request_id': 'request-7',
+            },
+        }
+        if body_kind == 'service'
+        else {}
+    )
+    assert close_secret not in surfaces
+    assert sum(client.close_calls for client in provider.returned_clients) == 1
+
+
+@pytest.mark.parametrize('command', ['head', 'list'])
+@pytest.mark.parametrize(
+    ('cleanup_factory', 'expected_code', 'expected_status'),
+    [
+        pytest.param(
+            lambda: socket.gaierror('cleanup-dns-private-agw49'),
+            'DNS', 502, id='transport'),
+        pytest.param(
+            lambda: google_auth_exceptions.DefaultCredentialsError(
+                'cleanup-credential-private-agw49'),
+            'CONFIG', 400, id='credential'),
+        pytest.param(
+            lambda: _FakeServiceError(503),
+            'GCS_STATUS', 503, id='service'),
+    ],
+)
+async def test_head_list_cleanup_only_failure_has_stable_public_type(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    cleanup_factory: Any,
+    expected_code: str,
+    expected_status: int,
+) -> None:
+    """Credential, transport, and service cleanup map deterministically."""
+    events: list[str] = []
+    provider = _HeadListErrorProvider()
+    provider.script('close', cleanup_factory())
+
+    result, _ = await _public_retrying_head_list(
+        monkeypatch, provider, command=command, retries=0, events=events)
+
+    assert result['status_code'] == expected_status
+    assert result['error']['code'] == expected_code
+    assert result['protocol_details'] == {}
+    assert 'private-agw49' not in repr(result)
+    assert events == (
+        ['failed', 'exhausted'] if expected_code == 'DNS' else ['abort'])
+
+
+@pytest.mark.parametrize('command', ['head', 'list'])
+async def test_head_list_cleanup_programming_defect_preserves_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """Unknown cleanup defects propagate unchanged at one conversion point."""
+    provider = _HeadListErrorProvider()
+    failure = RuntimeError(f'{command}-cleanup-programming-defect-agw49')
+    cause = ValueError(f'{command}-cleanup-programming-cause-agw49')
+    failure.__cause__ = cause
+    provider.script('close', failure)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _public_retrying_head_list(
+            monkeypatch, provider, command=command, retries=0, events=[])
+
+    assert caught.value is failure
+    assert caught.value.__cause__ is cause
+    assert sum(client.close_calls for client in provider.returned_clients) == 1
+
+
+async def test_list_failure_contains_tokens_credentials_and_sdk_values(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every failed-list surface omits caller/server/provider bearer data."""
+    sentinels = {
+        'caller': 'caller-page-token-private-agw49',
+        'server': 'server-page-token-private-agw49',
+        'credential': 'credential-value-private-agw49',
+        'sdk': 'sdk-response-private-agw49',
+    }
+    events: list[str] = []
+    provider = _HeadListErrorProvider()
+    provider.server_token = sentinels['server']
+    provider.credentials.__repr__ = lambda: sentinels['credential']
+    hostile = ' authorization=Bearer '.join(sentinels.values())
+    failure = _FakeServiceError(
+        403, code=hostile, message=hostile, request_id=hostile)
+    provider.script('iteration', failure)
+    caplog.set_level(logging.WARNING, logger='asyncio_gateway')
+
+    result, breaker = await _public_retrying_head_list(
+        monkeypatch,
+        provider,
+        command='list',
+        retries=1,
+        events=events,
+        caller_token=sentinels['caller'],
+    )
+
+    surfaces = ''.join((
+        repr(result),
+        _logged_gcs_surfaces(caplog),
+        repr(events),
+        ''.join(traceback.format_exception(failure)),
+        repr(breaker.__dict__),
+    ))
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert set(result['protocol_details']) == {
+        'command', 'bucket', 'target', 'gcs_error_code',
+        'gcs_error_message', 'response_metadata',
+    }
+    assert all(secret not in surfaces for secret in sentinels.values())
+
+
 # --- AGW-48 tranche A: guarded upload foundation -------------------------
 
 

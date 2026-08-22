@@ -70,3 +70,15 @@ recursively enumerating a bucket, or disclosing caller tokens (GCS-06).
   checks pass. Whitespace-only opaque server tokens remain valid. Files:
   `asyncio_gateway/logic/gcs_client.py`, `tests/logic/test_gcs_client.py`, this
   ticket, and `docs/project/tickets/index.json`.
+- 2026-08-22 — Added 63 deterministic public head/list error-hardening cases
+  for ADC/refresh, transport at every command seam, the complete service-status
+  retry matrix, body-over-cleanup precedence, cleanup-only typing, programming-
+  defect identity, and caller/server/provider secret containment. All 443
+  focused cases pass, so this tranche found no genuine product gap and made no
+  production change. Files: `tests/logic/test_gcs_client.py`, this ticket, and
+  `docs/project/tickets/index.json`.
+- 2026-08-22 — Independent validation reproduced all 443 focused passes and
+  confirmed scoped flake8, diff, JSON, production/config isolation, and the
+  exact three-file test/evidence scope. The passing tranche remains tests-only;
+  AGW-49 stays IN PROGRESS. Files: `tests/logic/test_gcs_client.py`, this
+  ticket, and `docs/project/tickets/index.json`.
