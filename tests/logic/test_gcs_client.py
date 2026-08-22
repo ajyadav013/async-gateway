@@ -2199,6 +2199,10 @@ class _DownloadBlob:
         """Record exact pin controls and the provider worker identity."""
         self.provider.record_thread('reload')
         self.provider.reload_calls.append(dict(kwargs))
+        if self.provider.reload_started is not None:
+            self.provider.reload_started.set()
+        if self.provider.reload_release is not None:
+            assert self.provider.reload_release.wait(timeout=1)
         if self.provider.reload_outcomes:
             outcome = self.provider.reload_outcomes.pop(0)
             if isinstance(outcome, BaseException):
@@ -2254,6 +2258,10 @@ class _DownloadClient:
         """Record one deterministic off-loop cleanup."""
         self.provider.record_thread('client-close')
         self.close_calls += 1
+        if self.provider.close_started is not None:
+            self.provider.close_started.set()
+        if self.provider.close_release is not None:
+            assert self.provider.close_release.wait(timeout=1)
         if self.provider.close_outcomes:
             outcome = self.provider.close_outcomes.pop(0)
             if isinstance(outcome, BaseException):
@@ -2278,6 +2286,10 @@ class _DownloadProvider:
         self.blob_keys: list[str] = []
         self.credentials = _UploadCredentials()
         self.adc_error: BaseException | None = None
+        self.reload_started: threading.Event | None = None
+        self.reload_release: threading.Event | None = None
+        self.close_started: threading.Event | None = None
+        self.close_release: threading.Event | None = None
         self.blob = _DownloadBlob(self)
         self.bucket = _DownloadBucket(self)
         self.client = _DownloadClient(self)
@@ -3194,6 +3206,202 @@ async def test_download_failure_redacts_provider_credential_and_local_target(
     assert result['error']['code'] == 'GCS_STATUS'
     assert target.read_bytes() == b'existing-target'
     assert all(secret not in surfaces for secret in sentinels.values())
+
+
+# --- AGW-48 tranche D2b2: download cancellation and timeout draining -----
+
+
+async def test_download_pin_cancellation_drains_and_preserves_original(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A cancelled metadata pin drains, closes, and preserves its target."""
+    provider = _DownloadProvider(b'x')
+    provider.reload_started = threading.Event()
+    provider.reload_release = threading.Event()
+    range_sentinel = 'download-late-reload-private-d2b2'
+    close_sentinel = 'download-reload-close-private-d2b2'
+    provider.script_reload(RuntimeError(range_sentinel))
+    provider.script_close(RuntimeError(close_sentinel))
+    target = tmp_path / 'cancelled-pin.bin'
+    target.write_bytes(b'existing-target')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    loop_thread = threading.get_ident()
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    other_leases = [acquire() for _ in range(3)]
+    task = asyncio.create_task(_public_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+    ))
+    admitted_after: Any = None
+    try:
+        assert provider.reload_started is not None
+        await _wait_for_thread_event(provider.reload_started)
+        task.cancel('first-download-pin-cancellation')
+        task.cancel('repeated-download-pin-cancellation')
+        with pytest.raises(GcsCapacityError):
+            acquire()
+
+        assert provider.reload_release is not None
+        provider.reload_release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+
+        surfaces = (
+            ''.join(traceback.format_exception(caught.value))
+            + _logged_gcs_surfaces(caplog)
+        )
+        assert caught.value.args == ('first-download-pin-cancellation',)
+        assert range_sentinel not in surfaces
+        assert close_sentinel not in surfaces
+        assert target.read_bytes() == b'existing-target'
+        assert list(tmp_path.iterdir()) == [target]
+        assert provider.range_calls == []
+        assert provider.client.close_calls == 1
+        assert provider.timeline[-1] == 'client-close'
+        close_thread, close_name = provider.threads['client-close'][0]
+        assert close_thread != loop_thread
+        assert close_name.startswith('asyncio-gateway-gcs')
+
+        admitted_after = acquire()
+        with pytest.raises(GcsCapacityError):
+            acquire()
+    finally:
+        if provider.reload_release is not None:
+            provider.reload_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if admitted_after is not None:
+            await _release_lease(admitted_after)
+        for lease in other_leases:
+            await _release_lease(lease)
+
+
+@pytest.mark.parametrize('outcome', ['cancel', 'timeout'])
+async def test_download_range_drain_retains_capacity_through_hostile_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+) -> None:
+    """Late range work and hostile close cannot replace the first outcome."""
+    provider = _DownloadProvider(b'x')
+    range_started = threading.Event()
+    range_release = threading.Event()
+    provider.close_started = threading.Event()
+    provider.close_release = threading.Event()
+    range_sentinel = f'download-late-range-{outcome}-private-d2b2'
+    close_sentinel = f'download-close-{outcome}-private-d2b2'
+
+    def blocked_range(arguments: Mapping[str, object]) -> bytes:
+        """Return late bytes or failure after deterministic release."""
+        del arguments
+        range_started.set()
+        assert range_release.wait(timeout=1)
+        if outcome == 'cancel':
+            raise RuntimeError(range_sentinel)
+        return b'x'
+
+    provider.range_handler = blocked_range
+    provider.script_close(RuntimeError(close_sentinel))
+    expiry_injected = asyncio.Event()
+    if outcome == 'timeout':
+        real_wait_for = asyncio.wait_for
+        expired = False
+
+        async def expire_started_range_once(
+            awaitable: Any,
+            *,
+            timeout: int | float,
+        ) -> Any:
+            """Expire only the wait whose provider range has started."""
+            nonlocal expired
+            if range_started.is_set() and not expired:
+                expired = True
+                operation = asyncio.ensure_future(awaitable)
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+                expiry_injected.set()
+                raise asyncio.TimeoutError
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr(
+            gcs_client.asyncio, 'wait_for', expire_started_range_once)
+
+    target = tmp_path / f'{outcome}-range.bin'
+    target.write_bytes(b'existing-target')
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    loop_thread = threading.get_ident()
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    other_leases = [acquire() for _ in range(3)]
+    task = asyncio.create_task(_public_download(
+        monkeypatch,
+        provider,
+        target,
+        max_response_bytes=1,
+    ))
+    admitted_after: Any = None
+    try:
+        await _wait_for_thread_event(range_started)
+        if outcome == 'cancel':
+            task.cancel('first-download-range-cancellation')
+            task.cancel('repeated-download-range-cancellation')
+        else:
+            await expiry_injected.wait()
+        with pytest.raises(GcsCapacityError):
+            acquire()
+
+        range_release.set()
+        assert provider.close_started is not None
+        await _wait_for_thread_event(provider.close_started)
+        with pytest.raises(GcsCapacityError):
+            acquire()
+        if outcome == 'cancel':
+            task.cancel('cancellation-during-download-close')
+
+        assert provider.close_release is not None
+        provider.close_release.set()
+        if outcome == 'cancel':
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert caught.value.args == (
+                'first-download-range-cancellation',)
+            surfaces = ''.join(traceback.format_exception(caught.value))
+        else:
+            result, _ = await task
+            assert result['ok'] is False
+            assert result['error']['code'] == 'TIMEOUT'
+            surfaces = repr(result)
+        surfaces += _logged_gcs_surfaces(caplog)
+
+        assert range_sentinel not in surfaces
+        assert close_sentinel not in surfaces
+        assert target.read_bytes() == b'existing-target'
+        assert list(tmp_path.iterdir()) == [target]
+        assert len(provider.range_calls) == 1
+        assert provider.client.close_calls == 1
+        assert provider.timeline[-1] == 'client-close'
+        assert provider.timeline.index('range') < provider.timeline.index(
+            'client-close')
+        for seam in ('range', 'client-close'):
+            worker_thread, worker_name = provider.threads[seam][0]
+            assert worker_thread != loop_thread
+            assert worker_name.startswith('asyncio-gateway-gcs')
+
+        admitted_after = acquire()
+        with pytest.raises(GcsCapacityError):
+            acquire()
+    finally:
+        range_release.set()
+        if provider.close_release is not None:
+            provider.close_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if admitted_after is not None:
+            await _release_lease(admitted_after)
+        for lease in other_leases:
+            await _release_lease(lease)
 
 
 # --- GCS-04 tranche B: shutdown, telemetry, and outcome precedence -------

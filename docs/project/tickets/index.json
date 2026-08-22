@@ -803,7 +803,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-47"], "blocks": ["AGW-49"]},
       "commits": [],
-      "note": "Pinned raw-download D2b1 GREEN: provider transport exceptions are translated at the GCS range boundary before the unchanged atomic path writer; all 319 focused and 276 entrypoint tests pass with scoped flake8/mypy clean. Status remains IN PROGRESS for remaining GCS-05 download lifecycle hardening."
+      "note": "Pinned raw-download D2b2: three deterministic cancellation/timeout retained-cleanup cases passed the existing implementation; all 322 focused tests, ten owner repeats, and three independent repeats pass with production untouched and clean flake8/diff/JSON/scope validation. Status remains IN PROGRESS for the GCS-05 acceptance-map audit."
     },
     {
       "id": "AGW-49",

@@ -34,6 +34,20 @@ beyond the cap (GCS-05).
 
 ## Work Log
 
+- 2026-08-22 — Independent D2b2 validation reproduced the exact 322/322
+  focused result, passed three additional repeated runs of the new lifecycle
+  cases, and confirmed flake8, diff, JSON, exact three-file scope, and
+  production-untouched checks. Status remains IN PROGRESS for the GCS-05
+  acceptance-map audit.
+- 2026-08-22 — Pinned raw-download D2b2 added three deterministic
+  cancellation/deadline cases for blocked metadata and range work, retained
+  fifth-admission refusal through late provider drain and hostile client
+  close, first-cancellation/timeout precedence, exact off-loop close ordering,
+  secret containment, and atomic preservation of an existing target. All
+  three new cases passed the existing implementation; the exact focused suite
+  is 322/322 and ten repeated focused runs are stable, so no artificial RED or
+  production edit is warranted. Status remains IN PROGRESS for the GCS-05
+  acceptance audit.
 - 2026-08-22 — Pinned raw-download D2b1 GREEN translates transport
   exceptions at the GCS range-provider boundary before the unchanged atomic
   path writer can classify local filesystem failures. This preserves the
