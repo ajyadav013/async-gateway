@@ -28,6 +28,7 @@ from failsafe import CircuitOpen, RetriesExhausted
 from google import auth as google_auth
 from google.auth import credentials as google_auth_credentials
 from google.auth import exceptions as google_auth_exceptions
+from google.auth import impersonated_credentials
 from google.cloud import storage
 
 import pytest
@@ -1436,6 +1437,415 @@ async def test_bearer_only_direct_credentials_fail_before_url_generation(
     assert provider.generate_calls == []
     assert breaker.calls == 0
     assert secret not in repr(result)
+
+
+# --- AGW-50 tranche S2: signer identity and IAM impersonation ------------
+
+
+class _HostileSignerIdentity:
+    """Non-string identity that fails if production tries to render it."""
+
+    def __init__(self) -> None:
+        """Start with no attempted string or representation conversion."""
+        self.str_calls = 0
+        self.repr_calls = 0
+
+    def __str__(self) -> str:
+        """Reject conversion of an untrusted credential-provider value."""
+        self.str_calls += 1
+        raise AssertionError('hostile signer identity was stringified')
+
+    def __repr__(self) -> str:
+        """Reject diagnostic rendering of an untrusted provider value."""
+        self.repr_calls += 1
+        raise AssertionError('hostile signer identity was represented')
+
+
+class _SignerIdentityCredentials(_DirectSigningCredentials):
+    """Direct signing credentials exposing one caller-selected identity."""
+
+    def __init__(
+        self,
+        provider: '_SignedUrlProvider',
+        identity: object,
+    ) -> None:
+        """Retain the raw identity without normalizing or rendering it."""
+        super().__init__(provider)
+        self.identity = identity
+
+    @property
+    def signer_email(self) -> Any:
+        """Return the raw test value and record off-loop validation."""
+        self.provider.record_thread('signer-identity')
+        return self.identity
+
+
+@pytest.mark.parametrize(
+    'identity_case',
+    [
+        pytest.param('blank', id='blank'),
+        pytest.param('whitespace', id='whitespace'),
+        pytest.param('hostile-non-string', id='hostile-non-string'),
+    ],
+)
+async def test_direct_signer_rejects_unusable_identity_before_client(
+    monkeypatch: pytest.MonkeyPatch,
+    identity_case: str,
+) -> None:
+    """Blank and hostile signer identities fail CONFIG without disclosure."""
+    provider = _SignedUrlProvider()
+    hostile: _HostileSignerIdentity | None = None
+    identity: object = ''
+    if identity_case == 'whitespace':
+        identity = ' \t\n '
+    elif identity_case == 'hostile-non-string':
+        hostile = _HostileSignerIdentity()
+        identity = hostile
+    provider.credentials = _SignerIdentityCredentials(provider, identity)
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+
+    result = await request(
+        'gs://signed-bucket/folder/object.bin',
+        protocol='GCS',
+        protocol_info={
+            'command': 'signed_url',
+            'method': 'GET',
+            'timeout': 2.5,
+        },
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == 400
+    assert result['error']['code'] == 'CONFIG'
+    assert result['protocol_details'] == {}
+    assert provider.client_calls == []
+    assert provider.generate_calls == []
+    assert breaker.calls == 0
+    assert provider.timeline.count('signer-identity') == 1
+    if hostile is not None:
+        assert hostile.str_calls == 0
+        assert hostile.repr_calls == 0
+
+
+class _ImpersonationSourceCredentials:
+    """Non-signing ADC source with deterministic refresh behavior."""
+
+    def __init__(
+        self,
+        provider: '_ImpersonationProvider',
+        *,
+        valid: bool,
+        refresh_error: BaseException | None = None,
+    ) -> None:
+        """Configure source validity and an optional refresh refusal."""
+        self.provider = provider
+        self.valid = valid
+        self.expired = not valid
+        self.refresh_error = refresh_error
+
+    def refresh(self, request: object) -> None:
+        """Refresh off-loop or raise the configured credential failure."""
+        self.provider.record_thread('source-refresh')
+        if self.refresh_error is not None:
+            raise self.refresh_error
+        self.valid = True
+        self.expired = False
+
+
+class _ImpersonatedSigningCredentials(google_auth_credentials.Signing):
+    """Deterministic signing target returned by IAM impersonation."""
+
+    def __init__(
+        self,
+        provider: '_ImpersonationProvider',
+        *,
+        refresh_error: BaseException | None = None,
+    ) -> None:
+        """Start invalid so target refresh is an observable requirement."""
+        self.provider = provider
+        self.valid = False
+        self.expired = True
+        self.refresh_error = refresh_error
+        self._signer = _DirectSigner()
+
+    def refresh(self, request: object) -> None:
+        """Refresh the impersonated target or raise one IAM refusal."""
+        self.provider.record_thread('target-refresh')
+        if self.refresh_error is not None:
+            raise self.refresh_error
+        self.valid = True
+        self.expired = False
+
+    def sign_bytes(self, message: bytes) -> bytes:
+        """Record nested IAM signing from inside URL generation."""
+        self.provider.record_thread('sign-bytes')
+        return b'impersonated-signature:' + message
+
+    @property
+    def signer_email(self) -> str:
+        """Expose the exact validated target principal while off-loop."""
+        self.provider.record_thread('signer-identity')
+        return self.provider.signing_target
+
+    @property
+    def signer(self) -> _DirectSigner:
+        """Expose a deterministic signer required by the Signing ABC."""
+        return self._signer
+
+
+class _ImpersonationSignedUrlBlob(_SignedUrlBlob):
+    """URL double exercising nested target signing in the provider worker."""
+
+    def generate_signed_url(self, **kwargs: object) -> str:
+        """Use the selected target signer without modeling IAM retries."""
+        credentials = kwargs['credentials']
+        assert credentials is self.provider.target_credentials
+        assert credentials.signer_email == self.provider.signing_target
+        credentials.sign_bytes(b'canonical-request')
+        return super().generate_signed_url(**kwargs)
+
+
+class _ImpersonationProvider(_SignedUrlProvider):
+    """ADC, IAM impersonation, and storage tree with exact call capture."""
+
+    def __init__(
+        self,
+        *,
+        source_valid: bool = False,
+        adc_error: BaseException | None = None,
+        source_refresh_error: BaseException | None = None,
+        target_refresh_error: BaseException | None = None,
+    ) -> None:
+        """Configure one deterministic impersonation lifecycle."""
+        self.signing_target = VALID_SIGNING_ACCOUNT
+        self.adc_error = adc_error
+        self.impersonation_calls: list[
+            tuple[tuple[object, ...], dict[str, object]]
+        ] = []
+        source = _ImpersonationSourceCredentials(
+            self,
+            valid=source_valid,
+            refresh_error=source_refresh_error,
+        )
+        super().__init__(source)
+        self.source_credentials = source
+        self.target_credentials = _ImpersonatedSigningCredentials(
+            self, refresh_error=target_refresh_error)
+        self.blob = _ImpersonationSignedUrlBlob(self)
+
+    def adc(self, *args: object, **kwargs: object) -> tuple[object, str]:
+        """Return source ADC or raise one deterministic discovery failure."""
+        self.record_thread('adc')
+        if self.adc_error is not None:
+            raise self.adc_error
+        return self.source_credentials, 'source-adc-project'
+
+    def make_impersonated_credentials(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> _ImpersonatedSigningCredentials:
+        """Capture the public google-auth constructor contract off-loop."""
+        self.record_thread('impersonated-constructor')
+        self.impersonation_calls.append((args, dict(kwargs)))
+        return self.target_credentials
+
+
+def _install_impersonation_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _ImpersonationProvider,
+) -> '_UploadBreaker':
+    """Install deterministic ADC, IAM, and storage provider boundaries."""
+    breaker = _install_signed_url_provider(monkeypatch, provider)
+    monkeypatch.setattr(
+        impersonated_credentials,
+        'Credentials',
+        provider.make_impersonated_credentials,
+    )
+    return breaker
+
+
+@pytest.mark.parametrize(
+    'method',
+    [pytest.param('GET', id='get'), pytest.param('PUT', id='put')],
+)
+async def test_impersonation_uses_scoped_target_and_closes_before_publish(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+) -> None:
+    """Validated GET/PUT impersonation uses one refreshed signing target."""
+    provider = _ImpersonationProvider()
+    breaker = _install_impersonation_provider(monkeypatch, provider)
+    loop_thread = threading.get_ident()
+    info: dict[str, object] = {
+        'command': 'signed_url',
+        'method': method,
+        'signing_service_account': provider.signing_target,
+        'timeout': 2.5,
+    }
+    if method == 'PUT':
+        info.update({
+            'content_type': 'application/octet-stream',
+            'max_upload_bytes': 17,
+            'if_generation_match': 9,
+        })
+    response = _response('gs://Signed-Bucket/folder/object.bin')
+    provider.response = response
+    strategy = GcsRequest(
+        'gs://Signed-Bucket/folder/object.bin',
+        None,
+        response,
+        _validate(info),
+        redact_params=frozenset(),
+    )
+
+    result = await strategy.handle_request()
+
+    assert not isinstance(
+        provider.source_credentials, google_auth_credentials.Signing)
+    assert provider.impersonation_calls == [(
+        (),
+        {
+            'source_credentials': provider.source_credentials,
+            'target_principal': provider.signing_target,
+            'target_scopes': (
+                'https://www.googleapis.com/auth/cloud-platform',
+            ),
+        },
+    )]
+    assert provider.timeline.count('source-refresh') == 1
+    assert provider.timeline.count('target-refresh') == 1
+    assert provider.timeline.index('source-refresh') \
+        < provider.timeline.index('impersonated-constructor') \
+        < provider.timeline.index('target-refresh') \
+        < provider.timeline.index('client') \
+        < provider.timeline.index('generate') \
+        < provider.timeline.index('client-close')
+    assert provider.client_calls == [(
+        (),
+        {
+            'credentials': provider.target_credentials,
+            'project': 'source-adc-project',
+        },
+    )]
+    assert len(provider.generate_calls) == 1
+    assert provider.generate_calls[0]['credentials'] \
+        is provider.target_credentials
+    assert provider.client_open_during_generate == [True]
+    assert provider.details_during_generate == [{}]
+    assert provider.details_during_close == [{}]
+    assert provider.client.close_calls == 1
+    assert provider.timeline.index('generate') < provider.timeline.index(
+        'client-close')
+    assert breaker.calls == 0
+    worker_seams = {
+        'source-refresh',
+        'impersonated-constructor',
+        'target-refresh',
+        'signer-identity',
+        'sign-bytes',
+        'generate',
+        'client-close',
+    }
+    observed_worker_seams = {
+        seam for seam, _, _ in provider.threads if seam in worker_seams
+    }
+    assert observed_worker_seams == worker_seams
+    assert all(
+        thread_id != loop_thread
+        and thread_name.startswith('asyncio-gateway-gcs')
+        for seam, thread_id, thread_name in provider.threads
+        if seam in worker_seams
+    )
+    assert result is response
+    assert result['ok'] is True
+    assert result['status_code'] == 200
+    assert result['protocol_details']['signed_url'] == provider.signed_url
+    assert result['protocol_details']['method'] == method
+
+
+@pytest.mark.parametrize(
+    'failure_stage',
+    [pytest.param('default', id='default'),
+     pytest.param('source-refresh', id='source-refresh')],
+)
+async def test_impersonation_source_failures_are_config_and_uncounted(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    """ADC discovery and source refresh fail CONFIG before IAM or storage."""
+    secret = f'source-secret-agw50-s2-{failure_stage}'
+    provider_kwargs: dict[str, object]
+    if failure_stage == 'default':
+        provider_kwargs = {
+            'adc_error': google_auth_exceptions.DefaultCredentialsError(
+                secret),
+        }
+    else:
+        provider_kwargs = {
+            'source_refresh_error': google_auth_exceptions.RefreshError(
+                secret),
+        }
+    provider = _ImpersonationProvider(**provider_kwargs)
+    breaker = _install_impersonation_provider(monkeypatch, provider)
+
+    result = await request(
+        'gs://signed-bucket/folder/object.bin',
+        protocol='GCS',
+        protocol_info={
+            'command': 'signed_url',
+            'method': 'GET',
+            'signing_service_account': provider.signing_target,
+            'timeout': 2.5,
+        },
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == 400
+    assert result['error']['code'] == 'CONFIG'
+    assert result['protocol_details'] == {}
+    assert provider.timeline.count('adc') == 1
+    assert provider.timeline.count('source-refresh') == (
+        1 if failure_stage == 'source-refresh' else 0)
+    assert provider.impersonation_calls == []
+    assert provider.client_calls == []
+    assert provider.generate_calls == []
+    assert breaker.calls == 0
+    assert secret not in repr(result)
+
+
+async def test_impersonation_target_refresh_error_is_safe_gcs_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unstructured IAM target refresh refusal is GCS_STATUS/502."""
+    secret = 'target-refresh-secret-agw50-s2'
+    provider = _ImpersonationProvider(
+        source_valid=True,
+        target_refresh_error=google_auth_exceptions.RefreshError(secret),
+    )
+    breaker = _install_impersonation_provider(monkeypatch, provider)
+
+    result = await request(
+        'gs://signed-bucket/folder/object.bin',
+        protocol='GCS',
+        protocol_info={
+            'command': 'signed_url',
+            'method': 'GET',
+            'signing_service_account': provider.signing_target,
+            'timeout': 2.5,
+        },
+    )
+
+    assert result['ok'] is False
+    assert result['status_code'] == 502
+    assert result['error']['code'] == 'GCS_STATUS'
+    assert result['protocol_details'] == {}
+    assert provider.timeline.count('target-refresh') == 1
+    assert provider.client_calls == []
+    assert provider.generate_calls == []
+    assert breaker.calls == 0
+    assert secret not in repr(result)
+    assert provider.signing_target not in repr(result)
 
 
 # --- AGW-49 foundation: normalized head and one-page list ----------------

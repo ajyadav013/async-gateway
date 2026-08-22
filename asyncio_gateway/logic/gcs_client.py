@@ -31,6 +31,7 @@ from google import auth as google_auth
 from google.api_core import exceptions as google_api_exceptions
 from google.auth import credentials as google_auth_credentials
 from google.auth import exceptions as google_auth_exceptions
+from google.auth import impersonated_credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 # google-cloud-storage does not publish a py.typed marker.
 from google.cloud import storage  # type: ignore[import-untyped]
@@ -113,6 +114,9 @@ _GCS_TRANSPORT_FAILURES: Final[Tuple[type[BaseException], ...]] = (
 _GCS_CREDENTIAL_FAILURES: Final[Tuple[type[BaseException], ...]] = (
     google_auth_exceptions.DefaultCredentialsError,
     google_auth_exceptions.RefreshError,
+)
+_GCS_IMPERSONATION_SCOPES: Final[Tuple[str, ...]] = (
+    'https://www.googleapis.com/auth/cloud-platform',
 )
 _GCS_MAX_LEASES: Final[int] = 4
 _GCS_DOWNLOAD_CHUNK_SIZE: Final[int] = 64 * 1024
@@ -1212,11 +1216,7 @@ class GcsRequest(BaseRequestClass):
             self.response, status_code=200, started=self.start_time)
 
     async def _signed_url_attempt(self, lease: _GcsLease) -> str:
-        """Generate one private direct-signer URL while the client is open."""
-        if 'signing_service_account' in self.info:
-            raise ConfigurationError(
-                'GCS signing service-account impersonation is unavailable')
-
+        """Generate one private selected-signer URL with the client open."""
         client: Any = None
         signed_url: object = _NO_RESULT
         try:
@@ -1228,11 +1228,34 @@ class GcsRequest(BaseRequestClass):
                     credentials,
                     timeout=self.timeout,
                 )
-                await lease.run(
-                    _require_direct_signer,
-                    credentials,
-                    timeout=self.timeout,
-                )
+                if 'signing_service_account' in self.info:
+                    source_credentials = credentials
+                    try:
+                        credentials = await lease.run(
+                            impersonated_credentials.Credentials,
+                            source_credentials=source_credentials,
+                            target_principal=cast(
+                                str, self.info['signing_service_account']),
+                            target_scopes=_GCS_IMPERSONATION_SCOPES,
+                            timeout=self.timeout,
+                        )
+                        await lease.run(
+                            _refresh_credentials_if_needed,
+                            credentials,
+                            timeout=self.timeout,
+                        )
+                    except google_auth_exceptions.RefreshError as error:
+                        error.args = (
+                            'GCS signing credential refresh failed',)
+                        raise GcsStatusError(
+                            'GCS signing credential refresh failed', 502
+                        ) from None
+                else:
+                    await lease.run(
+                        _require_direct_signer,
+                        credentials,
+                        timeout=self.timeout,
+                    )
                 client = await lease.run(
                     storage.Client,
                     credentials=credentials,

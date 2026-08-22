@@ -51,3 +51,16 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   identity case is the next direct-signing RED, impersonation belongs to S2,
   and credential/cleanup failure paths belong to S2/S3. AGW-50 remains in
   progress and the frozen S1 test hash is unchanged.
+- 2026-08-22 — S2 RED adds eight deterministic authentication cases. Three
+  unusable direct signer identities already pass; five impersonation cases
+  fail at the missing target-credential path while all 478 prior cases remain
+  green. The accepted test SHA-256 is
+  `b33e55f7e711cdc062a746f5ac45167885252e8552397799a8beec091f63af0f`.
+- 2026-08-22 — S2 GREEN selects direct or fixed-scope impersonated signing
+  credentials after source ADC refresh, constructs and refreshes the target
+  credential through the private GCS worker, and maps target refresh refusal
+  to sanitized `GCS_STATUS`/502. Focused GCS/no-blocking tests pass 486/486;
+  entrypoint tests pass 276/276; scoped flake8 and full-package mypy pass.
+  Focused coverage has 764/764 statements and 257/258 branches; the sole
+  `1311->1314` cleanup branch remains owned by S3. AGW-50 remains IN PROGRESS
+  for the hostile lifecycle and bearer-containment tranche.

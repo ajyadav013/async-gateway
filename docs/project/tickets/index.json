@@ -826,7 +826,8 @@
       "file": "docs/project/tickets/AGW-50-deliver-constrained-v4-gcs-signed-get-and-put.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-49"], "blocks": ["AGW-51"]},
-      "commits": []
+      "commits": [],
+      "note": "S2 GREEN adds fixed-scope IAM impersonation after sanitized source ADC refresh, private-worker target construction/refresh, and safe target-refresh GCS_STATUS/502 mapping. All 486 focused GCS/blocking-I/O cases and 276 entrypoint cases pass; focused coverage is 764/764 statements and 257/258 branches, with only the S3 cleanup branch open. Status remains IN PROGRESS for hostile lifecycle and bearer containment."
     },
     {
       "id": "AGW-51",
