@@ -26,6 +26,8 @@ the test loudly rather than silently reading nothing.
 import ast
 import importlib.util
 import re
+import runpy
+import socket
 import subprocess  # nosec B404 - builds this project's own sdist, no input
 import sys
 import tarfile
@@ -36,12 +38,16 @@ from importlib.metadata import version as metadata_version
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Final, Iterator, List, Tuple
+from urllib.parse import urlsplit
 
 from packaging.requirements import Requirement
 
 import pytest
 
 import asyncio_gateway
+import asyncio_gateway.asyncio_gateway as gateway_module
+from asyncio_gateway.logic import gcs_client
+from asyncio_gateway.logic.gcs_client import GCS_OPERATION_INFO_KEYS
 
 from tests.fixtures.http_server import RecordingHTTPServer
 
@@ -71,7 +77,8 @@ REPOSITORY_URL = f'https://github.com/{REPOSITORY_OWNER}/{REPOSITORY_NAME}'
 _DISTRIBUTION_METADATA = metadata('asyncio-gateway')
 EXAMPLES = REPO_ROOT / 'examples'
 
-#: The nine scripts PE-80 requires, named rather than globbed. A glob would
+#: The ten scripts the public protocol inventory requires, named rather than
+#: globbed. A glob would
 #: keep passing after one of them was deleted, which is the drift this
 #: list exists to catch.
 EXAMPLE_NAMES: Tuple[str, ...] = (
@@ -83,6 +90,7 @@ EXAMPLE_NAMES: Tuple[str, ...] = (
     'graphql_example.py',
     's3_example.py',
     'grpc_example.py',
+    'gcs_example.py',
     'error_handling_example.py',
 )
 NEW_PROTOCOL_EXAMPLE_NAMES: Tuple[str, ...] = (
@@ -90,6 +98,10 @@ NEW_PROTOCOL_EXAMPLE_NAMES: Tuple[str, ...] = (
     'graphql_example.py',
     's3_example.py',
     'grpc_example.py',
+    'gcs_example.py',
+)
+IMPORT_SAFE_EXAMPLE_NAMES: Tuple[str, ...] = tuple(
+    name for name in EXAMPLE_NAMES if name != 'gcs_example.py'
 )
 
 #: R35-AC5's "≤ ~40 lines", applied to the code rather than to the file:
@@ -1091,7 +1103,7 @@ async def running_server() -> Iterator[RecordingHTTPServer]:
 def test_every_required_example_exists(name: str) -> None:
     """R35-AC1: one runnable script per protocol, plus error handling."""
     assert (EXAMPLES / name).is_file(), (
-        f'examples/{name} is missing; PE-80 names all nine scripts')
+        f'examples/{name} is missing; the inventory names all ten scripts')
 
 
 def test_pe80_example_inventory_is_exact() -> None:
@@ -1146,7 +1158,7 @@ def test_every_example_parses(name: str) -> None:
     ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
 
 
-@pytest.mark.parametrize('name', EXAMPLE_NAMES)
+@pytest.mark.parametrize('name', IMPORT_SAFE_EXAMPLE_NAMES)
 def test_every_example_imports_cleanly(name: str) -> None:
     """Every example's imports resolve against the real package.
 
@@ -1305,6 +1317,400 @@ async def test_pe80_grpc_example_runs_on_a_local_generic_server() -> None:
     assert result['status_code'] == 200
     assert result['protocol_details']['grpc_status'] == 'OK'
     assert result['text'] == 'cG9uZw=='
+
+
+_GCS_EXAMPLE_OPERATION_KEYS: Final[
+    Dict[Tuple[str, Any], Tuple[frozenset[str], frozenset[str]]]
+] = {
+    ('download', None): (
+        frozenset({'command', 'local_path'}),
+        frozenset({
+            'command', 'local_path', 'max_response_bytes',
+            'if_generation_match', 'timeout', 'circuit_breaker_config',
+            'redact_query_params',
+        }),
+    ),
+    ('upload', None): (
+        frozenset({'command', 'local_path'}),
+        frozenset({
+            'command', 'local_path', 'max_upload_bytes',
+            'if_generation_match', 'timeout', 'circuit_breaker_config',
+            'redact_query_params',
+        }),
+    ),
+    ('head', None): (
+        frozenset({'command'}),
+        frozenset({
+            'command', 'if_generation_match', 'timeout',
+            'circuit_breaker_config', 'redact_query_params',
+        }),
+    ),
+    ('list', None): (
+        frozenset({'command'}),
+        frozenset({
+            'command', 'max_items', 'page_token', 'timeout',
+            'circuit_breaker_config', 'redact_query_params',
+        }),
+    ),
+    ('signed_url', 'GET'): (
+        frozenset({'command', 'method'}),
+        frozenset({
+            'command', 'method', 'expires_in_seconds',
+            'signing_service_account', 'timeout', 'redact_query_params',
+        }),
+    ),
+    ('signed_url', 'PUT'): (
+        frozenset({
+            'command', 'method', 'content_type', 'max_upload_bytes',
+        }),
+        frozenset({
+            'command', 'method', 'content_type', 'max_upload_bytes',
+            'expires_in_seconds', 'signing_service_account',
+            'if_generation_match', 'timeout', 'redact_query_params',
+        }),
+    ),
+}
+_GCS_RUNTIME_OPERATION_NAMES: Final[Dict[Tuple[str, Any], str]] = {
+    ('download', None): 'download',
+    ('upload', None): 'upload',
+    ('head', None): 'head',
+    ('list', None): 'list',
+    ('signed_url', 'GET'): 'signed_get',
+    ('signed_url', 'PUT'): 'signed_put',
+}
+_GCS_EXAMPLE_FORBIDDEN_ESCAPE_KEYS: Final[frozenset[str]] = frozenset({
+    'access_token', 'api_endpoint', 'client_options', 'credential',
+    'credentials', 'credentials_file', 'credentials_json', 'delegates',
+    'endpoint', 'headers', 'host', 'hostname', 'key_file', 'lifetime',
+    'private_key', 'private_key_id', 'project', 'project_id', 'query',
+    'query_parameters', 'query_params', 'scopes', 'service_account_file',
+    'service_account_info', 'service_account_json', 'signed_headers',
+    'token',
+})
+
+
+def _strict_gcs_literal(node: ast.AST, *, location: str) -> Any:
+    """Evaluate one literal while rejecting hidden mapping drift.
+
+    Args:
+        node: AST value to inspect.
+        location: Safe assertion label for a malformed example.
+
+    Returns:
+        The recursively evaluated Python literal.
+
+    Raises:
+        AssertionError: If a mapping unpacks, repeats a key, uses a
+            non-string key, or any value is non-literal.
+    """
+    for mapping in (
+        child for child in ast.walk(node) if isinstance(child, ast.Dict)
+    ):
+        assert all(key is not None for key in mapping.keys), (
+            f'{location} must not use mapping unpacking')
+        keys: List[str] = []
+        for key_node in mapping.keys:
+            assert key_node is not None
+            try:
+                key = ast.literal_eval(key_node)
+            except (TypeError, ValueError) as error:
+                raise AssertionError(
+                    f'{location} mapping keys must be string literals'
+                ) from error
+            assert isinstance(key, str), (
+                f'{location} mapping keys must be string literals')
+            keys.append(key)
+        assert len(keys) == len(set(keys)), (
+            f'{location} must not repeat mapping keys')
+    try:
+        return ast.literal_eval(node)
+    except (TypeError, ValueError) as error:
+        raise AssertionError(
+            f'{location} values must be deterministic literals') from error
+
+
+def _assert_gcs_public_request_binding(tree: ast.Module) -> None:
+    """Require one unaliased public request import and no shadow binding.
+
+    Args:
+        tree: Parsed GCS example module.
+
+    Raises:
+        AssertionError: If ``request`` is imported from another surface,
+            aliased, rebound, deleted, or shadowed in any nested scope.
+    """
+    approved_imports = [
+        node for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.level == 0
+        and node.module == 'asyncio_gateway.asyncio_gateway'
+        and len(node.names) == 1
+        and node.names[0].name == 'request'
+        and node.names[0].asname is None
+    ]
+    assert len(approved_imports) == 1, (
+        'GCS example must import exactly '
+        '`from asyncio_gateway.asyncio_gateway import request`')
+    approved_alias = approved_imports[0].names[0]
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.alias):
+            if node is approved_alias:
+                continue
+            bound_name = node.asname or node.name.split('.')[0]
+            assert bound_name != 'request', (
+                'GCS example must not import another request binding')
+        if isinstance(node, ast.Name) and isinstance(
+            node.ctx, (ast.Store, ast.Del)
+        ):
+            assert node.id != 'request', (
+                'GCS example must not rebind or delete request')
+        if isinstance(node, ast.arg):
+            assert node.arg != 'request', (
+                'GCS example must not shadow request with an argument')
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef,
+                             ast.ClassDef)):
+            assert node.name != 'request', (
+                'GCS example must not shadow request with a definition')
+        if isinstance(node, ast.ExceptHandler):
+            assert node.name != 'request', (
+                'GCS example must not shadow request in an exception handler')
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            assert 'request' not in node.names, (
+                'GCS example must not declare request for rebinding')
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            assert node.name != 'request', (
+                'GCS example must not shadow request in a match pattern')
+        if isinstance(node, ast.MatchMapping):
+            assert node.rest != 'request', (
+                'GCS example must not shadow request in a match mapping')
+
+
+def _gcs_example_request_calls() -> List[Dict[str, Any]]:
+    """Return literal public request calls declared by the GCS example.
+
+    Returns:
+        Six literal request keyword mappings, one per documented operation.
+
+    Raises:
+        AssertionError: If the example is absent or uses non-literal request
+            data that cannot be reviewed deterministically.
+    """
+    path = EXAMPLES / 'gcs_example.py'
+    assert path.is_file(), 'examples/gcs_example.py is missing'
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    _assert_gcs_public_request_binding(tree)
+    calls: List[Dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Name) or node.func.id != 'request':
+            continue
+        assert not node.args, (
+            'GCS example request calls must not use positional/starred args')
+        assert all(keyword.arg is not None for keyword in node.keywords), (
+            'GCS example request calls must not use **kwargs')
+        names = [keyword.arg for keyword in node.keywords]
+        assert len(names) == len(set(names)), (
+            'GCS example request calls must not repeat keyword args')
+        calls.append({
+            keyword.arg: _strict_gcs_literal(
+                keyword.value,
+                location=f'GCS request {keyword.arg}',
+            )
+            for keyword in node.keywords
+            if keyword.arg is not None
+        })
+    return calls
+
+
+def test_gcs_example_exposes_all_bounded_public_operations() -> None:
+    """The example carries all commands and distinct signed GET/PUT calls."""
+    calls = _gcs_example_request_calls()
+    assert len(calls) == 6
+    operations = {
+        (
+            call['protocol_info']['command'],
+            call['protocol_info'].get('method'),
+        )
+        for call in calls
+    }
+    assert operations == {
+        ('download', None),
+        ('upload', None),
+        ('head', None),
+        ('list', None),
+        ('signed_url', 'GET'),
+        ('signed_url', 'PUT'),
+    }
+
+
+def test_gcs_example_uses_adc_gs_targets_and_only_frozen_options() -> None:
+    """Example requests use explicit ADC and no credential/endpoint escape."""
+    expected_operations = set(_GCS_EXAMPLE_OPERATION_KEYS)
+    assert {
+        operation: GCS_OPERATION_INFO_KEYS[runtime_name]
+        for operation, runtime_name in _GCS_RUNTIME_OPERATION_NAMES.items()
+    } == {
+        operation: allowed
+        for operation, (_, allowed) in _GCS_EXAMPLE_OPERATION_KEYS.items()
+    }
+    for call in _gcs_example_request_calls():
+        assert set(call) == {'url', 'auth', 'protocol', 'protocol_info'}
+        assert call['protocol'] == 'GCS'
+        assert call['auth'] is None
+        assert isinstance(call['url'], str)
+        info = call['protocol_info']
+        assert isinstance(info, dict)
+        operation = (info['command'], info.get('method'))
+        assert operation in expected_operations
+        required, allowed = _GCS_EXAMPLE_OPERATION_KEYS[operation]
+        assert required <= set(info) <= allowed
+        present_keys = set(call) | set(info)
+        assert not present_keys & _GCS_EXAMPLE_FORBIDDEN_ESCAPE_KEYS
+
+        target = urlsplit(call['url'])
+        assert target.scheme == 'gs'
+        assert target.netloc and target.hostname == target.netloc
+        assert target.username is None and target.password is None
+        try:
+            port = target.port
+        except ValueError as error:
+            raise AssertionError('GCS example target has an invalid port') \
+                from error
+        assert port is None
+        assert not target.query and not target.fragment
+        assert not target.path.startswith('//')
+        object_name = target.path[1:] if target.path.startswith('/') \
+            else target.path
+        if info['command'] != 'list':
+            assert object_name and not target.path.endswith('/')
+        if info['command'] == 'signed_url':
+            assert object_name and not any(
+                marker in object_name for marker in ('*', '[', ']', '{', '}')
+            )
+
+
+def test_gcs_example_import_path_has_no_request_provider_or_network_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Running the module under a non-main name performs no external work."""
+    path = EXAMPLES / 'gcs_example.py'
+    assert path.is_file(), 'examples/gcs_example.py is missing'
+    assert set(EXAMPLE_NAMES) - set(IMPORT_SAFE_EXAMPLE_NAMES) == {
+        'gcs_example.py',
+    }
+
+    def fail_if_called(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError('GCS example performed external work on import')
+
+    monkeypatch.setattr(gateway_module, 'request', fail_if_called)
+    monkeypatch.setattr(gcs_client.google_auth, 'default', fail_if_called)
+    monkeypatch.setattr(gcs_client.storage, 'Client', fail_if_called)
+    monkeypatch.setattr(gcs_client, '_acquire_gcs_lease', fail_if_called)
+    monkeypatch.setattr(socket, 'create_connection', fail_if_called)
+    monkeypatch.setattr(socket, 'getaddrinfo', fail_if_called)
+    monkeypatch.setattr(socket, 'socket', fail_if_called)
+
+    namespace = runpy.run_path(str(path), run_name='_gcs_example_contract')
+
+    assert namespace['__name__'] == '_gcs_example_contract'
+    assert callable(namespace.get('call'))
+
+
+async def test_gcs_example_awaits_six_public_requests_without_external_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runnable example uses the public request binding and safe double."""
+    expected_calls = _gcs_example_request_calls()
+    observed_calls: List[Dict[str, Any]] = []
+    observed_results: List[Dict[str, Any]] = []
+    external_calls: List[str] = []
+
+    async def _public_request_spy(**kwargs: Any) -> Dict[str, Any]:
+        observed_calls.append(dict(kwargs))
+        result: Dict[str, Any] = {
+            'ok': True,
+            'protocol_details': {
+                'command': kwargs['protocol_info']['command'],
+            },
+        }
+        observed_results.append(result)
+        return result
+
+    def _external_call_sentinel(name: str) -> Any:
+        def _fail_if_called(*args: Any, **kwargs: Any) -> None:
+            external_calls.append(name)
+            raise AssertionError(
+                f'GCS example performed forbidden external work: {name}')
+
+        return _fail_if_called
+
+    monkeypatch.setattr(gateway_module, 'request', _public_request_spy)
+    monkeypatch.setattr(
+        gcs_client.google_auth,
+        'default',
+        _external_call_sentinel('ADC discovery'),
+    )
+    monkeypatch.setattr(
+        gcs_client.storage,
+        'Client',
+        _external_call_sentinel('storage client construction'),
+    )
+    monkeypatch.setattr(
+        gcs_client,
+        '_acquire_gcs_lease',
+        _external_call_sentinel('GCS lease acquisition'),
+    )
+    monkeypatch.setattr(
+        socket,
+        'create_connection',
+        _external_call_sentinel('socket connection'),
+    )
+    monkeypatch.setattr(
+        socket,
+        'getaddrinfo',
+        _external_call_sentinel('DNS resolution'),
+    )
+    monkeypatch.setattr(
+        socket,
+        'socket',
+        _external_call_sentinel('socket construction'),
+    )
+
+    example = _load_example('gcs_example.py')
+    result: Dict[str, Any] = await example.call()
+
+    assert len(observed_calls) == 6
+    assert observed_calls == expected_calls
+    assert [
+        (
+            call['protocol_info']['command'],
+            call['protocol_info'].get('method'),
+        )
+        for call in observed_calls
+    ] == [
+        ('download', None),
+        ('upload', None),
+        ('head', None),
+        ('list', None),
+        ('signed_url', 'GET'),
+        ('signed_url', 'PUT'),
+    ]
+    assert result is observed_results[-1]
+    assert external_calls == []
+
+
+def test_gcs_uses_existing_wheel_and_sdist_clean_import_gate() -> None:
+    """The public entrypoint import gates both clean artifact installs."""
+    workflow = CI_WORKFLOW.read_text(encoding='utf-8')
+    probe = (
+        'from asyncio_gateway.asyncio_gateway import request; '
+        'print(request)'
+    )
+    assert 'dist/*.whl' in workflow
+    assert 'dist/*.tar.gz' in workflow
+    assert workflow.count(probe) == 2
 
 
 async def test_the_error_handling_example_reports_a_remote_failure(

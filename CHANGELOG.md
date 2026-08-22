@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- First-class bounded GCS selector with `google-cloud-storage>=3,<4` for ADC-
+  authenticated upload, download, head, one-page list, and V4 signed URLs.
 - First-class JSON-RPC 2.0, GraphQL, guarded S3, and raw unary-unary gRPC
   selectors, all using the common response envelope, validation, redaction,
   retry, circuit-breaker, cancellation, and bounded-response contracts.

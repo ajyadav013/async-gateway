@@ -1,6 +1,6 @@
 # AGW-52: Publish documented example and artifact-verified GCS contract
 
-- **Status:** OPEN
+- **Status:** IN PROGRESS
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-09 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -35,3 +35,74 @@ packaging/documentation remain synchronized (GCS-09).
 - 2026-08-22 — Opened from approved GCS-09 planning before implementation;
   recorded its five-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-22 — Established the focused pre-correction RED baseline at 343
+  collected: 318 passed, 23 failed, and 2 skipped. Only
+  `tests/test_docs.py` was dirty; its README checks still searched outside a
+  GCS section and packaging had no GCS example coverage.
+- 2026-08-22 — Corrected the RED design without changing deliverables:
+  bounded README assertions to one dedicated H2 GCS section, added exact
+  SDK-versus-client header and command/schema checks, extended the existing
+  example inventory and artifact-import gate, and added a non-`__main__`
+  request/provider/network sentinel. Also updated the test-only
+  `handle_request` inventory from seven to eight implementations.
+- 2026-08-22 — Final tests-only RED collected 357 tests: 315 passed, 40
+  failed, and 2 skipped. All failures identify missing or stale README,
+  CHANGELOG, or `examples/gcs_example.py` deliverables; no test performed
+  live GCP, ADC, metadata-server, emulator, DNS, or network work. Product
+  changes remain limited to `tests/test_docs.py` and
+  `tests/test_packaging.py`, and the RED remains intentionally uncommitted.
+- 2026-08-22 — Applied two bounded candidate correction lanes after the
+  failure review. The documentation lane's `tests/test_docs.py` SHA-256 is
+  `e4d4771d976393dd4d11864c736b536ef955ef37ef1099da2622e9033bea0beb`;
+  its isolated run collected 243 tests: 212 passed and 31 failed. The
+  packaging lane's `tests/test_packaging.py` SHA-256 is
+  `602b85a35f2138d2397bc4482b411f1a44254e67a69d4e92b10aa57d4ab6d0eb`;
+  its isolated run collected 115 tests: 103 passed, 10 failed, and 2
+  skipped.
+- 2026-08-22 — The orchestrator's joined RED run collected 358 tests: 315
+  passed, 41 failed, and 2 skipped. Every failure identifies a missing or
+  stale README, example, or CHANGELOG deliverable. The candidate corrections
+  addressed the failure review's three High and two Medium findings. At that
+  RED checkpoint, closure still awaited fresh independent senior re-review,
+  and the joined RED remained intentionally uncommitted.
+- 2026-08-23 — Corrected the packaging import sentinel by removing only the
+  invalid package-level `request` monkeypatch; the real public-module request,
+  ADC, storage-client, GCS-lease, DNS, and socket sentinels remained active.
+  The isolated sentinel passed, and `tests/test_packaging.py` was refrozen at
+  SHA-256 `ac9dd62493642004a9f8986bb618b92f8522ff8fce6258635f3fae5cd8f58be1`.
+  Files: `tests/test_packaging.py`.
+- 2026-08-23 — Completed the bounded README, additive CHANGELOG, and import-safe
+  six-operation GCS example. The first GREEN join passed 356 tests with 2
+  existing skips; scoped lint, example compilation, diff, and JSON checks were
+  green, with no live GCP or network action. Files: `README.md`, `CHANGELOG.md`,
+  `examples/gcs_example.py`.
+- 2026-08-23 — Independent GREEN review iteration 1 reported 0 Critical, 2
+  High, and 1 Medium findings: direction-reversed documentation claims could
+  pass, a locally shadowed request binding could pass the example gates, and
+  ticket/index state was stale. Files: `tests/test_docs.py`,
+  `tests/test_packaging.py`, this ticket, and the local ticket index.
+- 2026-08-23 — Closed the documentation-oracle defect: all 18 individual
+  reversed-claim mutations are rejected, the truthful documentation suite is
+  243/243, and `tests/test_docs.py` is refrozen at SHA-256
+  `2954334537979a54826ace9b7b14ed26e07efc740398b8ec3bbdc2b3459556eb`.
+  Files: `tests/test_docs.py`.
+- 2026-08-23 — Closed the public-request-binding oracle defect: the local
+  shadow mutation now fails, the packaging suite passes 114 tests with 2
+  existing skips, and `tests/test_packaging.py` is refrozen at SHA-256
+  `68a98582b2e81f8f28ec96d24d9877b27ab4701a8b3af25f9d317b33619c7c12`.
+  Files: `tests/test_packaging.py`.
+- 2026-08-23 — Current orchestrator join passes 357 tests with 2 existing
+  skips; scoped lint, example compilation, diff, and ticket-index JSON checks
+  are green. The seven-file AGW-52 candidate remains uncommitted and no live
+  GCP, network, CI, deployment, tag, or release action occurred. Files:
+  `README.md`, `CHANGELOG.md`, `examples/gcs_example.py`,
+  `tests/test_docs.py`, `tests/test_packaging.py`, this ticket, and the local
+  ticket index.
+- 2026-08-23 — Final targeted re-review VERIFIED with 0 Critical, 0 High, 0
+  Medium, and 0 Low findings. All 10/10 truthful nodes passed; 18/18
+  documentation mutations and 3/3 public-request-binding attacks were
+  rejected. The runtime sentinel observed six public request awaits and zero
+  ADC, storage-client, GCS-lease, DNS, or socket calls. The joined suite remains
+  357 passed with 2 existing skips. The ticket and index remain IN PROGRESS,
+  AGW-32 remains OPEN, and the index diff affects only AGW-52. Files: this
+  ticket and the local ticket index.
