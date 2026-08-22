@@ -1,6 +1,6 @@
 {
   "prefix": "AGW",
-  "next": 44,
+  "next": 53,
   "spec": "docs/specs/v1_release_spec.md",
   "stories": "docs/specs/v1_release_stories.md",
   "note": "AGW-1 through AGW-32 map positionally to release stories S1-S32; later IDs are defect or work-package records. AGW-39 through AGW-41 each had two historical commit uses, preserved in reconstructed collision records. IDs are never reused going forward. Relations use depends_on = blockedBy and its inverse blocks.",
@@ -747,6 +747,105 @@
       "spec": "docs/specs/p0_contract_corrections_spec.md",
       "relations": {"depends_on": [], "blocks": []},
       "commits": ["4888ea6"]
+    },
+    {
+      "id": "AGW-44",
+      "title": "Package the supported Google Storage dependency",
+      "status": "OPEN",
+      "story": "GCS-01",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-44-package-supported-google-storage-dependency.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": [], "blocks": ["AGW-45", "AGW-52"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-45",
+      "title": "Establish the strict public selector boundary",
+      "status": "OPEN",
+      "story": "GCS-02",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-45-establish-strict-gcs-selector-boundary.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-44", "AGW-46"], "blocks": ["AGW-47"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-46",
+      "title": "Introduce stable typed GCS error vocabulary",
+      "status": "OPEN",
+      "story": "GCS-03",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-46-introduce-stable-gcs-error-vocabulary.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": [], "blocks": ["AGW-45", "AGW-47", "AGW-51"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-47",
+      "title": "Build the isolated provider lifecycle and capacity guard",
+      "status": "OPEN",
+      "story": "GCS-04",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-47-build-isolated-gcs-provider-lifecycle-and-capacity-guard.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-45", "AGW-46"], "blocks": ["AGW-48"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-48",
+      "title": "Deliver guarded upload and generation-pinned raw download",
+      "status": "OPEN",
+      "story": "GCS-05",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-48-deliver-guarded-gcs-upload-and-generation-pinned-raw-download.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-47"], "blocks": ["AGW-49"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-49",
+      "title": "Deliver normalized head and one-page list",
+      "status": "OPEN",
+      "story": "GCS-06",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-49-deliver-normalized-gcs-head-and-one-page-list.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-48"], "blocks": ["AGW-50"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-50",
+      "title": "Deliver constrained V4 signed GET and PUT without bearer leakage",
+      "status": "OPEN",
+      "story": "GCS-07",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-50-deliver-constrained-v4-gcs-signed-get-and-put.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-49"], "blocks": ["AGW-51"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-51",
+      "title": "Extend shared deterministic contract matrices",
+      "status": "OPEN",
+      "story": "GCS-08",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-51-extend-shared-deterministic-gcs-contract-matrices.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-46", "AGW-50"], "blocks": ["AGW-52"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-52",
+      "title": "Publish documented, example, and artifact-verified GCS contract",
+      "status": "OPEN",
+      "story": "GCS-09",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-52-publish-documented-example-and-artifact-verified-gcs-contract.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-44", "AGW-51"], "blocks": []},
+      "commits": []
     }
   ]
 }

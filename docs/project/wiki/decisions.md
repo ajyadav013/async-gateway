@@ -25,6 +25,7 @@ spec remains the source of truth.
 | **XML parsing** — stdlib `xml.etree.ElementTree` + prolog-scoped DOCTYPE rejection; `lxml` dev-only, `defusedxml` rejected | spec R19; ratification is **OQ6** |
 | **SOAP 1.2 interop** — spec-conformant only, no `SOAPAction` | spec R18; ratification is **OQ5** |
 | **Deferrals D1–D4, observations O1–O2, escalations E-1…E-3** | `docs/specs/v1_release_stories.md` §11 |
+| **Bounded GCS selector decisions of record** — strict `gs` selector boundary, isolated provider offloader/capacity, closed command/error schemas, generation-pinned raw transfer, one-page listing, constrained V4 signing, and no live-GCP/deployment scope | [`docs/specs/gcs_selector_spec.md`](../../specs/gcs_selector_spec.md) (no standalone ADR required) |
 
 ## Open questions awaiting a human answer
 
