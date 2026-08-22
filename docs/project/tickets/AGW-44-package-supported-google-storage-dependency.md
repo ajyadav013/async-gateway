@@ -1,6 +1,6 @@
 # AGW-44: Package the supported Google Storage dependency
 
-- **Status:** IN PROGRESS
+- **Status:** IN REVIEW
 - **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-01 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -39,3 +39,9 @@ AC12.1, AC12.3, AC12.4).
   `google-cloud-storage` requirement. GREEN: after adding only
   `google-cloud-storage>=3,<4` and reinstalling the editable project, the same
   command passed 2 tests with 104 deselected. Product commit: `60f5074`.
+- 2026-08-23 — JOIN-2 evidence: code review Iteration 3 APPROVED at product
+  HEAD `e22a440b` (C0/H0/M0/L0); build-green passed 5,927 tests with 20
+  declared skips, repo-wide and changed-module 100% statement/branch coverage,
+  and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
+  the nonblocking stale internal protocol-count docstring. Downstream tester,
+  security, operability, acceptance, and PR stages remain open.

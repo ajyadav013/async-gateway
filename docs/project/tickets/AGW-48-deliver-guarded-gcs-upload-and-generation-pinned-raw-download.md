@@ -1,6 +1,6 @@
 # AGW-48: Deliver guarded GCS upload and generation-pinned raw download
 
-- **Status:** IN PROGRESS
+- **Status:** IN REVIEW
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-05 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -174,3 +174,9 @@ beyond the cap (GCS-05).
 - 2026-08-22 — Opened from approved GCS-05 planning before implementation;
   recorded its two-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-23 — JOIN-2 evidence: code review Iteration 3 APPROVED at product
+  HEAD `e22a440b` (C0/H0/M0/L0); build-green passed 5,927 tests with 20
+  declared skips, repo-wide and changed-module 100% statement/branch coverage,
+  and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
+  the nonblocking stale internal protocol-count docstring. Downstream tester,
+  security, operability, acceptance, and PR stages remain open.

@@ -1,6 +1,6 @@
 # AGW-45: Establish strict GCS selector boundary
 
-- **Status:** IN PROGRESS
+- **Status:** IN REVIEW
 - **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-02 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -79,3 +79,9 @@ their mandated boundary before any cloud or local side effect (GCS-02).
   the frozen test hash remained unchanged. No signature, control flow, type,
   import, secret, or runtime behavior changed. Status stays IN PROGRESS for
   independent review.
+- 2026-08-23 — JOIN-2 evidence: code review Iteration 3 APPROVED at product
+  HEAD `e22a440b` (C0/H0/M0/L0); build-green passed 5,927 tests with 20
+  declared skips, repo-wide and changed-module 100% statement/branch coverage,
+  and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
+  the nonblocking stale internal protocol-count docstring. Downstream tester,
+  security, operability, acceptance, and PR stages remain open.

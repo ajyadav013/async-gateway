@@ -1,6 +1,6 @@
 # AGW-47: Build isolated GCS provider lifecycle and capacity guard
 
-- **Status:** IN PROGRESS
+- **Status:** IN REVIEW
 - **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-04 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -78,3 +78,9 @@ default executor, and stalled work must not starve unrelated protocols (GCS-04).
 - 2026-08-22 — Opened from approved GCS-04 planning before implementation;
   recorded its three-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-23 — JOIN-2 evidence: code review Iteration 3 APPROVED at product
+  HEAD `e22a440b` (C0/H0/M0/L0); build-green passed 5,927 tests with 20
+  declared skips, repo-wide and changed-module 100% statement/branch coverage,
+  and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
+  the nonblocking stale internal protocol-count docstring. Downstream tester,
+  security, operability, acceptance, and PR stages remain open.

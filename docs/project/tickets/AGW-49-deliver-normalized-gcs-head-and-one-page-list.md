@@ -1,6 +1,6 @@
 # AGW-49: Deliver normalized GCS head and one-page list
 
-- **Status:** IN PROGRESS
+- **Status:** IN REVIEW
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-06 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -122,3 +122,9 @@ recursively enumerating a bucket, or disclosing caller tokens (GCS-06).
   AGW-49 remains IN PROGRESS for independent formal-review recheck. Files:
   `asyncio_gateway/logic/gcs_client.py`, `tests/logic/test_gcs_client.py`, this
   ticket, and `docs/project/tickets/index.json`.
+- 2026-08-23 — JOIN-2 evidence: code review Iteration 3 APPROVED at product
+  HEAD `e22a440b` (C0/H0/M0/L0); build-green passed 5,927 tests with 20
+  declared skips, repo-wide and changed-module 100% statement/branch coverage,
+  and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
+  the nonblocking stale internal protocol-count docstring. Downstream tester,
+  security, operability, acceptance, and PR stages remain open.

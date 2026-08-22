@@ -1,6 +1,6 @@
 # AGW-50: Deliver constrained V4 GCS signed GET and PUT
 
-- **Status:** IN PROGRESS
+- **Status:** IN REVIEW
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-07 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -151,3 +151,9 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   SHA-256 remains
   `8721f3d482939dabac81f132d97307248711ed0cf9776ae8729e9d43a1ed9aba`.
   AGW-50 remains IN PROGRESS pending independent contribution re-audit.
+- 2026-08-23 — JOIN-2 evidence: code review Iteration 3 APPROVED at product
+  HEAD `e22a440b` (C0/H0/M0/L0); build-green passed 5,927 tests with 20
+  declared skips, repo-wide and changed-module 100% statement/branch coverage,
+  and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
+  the nonblocking stale internal protocol-count docstring. Downstream tester,
+  security, operability, acceptance, and PR stages remain open.
