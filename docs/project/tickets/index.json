@@ -762,13 +762,13 @@
     {
       "id": "AGW-45",
       "title": "Establish the strict public selector boundary",
-      "status": "IN PROGRESS",
+      "status": "DONE",
       "story": "GCS-02",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-45-establish-strict-gcs-selector-boundary.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-44", "AGW-46"], "blocks": ["AGW-47"]},
-      "commits": []
+      "commits": ["c8281ab", "053a836"]
     },
     {
       "id": "AGW-46",

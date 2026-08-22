@@ -1,6 +1,6 @@
 # AGW-45: Establish strict GCS selector boundary
 
-- **Status:** IN PROGRESS
+- **Status:** DONE
 - **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-02 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -48,3 +48,11 @@ their mandated boundary before any cloud or local side effect (GCS-02).
   `--no-cov` passed 2 tests with 274 deselected. Scoped flake8, three-file
   mypy, and `git diff --check` passed. Strict command/options and target/auth
   boundary work remains; status stays IN PROGRESS.
+- 2026-08-22 — Accepted full RED before production validation edits:
+  `tests/logic/test_gcs_client.py` collected 137 tests, with 115 failed and
+  22 passed. GREEN then passed all 137 focused boundary tests in 0.24s.
+  The entrypoint regression initially exposed its stale nine-protocol census;
+  the essential GCS census correction then passed all 276 entrypoint tests.
+  Scoped flake8, mypy, and `git diff --check` passed. No ADC, provider,
+  signing, operation, capacity, push, deployment, or live-GCP work was done.
+  Implementation commits: `c8281ab`, `053a836`.
