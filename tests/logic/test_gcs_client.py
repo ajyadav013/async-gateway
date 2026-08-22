@@ -942,7 +942,10 @@ async def test_one_lease_never_has_two_provider_futures_outstanding() -> None:
 
 @pytest.mark.parametrize(
     'seam',
-    ['adc', 'credential-refresh', 'client', 'bucket', 'blob', 'lookup', 'close'],
+    [
+        'adc', 'credential-refresh', 'client', 'bucket', 'blob', 'lookup',
+        'close',
+    ],
 )
 async def test_every_provider_lifecycle_seam_runs_only_on_the_gcs_pool(
     seam: str,
