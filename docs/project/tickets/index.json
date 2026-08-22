@@ -827,7 +827,7 @@
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-49"], "blocks": ["AGW-51"]},
       "commits": [],
-      "note": "S3A GREEN normalizes recognized signed-URL client-construction, signing, and cleanup failures while preserving source CONFIG handling, body-over-cleanup precedence, one signing invocation, zero breaker calls, and private bearer discard. The immutable focused suite passes 504/504 with gcs_client.py at 809/809 statements and 272/272 branches; entrypoint passes 276/276; scoped flake8 and mypy pass. Status remains IN PROGRESS for bounded S3B cancellation/timeout/bearer containment."
+      "note": "S3B1 adds ten deterministic public-request cancellation/acceptance-timeout rows across ADC, source refresh, impersonated construction, target refresh, and late storage-client construction. All ten already pass the current implementation and are retained as regression evidence: capacity remains held through drain/late close, one repeated cancellation preserves the first outcome, late clients close off-loop exactly once, and no signer/bearer surface or breaker/signing call appears. The exact focused suite passes 514/514 with production untouched. Status remains IN PROGRESS for later post-generation/close and broader bearer-containment tranches."
     },
     {
       "id": "AGW-51",

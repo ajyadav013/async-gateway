@@ -87,3 +87,16 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   entrypoint regression passes 276/276; scoped flake8 and full-package mypy
   pass. AGW-50 remains IN PROGRESS for the separately bounded S3B
   cancellation/timeout/bearer-surface tranche.
+- 2026-08-22 — S3B1 tests-first lifecycle probe adds ten deterministic public
+  `request()` cases across ADC discovery, source refresh, impersonated-
+  credential construction, target refresh, and storage-client construction,
+  with cancellation and injected result-acceptance timeout at every seam.
+  Every new row already passes the current implementation, so this tranche
+  records meaningful regression evidence rather than manufacturing a RED
+  failure: late provider work drains under retained capacity, a late-created
+  client closes off-loop exactly once before release, the one repeated-
+  cancellation adversary retains its first cancellation, and every path makes
+  zero signing/breaker calls with no credential, identity, cleanup, or signed-
+  URL sentinel in public/log surfaces. The exact focused GCS/no-blocking run
+  passes 514/514 with production untouched. AGW-50 remains IN PROGRESS for
+  the later post-generation/close and broader bearer-containment tranches.

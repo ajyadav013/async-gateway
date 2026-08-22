@@ -2213,6 +2213,245 @@ async def test_signed_url_unknown_close_defect_preserves_identity_without_url(
     assert getattr(gcs_client, '_active_gcs_leases')() == 0
 
 
+# --- AGW-50 tranche S3B1: pre-signing cancellation and timeout drains ----
+
+
+class _PreSigningLifecycleClient(_SignedUrlClient):
+    """Late-created client whose hostile close is externally controlled."""
+
+    def close(self) -> None:
+        """Block one off-loop close, then raise a private cleanup defect."""
+        provider = self.provider
+        assert isinstance(provider, _PreSigningLifecycleProvider)
+        provider.record_thread('client-close')
+        self.close_calls += 1
+        self.closed = True
+        provider.close_started.set()
+        assert provider.close_release.wait(timeout=1)
+        raise RuntimeError(provider.close_sentinel)
+
+
+class _PreSigningLifecycleProvider(_ImpersonationProvider):
+    """Event-driven credential/client tree for pre-signing race tests."""
+
+    def __init__(self, blocked_seam: str) -> None:
+        """Block exactly one selected provider seam before URL generation."""
+        self.blocked_seam = blocked_seam
+        self.operation_started = threading.Event()
+        self.operation_release = threading.Event()
+        self.operation_started_async = asyncio.Event()
+        self.event_loop = asyncio.get_running_loop()
+        self.close_started = threading.Event()
+        self.close_release = threading.Event()
+        self.close_sentinel = (
+            f'{blocked_seam}-hostile-close-private-s3b1')
+        super().__init__(source_valid=blocked_seam != 'source-refresh')
+        self.source_secret = f'{blocked_seam}-source-private-s3b1'
+        self.target_secret = f'{blocked_seam}-target-private-s3b1'
+        self.source_credentials.private_token = self.source_secret
+        self.target_credentials.private_signature = self.target_secret
+        self.client = _PreSigningLifecycleClient(self)
+
+    def record_thread(self, seam: str) -> None:
+        """Record every seam and block the one selected by the test row."""
+        super().record_thread(seam)
+        if seam != self.blocked_seam:
+            return
+        self.operation_started.set()
+        self.event_loop.call_soon_threadsafe(
+            self.operation_started_async.set)
+        assert self.operation_release.wait(timeout=1)
+
+
+@pytest.mark.parametrize(
+    ('blocked_seam', 'outcome'),
+    [
+        pytest.param('adc', 'cancel', id='adc-cancel'),
+        pytest.param('adc', 'timeout', id='adc-timeout'),
+        pytest.param('source-refresh', 'cancel', id='source-refresh-cancel'),
+        pytest.param('source-refresh', 'timeout',
+                     id='source-refresh-timeout'),
+        pytest.param('impersonated-constructor', 'cancel',
+                     id='impersonated-constructor-cancel'),
+        pytest.param('impersonated-constructor', 'timeout',
+                     id='impersonated-constructor-timeout'),
+        pytest.param('target-refresh', 'cancel', id='target-refresh-cancel'),
+        pytest.param('target-refresh', 'timeout',
+                     id='target-refresh-timeout'),
+        pytest.param('client', 'cancel', id='late-client-cancel'),
+        pytest.param('client', 'timeout', id='late-client-timeout'),
+    ],
+)
+async def test_signed_url_pre_signing_drain_retains_capacity_and_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    blocked_seam: str,
+    outcome: str,
+) -> None:
+    """Credential/client races drain without signing or secret publication."""
+    provider = _PreSigningLifecycleProvider(blocked_seam)
+    breaker = _install_impersonation_provider(monkeypatch, provider)
+    expiry_injected = asyncio.Event()
+    if outcome == 'timeout':
+        real_wait_for = asyncio.wait_for
+        expired = False
+
+        async def expire_selected_provider_wait_once(
+            awaitable: Any,
+            *,
+            timeout: int | float,
+        ) -> Any:
+            """Expire result acceptance only after the selected seam starts."""
+            nonlocal expired
+            if expired:
+                return await real_wait_for(awaitable, timeout=timeout)
+            operation = asyncio.ensure_future(awaitable)
+            started = asyncio.create_task(
+                provider.operation_started_async.wait())
+            done, _ = await asyncio.wait(
+                {operation, started},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if operation in done:
+                started.cancel()
+                await asyncio.gather(started, return_exceptions=True)
+                return operation.result()
+            expired = True
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            expiry_injected.set()
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            gcs_client.asyncio, 'wait_for',
+            expire_selected_provider_wait_once)
+
+    captured_responses: list[GatewayResponse] = []
+
+    async def capture_response(*, response: GatewayResponse) -> str:
+        """Retain the live public envelope without changing dispatch state."""
+        captured_responses.append(response)
+        return 'captured-before-gcs-dispatch'
+
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    loop_thread = threading.get_ident()
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    companion_leases = [acquire() for _ in range(3)]
+    target = 'gs://pre-signing-lifecycle-bucket/folder/object.bin'
+    task = asyncio.create_task(request(
+        target,
+        protocol='GCS',
+        protocol_info={
+            'command': 'signed_url',
+            'method': 'GET',
+            'signing_service_account': provider.signing_target,
+            'timeout': 1,
+        },
+        pre_processor_config={'function': capture_response},
+    ))
+    admitted_after: Any = None
+    try:
+        await _wait_for_thread_event(provider.operation_started)
+        selected_threads = [
+            (thread_id, thread_name)
+            for seam, thread_id, thread_name in provider.threads
+            if seam == blocked_seam
+        ]
+        assert len(selected_threads) == 1
+        assert selected_threads[0][0] != loop_thread
+        assert selected_threads[0][1].startswith('asyncio-gateway-gcs')
+
+        if outcome == 'cancel':
+            task.cancel('first-pre-signing-cancellation')
+            await asyncio.sleep(0)
+        else:
+            await expiry_injected.wait()
+        assert getattr(gcs_client, '_active_gcs_leases')() == 4
+        with pytest.raises(GcsCapacityError):
+            acquire()
+
+        provider.operation_release.set()
+        if blocked_seam == 'client':
+            await _wait_for_thread_event(provider.close_started)
+            assert getattr(gcs_client, '_active_gcs_leases')() == 4
+            with pytest.raises(GcsCapacityError):
+                acquire()
+            if outcome == 'cancel':
+                task.cancel('repeated-pre-signing-cancellation')
+                await asyncio.sleep(0)
+            provider.close_release.set()
+
+        if outcome == 'cancel':
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert caught.value.args == ('first-pre-signing-cancellation',)
+            outcome_surfaces = ''.join((
+                ''.join(traceback.format_exception(caught.value)),
+                repr(caught.value.__cause__),
+                repr(caught.value.__context__),
+            ))
+        else:
+            result = await task
+            assert result['ok'] is False
+            assert result['status_code'] == 504
+            assert result['error']['code'] == 'TIMEOUT'
+            assert result['protocol_details'] == {}
+            outcome_surfaces = repr(result)
+
+        assert len(captured_responses) == 1
+        captured = captured_responses[0]
+        assert captured['url'] == target
+        assert captured['protocol_details'] == {}
+        assert provider.generate_calls == []
+        assert provider.timeline.count('generate') == 0
+        assert breaker.calls == 0
+        if blocked_seam == 'client':
+            assert len(provider.client_calls) == 1
+            assert provider.client.close_calls == 1
+            assert provider.client.closed is True
+            assert provider.timeline.index('client') < provider.timeline.index(
+                'client-close')
+            close_threads = [
+                (thread_id, thread_name)
+                for seam, thread_id, thread_name in provider.threads
+                if seam == 'client-close'
+            ]
+            assert len(close_threads) == 1
+            assert close_threads[0][0] != loop_thread
+            assert close_threads[0][1].startswith('asyncio-gateway-gcs')
+        else:
+            assert provider.client_calls == []
+            assert provider.client.close_calls == 0
+
+        public_surfaces = ''.join((
+            repr(captured),
+            outcome_surfaces,
+            repr(breaker.__dict__),
+            _logged_gcs_surfaces(caplog),
+        ))
+        for sentinel in (
+            provider.source_secret,
+            provider.target_secret,
+            provider.signing_target,
+            provider.close_sentinel,
+            provider.signed_url,
+        ):
+            assert sentinel not in public_surfaces
+        assert getattr(gcs_client, '_active_gcs_leases')() == 3
+
+        admitted_after = acquire()
+        with pytest.raises(GcsCapacityError):
+            acquire()
+    finally:
+        provider.operation_release.set()
+        provider.close_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if admitted_after is not None:
+            await _release_lease(admitted_after)
+        for lease in companion_leases:
+            await _release_lease(lease)
+
+
 # --- AGW-49 foundation: normalized head and one-page list ----------------
 
 
