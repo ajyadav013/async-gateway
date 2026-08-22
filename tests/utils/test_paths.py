@@ -66,6 +66,10 @@ from asyncio_gateway.utils.paths import (
     under,
 )
 
+from tests.cancellation import (
+    assert_cancelled_error_survives_task_boundary,
+)
+
 # R22-AC2's own list, plus the two the Edge Cases section adds. Each is
 # a name a *remote server* could put in a directory listing.
 TRAVERSALS: tuple[tuple[Text, Text], ...] = (
@@ -825,7 +829,11 @@ async def test_pe50_iterator_close_self_cancellation_propagates_exactly(
             max_bytes=1,
         )
 
-    assert caught.value is marker
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('iterator-close-self-cancelled',),
+        original=marker,
+    )
     assert not target.exists()
 
 
@@ -921,7 +929,11 @@ async def test_pe50_thread_worker_self_cancellation_propagates_exactly(
     with pytest.raises(asyncio.CancelledError) as caught:
         await path_utils._run_thread_call(self_cancel)
 
-    assert caught.value is marker
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('thread-worker-self-cancelled',),
+        original=marker,
+    )
 
 
 async def test_pe50_completed_child_does_not_hide_caller_cancellation(
@@ -948,7 +960,10 @@ async def test_pe50_completed_child_does_not_hide_caller_cancellation(
     with pytest.raises(asyncio.CancelledError) as caught:
         await waiting
 
-    assert caught.value.args == (marker,)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        (marker,),
+    )
 
 
 def test_pe50_private_path_splitters_refuse_a_directory_root() -> None:

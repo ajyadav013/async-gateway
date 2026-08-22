@@ -41,6 +41,10 @@ from asyncio_gateway.utils.constants import UNKNOWN_PORT
 from asyncio_gateway.utils.envelope import GatewayResponse
 from asyncio_gateway.utils.exceptions import ConfigurationError
 
+from tests.cancellation import (
+    assert_cancelled_error_survives_task_boundary,
+)
+
 
 Outcome = Union[
     Mapping[str, Any],
@@ -1746,8 +1750,11 @@ async def test_cancellation_wins_over_every_cleanup_exception(
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
 
-    assert caught.value is sdk.exit_exceptions[0]
-    assert caught.value.args == ('original cancellation',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('original cancellation',),
+        original=sdk.exit_exceptions[0],
+    )
     assert sdk.exits == 1
 
 
@@ -1927,8 +1934,11 @@ async def test_nested_cleanup_chain_restores_original_cancellation(
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
 
-    assert caught.value is sdk.exit_exceptions[0]
-    assert caught.value.args == ('nested original cancellation',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('nested original cancellation',),
+        original=sdk.exit_exceptions[0],
+    )
 
 
 async def test_successful_body_may_ignore_a_truthy_exit_result(
@@ -2037,12 +2047,15 @@ async def test_body_cancellation_preserves_complete_exception_state(
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
 
-    assert caught.value is observed[0]
-    assert caught.value is sdk.exit_exceptions[0]
-    assert caught.value.args == ('original cancellation args',)
-    assert caught.value.__cause__ is original_cause
-    assert caught.value.__context__ is original_context
-    assert caught.value.__suppress_context__ is True
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('original cancellation args',),
+        original=observed[0],
+    )
+    assert sdk.exit_exceptions[0] is observed[0]
+    assert observed[0].__cause__ is original_cause
+    assert observed[0].__context__ is original_context
+    assert observed[0].__suppress_context__ is True
 
 
 async def test_cyclic_payload_success_stays_success(
@@ -2177,8 +2190,11 @@ async def test_actual_body_cancellation_beats_stale_cleanup_cause(
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
 
-    assert caught.value is sdk.exit_exceptions[0]
-    assert caught.value.args == ('actual body cancellation',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('actual body cancellation',),
+        original=sdk.exit_exceptions[0],
+    )
     assert sdk.exits == 1
 
 
@@ -2212,8 +2228,11 @@ async def test_body_cancellation_wins_over_every_exit_outcome(
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
 
-    assert caught.value is sdk.exit_exceptions[0]
-    assert caught.value.args == ('body cancellation wins',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('body cancellation wins',),
+        original=sdk.exit_exceptions[0],
+    )
     assert sdk.exits == 1
 
 
@@ -2289,7 +2308,10 @@ async def test_parent_cancellation_during_blocked_exit_drains_cleanup(
         await task
 
     assert remained_pending is True
-    assert caught.value.args == ('parent cancellation during exit',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('parent cancellation during exit',),
+    )
     assert sdk.exits == 1
     assert len(sdk.exit_tasks) == 1
     assert sdk.exit_tasks[0] is not task
@@ -2325,7 +2347,10 @@ async def test_repeated_parent_cancellation_keeps_first_and_exits_once(
 
     assert still_draining is True
     assert second_requested is True
-    assert caught.value.args == ('first parent cancellation',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('first parent cancellation',),
+    )
     assert sdk.exits == 1
     assert len(sdk.exit_tasks) == 1
     assert sdk.exit_tasks[0].done() is True

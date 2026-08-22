@@ -33,6 +33,10 @@ from asyncio_gateway.utils.exceptions import (
     SerializationError,
 )
 
+from tests.cancellation import (
+    assert_cancelled_error_survives_task_boundary,
+)
+
 
 PeerMetadata = Sequence[tuple[str, Union[str, bytes]]]
 Outcome = Union[
@@ -1340,8 +1344,11 @@ async def test_task_cancellation_cancels_rpc_and_closes_channel_exactly(
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
 
-    assert caught.value is observed[0]
-    assert caught.value.args == ('caller cancelled gRPC',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('caller cancelled gRPC',),
+        original=observed[0],
+    )
     assert grpc_double.calls[0].cancel_calls == 1
     assert grpc_double.channels[0].close_calls == 1
     assert get_breaker('grpc', 'service.test', 50051).failures == 0
@@ -1376,8 +1383,11 @@ async def test_cleanup_error_cannot_replace_body_cancellation(
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
 
-    assert caught.value is observed[0]
-    assert caught.value.args == ('body cancellation wins',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('body cancellation wins',),
+        original=observed[0],
+    )
     assert grpc_double.channels[0].close_calls == 1
 
 
@@ -1434,8 +1444,11 @@ async def test_rpc_cancel_hook_failure_cannot_replace_parent_cancellation(
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
 
-    assert caught.value is observed[0]
-    assert caught.value.args == ('parent cancellation',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('parent cancellation',),
+        original=observed[0],
+    )
     assert grpc_double.channels[0].close_calls == 1
 
 
@@ -1467,7 +1480,10 @@ async def test_cancellation_during_close_drains_cleanup_without_leak(
 
     close_task = grpc_double.close_tasks[0]
     assert remained_pending is True
-    assert caught.value.args == ('cancel during close',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('cancel during close',),
+    )
     assert close_task is not task
     assert close_task.done() is True
     assert close_task.cancelled() is False
@@ -1499,7 +1515,10 @@ async def test_repeated_cancellation_during_close_keeps_first_request(
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
 
-    assert caught.value.args == ('first close cancellation',)
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('first close cancellation',),
+    )
     assert grpc_double.channels[0].close_calls == 1
 
 

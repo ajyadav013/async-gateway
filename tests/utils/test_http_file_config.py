@@ -60,6 +60,9 @@ from asyncio_gateway.utils.http_file_config import (
     resolve_verb,
 )
 
+from tests.cancellation import (
+    assert_cancelled_error_survives_task_boundary,
+)
 from tests.fixtures.http_server import RecordingHTTPServer
 
 #: The module under test, as a path, for the two structural scans below.
@@ -570,7 +573,11 @@ async def test_pe50_async_body_close_self_cancellation_propagates_exactly(
             max_response_bytes=4,
         )
 
-    assert caught.value is marker
+    assert_cancelled_error_survives_task_boundary(
+        caught.value,
+        ('body-close-self-cancelled',),
+        original=marker,
+    )
     assert body.closed is True
     assert not target.exists()
 
