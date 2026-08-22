@@ -7,12 +7,18 @@ an object operation.
 
 import asyncio
 import concurrent.futures
+import importlib.util
 import inspect
+import itertools
+import logging
 import math
 import socket
 import ssl
+import sys
 import threading
 from collections.abc import Mapping
+from pathlib import Path
+from types import ModuleType
 from typing import Any, NoReturn
 
 import pytest
@@ -1149,3 +1155,310 @@ def test_transport_failure_mapping_preserves_existing_boundaries(
     mapped = getattr(gcs_client, '_transport_error_for')(error)
 
     assert type(mapped) is expected
+
+
+# --- GCS-04 tranche B: shutdown, telemetry, and outcome precedence -------
+
+
+_FRESH_GCS_MODULE_NUMBER = itertools.count()
+_CAPACITY_EVENT_FIELDS: Mapping[str, frozenset[str]] = {
+    'gcs_capacity_state': frozenset({'active_leases', 'max_leases'}),
+    'gcs_capacity_rejected': frozenset({'active_leases', 'reason'}),
+    'gcs_drain_started': frozenset(),
+    'gcs_drain_finished': frozenset({
+        'active_leases', 'duration_seconds',
+    }),
+    'gcs_capacity_closing': frozenset({'active_leases'}),
+}
+_STANDARD_LOG_RECORD_FIELDS = frozenset(logging.LogRecord(
+    name='', level=0, pathname='', lineno=0, msg='', args=(),
+    exc_info=None,
+).__dict__) | frozenset({'asctime', 'message'})
+
+
+class _RecordingExecutor:
+    """Run calls in one real worker while recording shutdown arguments."""
+
+    def __init__(self) -> None:
+        """Create an isolated executor and an empty shutdown trace."""
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix='gcs-tranche-b-test',
+        )
+        self.shutdown_calls: list[tuple[bool, bool]] = []
+
+    def submit(self, function: Any, *args: Any, **kwargs: Any) -> Any:
+        """Delegate provider work to the isolated real executor."""
+        return self._executor.submit(function, *args, **kwargs)
+
+    def shutdown(
+        self,
+        wait: bool = True,
+        *,
+        cancel_futures: bool = False,
+    ) -> None:
+        """Record and delegate the exact production shutdown call."""
+        self.shutdown_calls.append((wait, cancel_futures))
+        self._executor.shutdown(
+            wait=wait,
+            cancel_futures=cancel_futures,
+        )
+
+    def close_test_executor(self) -> None:
+        """Join the isolated worker without changing the recorded trace."""
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _fresh_gcs_lifecycle_module() -> tuple[ModuleType, _RecordingExecutor]:
+    """Load isolated process state so shutdown cannot poison another test."""
+    source_path = Path(gcs_client.__file__ or '')
+    module_name = (
+        'asyncio_gateway.logic.gcs_client_tranche_b_'
+        f'{next(_FRESH_GCS_MODULE_NUMBER)}'
+    )
+    spec = importlib.util.spec_from_file_location(module_name, source_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    original_executor = getattr(module, '_GCS_EXECUTOR')
+    original_executor.shutdown(wait=False, cancel_futures=True)
+    recording_executor = _RecordingExecutor()
+    setattr(module, '_GCS_EXECUTOR', recording_executor)
+    return module, recording_executor
+
+
+async def _call_gcs_shutdown(module: ModuleType) -> None:
+    """Call the private shutdown path whether it is sync or async."""
+    outcome = getattr(module, '_shutdown_gcs_offloader')()
+    if inspect.isawaitable(outcome):
+        await outcome
+
+
+async def _release_isolated_lease(lease: Any) -> None:
+    """Release one lease from an isolated lifecycle module."""
+    outcome = lease.release()
+    if inspect.isawaitable(outcome):
+        await outcome
+
+
+def _capacity_events(
+    caplog: pytest.LogCaptureFixture,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return exact custom fields for GCS capacity telemetry records."""
+    events: list[tuple[str, dict[str, Any]]] = []
+    for record in caplog.records:
+        event = record.getMessage()
+        if event not in _CAPACITY_EVENT_FIELDS:
+            continue
+        custom = {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _STANDARD_LOG_RECORD_FIELDS
+        }
+        assert set(custom) == set(_CAPACITY_EVENT_FIELDS[event])
+        events.append((event, custom))
+    return events
+
+
+async def test_idle_shutdown_closes_admission_once_and_refuses_after_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Idle shutdown is immediate, idempotent, and locally typed."""
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    module, executor = _fresh_gcs_lifecycle_module()
+    try:
+        await _call_gcs_shutdown(module)
+        await _call_gcs_shutdown(module)
+
+        with pytest.raises(GcsCapacityError) as raised:
+            getattr(module, '_acquire_gcs_lease')()
+
+        assert raised.value.code == 'GCS_CAPACITY'
+        assert raised.value.status_code == 503
+        assert executor.shutdown_calls == [(False, True)]
+        assert _capacity_events(caplog) == [
+            ('gcs_capacity_closing', {'active_leases': 0}),
+            ('gcs_capacity_rejected', {
+                'active_leases': 0,
+                'reason': 'closing',
+            }),
+        ]
+    finally:
+        executor.close_test_executor()
+
+
+async def test_active_shutdown_waits_for_final_release_and_keeps_cleanup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Closing refuses newcomers but preserves accepted cleanup capacity."""
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    module, executor = _fresh_gcs_lifecycle_module()
+    lease = getattr(module, '_acquire_gcs_lease')()
+    try:
+        await _call_gcs_shutdown(module)
+        assert executor.shutdown_calls == []
+
+        with pytest.raises(GcsCapacityError):
+            getattr(module, '_acquire_gcs_lease')()
+
+        assert await lease.run(lambda: 'cleanup-finished', timeout=1) == (
+            'cleanup-finished')
+        assert executor.shutdown_calls == []
+
+        await _release_isolated_lease(lease)
+        await _release_isolated_lease(lease)
+        await _call_gcs_shutdown(module)
+
+        assert executor.shutdown_calls == [(False, True)]
+        assert _capacity_events(caplog) == [
+            ('gcs_capacity_state', {
+                'active_leases': 1,
+                'max_leases': 4,
+            }),
+            ('gcs_capacity_closing', {'active_leases': 1}),
+            ('gcs_capacity_rejected', {
+                'active_leases': 1,
+                'reason': 'closing',
+            }),
+            ('gcs_capacity_state', {
+                'active_leases': 0,
+                'max_leases': 4,
+            }),
+        ]
+    finally:
+        await _release_isolated_lease(lease)
+        executor.close_test_executor()
+
+
+async def test_saturation_and_release_emit_each_exact_state_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Acquire, saturated rejection, and release telemetry is cardinal."""
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    module, executor = _fresh_gcs_lifecycle_module()
+    acquire = getattr(module, '_acquire_gcs_lease')
+    leases = [acquire() for _ in range(4)]
+    try:
+        with pytest.raises(GcsCapacityError):
+            acquire()
+        for lease in leases:
+            await _release_isolated_lease(lease)
+            await _release_isolated_lease(lease)
+
+        assert _capacity_events(caplog) == [
+            *[
+                ('gcs_capacity_state', {
+                    'active_leases': active,
+                    'max_leases': 4,
+                })
+                for active in (1, 2, 3, 4)
+            ],
+            ('gcs_capacity_rejected', {
+                'active_leases': 4,
+                'reason': 'saturated',
+            }),
+            *[
+                ('gcs_capacity_state', {
+                    'active_leases': active,
+                    'max_leases': 4,
+                })
+                for active in (3, 2, 1, 0)
+            ],
+        ]
+    finally:
+        for lease in leases:
+            await _release_isolated_lease(lease)
+        executor.close_test_executor()
+
+
+@pytest.mark.parametrize('outcome', ['cancel', 'timeout'])
+async def test_drain_telemetry_is_cardinal_finite_and_secret_safe(
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+) -> None:
+    """Only over-deadline/cancel drain emits safe start and finish events."""
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+    module, executor = _fresh_gcs_lifecycle_module()
+    lease = getattr(module, '_acquire_gcs_lease')()
+    started = threading.Event()
+    release = threading.Event()
+    sentinels = (
+        'bucket-secret-47', 'object-secret-47', 'page-token-secret-47',
+        'signer-secret-47', 'credential-secret-47', 'payload-secret-47',
+        'signed-header-secret-47', 'signed-query-secret-47',
+        'https://signed-secret-47.example/?signature=secret',
+    )
+
+    class CleanupFailure(RuntimeError):
+        """Hostile cleanup error that must not replace the first outcome."""
+
+    class Resource:
+        def close(self) -> None:
+            raise CleanupFailure(' '.join(sentinels))
+
+    def blocked_resource() -> Resource:
+        started.set()
+        assert release.wait(timeout=1)
+        return Resource()
+
+    for index, sentinel in enumerate(sentinels):
+        setattr(lease, f'hostile_{index}', sentinel)
+    timeout = 1 if outcome == 'cancel' else 1e-6
+    task = asyncio.create_task(
+        lease.run(
+            blocked_resource,
+            timeout=timeout,
+            close_result=lambda resource: resource.close(),
+        )
+    )
+    try:
+        await _wait_for_thread_event(started)
+        if outcome == 'cancel':
+            task.cancel('original-cancellation')
+            task.cancel('repeated-cancellation')
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        release.set()
+        if outcome == 'cancel':
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert caught.value.args == ('original-cancellation',)
+        else:
+            with pytest.raises(GatewayTimeoutError):
+                await task
+
+        await _release_isolated_lease(lease)
+        events = _capacity_events(caplog)
+        assert events[0] == ('gcs_capacity_state', {
+            'active_leases': 1,
+            'max_leases': 4,
+        })
+        assert events[1] == ('gcs_drain_started', {})
+        assert events[2][0] == 'gcs_drain_finished'
+        assert events[2][1]['active_leases'] == 1
+        duration = events[2][1]['duration_seconds']
+        assert isinstance(duration, (int, float))
+        assert not isinstance(duration, bool)
+        assert math.isfinite(duration) and duration >= 0
+        assert events[3] == ('gcs_capacity_state', {
+            'active_leases': 0,
+            'max_leases': 4,
+        })
+        assert len(events) == 4
+
+        telemetry_surfaces = caplog.text + ''.join(
+            repr(record.__dict__) for record in caplog.records)
+        for sentinel in sentinels:
+            assert sentinel not in telemetry_surfaces
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await _release_isolated_lease(lease)
+        executor.close_test_executor()

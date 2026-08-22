@@ -33,6 +33,25 @@ default executor, and stalled work must not starve unrelated protocols (GCS-04).
 
 ## Work Log
 
+- 2026-08-22 — Tranche B shutdown and telemetry lifecycle is GREEN: the exact
+  focused command (`pytest tests/logic/test_gcs_client.py
+  tests/test_no_blocking_io.py --no-cov -q`) reports 198 passed in 0.32s.
+  Admission closing and active-lease accounting are atomic, shutdown is
+  immediate when idle or deferred through the final idempotent release, and
+  exact capacity/drain events remain free of request and provider data. Scoped
+  flake8, scoped mypy, `git diff --check`, and ticket-index JSON validation all
+  pass. Status remains IN PROGRESS because real command-owned client lifecycle
+  belongs to GCS-05/GCS-06/GCS-07.
+- 2026-08-22 — Tranche B RED captured without production edits: the exact
+  focused command collected 198 tests, with 193 passed and five expected
+  failures for the absent shutdown and capacity/drain telemetry behavior.
+  Eight cases were added; the three AST/default-executor guard cases already
+  pass against tranche A. Scoped flake8 and `git diff --check` pass. Original
+  cancellation and acceptance-timeout precedence over hostile late-result
+  cleanup are covered through the existing lease seam. Full body/service/
+  transport failure precedence over an owned client-close failure remains
+  acceptance-required and is intentionally deferred to GCS-05/GCS-06/GCS-07,
+  where the first real operation-owned client lifecycle exists.
 - 2026-08-22 — Tranche A lifecycle/mapping foundation is GREEN: the exact
   focused command (`pytest tests/logic/test_gcs_client.py
   tests/test_no_blocking_io.py --no-cov -q`) reports 190 passed in 0.30s;

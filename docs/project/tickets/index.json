@@ -790,7 +790,8 @@
       "file": "docs/project/tickets/AGW-47-build-isolated-gcs-provider-lifecycle-and-capacity-guard.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-45", "AGW-46"], "blocks": ["AGW-48"]},
-      "commits": []
+      "commits": [],
+      "note": "Tranche B RED reproduced 5 expected shutdown/telemetry failures; GREEN passes all 198 focused tests plus scoped flake8, mypy, diff, and JSON checks; status remains IN PROGRESS."
     },
     {
       "id": "AGW-48",

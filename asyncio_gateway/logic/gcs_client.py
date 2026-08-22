@@ -1,6 +1,7 @@
 """Strict public-boundary strategy for Google Cloud Storage requests."""
 
 import asyncio
+import logging
 import math
 import re
 import socket
@@ -80,12 +81,19 @@ _SIGNING_ACCOUNT_PATTERN: Final[re.Pattern[str]] = re.compile(
 _GCS_RETRYABLE_STATUSES: Final[frozenset[int]] = frozenset({
     408, 429, 500, 502, 503, 504,
 })
+_GCS_MAX_LEASES: Final[int] = 4
 _GCS_EXECUTOR: Final[ThreadPoolExecutor] = ThreadPoolExecutor(
-    max_workers=4,
+    max_workers=_GCS_MAX_LEASES,
     thread_name_prefix='asyncio-gateway-gcs',
 )
 _GCS_PERMITS: Final[threading.BoundedSemaphore] = (
-    threading.BoundedSemaphore(4))
+    threading.BoundedSemaphore(_GCS_MAX_LEASES))
+_GCS_STATE_LOCK = threading.Lock()
+_GCS_ACTIVE_LEASES = 0
+_GCS_ADMISSION_CLOSING = False
+_GCS_EXECUTOR_SHUTDOWN = False
+
+logger = logging.getLogger(__name__)
 
 _ResultT = TypeVar('_ResultT')
 _NO_RESULT: Final[object] = object()
@@ -171,6 +179,8 @@ class _GcsLease:
                     return future.result()
                 timed_out = True
 
+            drain_started = loop.time()
+            logger.debug('gcs_drain_started')
             late_result, cancellation = await _drain_provider_future(
                 future, cancellation)
             if late_result is not _NO_RESULT and close_result is not None:
@@ -180,6 +190,16 @@ class _GcsLease:
                 )
                 _, cancellation = await _drain_provider_future(
                     cleanup, cancellation)
+            duration_seconds = max(0.0, loop.time() - drain_started)
+            if not math.isfinite(duration_seconds):
+                duration_seconds = 0.0
+            logger.debug(
+                'gcs_drain_finished',
+                extra={
+                    'active_leases': _active_gcs_leases(),
+                    'duration_seconds': duration_seconds,
+                },
+            )
 
             if cancellation is not None:
                 raise cancellation
@@ -194,14 +214,94 @@ class _GcsLease:
             if self._released:
                 return
             self._released = True
-            _GCS_PERMITS.release()
+            _release_gcs_lease()
+
+
+def _active_gcs_leases() -> int:
+    """Return the current active-lease count under the state lock."""
+    with _GCS_STATE_LOCK:
+        return _GCS_ACTIVE_LEASES
+
+
+def _release_gcs_lease() -> None:
+    """Release one permit and close an idle, closing executor once."""
+    global _GCS_ACTIVE_LEASES, _GCS_EXECUTOR_SHUTDOWN
+
+    should_shutdown = False
+    with _GCS_STATE_LOCK:
+        _GCS_PERMITS.release()
+        _GCS_ACTIVE_LEASES -= 1
+        logger.debug(
+            'gcs_capacity_state',
+            extra={
+                'active_leases': _GCS_ACTIVE_LEASES,
+                'max_leases': _GCS_MAX_LEASES,
+            },
+        )
+        if (
+            _GCS_ADMISSION_CLOSING
+            and _GCS_ACTIVE_LEASES == 0
+            and not _GCS_EXECUTOR_SHUTDOWN
+        ):
+            _GCS_EXECUTOR_SHUTDOWN = True
+            should_shutdown = True
+
+    if should_shutdown:
+        _GCS_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
 def _acquire_gcs_lease() -> _GcsLease:
     """Acquire one GCS lifecycle permit immediately or refuse capacity."""
-    if not _GCS_PERMITS.acquire(blocking=False):
-        raise GcsCapacityError()
+    global _GCS_ACTIVE_LEASES
+
+    with _GCS_STATE_LOCK:
+        if _GCS_ADMISSION_CLOSING:
+            logger.debug(
+                'gcs_capacity_rejected',
+                extra={
+                    'active_leases': _GCS_ACTIVE_LEASES,
+                    'reason': 'closing',
+                },
+            )
+            raise GcsCapacityError()
+        if not _GCS_PERMITS.acquire(blocking=False):
+            logger.debug(
+                'gcs_capacity_rejected',
+                extra={
+                    'active_leases': _GCS_ACTIVE_LEASES,
+                    'reason': 'saturated',
+                },
+            )
+            raise GcsCapacityError()
+        _GCS_ACTIVE_LEASES += 1
+        logger.debug(
+            'gcs_capacity_state',
+            extra={
+                'active_leases': _GCS_ACTIVE_LEASES,
+                'max_leases': _GCS_MAX_LEASES,
+            },
+        )
     return _GcsLease()
+
+
+def _shutdown_gcs_offloader() -> None:
+    """Close admission and shut down the idle private executor once."""
+    global _GCS_ADMISSION_CLOSING, _GCS_EXECUTOR_SHUTDOWN
+
+    should_shutdown = False
+    with _GCS_STATE_LOCK:
+        if not _GCS_ADMISSION_CLOSING:
+            _GCS_ADMISSION_CLOSING = True
+            logger.debug(
+                'gcs_capacity_closing',
+                extra={'active_leases': _GCS_ACTIVE_LEASES},
+            )
+        if _GCS_ACTIVE_LEASES == 0 and not _GCS_EXECUTOR_SHUTDOWN:
+            _GCS_EXECUTOR_SHUTDOWN = True
+            should_shutdown = True
+
+    if should_shutdown:
+        _GCS_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
 def _operational_sdk_kwargs(timeout: object) -> dict[str, object]:
