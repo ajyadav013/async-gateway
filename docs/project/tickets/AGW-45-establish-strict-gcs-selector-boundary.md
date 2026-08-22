@@ -60,3 +60,22 @@ their mandated boundary before any cloud or local side effect (GCS-02).
   restored status from `DONE` to `IN PROGRESS`. Implementation completion
   does not advance the ticket past the implementation-stage workflow gate;
   review and PR-stage transitions remain pending.
+- 2026-08-23 — Formal-review docstring defect-loop RED at clean HEAD
+  `7247a4a`: the unchanged entrypoint baseline passed 290/290, then three
+  section-bounded public `request()` docstring rows collected 293 tests with
+  290 passed and exactly 3 failed. The `protocol`, `data`, and `auth` failures
+  respectively prove the missing registered-GCS, unused-data, and
+  ADC/Workload-Identity claims. Test SHA-256 is
+  `85aeff973e722d3f21d8795b94c93549f2f997f9099ee7b8055fc60c0e2a858f`;
+  production remained unchanged. Status stays IN PROGRESS for GREEN and
+  independent review.
+- 2026-08-23 — Minimal docstring GREEN added only the three required GCS
+  claims to the public `request()` parameter sections. The three focused rows
+  passed 3/3, the complete entrypoint module passed 293/293, and the docs
+  module passed 243/243. Full flake8, the CI formatting selector, and mypy over
+  all 33 source files passed. Normalized ASTs with every docstring removed
+  remained byte-identical at SHA-256
+  `34cfdb97665a7fa9b4895dc11f22d97f1673585acc7f3c6a95a4ff03a7d94a7c`;
+  the frozen test hash remained unchanged. No signature, control flow, type,
+  import, secret, or runtime behavior changed. Status stays IN PROGRESS for
+  independent review.

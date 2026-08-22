@@ -26,6 +26,7 @@ against the URL actually dispatched, after the pre-processor -- has its own
 named test below.
 """
 
+import inspect
 import logging
 from collections.abc import Mapping
 from typing import Any, Callable, Final, Optional
@@ -208,6 +209,42 @@ def test_gcs_selector_resolves_case_insensitively() -> None:
 def test_gcs_selector_has_only_the_gs_scheme() -> None:
     """GCS dispatch accepts only explicit ``gs`` targets."""
     assert PROTOCOL_SCHEME_ALLOWLISTS['GCS'] == frozenset({'gs'})
+
+
+@pytest.mark.parametrize(
+    ('parameter', 'required_statement'),
+    [
+        pytest.param(
+            'protocol',
+            'one of the names registered in '
+            '``asyncio_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP, '
+            'SFTP, SOAP, JSONRPC, GRAPHQL, S3, GCS, or GRPC.',
+            id='protocol-registers-gcs',
+        ),
+        pytest.param(
+            'data',
+            'GCS does not use this argument.',
+            id='data-unused-by-gcs',
+        ),
+        pytest.param(
+            'auth',
+            'GCS requires ``None``; this selects Application Default '
+            'Credentials, including Workload Identity.',
+            id='auth-requires-adc-or-workload-identity',
+        ),
+    ],
+)
+def test_request_docstring_documents_gcs_in_parameter_section(
+    parameter: str,
+    required_statement: str,
+) -> None:
+    """Each GCS public-call claim belongs to its own parameter section."""
+    docstring = inspect.getdoc(request) or ''
+    marker = f':param {parameter}:'
+    _, separator, remainder = docstring.partition(marker)
+    section = remainder.partition('\n:param ')[0] if separator else ''
+
+    assert required_statement in ' '.join(section.split())
 
 
 # --- R11-AC2: everything that is not a protocol is a configuration error ---

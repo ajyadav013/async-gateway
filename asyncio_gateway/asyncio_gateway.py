@@ -655,22 +655,25 @@ async def request(
         or None for optional params; GRAPHQL accepts a mapping or None for
         optional variables; GRPC accepts bytes-like data without a serializer
         and arbitrary input when ``request_serializer`` is supplied; SOAP
-        accepts XML text or an Element. S3 does not use this argument. Legacy
-        selectors retain their existing payload behavior.
+        accepts XML text or an Element. S3 does not use this argument. GCS
+        does not use this argument. Legacy selectors retain their existing
+        payload behavior.
     :param protocol: one of the names registered in
         ``asyncio_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP,
-        SFTP, SOAP, JSONRPC, GRAPHQL, S3, or GRPC. Matched with surrounding
-        whitespace stripped and without regard to case, so 'http', ' HTTP '
-        and 'Http' are the same protocol. HTTPS additionally requires that
-        the call go out over TLS; see :raises: below
+        SFTP, SOAP, JSONRPC, GRAPHQL, S3, GCS, or GRPC. Matched with
+        surrounding whitespace stripped and without regard to case, so
+        'http', ' HTTP ' and 'Http' are the same protocol. HTTPS additionally
+        requires that the call go out over TLS; see :raises: below
     :param auth: Optional aiohttp-compatible authentication for HTTP, HTTPS,
         SOAP, JSONRPC, and GRAPHQL, where None sends no credentials. FTP
         requires the legacy non-empty ``.login``/``.password`` fields. SFTP
         accepts ``SFTPAuth`` with a password, explicit client key, or both,
         and retains legacy ``.login``/``.password`` objects. For S3, None
         selects the normal AWS credential chain and a supplied object provides
-        non-empty string ``.login``/``.password`` access and secret keys.
-        GRPC requires None; request credentials use bounded metadata.
+        non-empty string ``.login``/``.password`` access and secret keys. GCS
+        requires ``None``; this selects Application Default Credentials,
+        including Workload Identity. GRPC requires None; request credentials
+        use bounded metadata.
     :param protocol_info: {
         "request_type": "GET", #required
         "timeout": int, #Optional

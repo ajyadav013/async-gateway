@@ -768,7 +768,8 @@
       "file": "docs/project/tickets/AGW-45-establish-strict-gcs-selector-boundary.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-44", "AGW-46"], "blocks": ["AGW-47"]},
-      "commits": ["c8281ab", "053a836"]
+      "commits": ["c8281ab", "053a836"],
+      "note": "Formal-review docstring defect loop reproduced 293 collected with 290 passed and exactly 3 failed at clean HEAD 7247a4a. Minimal GREEN added only the registered-GCS, unused-data, and ADC/Workload-Identity claims: focused rows passed 3/3, full entrypoint passed 293/293, docs passed 243/243, full flake8, CI formatting, and mypy passed, and the docstring-stripped AST stayed identical at SHA-256 34cfdb97665a7fa9b4895dc11f22d97f1673585acc7f3c6a95a4ff03a7d94a7c. Frozen test SHA-256 remains 85aeff973e722d3f21d8795b94c93549f2f997f9099ee7b8055fc60c0e2a858f. Status stays IN PROGRESS for independent review."
     },
     {
       "id": "AGW-46",
