@@ -1,7 +1,7 @@
 # AGW-45: Establish strict GCS selector boundary
 
-- **Status:** OPEN
-- **Branch:** `codex/gcs-selector`
+- **Status:** IN PROGRESS
+- **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-02 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
 - **Decisions:** Bounded GCS decisions of record in [the GCS selector specification](../../specs/gcs_selector_spec.md); no ADR is required.
@@ -35,3 +35,16 @@ their mandated boundary before any cloud or local side effect (GCS-02).
 - 2026-08-22 — Opened from approved GCS-02 planning before implementation;
   recorded its five-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-22 — Implementation started from foundation commit `649a65c` in
+  the isolated backend worktree; reloaded the requested skills and re-read the
+  approved boundary clauses, story, ticket, entrypoint, base, and S3 patterns.
+- 2026-08-22 — Partial RED proved the absent selector boundary with the
+  venv-s24 `pytest tests/test_entrypoint.py -k 'gcs_selector'` command: 2
+  failed, 274 deselected. The failures were the missing `GCS` registry entry
+  and missing exact `{'gs'}` scheme row; the focused coverage threshold also
+  failed as expected.
+- 2026-08-22 — Partial GREEN added only the `GcsRequest` skeleton, registry
+  entry, and exact `gs` scheme row. The same focused selection with
+  `--no-cov` passed 2 tests with 274 deselected. Scoped flake8, three-file
+  mypy, and `git diff --check` passed. Strict command/options and target/auth
+  boundary work remains; status stays IN PROGRESS.

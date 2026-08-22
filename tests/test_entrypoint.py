@@ -37,6 +37,7 @@ import pytest
 from asyncio_gateway.asyncio_gateway import (
     DISPATCH_CONTROLLING_KEYS,
     HTTP_FAMILY_SCHEMES,
+    PROTOCOL_SCHEME_ALLOWLISTS,
     URL_DISPATCHED_PROTOCOLS,
     dispatch_url_for,
     request,
@@ -193,6 +194,18 @@ def test_r11_ac1_resolve_protocol_normalises_before_it_looks_up(
 ) -> None:
     """The guard and the lookup are one operation returning one value."""
     assert resolve_protocol(spelling(name)) == (name, protocol_mapping[name])
+
+
+def test_gcs_selector_resolves_case_insensitively() -> None:
+    """GCS has one normalized public selector backed by a strategy class."""
+    assert 'GCS' in protocol_mapping
+    assert resolve_protocol('  gCs  ') == (
+        'GCS', protocol_mapping['GCS'])
+
+
+def test_gcs_selector_has_only_the_gs_scheme() -> None:
+    """GCS dispatch accepts only explicit ``gs`` targets."""
+    assert PROTOCOL_SCHEME_ALLOWLISTS['GCS'] == frozenset({'gs'})
 
 
 # --- R11-AC2: everything that is not a protocol is a configuration error ---

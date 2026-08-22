@@ -61,6 +61,7 @@ PROTOCOL_SCHEME_ALLOWLISTS: Final[dict[str, frozenset[str]]] = {
     'JSONRPC': frozenset({'http', 'https'}),
     'GRAPHQL': frozenset({'http', 'https'}),
     'S3': frozenset({'s3'}),
+    'GCS': frozenset({'gs'}),
     'GRPC': frozenset({'grpc', 'grpcs'}),
 }
 
