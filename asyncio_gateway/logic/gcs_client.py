@@ -1,15 +1,43 @@
 """Strict public-boundary strategy for Google Cloud Storage requests."""
 
+import asyncio
 import math
 import re
+import socket
+import ssl
+import threading
 from collections.abc import Mapping
-from typing import Any, ClassVar, Final, Optional, Tuple, cast
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Final,
+    Optional,
+    Tuple,
+    TypeVar,
+    cast,
+)
 from urllib.parse import urlsplit
 
 from asyncio_gateway.helpers.internal.base import BaseRequestClass
+from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
+    AbortableServiceError,
+)
 from asyncio_gateway.utils.constants import (HTTP_TIMEOUT, MAX_RESPONSE_BYTES)
 from asyncio_gateway.utils.envelope import GatewayResponse
-from asyncio_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.utils.exceptions import (
+    AsyncGatewayError,
+    ConfigurationError,
+    ConnectError,
+    DnsError,
+    GatewayTimeoutError,
+    GcsCapacityError,
+    TlsError,
+    TransportError,
+)
+from asyncio_gateway.utils.redaction import redact_text
 
 
 GCS_COMMANDS: Final[frozenset[str]] = frozenset({
@@ -49,6 +77,198 @@ GCS_ALLOWED_INFO_KEYS: Final[frozenset[str]] = frozenset().union(
 _SIGNING_ACCOUNT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r'[a-z][a-z0-9-]{4,28}[a-z0-9]@'
     r'[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com')
+_GCS_RETRYABLE_STATUSES: Final[frozenset[int]] = frozenset({
+    408, 429, 500, 502, 503, 504,
+})
+_GCS_EXECUTOR: Final[ThreadPoolExecutor] = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix='asyncio-gateway-gcs',
+)
+_GCS_PERMITS: Final[threading.BoundedSemaphore] = (
+    threading.BoundedSemaphore(4))
+
+_ResultT = TypeVar('_ResultT')
+_NO_RESULT: Final[object] = object()
+
+
+class _GcsServiceFailure(AsyncGatewayError):
+    """Retain one safe retryable GCS service-failure snapshot."""
+
+    def __init__(self, status_code: int, details: Mapping[str, Any]) -> None:
+        """Store only normalized service fields for later conversion."""
+        super().__init__('retryable GCS service response', status_code)
+        self.details = dict(details)
+
+
+class _AbortableGcsServiceFailure(AbortableServiceError):
+    """Retain one safe non-retryable GCS service-failure snapshot."""
+
+    def __init__(self, status_code: int, details: Mapping[str, Any]) -> None:
+        """Store only normalized service fields for later conversion."""
+        super().__init__('abortable GCS service response', status_code)
+        self.details = dict(details)
+
+
+async def _drain_provider_future(
+    future: 'asyncio.Future[_ResultT]',
+    cancellation: Optional[asyncio.CancelledError],
+) -> tuple[object, Optional[asyncio.CancelledError]]:
+    """Drain one shielded provider future while retaining first cancel."""
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+        except BaseException:
+            break
+    try:
+        return future.result(), cancellation
+    except BaseException:
+        return _NO_RESULT, cancellation
+
+
+class _GcsLease:
+    """Serialize private provider calls under one retained capacity permit."""
+
+    def __init__(self) -> None:
+        """Create one live lease with no outstanding provider future."""
+        self._operation_lock = asyncio.Lock()
+        self._released = False
+
+    async def run(
+        self,
+        function: Callable[..., _ResultT],
+        *args: Any,
+        timeout: int | float,
+        close_result: Optional[Callable[[_ResultT], Any]] = None,
+        **kwargs: Any,
+    ) -> _ResultT:
+        """Run one synchronous provider call with deadline-safe draining."""
+        accepted_timeout = _positive_timeout(timeout)
+        async with self._operation_lock:
+            if self._released:
+                raise GcsCapacityError()
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + float(accepted_timeout)
+            future = loop.run_in_executor(
+                _GCS_EXECUTOR, partial(function, *args, **kwargs))
+            cancellation: Optional[asyncio.CancelledError] = None
+            timed_out = False
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=max(0.0, deadline - loop.time()),
+                )
+                if loop.time() < deadline:
+                    return result
+                timed_out = True
+            except asyncio.CancelledError as error:
+                cancellation = error
+            except (asyncio.TimeoutError, TimeoutError):
+                if future.done() and loop.time() < deadline:
+                    return future.result()
+                timed_out = True
+
+            late_result, cancellation = await _drain_provider_future(
+                future, cancellation)
+            if late_result is not _NO_RESULT and close_result is not None:
+                cleanup = loop.run_in_executor(
+                    _GCS_EXECUTOR,
+                    partial(close_result, cast(_ResultT, late_result)),
+                )
+                _, cancellation = await _drain_provider_future(
+                    cleanup, cancellation)
+
+            if cancellation is not None:
+                raise cancellation
+            if timed_out:
+                raise GatewayTimeoutError(
+                    'GCS provider result acceptance deadline expired')
+            raise TransportError('GCS provider operation failed')
+
+    async def release(self) -> None:
+        """Release this lease once all serialized provider work has drained."""
+        async with self._operation_lock:
+            if self._released:
+                return
+            self._released = True
+            _GCS_PERMITS.release()
+
+
+def _acquire_gcs_lease() -> _GcsLease:
+    """Acquire one GCS lifecycle permit immediately or refuse capacity."""
+    if not _GCS_PERMITS.acquire(blocking=False):
+        raise GcsCapacityError()
+    return _GcsLease()
+
+
+def _operational_sdk_kwargs(timeout: object) -> dict[str, object]:
+    """Return the frozen timeout and retry controls for storage calls."""
+    return {'retry': None, 'timeout': _positive_timeout(timeout)}
+
+
+def _safe_provider_text(value: object) -> Optional[str]:
+    """Return redacted provider text without stringifying foreign objects."""
+    if not isinstance(value, str):
+        return None
+    return redact_text(value)
+
+
+def _service_failure_for(
+    error: BaseException,
+    *,
+    command: str,
+    bucket: str,
+    target: str,
+) -> AsyncGatewayError:
+    """Structurally normalize and classify one Google service refusal."""
+    response = getattr(error, 'response', None)
+    response_mapping = response if isinstance(response, Mapping) else {}
+    raw_status = response_mapping.get('status_code')
+    status = (
+        raw_status
+        if isinstance(raw_status, int)
+        and not isinstance(raw_status, bool)
+        and 100 <= raw_status <= 599
+        else 502
+    )
+    headers = response_mapping.get('headers')
+    header_mapping = headers if isinstance(headers, Mapping) else {}
+    details = {
+        'command': command,
+        'bucket': bucket,
+        'target': target,
+        'gcs_error_code': _safe_provider_text(getattr(error, 'code', None)),
+        'gcs_error_message': _safe_provider_text(
+            getattr(error, 'message', None)),
+        'response_metadata': {
+            'http_status_code': status,
+            'request_id': _safe_provider_text(
+                header_mapping.get('x-goog-request-id')),
+        },
+    }
+    failure_type = (
+        _GcsServiceFailure
+        if status in _GCS_RETRYABLE_STATUSES
+        else _AbortableGcsServiceFailure
+    )
+    return failure_type(status, details)
+
+
+def _transport_error_for(error: BaseException) -> TransportError:
+    """Map a transport exception by type without exposing foreign prose."""
+    message = 'GCS provider transport failed'
+    if isinstance(error, socket.gaierror):
+        return DnsError(message)
+    if isinstance(error, ssl.SSLError):
+        return TlsError(message)
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return GatewayTimeoutError(message)
+    if isinstance(error, ConnectionError):
+        return ConnectError(message)
+    return TransportError(message)
 
 
 def _nonempty_string(value: object, *, setting: str) -> str:

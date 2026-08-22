@@ -784,7 +784,7 @@
     {
       "id": "AGW-47",
       "title": "Build the isolated provider lifecycle and capacity guard",
-      "status": "OPEN",
+      "status": "IN PROGRESS",
       "story": "GCS-04",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-47-build-isolated-gcs-provider-lifecycle-and-capacity-guard.md",

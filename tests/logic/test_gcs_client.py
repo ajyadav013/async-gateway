@@ -5,7 +5,13 @@ not construct credentials, contact Google Cloud, touch local paths, or execute
 an object operation.
 """
 
+import asyncio
+import concurrent.futures
+import inspect
 import math
+import socket
+import ssl
+import threading
 from collections.abc import Mapping
 from typing import Any, NoReturn
 
@@ -13,6 +19,10 @@ import pytest
 
 from asyncio_gateway.asyncio_gateway import request
 from asyncio_gateway.helpers.internal import base
+from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
+    AbortableServiceError,
+)
+from asyncio_gateway.logic import gcs_client
 from asyncio_gateway.logic.gcs_client import GcsRequest
 from asyncio_gateway.utils.constants import (
     HTTP_TIMEOUT,
@@ -20,7 +30,15 @@ from asyncio_gateway.utils.constants import (
     UNKNOWN_PORT,
 )
 from asyncio_gateway.utils.envelope import new_envelope
-from asyncio_gateway.utils.exceptions import ConfigurationError
+from asyncio_gateway.utils.exceptions import (
+    ConfigurationError,
+    ConnectError,
+    DnsError,
+    GatewayTimeoutError,
+    GcsCapacityError,
+    TlsError,
+    TransportError,
+)
 
 
 VALID_SIGNING_ACCOUNT = (
@@ -852,3 +870,279 @@ async def test_strict_options_fail_before_preprocessor(
         )
 
     assert processor_calls == []
+
+
+# --- GCS-04: private provider lifecycle and capacity foundation -----------
+
+
+async def _release_lease(lease: Any) -> None:
+    """Release a private test lease whether its seam is sync or async."""
+    outcome = lease.release()
+    if inspect.isawaitable(outcome):
+        await outcome
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    """Await a deterministic worker signal without blocking the loop."""
+    assert await asyncio.to_thread(event.wait, 1)
+
+
+def test_gcs_offloader_is_one_private_exactly_sized_executor() -> None:
+    """The provider pool has the frozen size and identifying prefix."""
+    executor = getattr(gcs_client, '_GCS_EXECUTOR')
+
+    assert isinstance(executor, concurrent.futures.ThreadPoolExecutor)
+    assert executor._max_workers == 4
+    assert executor._thread_name_prefix == 'asyncio-gateway-gcs'
+
+
+async def test_four_lifecycle_leases_admit_without_a_waiting_queue() -> None:
+    """Four immediate acquisitions succeed and the fifth fails locally."""
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    leases = [acquire() for _ in range(4)]
+    try:
+        with pytest.raises(GcsCapacityError) as raised:
+            acquire()
+        assert raised.value.code == 'GCS_CAPACITY'
+        assert raised.value.status_code == 503
+    finally:
+        for lease in leases:
+            await _release_lease(lease)
+
+
+async def test_one_lease_never_has_two_provider_futures_outstanding() -> None:
+    """A second provider call waits for the same lease's first call."""
+    lease = getattr(gcs_client, '_acquire_gcs_lease')()
+    first_started = threading.Event()
+    first_release = threading.Event()
+    second_started = threading.Event()
+
+    def first() -> str:
+        first_started.set()
+        assert first_release.wait(timeout=1)
+        return 'first'
+
+    def second() -> str:
+        second_started.set()
+        return 'second'
+
+    first_task = asyncio.create_task(lease.run(first, timeout=1))
+    try:
+        await _wait_for_thread_event(first_started)
+        second_task = asyncio.create_task(lease.run(second, timeout=1))
+        await asyncio.sleep(0)
+        assert not second_started.is_set()
+        first_release.set()
+        assert await first_task == 'first'
+        assert await second_task == 'second'
+    finally:
+        first_release.set()
+        await _release_lease(lease)
+
+
+@pytest.mark.parametrize(
+    'seam',
+    ['adc', 'credential-refresh', 'client', 'bucket', 'blob', 'lookup', 'close'],
+)
+async def test_every_provider_lifecycle_seam_runs_only_on_the_gcs_pool(
+    seam: str,
+) -> None:
+    """Generic provider work is never executed on the loop thread."""
+    lease = getattr(gcs_client, '_acquire_gcs_lease')()
+    loop_thread = threading.get_ident()
+    try:
+        worker_thread, worker_name, observed = await lease.run(
+            lambda: (threading.get_ident(), threading.current_thread().name,
+                     seam),
+            timeout=1,
+        )
+    finally:
+        await _release_lease(lease)
+
+    assert worker_thread != loop_thread
+    assert worker_name.startswith('asyncio-gateway-gcs')
+    assert observed == seam
+
+
+async def test_four_blocked_provider_workers_do_not_starve_default_executor(
+) -> None:
+    """Provider saturation leaves unrelated default-executor work runnable."""
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    leases = [acquire() for _ in range(4)]
+    started = [threading.Event() for _ in range(4)]
+    release = threading.Event()
+
+    def block(marker: threading.Event) -> None:
+        marker.set()
+        assert release.wait(timeout=1)
+
+    tasks = [
+        asyncio.create_task(lease.run(block, marker, timeout=1))
+        for lease, marker in zip(leases, started)
+    ]
+    try:
+        for marker in started:
+            await _wait_for_thread_event(marker)
+        unrelated_thread = await asyncio.wait_for(
+            asyncio.to_thread(threading.get_ident), timeout=0.25)
+        assert unrelated_thread != threading.get_ident()
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for lease in leases:
+            await _release_lease(lease)
+
+
+async def test_cancellation_retains_capacity_drains_and_closes_late_resource(
+) -> None:
+    """Repeated cancellation cannot release or leak a late provider result."""
+    acquire = getattr(gcs_client, '_acquire_gcs_lease')
+    leases = [acquire() for _ in range(4)]
+    started = threading.Event()
+    release = threading.Event()
+    closed_on: list[int] = []
+
+    class Resource:
+        def close(self) -> None:
+            closed_on.append(threading.get_ident())
+
+    def late_resource() -> Resource:
+        started.set()
+        assert release.wait(timeout=1)
+        return Resource()
+
+    task = asyncio.create_task(
+        leases[0].run(late_resource, timeout=1,
+                      close_result=lambda resource: resource.close()))
+    try:
+        await _wait_for_thread_event(started)
+        task.cancel('original-cancellation')
+        task.cancel('repeated-cancellation')
+        with pytest.raises(GcsCapacityError):
+            acquire()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.value.args == ('original-cancellation',)
+        assert closed_on and closed_on[0] != threading.get_ident()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        for lease in leases:
+            await _release_lease(lease)
+
+
+async def test_result_acceptance_deadline_rejects_and_closes_late_result(
+) -> None:
+    """A worker result produced after the finite deadline is never success."""
+    lease = getattr(gcs_client, '_acquire_gcs_lease')()
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class Resource:
+        def close(self) -> None:
+            closed.set()
+
+    def late_resource() -> Resource:
+        started.set()
+        assert release.wait(timeout=1)
+        return Resource()
+
+    task = asyncio.create_task(
+        lease.run(late_resource, timeout=1e-6,
+                  close_result=lambda resource: resource.close()))
+    try:
+        await _wait_for_thread_event(started)
+        release.set()
+        with pytest.raises(GatewayTimeoutError):
+            await task
+        assert closed.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await _release_lease(lease)
+
+
+def test_operational_sdk_controls_are_retry_none_with_finite_timeout() -> None:
+    """The shared adapter freezes provider retry and timeout ownership."""
+    controls = getattr(gcs_client, '_operational_sdk_kwargs')(2.5)
+
+    assert controls == {'retry': None, 'timeout': 2.5}
+
+
+class _FakeServiceError(Exception):
+    """Structural Google-like service error with hostile incidental state."""
+
+    def __init__(self, status: object) -> None:
+        super().__init__('safe service refusal')
+        self.code = 'conditionNotMet'
+        self.message = 'safe service refusal'
+        self.response = {
+            'status_code': status,
+            'headers': {'x-goog-request-id': 'request-7'},
+            'provider_object': object(),
+        }
+
+
+@pytest.mark.parametrize(
+    ('status', 'abortable'),
+    [(408, False), (429, False), (500, False), (502, False), (503, False),
+     (504, False), (400, True), (401, True), (403, True), (404, True),
+     (409, True), (412, True)],
+)
+def test_service_failure_classification_is_structural(
+    status: int,
+    abortable: bool,
+) -> None:
+    """Only the frozen status set is retryable and breaker-counted."""
+    failure = getattr(gcs_client, '_service_failure_for')(
+        _FakeServiceError(status), command='head', bucket='bucket',
+        target='object')
+
+    assert isinstance(failure, AbortableServiceError) is abortable
+    assert failure.status_code == status
+    assert failure.details == {
+        'command': 'head',
+        'bucket': 'bucket',
+        'target': 'object',
+        'gcs_error_code': 'conditionNotMet',
+        'gcs_error_message': 'safe service refusal',
+        'response_metadata': {
+            'http_status_code': status,
+            'request_id': 'request-7',
+        },
+    }
+
+
+@pytest.mark.parametrize('status', [True, '503', 99, 600, None])
+def test_malformed_service_status_normalizes_to_502(status: object) -> None:
+    """Provider status is trusted only when it is an integer in 100..599."""
+    failure = getattr(gcs_client, '_service_failure_for')(
+        _FakeServiceError(status), command='list', bucket='bucket', target='')
+
+    assert failure.status_code == 502
+    assert failure.details['response_metadata'] == {
+        'http_status_code': 502,
+        'request_id': 'request-7',
+    }
+
+
+@pytest.mark.parametrize(
+    ('error', 'expected'),
+    [
+        (socket.gaierror(), DnsError),
+        (ssl.SSLError(), TlsError),
+        (TimeoutError(), GatewayTimeoutError),
+        (ConnectionError(), ConnectError),
+        (OSError(), TransportError),
+    ],
+)
+def test_transport_failure_mapping_preserves_existing_boundaries(
+    error: BaseException,
+    expected: type[TransportError],
+) -> None:
+    """GCS transport faults reuse the existing public vocabulary."""
+    mapped = getattr(gcs_client, '_transport_error_for')(error)
+
+    assert type(mapped) is expected

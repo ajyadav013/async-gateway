@@ -1,7 +1,7 @@
 # AGW-47: Build isolated GCS provider lifecycle and capacity guard
 
-- **Status:** OPEN
-- **Branch:** `codex/gcs-selector`
+- **Status:** IN PROGRESS
+- **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-04 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
 - **Decisions:** Bounded GCS decisions of record in [the GCS selector specification](../../specs/gcs_selector_spec.md); no ADR is required.
@@ -33,6 +33,15 @@ default executor, and stalled work must not starve unrelated protocols (GCS-04).
 
 ## Work Log
 
+- 2026-08-22 — Tranche A lifecycle/mapping foundation is GREEN: the exact
+  focused command (`pytest tests/logic/test_gcs_client.py
+  tests/test_no_blocking_io.py --no-cov -q`) reports 190 passed in 0.30s;
+  scoped flake8, scoped mypy, and `git diff --check` also pass. Status remains
+  IN PROGRESS because shutdown, telemetry/AST guards, and command operations
+  are intentionally deferred to their authorized follow-on tranches.
+- 2026-08-22 — Marked IN PROGRESS for the tests-only RED phase on
+  `codex/gcs-selector-backend`; production remains unchanged while focused
+  lifecycle, capacity, isolation, normalization, and AST contracts are added.
 - 2026-08-22 — Opened from approved GCS-04 planning before implementation;
   recorded its three-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.
