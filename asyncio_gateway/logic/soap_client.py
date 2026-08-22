@@ -855,6 +855,38 @@ class SoapRequest(BaseRequestClass):
     #: to choose.
     REQUIRED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset()
 
+    #: HTTP transport options this strategy recognises plus SOAP's own keys.
+    #: The four HTTP request-shaping keys which do not apply are included
+    #: because they are recognised and explicitly refused, not unknown.
+    ACCEPTED_INFO_KEYS: ClassVar[frozenset[str]] = (
+        BaseRequestClass.ACCEPTED_INFO_KEYS | frozenset({
+            'allow_redirects',
+            'allowed_schemes',
+            'cookies',
+            'cross_origin_headers',
+            'headers',
+            'http_file_download_config',
+            'http_file_upload_config',
+            'max_redirects',
+            'max_response_bytes',
+            'request_type',
+            'serialization',
+            'session',
+            'soap_action',
+            'soap_headers',
+            'soap_version',
+            'trace_config',
+            'verify_ssl',
+        })
+    )
+
+    #: HTTP request-shaping keys which cannot apply to SOAP.
+    UNSUPPORTED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset({
+        'http_file_download_config',
+        'http_file_upload_config',
+        'request_type',
+    })
+
     #: The verb every SOAP binding uses.
     REQUEST_TYPE: ClassVar[str] = 'POST'
 
@@ -892,6 +924,13 @@ class SoapRequest(BaseRequestClass):
                 call.
         """
         super().__init__(*args, **kwargs)
+
+        unsupported = sorted(self.UNSUPPORTED_INFO_KEYS & self.info.keys())
+        if unsupported:
+            raise ConfigurationError(
+                f'protocol_info key(s) {unsupported} do not apply to SOAP: '
+                f'the verb is always POST and MTOM/file transfers are not '
+                f'supported')
 
         self.soap_version: str = validated_soap_version(
             self.info.get('soap_version', SOAP_11))

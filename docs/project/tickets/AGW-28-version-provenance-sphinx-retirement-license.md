@@ -1,6 +1,6 @@
 # AGW-28: Version, provenance, Sphinx retirement, LICENSE
 
-- **Status:** IN REVIEW
+- **Status:** DONE
 - **Story:** S28 — spec Step 27, size M (`docs/specs/v1_release_stories.md` §4, Phase 7)
 - **Spec:** `docs/specs/v1_release_spec.md` — R5-AC1,2,3,5,6 (Group A — Scaffolding and quality-gate infrastructure) · R31-AC1/AC2, AC3 (Group N — Documentation) · R34-AC1,2,3 (Group O — Value-adds)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; File structure — current vs target
@@ -134,6 +134,17 @@ to collapse — and would convert "not installed" into a silently wrong version 
 failure at import. Importing from an uninstalled source tree raises, which is intended.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`f3ddfc2`](https://github.com/ajyadav013/asyncio-gateway/commit/f3ddfc2), [`0de1515`](https://github.com/ajyadav013/asyncio-gateway/commit/0de1515); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 ### 2026-08-17 — implementation (branch `lane/s28`)
 

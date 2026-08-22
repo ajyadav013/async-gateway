@@ -15,6 +15,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Explicit FTP `tls_mode` support for verified implicit and explicit FTPS,
   while preserving the legacy omitted-mode behavior.
 - Runnable loopback or deterministic-double examples for every new selector.
+- Typed `SFTPAuth` for password, explicit client-key, or mixed SFTP
+  authentication, with encrypted-key passphrases and explicit SSH-agent
+  opt-in.
+- Documentation, Source, Issues, Changelog, and Security project links in
+  package metadata, plus the repository security policy.
+
+### Changed
+
+- Pre-processors may still enrich payload and metadata, but now raise
+  `ProcessorError` if they change `url` or `protocol`; post-processors retain
+  report-field editability.
+- Unknown ordinary legacy `protocol_info` keys emit `DeprecationWarning` in
+  1.x and will become errors in 2.0. Unknown security-sensitive keys fail
+  immediately; the four new selector contracts reject every unknown key.
+
+### Fixed
+
+- Unknown top-level `request()` keywords now raise `ConfigurationError` before
+  processors or network code instead of being silently ignored.
+- SFTP key-only authentication no longer passes through the FTP validator that
+  required a password.
+- Package metadata now names all supported protocols rather than claiming
+  unsupported Redis/XML protocols.
+
+### Security
+
+- SFTP passes `agent_path=None` unless `SFTPAuth.use_ssh_agent=True`, so
+  explicit client keys cannot implicitly activate `SSH_AUTH_SOCK`.
 
 ## [1.0.0] — 2026-08-19
 

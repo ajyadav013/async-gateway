@@ -702,6 +702,54 @@ def test_every_project_url_resolves_to_this_repository() -> None:
     )
 
 
+def test_project_description_names_only_the_supported_protocols() -> None:
+    """PEP 621 metadata describes the library that is actually shipped."""
+    source = PYPROJECT.read_text(encoding='utf-8')
+    matched = re.search(
+        r'^description\s*=\s*[\'"](?P<description>[^\'"]+)[\'"]$',
+        source,
+        re.MULTILINE,
+    )
+    assert matched is not None, 'pyproject declares no literal description'
+    description = matched['description']
+
+    for protocol in (
+        'HTTP', 'HTTPS', 'SOAP', 'FTP', 'FTPS', 'SFTP', 'JSON-RPC',
+        'GraphQL', 'S3', 'gRPC',
+    ):
+        assert protocol in description
+    assert 'redis' not in description.lower()
+    assert 'XML' not in description
+
+
+def test_project_urls_cover_the_consumer_support_routes() -> None:
+    """Metadata exposes the six repository destinations users need."""
+    source = PYPROJECT.read_text(encoding='utf-8')
+    section = re.search(
+        r'^\[project\.urls\]\n(?P<body>.*?)(?=^\[|\Z)',
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert section is not None, 'pyproject declares no [project.urls] table'
+    entries = {
+        label.strip(): url for label, url in re.findall(
+            r'^(\w[\w ]*)\s*=\s*[\'"]([^\'"]+)[\'"]$',
+            section['body'],
+            re.MULTILINE,
+        )
+    }
+
+    assert entries == {
+        'Homepage': REPOSITORY_URL,
+        'Documentation': f'{REPOSITORY_URL}#readme',
+        'Source': REPOSITORY_URL,
+        'Issues': f'{REPOSITORY_URL}/issues',
+        'Changelog': f'{REPOSITORY_URL}/blob/master/CHANGELOG.md',
+        'Security': f'{REPOSITORY_URL}/security/policy',
+    }
+    assert (REPO_ROOT / 'SECURITY.md').is_file()
+
+
 #: The documents whose GitHub links a reader will actually follow. The two
 #: Markdown files ship -- ``README.md`` is the distribution's long
 #: description, so a stale link in it is republished in every sdist -- and

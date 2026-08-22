@@ -1200,6 +1200,27 @@ def transport_error_for(
 class HttpRequest(BaseRequestClass):
     """Implements Aiohttp Request to make http/https calls."""
 
+    #: Every option this strategy or its base recognises. The entry point
+    #: validates against this set before any processor or network code runs.
+    ACCEPTED_INFO_KEYS: ClassVar[frozenset[str]] = (
+        BaseRequestClass.ACCEPTED_INFO_KEYS | frozenset({
+            'allow_redirects',
+            'allowed_schemes',
+            'cookies',
+            'cross_origin_headers',
+            'headers',
+            'http_file_download_config',
+            'http_file_upload_config',
+            'max_redirects',
+            'max_response_bytes',
+            'request_type',
+            'serialization',
+            'session',
+            'trace_config',
+            'verify_ssl',
+        })
+    )
+
     # There is no default verb to fall back on: a GET assumed for a caller
     # who meant DELETE is worse than a rejected call, so the key is
     # required and `BaseRequestClass` rejects the call without it.

@@ -1,6 +1,6 @@
 # AGW-10: FTP: C6 + H1 + M2 in one commit
 
-- **Status:** OPEN
+- **Status:** DONE
 - **Story:** S10 — spec Step 8, size M (`docs/specs/v1_release_stories.md` §4, Phase 2)
 - **Spec:** `docs/specs/v1_release_spec.md` — R15-AC1…7,9 *(AC5 README half → AGW-29; AC8 → AGW-19)* (Group F — FTP protocol correctness)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; protocol clients
@@ -51,5 +51,16 @@ Closes findings: C6, H1, M2, M3, H10-ftp. Discharges FI-1.
 _None recorded yet._
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`8b7e148`](https://github.com/ajyadav013/asyncio-gateway/commit/8b7e148), [`d2a7516`](https://github.com/ajyadav013/asyncio-gateway/commit/d2a7516); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 _Empty — opened at stage 1g, before implementation._

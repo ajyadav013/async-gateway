@@ -1,6 +1,6 @@
 # AGW-37: Blocking TLS context construction reached from `_tls_value` (`tls_context_for`)
 
-- **Status:** OPEN
+- **Status:** DONE
 - **Severity:** Critical (auto-Critical: blocking I/O on an async path —
   `.claude/rules/quality-gates.md` §1)
 - **Story:** **none — owner unassigned.** See *Ownership* below; this needs an owner before the
@@ -74,6 +74,17 @@ and polluting S19's subject.
 - **blocks:** the acceptance gate should not pass with an unowned Critical
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`fd88357`](https://github.com/ajyadav013/asyncio-gateway/commit/fd88357); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 - **2026-08-17 (S14, iteration 4):** found by the `developer` while fixing AGW-36's containment,
   and flagged as out-of-boundary rather than silently fixed — the correct escalation. Verified

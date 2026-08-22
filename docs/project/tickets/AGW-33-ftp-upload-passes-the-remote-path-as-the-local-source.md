@@ -1,6 +1,6 @@
 # AGW-33: transfer verbs pass the remote path as the LOCAL source (FTP `upload`, SFTP `put`/`mput`)
 
-- **Status:** DONE — fixed in S18 (`lane/s18`), pending the main session's merge
+- **Status:** DONE
 - **Severity: High.** Not Critical — it needs a misconfiguration-shaped precondition — but see
   *The silent-wrong-file case* below: in a mirrored-tree deployment both clients transfer the wrong
   file to the wrong destination and report `ok=True`.
@@ -151,6 +151,17 @@ which are genuinely ambiguous. Then:
   the landed S10. Rationale above. Recorded rather than silent.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`8578972`](https://github.com/ajyadav013/asyncio-gateway/commit/8578972), [`925c784`](https://github.com/ajyadav013/asyncio-gateway/commit/925c784), [`f1ce83d`](https://github.com/ajyadav013/asyncio-gateway/commit/f1ce83d); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 Fixed inside S18 (`lane/s18`), as Ruling R routed it. Against the Definition of Done, item by item:
 

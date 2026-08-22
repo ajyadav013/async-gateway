@@ -1,6 +1,6 @@
 # AGW-8: Dispatch, validation, the one exception→envelope boundary
 
-- **Status:** OPEN
+- **Status:** DONE
 - **Story:** S8 — spec Step 6, size M (`docs/specs/v1_release_stories.md` §4, Phase 1)
 - **Spec:** `docs/specs/v1_release_spec.md` — R11-AC1,2,3,4,6,7 (Group D — Entry point and protocol dispatch) · R10-AC3 (Group C — The public response contract and the error model)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; Architecture overview, `request()` and the protocol registry
@@ -37,6 +37,17 @@ Closes findings: H4, H5, H6, L2. Discharges FI-14.
 _None recorded yet._
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`a16a324`](https://github.com/ajyadav013/asyncio-gateway/commit/a16a324), [`d359640`](https://github.com/ajyadav013/asyncio-gateway/commit/d359640); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 ### Implementation (developer, S8)
 

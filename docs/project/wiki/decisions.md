@@ -7,10 +7,8 @@ An **index** of the architecture decision records under `docs/decisions/`. ADRs 
 
 | ADR | Title | Status | Authored by |
 |---|---|---|---|
-| `docs/decisions/0001-resilience-library.md` | The resilience-library decision — keep `pyfailsafe` with a named cost, vs replace, vs vendor | **PENDING — the file does not exist yet** | [AGW-23](../tickets/AGW-23-the-resilience-library-decision-and-adr.md) creates it at spec Step 22 |
-
-`docs/decisions/` itself does not exist yet; AGW-23 creates the directory together with the first ADR.
-AGW-28 explicitly preserves `docs/decisions/` when it retires the Sphinx scaffolding.
+| [`docs/decisions/0001-resilience-library.md`](../../decisions/0001-resilience-library.md) | Keep `pyfailsafe` with a named, measured residual | **Accepted** | [AGW-23](../tickets/AGW-23-the-resilience-library-decision-and-adr.md) |
+| [`docs/decisions/0002-processors-do-not-control-dispatch.md`](../../decisions/0002-processors-do-not-control-dispatch.md) | Processor hooks may enrich requests but may not retarget dispatch | **Accepted** | [AGW-43](../tickets/AGW-43-p0-contract-corrections.md) |
 
 ## Decisions of record that are not ADRs
 

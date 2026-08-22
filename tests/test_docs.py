@@ -1126,13 +1126,15 @@ def test_pe80_s3_success_detail_schemas_are_exact() -> None:
     }
 
 
-def test_pe80_changelog_has_one_unreleased_added_section() -> None:
-    """Protocol expansion is recorded without inventing a release."""
+def test_pe80_changelog_has_one_complete_unreleased_section() -> None:
+    """Protocol expansion and P0 corrections share one unreleased record."""
     changelog = (REPO_ROOT / 'CHANGELOG.md').read_text(encoding='utf-8')
     unreleased = changelog.partition('## [Unreleased]')[2]
     assert unreleased
     unreleased = unreleased.partition('\n## ')[0]
-    assert re.findall(r'^### (.+)$', unreleased, re.MULTILINE) == ['Added']
+    assert re.findall(r'^### (.+)$', unreleased, re.MULTILINE) == [
+        'Added', 'Changed', 'Fixed', 'Security',
+    ]
     for selector in ('JSON-RPC 2.0', 'GraphQL', 'S3', 'gRPC'):
         assert selector in unreleased
     assert re.search(r'\b20\d{2}-\d{2}-\d{2}\b', unreleased) is None

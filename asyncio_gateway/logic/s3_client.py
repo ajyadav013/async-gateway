@@ -669,16 +669,20 @@ class S3Request(BaseRequestClass):
 
     REQUIRED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset({'command'})
     ALLOWED_INFO_KEYS: ClassVar[frozenset[str]] = S3_ALLOWED_INFO_KEYS
+    ACCEPTED_INFO_KEYS: ClassVar[frozenset[str]] = ALLOWED_INFO_KEYS
 
     @classmethod
     def validate_protocol_info(
         cls,
         info: Optional[Mapping[str, Any]],
+        *,
+        protocol: Optional[str] = None,
     ) -> dict[str, Any]:
         """Validate S3's command-dependent option inventory at the boundary.
 
         Args:
             info: Caller-supplied protocol mapping or None.
+            protocol: Normalized public selector used in diagnostics.
 
         Returns:
             A copied mapping with a normalized command and validated values.
@@ -687,7 +691,8 @@ class S3Request(BaseRequestClass):
             ConfigurationError: For an unknown command, an option belonging
             to another command, a missing local path, or a malformed option.
         """
-        validated = super().validate_protocol_info(info)
+        validated = super().validate_protocol_info(
+            info, protocol=protocol)
         raw_command = validated['command']
         command = (
             raw_command.strip().lower()

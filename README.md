@@ -270,19 +270,19 @@ not accept a client certificate.
 
 ### SFTP
 
-SFTP also takes a bare host and login/password credentials. Host-key
-verification is enabled by default through asyncssh's normal known-hosts
-resolution. Choose exactly one explicit policy: `known_hosts`, a pinned
-`host_key`, or the loudly named `insecure_skip_host_key_check=True`. The
-`client_keys` option adds client-key authentication material but does not make
-the required login/password object optional. A host-key mismatch reports
-`HOST_KEY`.
+SFTP takes a bare host and an `SFTPAuth` value. It supports password, explicit
+client key, or both; legacy objects with `.login` and `.password` remain
+compatible. SSH-agent use is disabled unless `use_ssh_agent=True` is chosen
+explicitly. Host-key verification is enabled by default through asyncssh's
+normal known-hosts resolution. Choose exactly one explicit policy:
+`known_hosts`, a pinned `host_key`, or the loudly named
+`insecure_skip_host_key_check=True`. A host-key mismatch reports `HOST_KEY`.
 
 ```python
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 
+from asyncio_gateway import SFTPAuth
 from asyncio_gateway.asyncio_gateway import request
 
 with tempfile.TemporaryDirectory() as temp_dir:
@@ -292,7 +292,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
     sftp = await request(
         url='api.example.com',
         protocol='SFTP',
-        auth=SimpleNamespace(login='demo', password='secret'),
+        auth=SFTPAuth(username='demo', password='secret'),
         protocol_info={
             'mode': 'get',
             'remote_path': '/reports/q1.csv',
@@ -467,18 +467,20 @@ async def request(
 |---|---|
 | `url` | HTTP(S), SOAP, JSON-RPC, and GraphQL URL; bare FTP/SFTP host; `s3://bucket/key`; or `grpc://host:port` / `grpcs://host:port` |
 | `data` | HTTP/SOAP body, JSON-RPC/GraphQL params or variables, gRPC bytes/serializer input; `None` is meaningful for JSON-RPC/GraphQL |
-| `auth` | HTTP accepts only `aiohttp.BasicAuth` or `None` and rejects URL-userinfo conflicts; FTP/SFTP use a credential object; S3 accepts an access/secret object and `None` selects the AWS credential chain; gRPC auth must be None |
+| `auth` | HTTP accepts only `aiohttp.BasicAuth` or `None` and rejects URL-userinfo conflicts; FTP uses legacy `.login`/`.password`; SFTP accepts `SFTPAuth` password, key, or both plus legacy credentials; S3 accepts an access/secret object and `None` selects the AWS credential chain; gRPC auth must be None |
 | `protocol` | One of `HTTP`, `HTTPS`, `FTP`, `SFTP`, `SOAP`, `JSONRPC`, `GRAPHQL`, `S3`, `GRPC` |
 | `protocol_info` | Protocol-specific configuration mapping |
 | `pre_processor_config` | Optional async processor run before dispatch |
 | `post_processor_config` | Optional async processor run after dispatch |
-| `kwargs` | Compatibility-only extra keywords; currently ignored |
+| `kwargs` | Residual top-level keywords are rejected before processors or I/O; protocol options belong in `protocol_info` |
 
 Processor configuration has the shape
 `{'function': async_callable, 'params': {'name': value}}`. The callable receives
 the live envelope as the keyword `response`; its return value lands in
 `pre_processor_response` or `post_processor_response`. Processor failures raise
-`ProcessorError`.
+`ProcessorError`. A pre-processor may reshape payload and caller metadata, but
+cannot remove required envelope keys or rewrite the dispatch `url` or
+`protocol`. A post-processor runs after dispatch and may relabel report fields.
 
 ### File helpers
 
@@ -558,9 +560,11 @@ the stricter policy: `overwrite=False` and a mandatory positive cap.
 
 ## Configuration reference
 
-Legacy selectors accept unknown `protocol_info` keys for compatibility. The
-four additive selectors use closed allowlists and reject misspellings before
-processors or I/O.
+For legacy selectors, an ordinary unknown `protocol_info` key emits a
+`DeprecationWarning` during the 1.x compatibility window. Non-string keys and
+unknown names resembling authentication, TLS, redirect, header, cookie, or
+host-key controls fail closed. The four additive selectors use closed
+allowlists and reject every unknown key before processors or I/O.
 
 ### `protocol_info` — HTTP and HTTPS
 
@@ -625,6 +629,12 @@ Download config supports `download_filepath`, `file_download_chunk_size`, and
 | `timeout` | no | `15` | Connect/login seconds |
 | `circuit_breaker_config` | no | `None` | Breaker and retry configuration |
 | `redact_query_params` | no | `None` | Additional sensitive names |
+
+Authentication is separate from `protocol_info`. `SFTPAuth` carries
+`username`, optional `password`, optional `client_keys`, optional
+`key_passphrase`, and the opt-in `use_ssh_agent` flag. The table's
+`client_keys` key remains as a compatibility bridge for legacy
+`.login`/`.password` auth objects.
 
 ### `protocol_info` — SOAP
 
@@ -856,13 +866,14 @@ normally return `ok=False`. Unexpected implementation exceptions and
 cancellation propagate.
 
 The errors that escape this way are: selector and processor-shape failures;
-unknown keys and missing required keys for `JSONRPC`, `GRAPHQL`, `S3`, and
-`GRPC`; invalid URL, auth, payload, method, metadata, or command values found
-before dispatch; and HTTP/SOAP constructor validation. The four deferred
-FTP/SFTP option checks run inside their operation and therefore return a
-`CONFIG`/400 envelope. S3 credential-provider discovery can happen only during
-the operation and likewise returns a `CONFIG`/400 envelope. Robust callers both
-catch `ConfigurationError` and inspect `result['ok']`.
+unknown top-level keywords; non-string or security-like unknown legacy
+options; unknown keys and missing required keys for `JSONRPC`, `GRAPHQL`,
+`S3`, and `GRPC`; invalid URL, auth, payload, method, metadata, or command
+values found before dispatch; and HTTP/SOAP constructor validation. The four
+deferred FTP/SFTP option checks run inside their operation and therefore return
+a `CONFIG`/400 envelope. S3 credential-provider discovery can happen only
+during the operation and likewise returns a `CONFIG`/400 envelope. Robust
+callers both catch `ConfigurationError` and inspect `result['ok']`.
 
 ## Reliability
 
@@ -936,7 +947,8 @@ metadata is masked; binary peer metadata is bounded and represented as base64.
 TLS verification defaults on. Disabling HTTP verification warns; disabling
 FTP verification without a named mode selects legacy plaintext FTP and warns.
 Explicit FTPS upgrades before login. SFTP host verification can only be
-disabled by the named insecure option.
+disabled by the named insecure option, and SSH-agent discovery is disabled
+unless `SFTPAuth(use_ssh_agent=True)` opts in.
 
 ## Redaction and the payload echo
 

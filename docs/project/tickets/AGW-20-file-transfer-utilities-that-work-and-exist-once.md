@@ -1,6 +1,6 @@
 # AGW-20: File-transfer utilities that work and exist once
 
-- **Status:** IN REVIEW
+- **Status:** DONE
 - **Story:** S20 — spec Step 18, size M (`docs/specs/v1_release_stories.md` §4, Phase 3)
 - **Spec:** `docs/specs/v1_release_spec.md` — R25-AC1,2,3,4,5,7 (export half) (Group L — Utilities and observability primitives)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; utilities
@@ -39,6 +39,17 @@ Closes findings: H15, H16, MG5, L13. Discharges FI-11 (written once, against the
 _None recorded yet._
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`54dbdf0`](https://github.com/ajyadav013/asyncio-gateway/commit/54dbdf0); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 ### 2026-08-17 — implementation (lane `lane/s20`, worktree `wt/s20`, commit `54dbdf0`)
 

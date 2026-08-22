@@ -53,6 +53,17 @@ too. The CI gate is what stops the changelog rotting after this release.
 
 ## Work Log
 
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`5974cde`](https://github.com/ajyadav013/asyncio-gateway/commit/5974cde), [`e2b94fe`](https://github.com/ajyadav013/asyncio-gateway/commit/e2b94fe), [`63a5793`](https://github.com/ajyadav013/asyncio-gateway/commit/63a5793), [`9d67147`](https://github.com/ajyadav013/asyncio-gateway/commit/9d67147); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
+
 - **Breaking changes derived from history, then re-verified against the code.** Source was
   `git log --oneline 31542aa..HEAD` with each commit body read, cross-checked against the work logs
   on AGW-18 ("Breaking change (for the CHANGELOG — AGW-31 / S31)") and AGW-29, and against

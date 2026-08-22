@@ -1,6 +1,6 @@
 # AGW-3: Declarative PEP 621 packaging
 
-- **Status:** IN REVIEW
+- **Status:** DONE
 - **Story:** S3 — spec Step 2, size M (`docs/specs/v1_release_stories.md` §4, Phase 0)
 - **Spec:** `docs/specs/v1_release_spec.md` — R4-AC1,2,3,4,6,7,8 (Group A — Scaffolding and quality-gate infrastructure)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; File structure — current vs target
@@ -53,6 +53,17 @@ Closes findings: M22, M23, H26, L16, L17.
   scanner runs unconfigured.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`c5750a8`](https://github.com/ajyadav013/asyncio-gateway/commit/c5750a8); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 **2026-08-16 — implemented, reviewed (1 Medium found and fixed), validated, committed `c5750a8`.**
 

@@ -281,6 +281,7 @@ class GraphqlRequest(HttpRequest):
         'circuit_breaker_config',
         'redact_query_params',
     })
+    ACCEPTED_INFO_KEYS: ClassVar[frozenset[str]] = ALLOWED_INFO_KEYS
 
     def __init__(
         self,

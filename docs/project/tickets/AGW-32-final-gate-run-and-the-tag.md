@@ -33,4 +33,14 @@ _None recorded yet._
 
 ## Work Log
 
+### 2026-08-20 — release evidence reconciled; tag DoD remains open
+
+PyPI's project JSON confirms that 1.0.0 was published on 2026-08-19, and
+[release PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4) is present
+as merge commit [`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113). However, a fresh fetch followed by
+`git tag -l` found no 1.0.0 tag locally or from `origin`. Because this ticket's
+Definition of Done explicitly requires an annotated tag, the release evidence is
+recorded without falsely closing the remaining tag obligation.
+
+
 _Empty — opened at stage 1g, before implementation._

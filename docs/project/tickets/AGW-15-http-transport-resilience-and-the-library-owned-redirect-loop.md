@@ -1,6 +1,6 @@
 # AGW-15: HTTP transport resilience + the library-owned redirect loop
 
-- **Status:** IN PROGRESS
+- **Status:** DONE
 - **Story:** S15 — spec Step 13, size **L** (`docs/specs/v1_release_stories.md` §4, Phase 3; sizing exception §12 — one step's worth of a single requirement pair over a fixed file set)
 - **Spec:** `docs/specs/v1_release_spec.md` — R14 all (Group E — HTTP protocol correctness) · R21-AC6 (Group J — The caller-controlled capability surface)
 - **Design:** `docs/specs/v1_release_spec.md` — Part B, Developer Documentation; the transport layer
@@ -101,6 +101,17 @@ Closes findings: H9, H10-http, H11, H12, MG4, M21-in-scope. Discharges FI-16.
   three ways the module reads a body. SOAP's read path is untouched — it is AGW-22's.
 
 ## Work Log
+
+### 2026-08-20 — default-branch ledger reconciliation
+
+Re-verified this ticket's Definition of Done against release merge
+[`11d6e26`](https://github.com/ajyadav013/asyncio-gateway/commit/11d6e26c4c3893f84983d5c8375dd713b8233113)
+([PR #4](https://github.com/ajyadav013/asyncio-gateway/pull/4)). The implementing
+history is [`c5026c9`](https://github.com/ajyadav013/asyncio-gateway/commit/c5026c9); the source and regression coverage remain present, and the
+post-release suite passes with 3,161 tests, 8 skips, and 100% line/branch
+coverage. The primary status is therefore normalized to `DONE`; the original
+work log below is retained as historical context.
+
 
 ### 2026-08-17 — implementation (S15)
 

@@ -1,14 +1,14 @@
 {
   "prefix": "AGW",
-  "next": 39,
+  "next": 44,
   "spec": "docs/specs/v1_release_spec.md",
   "stories": "docs/specs/v1_release_stories.md",
-  "note": "One ticket per story, 1:1 and positional — AGW-n is story Sn. Spec Step 21 is vacated and carries no story; the numbering is never reused or renumbered. Relations are the story breakdown's §6 edge list (depends_on = blockedBy) and its inverse (blocks).",
+  "note": "AGW-1 through AGW-32 map positionally to release stories S1-S32; later IDs are defect or work-package records. AGW-39 through AGW-41 each had two historical commit uses, preserved in reconstructed collision records. IDs are never reused going forward. Relations use depends_on = blockedBy and its inverse blocks.",
   "tickets": [
     {
       "id": "AGW-1",
       "title": "Suite can fail, runs async, is measured",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S1",
       "step": "1",
       "file": "docs/project/tickets/AGW-1-suite-can-fail-runs-async-is-measured.md",
@@ -24,7 +24,7 @@
     {
       "id": "AGW-2",
       "title": "Upgrade the dependency set — closes C7 in Phase 0",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S2",
       "step": "1.5",
       "file": "docs/project/tickets/AGW-2-upgrade-the-dependency-set.md",
@@ -42,7 +42,7 @@
     {
       "id": "AGW-3",
       "title": "Declarative PEP 621 packaging",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S3",
       "step": "2",
       "file": "docs/project/tickets/AGW-3-declarative-pep-621-packaging.md",
@@ -60,7 +60,7 @@
     {
       "id": "AGW-4",
       "title": "CI",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S4",
       "step": "3",
       "file": "docs/project/tickets/AGW-4-ci.md",
@@ -78,7 +78,7 @@
     {
       "id": "AGW-5",
       "title": "Finish the orjson migration — four call sites",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S5",
       "step": "4",
       "file": "docs/project/tickets/AGW-5-finish-the-orjson-migration-four-call-sites.md",
@@ -96,7 +96,7 @@
     {
       "id": "AGW-6",
       "title": "Rename the protocol modules",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S6",
       "step": "4.5",
       "file": "docs/project/tickets/AGW-6-rename-the-protocol-modules.md",
@@ -117,7 +117,7 @@
     {
       "id": "AGW-7",
       "title": "Envelope · timestamps · exceptions · logger · FI-7's HTTP half",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S7",
       "step": "5",
       "file": "docs/project/tickets/AGW-7-envelope-timestamps-exceptions-logger-fi-7s-http-half.md",
@@ -135,7 +135,7 @@
     {
       "id": "AGW-8",
       "title": "Dispatch, validation, the one exception→envelope boundary",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S8",
       "step": "6",
       "file": "docs/project/tickets/AGW-8-dispatch-validation-the-one-exception-envelope-boundary.md",
@@ -153,7 +153,7 @@
     {
       "id": "AGW-9",
       "title": "The contract tests, before the protocol work",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S9",
       "step": "7",
       "file": "docs/project/tickets/AGW-9-the-contract-tests-before-the-protocol-work.md",
@@ -172,7 +172,7 @@
     {
       "id": "AGW-10",
       "title": "FTP: C6 + H1 + M2 in one commit",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S10",
       "step": "8",
       "file": "docs/project/tickets/AGW-10-ftp-c6-h1-m2-in-one-commit.md",
@@ -191,7 +191,7 @@
     {
       "id": "AGW-11",
       "title": "SFTP transport security, fixture verification-on",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S11",
       "step": "9",
       "file": "docs/project/tickets/AGW-11-sftp-transport-security-fixture-verification-on.md",
@@ -209,7 +209,7 @@
     {
       "id": "AGW-12",
       "title": "SFTP reports the truth about what it completed",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S12",
       "step": "10",
       "file": "docs/project/tickets/AGW-12-sftp-reports-the-truth-about-what-it-completed.md",
@@ -227,7 +227,7 @@
     {
       "id": "AGW-13",
       "title": "HTTP request construction and response handling",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S13",
       "step": "11",
       "file": "docs/project/tickets/AGW-13-http-request-construction-and-response-handling.md",
@@ -245,7 +245,7 @@
     {
       "id": "AGW-14",
       "title": "No blocking I/O on an async path + the AST test",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S14",
       "step": "12",
       "file": "docs/project/tickets/AGW-14-no-blocking-io-on-an-async-path-and-the-ast-test.md",
@@ -263,7 +263,7 @@
     {
       "id": "AGW-15",
       "title": "HTTP transport resilience + the library-owned redirect loop",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S15",
       "step": "13",
       "file": "docs/project/tickets/AGW-15-http-transport-resilience-and-the-library-owned-redirect-loop.md",
@@ -284,7 +284,7 @@
     {
       "id": "AGW-16",
       "title": "Breaker facade + per-destination registry + clock/sleep seam",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S16",
       "step": "14",
       "file": "docs/project/tickets/AGW-16-breaker-facade-per-destination-registry-clock-sleep-seam.md",
@@ -303,7 +303,7 @@
     {
       "id": "AGW-17",
       "title": "A client TLS context that is actually a client TLS context",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S17",
       "step": "15",
       "file": "docs/project/tickets/AGW-17-a-client-tls-context-that-is-actually-a-client-tls-context.md",
@@ -321,7 +321,7 @@
     {
       "id": "AGW-18",
       "title": "Path containment and safe local file handling",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S18",
       "step": "16",
       "file": "docs/project/tickets/AGW-18-path-containment-and-safe-local-file-handling.md",
@@ -341,7 +341,7 @@
     {
       "id": "AGW-19",
       "title": "Verb allowlists and the URL-trust contract",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S19",
       "step": "17",
       "file": "docs/project/tickets/AGW-19-verb-allowlists-and-the-url-trust-contract.md",
@@ -360,7 +360,7 @@
     {
       "id": "AGW-20",
       "title": "File-transfer utilities that work and exist once",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S20",
       "step": "18",
       "file": "docs/project/tickets/AGW-20-file-transfer-utilities-that-work-and-exist-once.md",
@@ -378,7 +378,7 @@
     {
       "id": "AGW-21",
       "title": "A request tracer whose results belong to one request",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S21",
       "step": "19",
       "file": "docs/project/tickets/AGW-21-a-request-tracer-whose-results-belong-to-one-request.md",
@@ -397,7 +397,7 @@
     {
       "id": "AGW-22",
       "title": "logic/soap_client.py, from scratch",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S22",
       "step": "20",
       "file": "docs/project/tickets/AGW-22-logic-soap-client-py-from-scratch.md",
@@ -418,7 +418,7 @@
     {
       "id": "AGW-23",
       "title": "The resilience-library decision + ADR",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S23",
       "step": "22",
       "file": "docs/project/tickets/AGW-23-the-resilience-library-decision-and-adr.md",
@@ -443,7 +443,7 @@
     {
       "id": "AGW-24",
       "title": "Docstrings and full type annotations",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S24",
       "step": "23",
       "file": "docs/project/tickets/AGW-24-docstrings-and-full-type-annotations.md",
@@ -462,7 +462,7 @@
     {
       "id": "AGW-25",
       "title": "flake8 to zero",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S25",
       "step": "24",
       "file": "docs/project/tickets/AGW-25-flake8-to-zero.md",
@@ -480,7 +480,7 @@
     {
       "id": "AGW-26",
       "title": "Remove mypy ignore_errors; drive to zero; then py.typed",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S26",
       "step": "25",
       "file": "docs/project/tickets/AGW-26-remove-mypy-ignore-errors-drive-to-zero-then-py-typed.md",
@@ -498,7 +498,7 @@
     {
       "id": "AGW-27",
       "title": "Coverage ratchet to its terminal value",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S27",
       "step": "26",
       "file": "docs/project/tickets/AGW-27-coverage-ratchet-to-its-terminal-value.md",
@@ -518,7 +518,7 @@
     {
       "id": "AGW-28",
       "title": "Version, provenance, Sphinx retirement, LICENSE",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S28",
       "step": "27",
       "file": "docs/project/tickets/AGW-28-version-provenance-sphinx-retirement-license.md",
@@ -540,7 +540,7 @@
     {
       "id": "AGW-29",
       "title": "README rewrite, with its five mechanical tests",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S29",
       "step": "28",
       "file": "docs/project/tickets/AGW-29-readme-rewrite-with-its-five-mechanical-tests.md",
@@ -558,7 +558,7 @@
     {
       "id": "AGW-30",
       "title": "Correct the repository's own agent-facing instructions",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S30",
       "step": "29",
       "file": "docs/project/tickets/AGW-30-correct-the-repositorys-own-agent-facing-instructions.md",
@@ -579,7 +579,7 @@
     {
       "id": "AGW-31",
       "title": "CHANGELOG and examples",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "S31",
       "step": "30",
       "file": "docs/project/tickets/AGW-31-changelog-and-examples.md",
@@ -616,7 +616,7 @@
     {
       "id": "AGW-33",
       "title": "FTP upload passes the remote path as aioftp's local SOURCE",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "routed to S18",
       "step": "16 (rides with S18)",
       "file": "docs/project/tickets/AGW-33-ftp-upload-passes-the-remote-path-as-the-local-source.md",
@@ -633,7 +633,7 @@
     {
       "id": "AGW-34",
       "title": "redact_url returns unparseable URLs verbatim (S8-L1)",
-      "status": "OPEN",
+      "status": "DONE",
       "story": "none - security gate adjudicates",
       "step": "security-clear gate",
       "file": "docs/project/tickets/AGW-34-redact-url-echoes-unparseable-urls-verbatim.md",
@@ -648,7 +648,7 @@
     {
       "id": "AGW-35",
       "title": "Two unpredictable ConfigurationError contracts across protocols",
-      "status": "CLOSED",
+      "status": "DONE",
       "story": "none - acceptance gate",
       "step": "acceptance gate",
       "file": "docs/project/tickets/AGW-35-two-unpredictable-configuration-error-contracts.md",
@@ -659,6 +659,94 @@
       },
       "commits": [],
       "note": "Medium. RESOLVED on fix/auth-none with H5. The rule is placement relative to the entry point's one conversion try: a constructor rejection raises unlogged, one from handle_request envelopes as CONFIG/400 and logs once. Re-measurement found the divergence was four outcomes, not two -- FTP command and SFTP mode were checked after the connect, so a typo reported CONNECT/502 and HOST_KEY/495. All four deferred keys now validate pre-connect. Docstring, README and spec failure table state the rule."
+    },
+    {
+      "id": "AGW-36",
+      "title": "Move TLS context construction off the event loop",
+      "status": "DONE",
+      "story": "S17 defect loop",
+      "step": "15",
+      "file": "docs/project/tickets/AGW-36-blocking-tls-context-build-inside-get-ssl-config.md",
+      "spec": "docs/specs/v1_release_spec.md",
+      "relations": {"depends_on": ["AGW-17"], "blocks": []},
+      "commits": ["767a872", "9791abc"]
+    },
+    {
+      "id": "AGW-37",
+      "title": "Move FTP TLS context construction off the event loop",
+      "status": "DONE",
+      "story": "post-review defect",
+      "step": "release hardening",
+      "file": "docs/project/tickets/AGW-37-blocking-tls-context-build-in-tls-context-for.md",
+      "spec": "docs/specs/v1_release_spec.md",
+      "relations": {"depends_on": ["AGW-17"], "blocks": []},
+      "commits": ["fd88357"]
+    },
+    {
+      "id": "AGW-38",
+      "title": "Rebuild streaming upload bodies for every retry",
+      "status": "DONE",
+      "story": "S15 defect loop",
+      "step": "13",
+      "file": "docs/project/tickets/AGW-38-streaming-upload-replays-an-exhausted-body-on-retry.md",
+      "spec": "docs/specs/v1_release_spec.md",
+      "relations": {"depends_on": ["AGW-15"], "blocks": []},
+      "commits": ["c5026c9"]
+    },
+    {
+      "id": "AGW-39",
+      "title": "Historical ID collision: URL redaction and wheel smoke",
+      "status": "DONE",
+      "story": "post-release hardening",
+      "step": "release hardening",
+      "file": "docs/project/tickets/AGW-39-historical-id-collision.md",
+      "spec": "historical commit contracts",
+      "relations": {"depends_on": [], "blocks": []},
+      "commits": ["d9e8143", "39a1596"]
+    },
+    {
+      "id": "AGW-40",
+      "title": "Historical ID collision: redaction scan and SFTP stat",
+      "status": "DONE",
+      "story": "post-release hardening",
+      "step": "release hardening",
+      "file": "docs/project/tickets/AGW-40-historical-id-collision.md",
+      "spec": "historical commit contracts",
+      "relations": {"depends_on": [], "blocks": []},
+      "commits": ["75fad95", "3d2961e"]
+    },
+    {
+      "id": "AGW-41",
+      "title": "Historical ID collision: URL validation and Docker protocols",
+      "status": "DONE",
+      "story": "post-release hardening",
+      "step": "release hardening",
+      "file": "docs/project/tickets/AGW-41-historical-id-collision.md",
+      "spec": "historical commit contracts",
+      "relations": {"depends_on": [], "blocks": []},
+      "commits": ["d00d9f8", "8362cc7"]
+    },
+    {
+      "id": "AGW-42",
+      "title": "Pin the multipart byte-cap boundary",
+      "status": "DONE",
+      "story": "post-release HTTP hardening",
+      "step": "release hardening",
+      "file": "docs/project/tickets/AGW-42-multipart-byte-cap-boundary.md",
+      "spec": "existing bounded multipart response contract",
+      "relations": {"depends_on": [], "blocks": []},
+      "commits": ["7db7ea8"]
+    },
+    {
+      "id": "AGW-43",
+      "title": "P0 public contract corrections",
+      "status": "DONE",
+      "story": "Work Package 1",
+      "step": "P0",
+      "file": "docs/project/tickets/AGW-43-p0-contract-corrections.md",
+      "spec": "docs/specs/p0_contract_corrections_spec.md",
+      "relations": {"depends_on": [], "blocks": []},
+      "commits": ["4888ea6"]
     }
   ]
 }

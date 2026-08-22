@@ -542,16 +542,20 @@ class GrpcRequest(BaseRequestClass):
 
     REQUIRED_INFO_KEYS: ClassVar[frozenset[str]] = frozenset({'method'})
     ALLOWED_INFO_KEYS: ClassVar[frozenset[str]] = GRPC_INFO_KEYS
+    ACCEPTED_INFO_KEYS: ClassVar[frozenset[str]] = ALLOWED_INFO_KEYS
 
     @classmethod
     def validate_protocol_info(
         cls,
         info: Optional[Mapping[str, Any]],
+        *,
+        protocol: Optional[str] = None,
     ) -> dict[str, Any]:
         """Validate and normalize the closed gRPC option inventory.
 
         Args:
             info: Caller-supplied protocol mapping or None.
+            protocol: Normalized public selector used in diagnostics.
 
         Returns:
             A copied mapping containing normalized method, metadata, deadline,
@@ -560,7 +564,8 @@ class GrpcRequest(BaseRequestClass):
         Raises:
             ConfigurationError: If any caller-controlled option is invalid.
         """
-        validated = super().validate_protocol_info(info)
+        validated = super().validate_protocol_info(
+            info, protocol=protocol)
         validated['method'] = _validated_method(validated['method'])
         validated['metadata'] = _validated_metadata(
             validated.get('metadata'))
