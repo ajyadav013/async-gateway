@@ -1,6 +1,6 @@
 # AGW-51: Extend shared deterministic GCS contract matrices
 
-- **Status:** OPEN
+- **Status:** IN PROGRESS
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-08 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -31,3 +31,20 @@ repository-wide protocol matrix and shared error/fixture contracts (GCS-08).
 - 2026-08-22 — Opened from approved GCS-08 planning before implementation;
   recorded its four-file boundary, acceptance criteria, RED-first proof, and
   dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-22 — Reproduced the immutable global-contract RED: the unchanged
+  entrypoint invariant suite reported 2395 passed and one failure because GCS
+  was present only in the production registry. Began the minimal deterministic
+  fixture integration without runtime changes. Files:
+  `tests/fixtures/protocol_transports.py`, `tests/test_entrypoint.py`, this
+  ticket, and the local ticket index.
+- 2026-08-22 — Added the no-network/no-ADC GCS head, service-failure,
+  provider-fault, and raw-download fixture rows and removed the temporary GCS
+  exception from the exact registry assertion. The unchanged global invariant
+  suite passed 2662 tests; shared envelope matrices passed 406 with 18 declared
+  skips; entrypoint/exception/no-blocking modules passed 379; and focused GCS/
+  no-blocking tests passed 536. Existing exception/status and provider-prefix/
+  default-executor tests already covered AGW-51, so those files needed no
+  duplicate assertions. Scoped flake8, `git diff --check`, ticket JSON parsing,
+  and the exact four-file product boundary passed. Files:
+  `tests/fixtures/protocol_transports.py`, `tests/test_entrypoint.py`, this
+  ticket, and the local ticket index.

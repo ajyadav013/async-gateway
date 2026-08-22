@@ -255,7 +255,7 @@ def test_h3_soap_maps_to_a_real_class_and_never_to_none() -> None:
 def test_pe80_registry_is_the_exact_ten_protocol_contract() -> None:
     """The production selector registry contains every first-class client."""
     assert protocol_mapping == EXPECTED_PROTOCOL_MAPPING
-    assert set(CONTRACT_CALL) == set(protocol_mapping) - {'GCS'}
+    assert set(CONTRACT_CALL) == set(protocol_mapping)
     for protocol, row in CONTRACT_CALL.items():
         assert {'url', 'data', 'auth', 'info'} <= set(row), protocol
 

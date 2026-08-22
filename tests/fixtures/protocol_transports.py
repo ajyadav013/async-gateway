@@ -1,4 +1,4 @@
-"""Transport doubles for the nine-protocol envelope contract.
+"""Transport doubles for the ten-protocol envelope contract.
 
 R8-AC2 asserts that ``request()`` returns one key set for every protocol on
 both the success and the failure path. Proving that needs each protocol to
@@ -39,6 +39,7 @@ import socket
 import ssl
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import aioftp
@@ -57,6 +58,7 @@ import pytest
 
 from asyncio_gateway.helpers.internal.request_helper import HttpResult
 from asyncio_gateway.logic import (
+    gcs_client,
     grpc_client,
     http_client,
     s3_client,
@@ -147,6 +149,13 @@ CONTRACT_CALL: dict[str, dict[str, Any]] = {
     },
     'S3': {
         'url': 's3://contract-bucket/path/to/object',
+        'data': {},
+        'auth': None,
+        'info': {'command': 'head'},
+        'operation_key': 'command',
+    },
+    'GCS': {
+        'url': 'gs://contract-bucket/path/to/object',
         'data': {},
         'auth': None,
         'info': {'command': 'head'},
@@ -527,6 +536,114 @@ def _install_s3_client(
     )
 
 
+class StubGcsCredentials:
+    """Valid ADC credentials that never contact a provider."""
+
+    valid = True
+
+    def refresh(self, request: Any) -> None:
+        """Reject an unexpected refresh of already-valid credentials."""
+        raise AssertionError(f'unexpected GCS credential refresh: {request!r}')
+
+
+class StubGcsBlob:
+    """Metadata and raw-range surface for deterministic GCS rows."""
+
+    def __init__(
+        self,
+        *,
+        head: Any = None,
+        download_body: Optional[bytes] = None,
+    ) -> None:
+        """Choose a reload outcome and optional stored-byte body."""
+        self.head = head
+        self.download_body = download_body
+        self.size = len(download_body) if download_body is not None else 1
+        self.content_type = 'application/octet-stream'
+        self.etag = 'contract-etag'
+        self.generation = 1
+        self.metageneration = 1
+        self.updated = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.crc32c = 'contract-crc32c=='
+        self.metadata = {'contract': 'true'}
+
+    def reload(self, **kwargs: Any) -> None:
+        """Return metadata or raise the configured provider outcome."""
+        del kwargs
+        if isinstance(self.head, BaseException):
+            raise self.head
+
+    def download_as_bytes(
+        self,
+        *,
+        start: int,
+        end: int,
+        if_generation_match: int,
+        raw_download: bool,
+        **kwargs: Any,
+    ) -> bytes:
+        """Return one exact inclusive range from the stored-byte body."""
+        del kwargs
+        if self.download_body is None:
+            raise AssertionError('the GCS double has no download body')
+        if if_generation_match != self.generation or not raw_download:
+            raise AssertionError('the GCS range lost its raw generation pin')
+        return self.download_body[start:end + 1]
+
+
+class StubGcsBucket:
+    """Bucket facade returning one deterministic object."""
+
+    def __init__(self, blob: StubGcsBlob) -> None:
+        """Retain the object returned by ``blob``."""
+        self.blob_instance = blob
+
+    def blob(self, key: str) -> StubGcsBlob:
+        """Return the sole object after checking its contract key."""
+        if key != 'path/to/object':
+            raise AssertionError(f'unexpected GCS object key {key!r}')
+        return self.blob_instance
+
+
+class StubGcsClient:
+    """Storage client facade with no ADC, metadata, or network access."""
+
+    def __init__(self, blob: StubGcsBlob) -> None:
+        """Build one bucket facade around ``blob``."""
+        self.bucket_instance = StubGcsBucket(blob)
+        self.closed = False
+
+    def bucket(self, name: str) -> StubGcsBucket:
+        """Return the sole bucket after checking its contract name."""
+        if name != 'contract-bucket':
+            raise AssertionError(f'unexpected GCS bucket {name!r}')
+        return self.bucket_instance
+
+    def close(self) -> None:
+        """Record deterministic client cleanup."""
+        self.closed = True
+
+
+def _install_gcs_client(
+    monkeypatch: pytest.MonkeyPatch,
+    blob: StubGcsBlob,
+) -> StubGcsClient:
+    """Patch ADC and storage construction with deterministic doubles."""
+    credentials = StubGcsCredentials()
+    client = StubGcsClient(blob)
+    monkeypatch.setattr(
+        gcs_client.google_auth,
+        'default',
+        lambda: (credentials, 'contract-project'),
+    )
+    monkeypatch.setattr(
+        gcs_client.storage,
+        'Client',
+        lambda **kwargs: client,
+    )
+    return client
+
+
 class StubGrpcCall:
     """Awaitable unary gRPC call with deterministic peer metadata."""
 
@@ -700,6 +817,12 @@ def install_transport(
             )
         _install_s3_client(
             monkeypatch, StubS3Client(head=outcome))
+    elif protocol == 'GCS':
+        outcome = None
+        if not succeeds:
+            outcome = gcs_client.google_api_exceptions.Forbidden(REFUSED)
+        _install_gcs_client(
+            monkeypatch, StubGcsBlob(head=outcome))
     elif protocol == 'GRPC':
         _install_grpc_channel(
             monkeypatch,
@@ -963,6 +1086,15 @@ PROTOCOL_FAULTS: dict[str, dict[str, Callable[[], BaseException]]] = {
         'DNS': lambda: socket.gaierror('name not resolved'),
         'PROTOCOL': BotoCoreError,
     },
+    'GCS': {
+        'TLS': lambda: ssl.SSLError('handshake failed'),
+        'TIMEOUT': lambda: asyncio.TimeoutError(),
+        'TIMEOUT_BUILTIN': lambda: TimeoutError('timed out'),
+        'CONNECT': lambda: ConnectionRefusedError('connection refused'),
+        'DNS': lambda: socket.gaierror('name not resolved'),
+        'PROTOCOL': lambda: gcs_client.google_auth_exceptions.TransportError(
+            'malformed provider response'),
+    },
     # grpcio's public transport vocabulary is StatusCode, not native Python
     # wire exceptions. Every generic category is explicitly exempt above;
     # retaining the empty row makes omission and exemption mechanically
@@ -1047,6 +1179,9 @@ def install_failing_transport(
     elif protocol == 'S3':
         _install_s3_client(
             monkeypatch, StubS3Client(head=fault()))
+    elif protocol == 'GCS':
+        _install_gcs_client(
+            monkeypatch, StubGcsBlob(head=fault()))
     else:
         raise ValueError(
             f'{protocol!r} owns no transport seam. Returning quietly here'
@@ -1649,6 +1784,9 @@ def install_writing_transport(
         client = StubS3Client(download_body=body)
         _install_s3_client(monkeypatch, client)
         return client
+    if protocol == 'GCS':
+        return _install_gcs_client(
+            monkeypatch, StubGcsBlob(download_body=body))
     raise ValueError(
         f'{protocol!r} has no doubled local-write seam. HTTP and '
         'HTTPS write below the seam this doubles and must dial the '
@@ -1683,5 +1821,6 @@ def local_io_call(protocol: str, destination: str) -> dict[str, Any]:
         'FTP': {'client_path': destination},
         'SFTP': {'local_path': destination},
         'S3': {'command': 'download', 'local_path': destination},
+        'GCS': {'command': 'download', 'local_path': destination},
     }[protocol])
     return call

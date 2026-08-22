@@ -832,7 +832,7 @@
     {
       "id": "AGW-51",
       "title": "Extend shared deterministic contract matrices",
-      "status": "OPEN",
+      "status": "IN PROGRESS",
       "story": "GCS-08",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-51-extend-shared-deterministic-gcs-contract-matrices.md",
