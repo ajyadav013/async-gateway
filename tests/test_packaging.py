@@ -1486,6 +1486,40 @@ def test_pe80_installed_metadata_requires_exact_grpcio_runtime() -> None:
     ]
 
 
+def test_gcs_runtime_dependency_is_exact_and_has_no_emulator() -> None:
+    """Packaging freezes the supported GCS SDK major without an emulator."""
+    project = PYPROJECT.read_text(encoding='utf-8')
+    dependencies = re.findall(
+        r'^[ \t]*[\'\"](?P<requirement>[^\'\"]+)[\'\"],?[ \t]*$',
+        project,
+        re.MULTILINE,
+    )
+    google_storage = [
+        requirement for requirement in dependencies
+        if requirement.lower().startswith('google-cloud-storage')
+    ]
+    assert google_storage == ['google-cloud-storage>=3,<4']
+    assert not [
+        requirement for requirement in dependencies
+        if 'emulator' in requirement.lower()
+    ]
+
+
+def test_installed_metadata_requires_exact_gcs_runtime() -> None:
+    """The installed distribution exposes the GCS runtime to resolvers."""
+    installed = [
+        Requirement(requirement)
+        for requirement in metadata_requires(DISTRIBUTION) or ()
+    ]
+    google_storage = [
+        item for item in installed
+        if item.name.lower() == 'google-cloud-storage'
+    ]
+    assert len(google_storage) == 1
+    assert google_storage[0].marker is None
+    assert str(google_storage[0].specifier) == '<4,>=3'
+
+
 def test_pe80_public_request_data_type_checks_new_selector_shapes(
     tmp_path: Path,
 ) -> None:
