@@ -1,7 +1,7 @@
 # AGW-47: Build isolated GCS provider lifecycle and capacity guard
 
 - **Status:** IN REVIEW
-- **Branch:** `codex/gcs-selector-backend`
+- **Branch:** `codex/gcs-selector`
 - **Story:** GCS-04 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
 - **Decisions:** Bounded GCS decisions of record in [the GCS selector specification](../../specs/gcs_selector_spec.md); no ADR is required.
@@ -84,3 +84,60 @@ default executor, and stalled work must not starve unrelated protocols (GCS-04).
   and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
   the nonblocking stale internal protocol-count docstring. Downstream tester,
   security, operability, acceptance, and PR stages remain open.
+- 2026-08-23 — Pipeline Green cancellation-oracle defect loop at frozen
+  product HEAD `362e184f`: the unchanged test first reproduced Python 3.10 as
+  507 passed / 21 failed and Python 3.11 as 525 passed / 3 failed. Replacing
+  exactly ten caller-boundary `.args` checks with the repository's established
+  cross-version cancellation helper made Python 3.10 fully green at 528/528,
+  retained exactly the three accepted Python 3.11 product RED nodes at 525
+  passed / 3 failed, and kept Python 3.14 green at 528/528. The internal
+  pre-boundary cancellation assertion and all lifecycle, capacity, status,
+  identity, context, and bearer-containment assertions remain intact. Test
+  SHA-256 is `4fa758b51d2217b20d565c46e1bff4835b81562d2f1f59f0c75ec0ab9dce4e43`;
+  frozen `gcs_client.py` SHA-256 is
+  `a0cfcac7c306554f4c2548bbb28366f56e6aa16c1c48f562680498b924e248ef`.
+  The candidate remains uncommitted and intentionally RED on Python 3.11 for
+  the separate production normalization defect loop.
+- 2026-08-23 — The normalization RED extension adds exactly one focused
+  retained-lease regression. Its selected node fails 0 passed / 1 failed on
+  both Python 3.10 and Python 3.14 because the repeated top-level cancellation
+  is propagated instead of the exact earliest contiguous cancellation. The
+  full Python 3.11 GCS module reports 525 passed / 4 failed: that new focused
+  node plus exactly the previously accepted head, list, and signed-URL-close
+  nodes. The regression also freezes cycle, non-cancellation barrier, cause,
+  and exception-state preservation behavior. Scoped flake8, `py_compile`,
+  diff, JSON, and exact three-file scope checks pass. Final test SHA-256 is
+  `377036299c08269774038ce982706edc0d11b8fa3306750750c710ca3c35e24c`;
+  production remains frozen at SHA-256
+  `a0cfcac7c306554f4c2548bbb28366f56e6aa16c1c48f562680498b924e248ef`.
+  The candidate remains uncommitted and intentionally RED for production
+  normalization.
+- 2026-08-23 — RED-review Iteration 1 corrected only the traceback oracle so
+  both deliberately raised cancellation objects may gain propagation prefixes
+  while retaining their original traceback tails; barrier, hidden-context,
+  and cause tracebacks still require exact identity. The selected node remains
+  intentionally 0 passed / 1 failed on Python 3.10, 3.11, and 3.14 solely at
+  the final earliest-object identity assertion. Full Python 3.11 remains 525
+  passed / 4 failed with exactly that node plus the prior head, list, and
+  signed-URL-close failures. Static, JSON, diff, and three-file scope checks
+  pass. Corrected test SHA-256 is
+  `e7492a7eed8cfaca25c24da97e93ecf009622057bdd46b23ea8b98c4ef1c5706`;
+  production remains frozen at SHA-256
+  `a0cfcac7c306554f4c2548bbb28366f56e6aa16c1c48f562680498b924e248ef`.
+- 2026-08-23 — Minimal production GREEN adds one private, typed, cycle-safe
+  selector that follows only contiguous `CancelledError.__context__` links to
+  the earliest cancellation. `_GcsLease.run()` uses it at initial capture and
+  `_drain_provider_future()` uses it when first recording cancellation; no
+  cause traversal, exception mutation, version branch, task internals, or
+  lifecycle-loop change was introduced. The full GCS module passes 529/529 on
+  Python 3.10.18, 3.11.15, 3.12.14, 3.13.6, and 3.14.7. The focused GCS plus
+  no-blocking-I/O slice passes 549/549, and the entrypoint plus invariant slice
+  passes 2,965/2,965. Full-suite coverage is 4,902/4,902 statements and
+  1,548/1,548 branches; `gcs_client.py` is 829/829 statements and 282/282
+  branches. Scoped Flake8, the exact CI-format selector, mypy over 33 source
+  files, suppression policy, `py_compile`, and diff checks pass. The immutable
+  test SHA-256 remains
+  `e7492a7eed8cfaca25c24da97e93ecf009622057bdd46b23ea8b98c4ef1c5706`;
+  candidate production SHA-256 is
+  `54d91f4180d3589be9177ead1e8bb861241153b171ea9bc7572e6756d28a341b`.
+  The candidate remains uncommitted for independent review.

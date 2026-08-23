@@ -60,6 +60,10 @@ from asyncio_gateway.utils.exceptions import (
 )
 from asyncio_gateway.utils.paths import stream_to_path
 
+from tests.cancellation import (
+    assert_cancelled_error_survives_task_boundary,
+)
+
 
 VALID_SIGNING_ACCOUNT = (
     'signer@example-project.iam.gserviceaccount.com')
@@ -1047,7 +1051,10 @@ async def test_cancellation_retains_capacity_drains_and_closes_late_resource(
         release.set()
         with pytest.raises(asyncio.CancelledError) as caught:
             await task
-        assert caught.value.args == ('original-cancellation',)
+        assert_cancelled_error_survives_task_boundary(
+            caught.value,
+            ('original-cancellation',),
+        )
         assert closed_on and closed_on[0] != threading.get_ident()
     finally:
         release.set()
@@ -2384,7 +2391,10 @@ async def test_signed_url_pre_signing_drain_retains_capacity_and_outcome(
         if outcome == 'cancel':
             with pytest.raises(asyncio.CancelledError) as caught:
                 await task
-            assert caught.value.args == ('first-pre-signing-cancellation',)
+            assert_cancelled_error_survives_task_boundary(
+                caught.value,
+                ('first-pre-signing-cancellation',),
+            )
             outcome_surfaces = ''.join((
                 ''.join(traceback.format_exception(caught.value)),
                 repr(caught.value.__cause__),
@@ -2675,8 +2685,10 @@ async def test_signed_url_generation_and_close_drain_never_publish_bearer(
         if outcome == 'cancel':
             with pytest.raises(asyncio.CancelledError) as caught:
                 await task
-            assert caught.value.args == (
-                'first-post-signing-cancellation',)
+            assert_cancelled_error_survives_task_boundary(
+                caught.value,
+                ('first-post-signing-cancellation',),
+            )
             outcome_surfaces = ''.join((
                 ''.join(traceback.format_exception(caught.value)),
                 repr(caught.value.__cause__),
@@ -4571,7 +4583,10 @@ async def test_head_list_drain_retains_capacity_and_first_outcome(
         if outcome == 'cancel':
             with pytest.raises(asyncio.CancelledError) as caught:
                 await task
-            assert caught.value.args == ('first-head-list-cancellation',)
+            assert_cancelled_error_survives_task_boundary(
+                caught.value,
+                ('first-head-list-cancellation',),
+            )
             surfaces = ''.join((
                 ''.join(traceback.format_exception(caught.value)),
                 repr(caught.value.__cause__),
@@ -5600,7 +5615,10 @@ async def test_upload_cancellation_drains_cleanup_and_retains_capacity(
         release.set()
         with pytest.raises(asyncio.CancelledError) as caught:
             await task
-        assert caught.value.args == ('first-upload-cancellation',)
+        assert_cancelled_error_survives_task_boundary(
+            caught.value,
+            ('first-upload-cancellation',),
+        )
         cancellation_surfaces = (
             ''.join(traceback.format_exception(caught.value))
             + _logged_gcs_surfaces(caplog)
@@ -5705,7 +5723,10 @@ async def test_late_created_upload_client_closes_under_retained_capacity(
         if outcome == 'cancel':
             with pytest.raises(asyncio.CancelledError) as caught:
                 await task
-            assert caught.value.args == ('late-client-cancellation',)
+            assert_cancelled_error_survives_task_boundary(
+                caught.value,
+                ('late-client-cancellation',),
+            )
         else:
             result, _ = await task
             assert result['error']['code'] == 'TIMEOUT'
@@ -7013,7 +7034,10 @@ async def test_download_pin_cancellation_drains_and_preserves_original(
             ''.join(traceback.format_exception(caught.value))
             + _logged_gcs_surfaces(caplog)
         )
-        assert caught.value.args == ('first-download-pin-cancellation',)
+        assert_cancelled_error_survives_task_boundary(
+            caught.value,
+            ('first-download-pin-cancellation',),
+        )
         assert range_sentinel not in surfaces
         assert close_sentinel not in surfaces
         assert target.read_bytes() == b'existing-target'
@@ -7125,8 +7149,10 @@ async def test_download_range_drain_retains_capacity_through_hostile_close(
         if outcome == 'cancel':
             with pytest.raises(asyncio.CancelledError) as caught:
                 await task
-            assert caught.value.args == (
-                'first-download-range-cancellation',)
+            assert_cancelled_error_survives_task_boundary(
+                caught.value,
+                ('first-download-range-cancellation',),
+            )
             surfaces = ''.join(traceback.format_exception(caught.value))
         else:
             result, _ = await task
@@ -7435,7 +7461,10 @@ async def test_drain_telemetry_is_cardinal_finite_and_secret_safe(
         if outcome == 'cancel':
             with pytest.raises(asyncio.CancelledError) as caught:
                 await task
-            assert caught.value.args == ('original-cancellation',)
+            assert_cancelled_error_survives_task_boundary(
+                caught.value,
+                ('original-cancellation',),
+            )
         else:
             with pytest.raises(GatewayTimeoutError):
                 await task
@@ -7468,6 +7497,93 @@ async def test_drain_telemetry_is_cardinal_finite_and_secret_safe(
         await asyncio.gather(task, return_exceptions=True)
         await _release_isolated_lease(lease)
         executor.close_test_executor()
+
+
+async def test_lease_propagates_earliest_contiguous_cancellation_unchanged(
+) -> None:
+    """The retained lease selects the earliest contiguous cancellation."""
+    module, executor = _fresh_gcs_lifecycle_module()
+    observations: list[tuple[
+        asyncio.CancelledError,
+        asyncio.CancelledError,
+        tuple[BaseException, ...],
+        dict[int, tuple[Any, ...]],
+    ]] = []
+
+    def seed_traceback(error: BaseException) -> Any:
+        """Attach and return one stable traceback tail for mutation checks."""
+        try:
+            raise error
+        except BaseException as caught:
+            assert caught is error
+            return caught.__traceback__
+
+    try:
+        for shape in ('cycle', 'barrier-and-cause'):
+            repeated = asyncio.CancelledError(f'repeated-{shape}')
+            first = asyncio.CancelledError(f'first-{shape}')
+            barrier = RuntimeError(f'barrier-{shape}')
+            hidden = asyncio.CancelledError(f'hidden-{shape}')
+            cause = asyncio.CancelledError(f'cause-{shape}')
+            errors = (repeated, first, barrier, hidden, cause)
+            for error in errors:
+                seed_traceback(error)
+
+            repeated.__context__ = first
+            repeated.__cause__ = cause
+            repeated.__suppress_context__ = True
+            if shape == 'cycle':
+                first.__context__ = repeated
+            else:
+                first.__context__ = barrier
+                barrier.__context__ = hidden
+
+            states = {
+                id(error): (
+                    error.args,
+                    error.__context__,
+                    error.__cause__,
+                    error.__suppress_context__,
+                    error.__traceback__,
+                )
+                for error in errors
+            }
+
+            def deliver_repeated_cancellation() -> NoReturn:
+                """Deliver the repeated wrapper through the provider seam."""
+                raise repeated
+
+            lease = getattr(module, '_acquire_gcs_lease')()
+            try:
+                with pytest.raises(asyncio.CancelledError) as caught:
+                    await lease.run(
+                        deliver_repeated_cancellation,
+                        timeout=1,
+                    )
+            finally:
+                await _release_isolated_lease(lease)
+            observations.append((caught.value, first, errors, states))
+    finally:
+        executor.close_test_executor()
+
+    for caught, first, errors, states in observations:
+        for error in errors:
+            state = states[id(error)]
+            assert error.args == state[0]
+            assert error.__context__ is state[1]
+            assert error.__cause__ is state[2]
+            assert error.__suppress_context__ is state[3]
+            traceback_tail = error.__traceback__
+            if error in errors[:2]:
+                while (
+                    traceback_tail is not None
+                    and traceback_tail is not state[4]
+                ):
+                    traceback_tail = traceback_tail.tb_next
+                assert traceback_tail is state[4]
+            else:
+                assert traceback_tail is state[4]
+        assert caught is first
 
 
 # --- AGW-49 focused coverage defect loop --------------------------------
@@ -7821,7 +7937,10 @@ async def test_head_list_cleanup_repeated_cancellation_preserves_first(
         with pytest.raises(asyncio.CancelledError) as caught:
             await task
 
-        assert caught.value.args == ('first-cleanup-cancellation',)
+        assert_cancelled_error_survives_task_boundary(
+            caught.value,
+            ('first-cleanup-cancellation',),
+        )
         assert response['protocol_details'] == {}
         assert provider.close_sentinel not in ''.join(
             traceback.format_exception(caught.value))

@@ -250,6 +250,21 @@ def _scrub_exception_bearer(
     state['args'] = error.args
 
 
+def _earliest_contiguous_cancellation(
+    error: asyncio.CancelledError,
+) -> asyncio.CancelledError:
+    """Select the earliest cancellation in one contiguous context chain."""
+    selected = error
+    seen = {id(error)}
+    while isinstance(selected.__context__, asyncio.CancelledError):
+        context = selected.__context__
+        if id(context) in seen:
+            break
+        seen.add(id(context))
+        selected = context
+    return selected
+
+
 async def _drain_provider_future(
     future: 'asyncio.Future[_ResultT]',
     cancellation: Optional[asyncio.CancelledError],
@@ -260,7 +275,7 @@ async def _drain_provider_future(
             await asyncio.shield(future)
         except asyncio.CancelledError as error:
             if cancellation is None:
-                cancellation = error
+                cancellation = _earliest_contiguous_cancellation(error)
         except BaseException:
             break
     try:
@@ -347,7 +362,7 @@ class _GcsLease:
                         return cast(_ResultT, payload)
                     raise cast(BaseException, payload)
             except asyncio.CancelledError as error:
-                cancellation = error
+                cancellation = _earliest_contiguous_cancellation(error)
             except (asyncio.TimeoutError, TimeoutError):
                 pass
 
