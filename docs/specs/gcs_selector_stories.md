@@ -5,12 +5,12 @@
 
 ## Boundaries and assumptions
 
-- The product-file inventory is frozen to the 16 paths in the source specification. No story may add a public option, command, file, dependency, CI/deployment change, live-GCP test, or release action.
+- The product-file inventory is frozen to the 18 paths in the source specification. No story may add a public option, command, file, dependency, executable CI/deployment change, live-GCP test, or release action. GCS-01 alone may synchronize comment-only workflow documentation to the independently approved dependency/build policy; it may change no YAML key, step, command, trigger, permission, or runtime semantics.
 - Every implementation story is **RED → GREEN → refactor → focused verification**. “RED” means the named deterministic test or contract assertion is committed/run first and demonstrably fails because its corresponding behavior is absent; production behavior may be added only after that evidence. The story may not be called done until its focused tests are green.
 - `gcs_client.py` and `tests/logic/test_gcs_client.py` are shared critical files. Mode A therefore permits only the two explicitly disjoint foundations below to start together. All other implementation stories are deliberately serial, even where their functional requirements might otherwise look independent.
 - This planner owns only this document. `.claude/CONTINUITY.md` must be updated by the parent/orchestrator at handoff with this coverage result; editing it here would violate the one-output-file assignment.
 
-## Frozen product inventory (exactly 16 files)
+## Frozen product inventory (exactly 18 files)
 
 1. `asyncio_gateway/asyncio_gateway.py`
 2. `asyncio_gateway/logic/__init__.py`
@@ -28,6 +28,8 @@
 14. `CHANGELOG.md`
 15. `README.md`
 16. `pyproject.toml`
+17. `.github/workflows/ci.yml`
+18. `.github/workflows/publish.yml`
 
 Planning and ticket documents are not product scope. A repeated file in successive stories remains a shared-file handoff, not an inventory expansion.
 
@@ -39,18 +41,20 @@ Planning and ticket documents are not product scope. A repeated file in successi
 
 **Why:** The selector cannot be imported reliably, or distributed safely, without the frozen `google-cloud-storage>=3,<4` package contract.
 
-**Acceptance IDs:** AC1.4, AC12.1, AC12.3, AC12.4.
+**Acceptance IDs:** AC1.4, AC12.1, AC12.3, AC12.4, AC12.6.
 
-**Product-file boundary (2):**
+**Product-file boundary (4):**
 
 - `tests/test_packaging.py`
 - `pyproject.toml`
+- `.github/workflows/ci.yml`
+- `.github/workflows/publish.yml`
 
 **RED evidence before production:** Add focused packaging assertions that fail until runtime metadata contains exactly `google-cloud-storage>=3,<4` and clean package/import inventory recognizes the selector dependency; run the focused packaging test and capture the failure.
 
-**GREEN/refactor/verification:** Add only the approved metadata entry; keep no emulator or extra dependency. Re-run the focused packaging test, then the relevant install/import/build checks prescribed by the spec.
+**GREEN/refactor/verification:** Add only the approved metadata entry; keep no emulator or extra dependency. Synchronize only the two workflow files' comment documentation to that independently approved dependency/build policy, without changing any YAML key, step, command, trigger, permission, or runtime semantics. Re-run the focused packaging test, then the relevant install/import/build checks prescribed by the spec.
 
-**Done checks:** Exact dependency range present; no new dependency; focused packaging assertion green; file count remains 2.
+**Done checks:** Exact dependency range present; no new dependency; focused packaging assertion green; workflow diffs are comment-only and encode no YAML or runtime-semantics change; file count remains 4.
 
 **blockedBy:** none
 **blocks:** GCS-02, GCS-09
@@ -250,7 +254,7 @@ Planning and ticket documents are not product scope. A repeated file in successi
 
 **RED evidence before production behavior:** First extend documentation/package anti-drift tests so they fail until the README/example/CHANGELOG cover all five commands, exact strict allowlists and schemas, ADC/Workload Identity and least privilege, impersonation/signing limits, retry/timeout/capacity behavior, page-token rule, raw pinned download/no-CRC limitation, signed bearer/expiry limitation, and PUT’s two-SDK-vs-three-client headers/relative expiry. Add a compile/import assertion for the example and run the focused docs/packaging checks red.
 
-**GREEN/refactor/verification:** Write only the approved documentation, additive changelog note, and bounded no-live-GCP example. Do not edit CI, create a release tag, deploy, or claim service-side enforcement was live tested.
+**GREEN/refactor/verification:** Write only the approved documentation, additive changelog note, and bounded no-live-GCP example. Do not change any YAML key, step, command, trigger, permission, or runtime semantics, create a release tag, deploy, or claim service-side enforcement was live tested. The dependency-policy-only workflow comments permitted by AC12.6 belong exclusively to GCS-01 and are outside this story's five-file boundary.
 
 **Done checks:** Anti-drift tests and example compilation green; complete focused suite and specified full quality/artifact commands are run by the downstream test/quality gates; no C/H/M issue remains; five-file limit met.
 
@@ -272,7 +276,7 @@ More precisely: `GCS-02.blockedBy=[GCS-01,GCS-03]`; `GCS-04=[GCS-02,GCS-03]`; `G
 
 **Immediately startable implementation set:**
 
-- **Package lane:** GCS-01 — owns only `pyproject.toml` and `tests/test_packaging.py`.
+- **Package lane:** GCS-01 — owns only `pyproject.toml`, `tests/test_packaging.py`, `.github/workflows/ci.yml`, and `.github/workflows/publish.yml`.
 - **Typed-error lane:** GCS-03 — owns only exception/status-map files and `tests/test_exceptions.py`.
 
 These two sets are disjoint. They may run concurrently only if each lane preserves the other’s work. Every later story is a **single sequential backend lane** because it changes `gcs_client.py` and/or `test_gcs_client.py`, or it is a global-contract/documentation join that needs the completed runtime surface. Read-only review of the spec or test design can overlap, but no other implementation ticket is safely parallel.
@@ -296,12 +300,12 @@ Every acceptance ID from the approved source maps to one or more stories. Repeti
 | R9 | AC9.1, AC9.2, AC9.3, AC9.4, AC9.5 | GCS-07 (AC9.1–AC9.5); GCS-09 (AC9.2) |
 | R10 | AC10.1, AC10.2, AC10.3, AC10.4, AC10.5 | GCS-07 (AC10.1–AC10.5); GCS-09 (AC10.2, AC10.3, AC10.5) |
 | R11 | AC11.1, AC11.2, AC11.3, AC11.4, AC11.5 | GCS-02 (AC11.1); GCS-04 (AC11.1); GCS-05 (AC11.1, AC11.2); GCS-06 (AC11.1, AC11.2, AC11.4); GCS-07 (AC11.1–AC11.5); GCS-08 (AC11.1) |
-| R12 | AC12.1, AC12.2, AC12.3, AC12.4, AC12.5, AC12.6 | GCS-01 (AC12.1, AC12.3, AC12.4); GCS-02/GCS-04/GCS-05/GCS-06/GCS-07/GCS-08/GCS-09 (AC12.1); GCS-02/GCS-04/GCS-05/GCS-06/GCS-07/GCS-08 (AC12.2); GCS-01/GCS-02/GCS-03/GCS-04/GCS-08/GCS-09 (AC12.3); GCS-01/GCS-09 (AC12.4); GCS-09 (AC12.5, AC12.6) |
+| R12 | AC12.1, AC12.2, AC12.3, AC12.4, AC12.5, AC12.6 | GCS-01 (AC12.1, AC12.3, AC12.4, AC12.6); GCS-02/GCS-04/GCS-05/GCS-06/GCS-07/GCS-08/GCS-09 (AC12.1); GCS-02/GCS-04/GCS-05/GCS-06/GCS-07/GCS-08 (AC12.2); GCS-01/GCS-02/GCS-03/GCS-04/GCS-08/GCS-09 (AC12.3); GCS-01/GCS-09 (AC12.4); GCS-09 (AC12.5); GCS-01/GCS-09 (AC12.6) |
 | R13 | AC13.1, AC13.2, AC13.3, AC13.4, AC13.5, AC13.6, AC13.7, AC13.8 | GCS-04 (AC13.1–AC13.8); GCS-03 (AC13.4); GCS-08 (AC13.4, AC13.7, AC13.8) |
 
 ## RARV coverage-gate verification
 
-**Reason:** Decompose the approved 13-requirement, 71-AC library feature into verifiable test-first tickets without expanding the frozen 16-file scope.
+**Reason:** Decompose the approved 13-requirement, 71-AC library feature into verifiable test-first tickets without expanding the frozen 18-file scope.
 
 **Act:** Created nine stories, each with a one-ticket boundary, at most five owned product files, named RED evidence, GREEN behavior, focused verification, dependencies, and done checks.
 
@@ -317,7 +321,7 @@ Every acceptance ID from the approved source maps to one or more stories. Repeti
 | Stories with zero ACs | 0 | 0 |
 | Graph cycles | 0 | 0 (topological order: 01/03, 02, 04, 05, 06, 07, 08, 09) |
 | Maximum product files per story | 5 | 5 |
-| Frozen inventory union | 16 | 16 exact; no extra product file |
+| Frozen inventory union | 18 | 18 exact; no extra product file |
 | Immediately startable stories with unmet dependency | 0 | 0 (GCS-01, GCS-03 only) |
 
 **Severity/gaps:** No Critical, High, Medium, Low, or Cosmetic planning gap found. The required `.claude/CONTINUITY.md` handoff update is intentionally not performed because the parent assigned this agent ownership of exactly one output file; the parent/orchestrator must record this RARV evidence there.

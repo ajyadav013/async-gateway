@@ -24,11 +24,16 @@ packaging/documentation remain synchronized (GCS-09).
   and PUT’s two-SDK-vs-three-client headers/relative expiry. Add a compile/
   import assertion for the example and run focused docs/packaging checks red.
 - **GREEN/refactor:** Write only the approved documentation, additive changelog
-  note, and bounded no-live-GCP example. Do not edit CI, create a release tag,
-  deploy, or claim service-side enforcement was live tested.
+  note, and bounded no-live-GCP example. Within this ticket's exact five-file
+  scope, do not change any YAML key, step, command, trigger, permission, or
+  runtime semantics, create a release tag, deploy, or claim service-side
+  enforcement was live tested. AC12.6's independently approved dependency-
+  policy-only workflow comments belong to GCS-01 and are outside this ticket.
 - **Done checks:** Anti-drift tests and example compilation green; complete
   focused suite and specified full quality/artifact commands are run by
-  downstream test/quality gates; no C/H/M issue remains; five-file limit met.
+  downstream test/quality gates; CHANGELOG satisfies GCS-09's AC12.6 ownership;
+  no executable workflow semantics change; no C/H/M issue remains; five-file
+  limit met.
 
 ## Work Log
 
@@ -116,3 +121,12 @@ packaging/documentation remain synchronized (GCS-09).
   required behavioral matrices; and complete code-review, contract, test,
   security, pipeline, observability, and acceptance gates. Files: this ticket
   and the local ticket index.
+- 2026-08-23 — Acceptance iteration 1 rejected AC12.6 because the literal
+  no-workflow-edit wording conflicted with two already reviewed, comment-only
+  dependency-policy corrections whose executable YAML semantics were
+  unchanged. Opened a docs-only contract amendment assigning those workflow
+  comments to GCS-01 while retaining GCS-09's CHANGELOG ownership and this
+  ticket's exact five-file scope. No runtime, test, workflow, dependency,
+  release, deployment, or live-GCP action is part of this amendment, and it
+  makes no completion or delivery claim. Files: `docs/specs/gcs_selector_spec.md`,
+  `docs/specs/gcs_selector_stories.md`, and this ticket.

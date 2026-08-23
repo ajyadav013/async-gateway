@@ -3,7 +3,7 @@
 ## Status and risk
 
 Status: **Contract approved, including the generation-pinned ranged-download
-design, private four-lease GCS offloader, 16-file plan, and
+design, private four-lease GCS offloader, 18-file plan, and
 `google-cloud-storage>=3,<4` dependency; implementation remains pending the
 independent architecture, EM, security, and test-planning gates.**
 
@@ -743,9 +743,13 @@ existing protocol matrix.
   helper/default-executor behavior under that lease, exact stored/raw download
   semantics with transparent decompression disabled, no-live-test policy, and
   the out-of-scope boundaries.
-- **AC12.6:** CHANGELOG records the additive selector and dependency. No CI
-  workflow, database, deployment, GCP resource, Kubernetes object, or release
-  tag is changed by this feature.
+- **AC12.6:** CHANGELOG records the additive selector and dependency.
+  Executable CI workflow semantics, databases, deployments, GCP resources,
+  Kubernetes objects, and release tags remain unchanged. The only permitted
+  workflow-file edits are comment-only documentation in
+  `.github/workflows/ci.yml` and `.github/workflows/publish.yml` synchronized
+  to an independently approved dependency/build policy; those edits change no
+  YAML key, step, command, trigger, permission, or runtime semantics.
 
 **Edge Cases**:
 
@@ -896,9 +900,11 @@ capacity and accepted GCS requests can always drain and close their resources.
 ## Open Questions
 
 None. The approved public contract is frozen. Any implementation evidence
-that requires a public-contract change, an additional dependency, a CI edit,
-or a file outside the inventory below must stop and return to specification
-review rather than improvising.
+that requires a public-contract change, an additional dependency, an
+executable CI workflow change, workflow commentary beyond AC12.6's
+independently approved dependency/build policy, or a file outside the
+inventory below must stop and return to specification review rather than
+improvising.
 
 ---
 
@@ -947,7 +953,7 @@ offloading.
 
 ## File Structure and Blast Radius
 
-The approved plan is capped at these **16 files**:
+The approved plan is capped at these **18 files**:
 
 ```text
 asyncio_gateway/
@@ -971,17 +977,22 @@ tests/
 CHANGELOG.md                                 MODIFIED — additive feature/dependency note
 README.md                                    MODIFIED — complete GCS consumer/security docs
 pyproject.toml                               MODIFIED — google-cloud-storage>=3,<4
+.github/
+  workflows/
+    ci.yml                                   MODIFIED — dependency/build-policy comments only
+    publish.yml                              MODIFIED — dependency/build-policy comments only
 ```
 
 `tests/test_entrypoint_invariant.py` consumes the extended fixture without a
 required edit. `asyncio_gateway/utils/paths.py` is reused unchanged. If either
 needs modification, implementation must stop and obtain approval for a revised
-17- or 18-file plan.
+19- or 20-file plan.
 
 Blast radius: one new public selector and stable error code; one dependency;
 registry/scheme/doc/example/package inventories; shared breaker and envelope
-execution but no schema, database, route, CI, deployment, or infrastructure
-change.
+execution; and two workflow files whose dependency/build-policy comments only
+are synchronized. There is no schema, database, route, executable CI workflow,
+deployment, or infrastructure change.
 
 ## Data Models
 
@@ -1229,20 +1240,27 @@ GcsCapacityError(message: str = safe_constant_message)
 
 ## Implementation Steps
 
-1. Record the approved contract, dependency, and 16-file plan, then close the
+1. Record the approved contract, dependency, and 18-file plan, then close the
    independent architecture, EM, security, and test-planning gates before
    implementation. **Files:** none (gate evidence only).
-2. Add RED registry, scheme, strict allowlist, target/auth, and validation-
-   before-ADC tests; add the dependency metadata assertion, including exact
-   page-token boundary cases. **Files:** `tests/logic/test_gcs_client.py`,
-   `tests/test_entrypoint.py`, `tests/test_packaging.py`, `pyproject.toml` (4).
-3. Add `GcsStatusError`, `GcsCapacityError`, status-map entries, `GcsRequest`
-   skeleton, registry, and scheme row sufficient to pass boundary tests.
-   **Files:**
-   `asyncio_gateway/logic/gcs_client.py`, `asyncio_gateway/logic/__init__.py`,
-   `asyncio_gateway/asyncio_gateway.py`, `asyncio_gateway/utils/exceptions.py`,
-   `asyncio_gateway/utils/status_map.py` (5).
-4. Add RED provider-off-loop/deadline/retry-none/cleanup and capacity tests,
+2. Add the RED dependency-metadata assertion, then add the exact approved
+   dependency and synchronize only the two workflow files' comment-only
+   dependency/build-policy documentation after that policy is independently
+   approved. No YAML key, step, command, trigger, permission, or runtime
+   semantics may change. **Files:** `tests/test_packaging.py`, `pyproject.toml`,
+   `.github/workflows/ci.yml`, `.github/workflows/publish.yml` (4).
+3. Add RED hierarchy/status tests, then add `GcsStatusError`,
+   `GcsCapacityError`, and their status-map entries. **Files:**
+   `tests/test_exceptions.py`, `asyncio_gateway/utils/exceptions.py`,
+   `asyncio_gateway/utils/status_map.py` (3).
+4. Add RED registry, scheme, strict allowlist, target/auth, and validation-
+   before-ADC tests, including exact page-token boundary cases. Then add the
+   `GcsRequest` skeleton, registry, and scheme row sufficient to pass those
+   boundary tests. **Files:** `tests/logic/test_gcs_client.py`,
+   `tests/test_entrypoint.py`, `asyncio_gateway/logic/gcs_client.py`,
+   `asyncio_gateway/logic/__init__.py`,
+   `asyncio_gateway/asyncio_gateway.py` (5).
+5. Add RED provider-off-loop/deadline/retry-none/cleanup and capacity tests,
    including four blocked provider workers, prompt fifth/closing rejection,
    one outstanding private provider future per lease, retained cleanup
    capacity, cancellation drain, idempotent shutdown, exact safe telemetry,
@@ -1253,7 +1271,7 @@ GcsCapacityError(message: str = safe_constant_message)
    **Files:**
    `tests/logic/test_gcs_client.py`, `asyncio_gateway/logic/gcs_client.py`,
    `tests/test_no_blocking_io.py` (3).
-5. Add RED upload/download tests, then implement reuse of `read_guarded_file`
+6. Add RED upload/download tests, then implement reuse of `read_guarded_file`
    and `stream_to_path`, guarded upload replay, and the download reload pin plus
    sequential inclusive stored-byte ranges capped at exactly 64 KiB, always
    passing `raw_download=True`. Cover exact arguments for one-byte/single-
@@ -1265,11 +1283,11 @@ GcsCapacityError(message: str = safe_constant_message)
    provider pool while retaining the lifecycle lease across their calls.
    **Files:**
    `tests/logic/test_gcs_client.py`, `asyncio_gateway/logic/gcs_client.py` (2).
-6. Add RED head/list tests, then implement one-page bounded normalization and
+7. Add RED head/list tests, then implement one-page bounded normalization and
    safe page-token handling, including empty, exact 4096-byte, and 4097-byte
    UTF-8 cases plus exact whitespace preservation. **Files:**
    `tests/logic/test_gcs_client.py`, `asyncio_gateway/logic/gcs_client.py` (2).
-7. Add RED direct/impersonated signed GET tests, then signed PUT tests for
+8. Add RED direct/impersonated signed GET tests, then signed PUT tests for
    exact dedicated SDK `content_type`, exact two-entry SDK header mapping,
    separate exact three-entry public `required_headers`, no arbitrary signed
    query parameters, `timedelta` expiry conversion at 1/900/3600, one gateway
@@ -1278,26 +1296,26 @@ GcsCapacityError(message: str = safe_constant_message)
    exhaustive bearer containment; implement only after those tests fail.
    **Files:** `tests/logic/test_gcs_client.py`,
    `asyncio_gateway/logic/gcs_client.py` (2).
-8. Extend global transport fixtures plus entrypoint, both GCS exception/status
+9. Extend global transport fixtures plus entrypoint, both GCS exception/status
    contracts, and provider-blocking/default-executor isolation contracts that
    preserve the path helpers' established internal behavior. **Files:**
    `tests/fixtures/protocol_transports.py`, `tests/test_entrypoint.py`,
    `tests/test_exceptions.py`, `tests/test_no_blocking_io.py` (4).
-9. Extend documentation/package inventories and add the bounded GCS example.
+10. Extend documentation/package inventories and add the bounded GCS example.
    **Files:** `tests/test_docs.py`, `tests/test_packaging.py`,
    `examples/gcs_example.py` (3).
-10. Update consumer/release documentation, then run the docs/example/package
+11. Update consumer/release documentation, then run the docs/example/package
     anti-drift checkpoint before proceeding. **Files:** `README.md`,
     `CHANGELOG.md` (2). The checkpoint executes existing tests without another
     file edit.
-11. Run focused and full verification, security review, test review, dependency
+12. Run focused and full verification, security review, test review, dependency
    audit, clean artifacts, and acceptance review. Resolve every
    Critical/High/Medium finding before delivery. **Files:** none unless a
    failing gate returns work to its owning step.
 
 Each implementation step is independently verifiable, touches at most five
 files, and depends on no later step. Together the editing steps use exactly the
-approved 16-file inventory and no other file.
+approved 18-file inventory and no other file.
 
 ## Error Handling
 
@@ -1515,7 +1533,7 @@ remain valid until expiry or an external IAM/object-generation intervention.
   credentials and signed URLs as high-risk material.
 - **Act:** Freeze the selector, exact allowlists, schemas, error/retry rules,
   generation-pinned raw ranged-download lifecycle, fixed private capacity,
-  off-loop lifecycle, signing constraints, 16-file inventory, tests, rollback,
+  off-loop lifecycle, signing constraints, 18-file inventory, tests, rollback,
   and residual risks in this single specification before code.
 - **Reflect:** The weakest requirement is signed PUT size enforcement because
   it is provider behavior not live-tested here; AC10.2/AC10.5 resolve this by
@@ -1553,12 +1571,12 @@ remain valid until expiry or an external IAM/object-generation intervention.
   page-token criterion measures an exact 4096-byte UTF-8 ceiling without
   normalization, and its 4096/4097-byte boundary is directly testable.
   Cross-cutting work remains split into tasks of at most five files without
-  expanding the 16-file inventory.
+  expanding the 18-file inventory.
 - **Verify:** Every R1–R13 requirement has individually numbered boolean
   acceptance criteria—71 unique AC IDs in total—edge cases, an implementation
   approach, and one of 13 traceability rows. No placeholder or unresolved open
   question remains. The plan matches the audited repository seams and remains
-  within 16 files.
+  within 18 files.
 
 Severity review at specification stage: Critical—none; High—bearer disclosure,
 IAM trust expansion, and dependency addition are contained; contract approval
@@ -1585,5 +1603,5 @@ and test-planning gates close.
 | R9 | Direct Signing credentials or validated IAM impersonation use one gateway V4 GET invocation with exact relative `timedelta` expiry, then close-before-publish | `gcs_client.py`, `test_gcs_client.py`, README/example |
 | R10 | Dedicated SDK content type + exact two SDK headers versus exact three client headers, `timedelta` expiry, no arbitrary query, one gateway invocation, internal-retry allowance, and cleanup-before-publish | `gcs_client.py`, `test_gcs_client.py`, README/example |
 | R11 | Keep bearer private through shielded/drained close, atomically publish success only, and exhaustively scan failure surfaces | `gcs_client.py`, fixture, focused/invariant tests |
-| R12 | Deterministic no-GCP tests include exact raw range calls and gzip/content-encoding adversaries; docs/example/package anti-drift and full quality/artifact gates cover the contract | all 16 inventoried files |
+| R12 | Deterministic no-GCP tests include exact raw range calls and gzip/content-encoding adversaries; docs/example/package anti-drift and full quality/artifact gates cover the contract; AC12.6 assigns independently approved dependency/build-policy-only workflow comments to GCS-01 and the CHANGELOG record to GCS-09 | all 18 inventoried files |
 | R13 | Private four-worker/four-lease fail-fast provider offloader retains one lease through provider futures/resources and unchanged path helpers, with typed capacity refusal, idempotent shutdown, safe telemetry, and provider/default-executor isolation tests | `gcs_client.py`, `exceptions.py`, `status_map.py`, focused/exception/blocking-I/O tests, README |
