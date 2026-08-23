@@ -8159,6 +8159,18 @@ async def test_signed_url_unknown_close_defect_scrubs_live_bearer_state(
         pytest.param('direct', id='direct-signer'),
         pytest.param('impersonated', id='configured-impersonation'),
         pytest.param('direct-compute', id='direct-compute-signer'),
+        pytest.param(
+            'direct-encoded-resource',
+            id='direct-encoded-iam-resource',
+        ),
+        pytest.param(
+            'impersonated-encoded-resource',
+            id='configured-impersonation-encoded-iam-resource',
+        ),
+        pytest.param(
+            'direct-safe-diagnostic',
+            id='safe-signing-diagnostic-control',
+        ),
     ],
 )
 async def test_public_signing_forbidden_never_exposes_signer_identity(
@@ -8166,15 +8178,20 @@ async def test_public_signing_forbidden_never_exposes_signer_identity(
     caplog: pytest.LogCaptureFixture,
     signer_path: str,
 ) -> None:
-    """A plain IAM principal in signing prose stays private everywhere."""
+    """Signer representations stay private while safe prose survives."""
     info: dict[str, object] = {
         'command': 'signed_url',
         'method': 'GET',
         'timeout': 2.5,
     }
-    if signer_path in {'direct', 'direct-compute'}:
+    if signer_path in {
+        'direct',
+        'direct-compute',
+        'direct-encoded-resource',
+        'direct-safe-diagnostic',
+    }:
         provider: _SignedUrlProvider = _SignedUrlProvider()
-        if signer_path == 'direct':
+        if signer_path != 'direct-compute':
             principal = (
                 'direct-signer@example-project.iam.gserviceaccount.com')
         else:
@@ -8203,9 +8220,24 @@ async def test_public_signing_forbidden_never_exposes_signer_identity(
         info['signing_service_account'] = principal
         breaker = _install_impersonation_provider(monkeypatch, provider)
 
+    if signer_path == 'direct-encoded-resource':
+        leak_marker = (
+            'projects/-/serviceAccounts/'
+            'direct-signer%40example-project.iam.gserviceaccount.com')
+    elif signer_path == 'impersonated-encoded-resource':
+        leak_marker = (
+            'projects/-/serviceAccounts/'
+            'signer%40example-project.iam.gserviceaccount.com')
+    else:
+        leak_marker = principal
     provider_message = (
-        'Permission iam.serviceAccounts.signBlob denied for '
-        f'{principal}')
+        'Permission iam.serviceAccounts.signBlob denied by policy'
+        if signer_path == 'direct-safe-diagnostic'
+        else (
+            'Permission iam.serviceAccounts.signBlob denied for '
+            f'{leak_marker}'
+        )
+    )
     provider_error = google_api_exceptions.Forbidden(provider_message)
     assert '=' not in provider_message
     assert '://' not in provider_message
@@ -8256,6 +8288,8 @@ async def test_public_signing_forbidden_never_exposes_signer_identity(
         },
     }
     assert isinstance(details['gcs_error_message'], (str, type(None)))
+    if signer_path == 'direct-safe-diagnostic':
+        assert details['gcs_error_message'] == provider_message
 
     assert provider.generate_calls == [{
         'version': 'v4',
@@ -8304,12 +8338,12 @@ async def test_public_signing_forbidden_never_exposes_signer_identity(
     leaks = {
         'envelope_leaves': [
             path for path, value in _surface_leaves(result)
-            if isinstance(value, str) and principal in value
+            if isinstance(value, str) and leak_marker in value
         ],
-        'result_repr': principal in repr(result),
-        'caplog': principal in _logged_gcs_surfaces(caplog),
-        'breaker': principal in repr(breaker.__dict__),
-        'capacity_telemetry': principal in ''.join(
+        'result_repr': leak_marker in repr(result),
+        'caplog': leak_marker in _logged_gcs_surfaces(caplog),
+        'breaker': leak_marker in repr(breaker.__dict__),
+        'capacity_telemetry': leak_marker in ''.join(
             repr(record.__dict__) for record in capacity_records),
     }
     assert leaks == {

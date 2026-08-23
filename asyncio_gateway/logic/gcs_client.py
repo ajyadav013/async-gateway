@@ -106,7 +106,7 @@ _GCS_PROVIDER_SECRET_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 _GCS_PROVIDER_SERVICE_ACCOUNT: Final[re.Pattern[str]] = re.compile(
-    r'(?<![a-z0-9._%+-])[a-z0-9._%+-]+@'
+    r'(?<![a-z0-9._%+-])[a-z0-9._%+-]+(?:@|%40)'
     r'(?:[a-z0-9-]+\.)+gserviceaccount\.com'
     r'(?![a-z0-9-]|\.[a-z0-9])',
     re.IGNORECASE,

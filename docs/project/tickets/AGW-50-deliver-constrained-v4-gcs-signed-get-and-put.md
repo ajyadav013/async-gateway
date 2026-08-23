@@ -201,3 +201,31 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   SHA-256 remains
   `f5e7f40f8bc89104004c4b448ae914942c5864be0a3d6db1288efe10abd7c1ad`.
   AGW-50 remains IN PROGRESS pending independent review.
+- 2026-08-23 — Postfix Devil's Advocate RED extends the existing public
+  signing-refusal matrix with three deterministic cases: percent-encoded IAM
+  resource names from direct ADC and configured impersonation, plus a safe
+  `iam.serviceAccounts.signBlob` diagnostic control. The exact six-row matrix
+  reports 4 pass and 2 fail; the full GCS file reports 526 pass and 2 fail out
+  of 528. Both failures are confined to the encoded resource surviving in
+  `protocol_details.gcs_error_message` and the returned-result
+  representation. Status/schema, one generation call, client-open-through-
+  generation, exact-once close, zero breaker calls, empty pre-publication
+  details, capacity telemetry, lease release, all three earlier identity
+  rows, and the safe diagnostic control remain green. Production is unchanged
+  at `22f7abe269966b1f643c31890596ffa68da8592a`; the candidate RED test
+  SHA-256 is
+  `864107a4707fdb6769abfd331bc8ee8bc08d04bc1bad0d60d5552adbd3021807`.
+  AGW-50 remains IN PROGRESS for the minimal encoded-resource containment
+  GREEN.
+- 2026-08-23 — Encoded-resource GREEN recognizes `%40` alongside literal `@`
+  only in the dedicated provider-output service-account detector. It does not
+  decode provider prose or alter AC9.4 caller validation, generic redaction,
+  exception state, or signing lifecycle. The immutable six-row matrix passes
+  6/6, the full GCS suite passes 528/528, and no-blocking plus entrypoint
+  regressions pass 313/313. The full repository passes 5,934 tests with 20
+  declared skips and 100% statement/branch coverage (4,887 statements and
+  1,538 branches); `gcs_client.py` remains 819/819 statements and 278/278
+  branches. Full flake8, the exact CI format selector, package mypy, and the
+  suppression checker pass. The RED test SHA-256 remains
+  `864107a4707fdb6769abfd331bc8ee8bc08d04bc1bad0d60d5552adbd3021807`.
+  AGW-50 remains IN PROGRESS pending independent review.
