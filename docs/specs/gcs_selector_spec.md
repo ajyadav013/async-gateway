@@ -1409,6 +1409,25 @@ unredacted embedded URLs.
 - **Documentation:** exact public contract, least-privilege guidance, signing
   limitations, and runnable bounded examples stay under anti-drift tests.
 
+## GCS private-capacity SLI and SLO
+
+This SLI/SLO applies only to local admission while all four private GCS
+lifecycle leases are occupied. The durable method and the 2026-08-23 evidence
+are recorded in [GCS private-capacity admission evidence](../performance/gcs_capacity_admission_2026-08-23.md).
+It makes no external-provider latency or availability claim.
+
+For one fixed, synchronized batch of 100 public requests, every request must
+return typed `GCS_CAPACITY` with status 503 before any held permit is released
+and before its explicit 1.0-second request deadline. The nearest-rank p99,
+maximum per-request latency, and total batch wall time must each be below 1.0
+second, and throughput must be at least 100 admission decisions per second.
+The rejected batch must perform zero provider, ADC, storage, URL-generation,
+resource-close, breaker, or network work. It must leave all four held leases
+occupied and emit one exact, secret-safe rejection event per request. After
+the four permits are released, one request must be admitted successfully,
+perform exactly one in-memory generation and close, and leave zero active
+leases.
+
 ## Verification Commands
 
 Use the repository's actual commands:
