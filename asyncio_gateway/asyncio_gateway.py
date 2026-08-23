@@ -656,8 +656,9 @@ async def request(
         optional variables; GRPC accepts bytes-like data without a serializer
         and arbitrary input when ``request_serializer`` is supplied; SOAP
         accepts XML text or an Element. S3 does not use this argument. GCS
-        does not use this argument. Legacy selectors retain their existing
-        payload behavior.
+        does not use this argument. It accepts only None or an exact empty
+        built-in dict and rejects every other value with ConfigurationError.
+        Legacy selectors retain their existing payload behavior.
     :param protocol: one of the names registered in
         ``asyncio_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP,
         SFTP, SOAP, JSONRPC, GRAPHQL, S3, GCS, or GRPC. Matched with
@@ -904,7 +905,12 @@ async def request(
             post_processor_config, setting='post_processor_config')
         if post_processor_config else None)
 
-    if data is None and protocol_name not in {'JSONRPC', 'GRAPHQL'}:
+    if protocol_name == 'GCS':
+        if data is None:
+            data = {}
+        elif type(data) is not dict or data:
+            raise ConfigurationError('GCS does not accept request data')
+    elif data is None and protocol_name not in {'JSONRPC', 'GRAPHQL'}:
         data = {}
 
     # The one place caller-supplied redaction config is read, so the one

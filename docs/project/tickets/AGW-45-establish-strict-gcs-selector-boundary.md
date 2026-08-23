@@ -1,6 +1,6 @@
 # AGW-45: Establish strict GCS selector boundary
 
-- **Status:** IN REVIEW
+- **Status:** IN PROGRESS
 - **Branch:** `codex/gcs-selector-backend`
 - **Story:** GCS-02 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -85,3 +85,34 @@ their mandated boundary before any cloud or local side effect (GCS-02).
   and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
   the nonblocking stale internal protocol-count docstring. Downstream tester,
   security, operability, acceptance, and PR stages remain open.
+- 2026-08-23 — Security defect-loop RED for GCS-SEC-001 at required clean
+  product HEAD `a6d8368a9541febe20e7a0d9acf9c9fb6f3c6f54`: external validated
+  runner baseline passed 293/293. Added ten public `request()` rows: eight
+  representative non-empty/non-mapping AC1.3 data families, including an
+  ordinary opaque mapping, plus `None` and `{}` controls. The exact selected
+  command produced 8 failed / 2 passed / 293 deselected; the complete module
+  produced 8 failed / 295 passed. Every
+  intended failure reaches the deterministic `new_envelope` sentinel at
+  `asyncio_gateway.py:917`, proving the missing pre-envelope GCS data boundary
+  rather than an ADC, network, fixture, or collection fault. The new rows
+  arm sentinels for envelope creation, processor invocation, GCS construction,
+  breaker lookup, ADC, SDK client creation, and guarded filesystem I/O; they
+  also require no sentinel in the raised error or gateway logs. Status stays
+  IN PROGRESS for the smallest production GREEN; no live GCP/network call,
+  dependency mutation, or commit occurred.
+- 2026-08-23 — Security defect-loop GREEN for GCS-SEC-001: public
+  `request()` now accepts GCS `data` only when it is `None` or an exact empty
+  built-in `dict`, preserving the compatible `{}` payload; every other value
+  raises the fixed generic `ConfigurationError` before envelope creation,
+  processors, GCS construction, breaker lookup, ADC, SDK, or filesystem work,
+  without reading or formatting the rejected value. The ten frozen rows passed
+  10/10 (293 deselected), the full entrypoint module passed 303/303, and the
+  focused GCS/no-blocking selection passed 548/548. Orchestrator VALIDATE then
+  ran `uv run --isolated --no-project --with-editable '.[dev]' pytest -q` in
+  its isolated editable environment: 5,944 passed, 20 declared skips, 171
+  warnings, and 100% of 4,892 statements plus 1,544 branches (zero missing or
+  partial); changed `asyncio_gateway.py` was 129/129 statements and 52/52
+  branches. Tracked-Python full flake8 and the CI format selector, mypy (33
+  files), suppression, py_compile, JSON, diff, scope, and frozen-test-hash
+  checks passed. Status remains IN PROGRESS pending independent review; no
+  live GCP/network, dependency, or protocol-client change occurred.

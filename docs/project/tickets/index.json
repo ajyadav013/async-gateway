@@ -762,14 +762,14 @@
     {
       "id": "AGW-45",
       "title": "Establish the strict public selector boundary",
-      "status": "IN REVIEW",
+      "status": "IN PROGRESS",
       "story": "GCS-02",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-45-establish-strict-gcs-selector-boundary.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-44", "AGW-46"], "blocks": ["AGW-47"]},
       "commits": ["c8281ab", "053a836"],
-      "note": "Formal-review docstring defect loop reproduced 293 collected with 290 passed and exactly 3 failed at clean HEAD 7247a4a. Minimal GREEN added only the registered-GCS, unused-data, and ADC/Workload-Identity claims: focused rows passed 3/3, full entrypoint passed 293/293, docs passed 243/243, full flake8, CI formatting, and mypy passed, and the docstring-stripped AST stayed identical at SHA-256 34cfdb97665a7fa9b4895dc11f22d97f1673585acc7f3c6a95a4ff03a7d94a7c. Frozen test SHA-256 remains 85aeff973e722d3f21d8795b94c93549f2f997f9099ee7b8055fc60c0e2a858f. Status stays IN PROGRESS for independent review."
+      "note": "Formal-review docstring defect loop reproduced 293 collected with 290 passed and exactly 3 failed at clean HEAD 7247a4a. Minimal GREEN added only the registered-GCS, unused-data, and ADC/Workload-Identity claims: focused rows passed 3/3, full entrypoint passed 293/293, docs passed 243/243, full flake8, CI formatting, and mypy passed, and the docstring-stripped AST stayed identical at SHA-256 34cfdb97665a7fa9b4895dc11f22d97f1673585acc7f3c6a95a4ff03a7d94a7c. Frozen test SHA-256 remains 85aeff973e722d3f21d8795b94c93549f2f997f9099ee7b8055fc60c0e2a858f. Security defect-loop RED at required product HEAD a6d8368a9541febe20e7a0d9acf9c9fb6f3c6f54: validated external-runner baseline passed 293/293; eight AC1.3 non-empty/non-mapping data-family rows, including an ordinary opaque mapping, plus None/{} controls then produced selected 8 failed / 2 passed / 293 deselected and module 8 failed / 295 passed. Each intended failure hits the deterministic new_envelope sentinel at asyncio_gateway.py:917, proving missing GCS data validation before envelope, processor, GCS constructor, breaker, ADC, SDK, or filesystem I/O rather than fixture/collection/network behavior. Raised errors and gateway logs are required to omit test sentinels. GREEN accepts only None or an exact empty built-in dict for GCS data, rejects every other value generically before owned work, and passed selected 10/10, entrypoint 303/303, and focused GCS/no-blocking 548/548. Orchestrator VALIDATE isolated editable full pytest passed 5,944 with 20 declared skips, 4,892/4,892 statements and 1,544/1,544 branches; changed asyncio_gateway.py was 129/129 statements and 52/52 branches. Tracked static, JSON, diff, scope, and frozen-hash checks passed. Status stays IN PROGRESS pending independent review; no live GCP/network, dependency, or protocol-client change occurred."
     },
     {
       "id": "AGW-46",

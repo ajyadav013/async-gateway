@@ -70,6 +70,15 @@ from tests.fixtures.protocol_transports import CONTRACT_CALL, contract_call
 
 AUTH: Final[BasicAuth] = BasicAuth('user', 'password')
 
+
+class _HostileCredentialObject:
+    """A credential-shaped scalar whose representation is sensitive."""
+
+    def __repr__(self) -> str:
+        """Return the secret-like representation a boundary must not read."""
+        return 'gcs-ac13-credential-object'
+
+
 EXPECTED_PROTOCOL_MAPPING: Final[dict[
     str, type[BaseRequestClass]
 ]] = {
@@ -245,6 +254,144 @@ def test_request_docstring_documents_gcs_in_parameter_section(
     section = remainder.partition('\n:param ')[0] if separator else ''
 
     assert required_statement in ' '.join(section.split())
+
+
+# --- GCS-SEC-001 / AC1.3: GCS data is not an authentication side channel --
+
+
+@pytest.mark.parametrize(
+    ('data', 'secrets'),
+    [
+        pytest.param(
+            {'ordinary': 'gcs-ac13-opaque-data'},
+            ('gcs-ac13-opaque-data',),
+            id='ordinary-non-empty-mapping',
+        ),
+        pytest.param(
+            {
+                'type': 'service_account',
+                'private_key': 'gcs-ac13-service-account-key',
+                'client_email': 'gcs-ac13@example.invalid',
+                'token_uri': 'https://gcs-ac13.invalid/token',
+            },
+            (
+                'gcs-ac13-service-account-key',
+                'gcs-ac13@example.invalid',
+                'gcs-ac13.invalid/token',
+            ),
+            id='service-account-mapping',
+        ),
+        pytest.param(
+            _HostileCredentialObject(),
+            ('gcs-ac13-credential-object',),
+            id='credential-object-with-hostile-repr',
+        ),
+        pytest.param(
+            'Bearer gcs-ac13-access-token',
+            ('gcs-ac13-access-token',),
+            id='bearer-token-text',
+        ),
+        pytest.param(
+            b'gcs-ac13-key-material',
+            ('gcs-ac13-key-material',),
+            id='key-material-bytes',
+        ),
+        pytest.param(
+            {'project': 'gcs-ac13-project-override'},
+            ('gcs-ac13-project-override',),
+            id='project-override',
+        ),
+        pytest.param(
+            {'api_endpoint': 'https://gcs-ac13-endpoint.invalid'},
+            ('gcs-ac13-endpoint.invalid',),
+            id='custom-endpoint',
+        ),
+        pytest.param(
+            {'hostname': 'gcs-ac13-hostname.invalid'},
+            ('gcs-ac13-hostname.invalid',),
+            id='custom-hostname',
+        ),
+    ],
+)
+async def test_gcs_sec001_ac13_rejects_data_before_gateway_work(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    data: object,
+    secrets: tuple[str, ...],
+) -> None:
+    """GCS rejects every populated data shape before any owned side effect.
+
+    The sentinels are deliberately the boundaries that an accepted GCS call
+    would otherwise reach: envelope creation, a caller processor, strategy
+    construction and its breaker, and the ADC, SDK, and filesystem seams.
+    Their emptiness after the public call is the placement proof, not a mock
+    of the outcome.  The credential object has a hostile ``repr`` so a
+    diagnostic that attempts to format caller data fails this test too.
+    """
+    crossed: list[str] = []
+
+    def prohibit(boundary: str) -> Callable[..., None]:
+        """Return a boundary sentinel that records and rejects a crossing."""
+        def forbidden(*args: Any, **kwargs: Any) -> None:
+            """Fail if a rejected request reaches an owned side effect."""
+            crossed.append(boundary)
+            raise AssertionError(
+                'rejected GCS data crossed a pre-dispatch boundary')
+
+        return forbidden
+
+    monkeypatch.setattr(
+        'asyncio_gateway.asyncio_gateway.new_envelope', prohibit('envelope'))
+    monkeypatch.setattr(
+        'asyncio_gateway.asyncio_gateway.run_processor',
+        prohibit('processor'))
+    monkeypatch.setattr(GcsRequest, '__init__', prohibit('gcs-constructor'))
+    monkeypatch.setattr(
+        'asyncio_gateway.helpers.internal.base.get_breaker',
+        prohibit('breaker'))
+    monkeypatch.setattr(
+        'asyncio_gateway.logic.gcs_client.google_auth.default',
+        prohibit('adc'))
+    monkeypatch.setattr(
+        'asyncio_gateway.logic.gcs_client.storage.Client',
+        prohibit('storage-client'))
+    monkeypatch.setattr(
+        'asyncio_gateway.logic.gcs_client.read_guarded_file',
+        prohibit('filesystem-read'))
+    monkeypatch.setattr(
+        'asyncio_gateway.logic.gcs_client.stream_to_path',
+        prohibit('filesystem-write'))
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+
+    call = contract_call('GCS')
+    call['data'] = data
+    call['pre_processor_config'] = {'function': _valid_processor}
+    with pytest.raises(ConfigurationError) as raised:
+        await request(**call)
+
+    surfaces = (str(raised.value), caplog.text)
+    assert all(
+        secret not in surface for secret in secrets for surface in surfaces)
+    assert gateway_records(caplog) == []
+    assert crossed == []
+
+
+@pytest.mark.parametrize(
+    'data', [None, {}],
+    ids=['none-normalizes-to-empty-payload', 'empty-mapping'])
+async def test_ac13_gcs_keeps_the_empty_shared_payload_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    data: object,
+) -> None:
+    """The ADC-only boundary retains the compatible empty data controls."""
+    dispatched = capture_dispatch(monkeypatch)
+    call = contract_call('GCS')
+    call['data'] = data
+
+    result = await request(**call)
+
+    assert result['payload'] == {}
+    assert [type(item) for item in dispatched] == [GcsRequest]
 
 
 # --- R11-AC2: everything that is not a protocol is a configuration error ---
