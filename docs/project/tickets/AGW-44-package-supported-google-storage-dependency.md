@@ -1,7 +1,7 @@
 # AGW-44: Package the supported Google Storage dependency
 
 - **Status:** IN REVIEW
-- **Branch:** `codex/gcs-selector-backend`
+- **Branch:** `codex/gcs-selector`
 - **Story:** GCS-01 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
 - **Decisions:** Bounded GCS decisions of record in [the GCS selector specification](../../specs/gcs_selector_spec.md); no ADR is required.
@@ -97,3 +97,10 @@ does not describe the active Security Cycle 2 defect lane.
   rows and 122 packaging tests passed with 2 declared skips; scoped and full tracked-Python lint
   plus format checks emitted no output. Files: `tests/test_packaging.py`, this
   ticket, and `docs/project/tickets/index.json`.
+- 2026-08-23 — Final security and delivery evidence: commit
+  `362e184f29ed42a53e3e54984027add599582531` completed the dependency and
+  secret-hygiene lane; independent dependency and secret rechecks passed, and
+  Security Clear reported C0/H0/M0/L0. Final Pipeline Green inherited
+  unchanged dependency/package bytes and the artifact/source-install proof.
+  Status is IN REVIEW on `codex/gcs-selector`; Acceptance remains pending and
+  no PR is recorded. Files: this ticket and `docs/project/tickets/index.json`.

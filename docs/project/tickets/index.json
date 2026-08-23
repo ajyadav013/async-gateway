@@ -757,21 +757,21 @@
       "file": "docs/project/tickets/AGW-44-package-supported-google-storage-dependency.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": [], "blocks": ["AGW-45", "AGW-52"]},
-      "commits": ["60f5074"],
-      "note": "IN REVIEW. The completed historical GCS-01 slice used two files; active Security Cycle 2 reopens it for DEP-V-001, DEP-V-002, and SEC-S-001 with an exact seven-file defect lane. Build/dev share the unconditional, extra-free, URL-free setuptools>=83,<85 requirement; only flake8-import-order moves to 0.19.2; four narrow local-secret exclusions and two comment-only workflow corrections complete the lane. Focused TDD is RED 8/8 then GREEN 8/8, including unsafe version boundaries and marker/extra/URL mutation resistance. Fresh isolated validation passed lint, 5,952 tests plus 20 declared skips at 100% statement/branch coverage, static/security/scope checks, and both artifacts. Independent dependency/secret security rechecks remain required before closure."
+      "commits": ["60f5074", "362e184f29ed42a53e3e54984027add599582531"],
+      "note": "IN REVIEW on codex/gcs-selector. Security-hygiene commit 362e184f29ed42a53e3e54984027add599582531 completed dependency and secret rechecks; Security Clear reported C0/H0/M0/L0. Final Pipeline Green inherits unchanged dependency/package bytes and artifact/source-install proof. Acceptance remains pending; no PR is recorded."
     },
     {
       "id": "AGW-45",
       "title": "Establish the strict public selector boundary",
-      "status": "IN PROGRESS",
+      "status": "IN REVIEW",
       "story": "GCS-02",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-45-establish-strict-gcs-selector-boundary.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-44", "AGW-46"], "blocks": ["AGW-47"]},
-      "commits": ["c8281ab", "053a836"],
-      "observability": "2026-08-23 OBS-GCS-001 RED: one selected public request() node failed only because the sole gateway request failed ERROR record logged full gs://ops-bucket/customer-secret/object-123.csv rather than permitted bucket-only gs://ops-bucket; the envelope retained GCS_CAPACITY/503 and the original target. GREEN reduces only the GCS failure-record URL to the validated normalized gs://bucket, preserving the public envelope and every non-GCS redaction path. Selected 1/1, entrypoint 304/304, GCS/no-blocking 549/549, logging/redaction/bearer 666 passed with 591 deselected, and full repository 5,954 passed / 20 declared skips at 100% of 4,903 statements and 1,548 branches; changed asyncio_gateway.py was 130/130 statements and 52/52 branches. Independent code review, Tester, and Senior Tester each reported C0/H0/M0/L0. Product SHA-256 5e9dafa78216093f55b279d482adf7791f07ce0530b24a120d270bc6a9e90386; frozen test SHA-256 7455eabfd69af1f4f3f7404e535e49aab1f698283e3e6776e44af97ed18b86e0. Status remains IN PROGRESS pending Observability Ready.",
-      "note": "Formal-review docstring defect loop reproduced 293 collected with 290 passed and exactly 3 failed at clean HEAD 7247a4a. Minimal GREEN added only the registered-GCS, unused-data, and ADC/Workload-Identity claims: focused rows passed 3/3, full entrypoint passed 293/293, docs passed 243/243, full flake8, CI formatting, and mypy passed, and the docstring-stripped AST stayed identical at SHA-256 34cfdb97665a7fa9b4895dc11f22d97f1673585acc7f3c6a95a4ff03a7d94a7c. Frozen test SHA-256 remains 85aeff973e722d3f21d8795b94c93549f2f997f9099ee7b8055fc60c0e2a858f. Security defect-loop RED at required product HEAD a6d8368a9541febe20e7a0d9acf9c9fb6f3c6f54: validated external-runner baseline passed 293/293; eight AC1.3 non-empty/non-mapping data-family rows, including an ordinary opaque mapping, plus None/{} controls then produced selected 8 failed / 2 passed / 293 deselected and module 8 failed / 295 passed. Each intended failure hits the deterministic new_envelope sentinel at asyncio_gateway.py:917, proving missing GCS data validation before envelope, processor, GCS constructor, breaker, ADC, SDK, or filesystem I/O rather than fixture/collection/network behavior. Raised errors and gateway logs are required to omit test sentinels. GREEN accepts only None or an exact empty built-in dict for GCS data, rejects every other value generically before owned work, and passed selected 10/10, entrypoint 303/303, and focused GCS/no-blocking 548/548. Orchestrator VALIDATE isolated editable full pytest passed 5,944 with 20 declared skips, 4,892/4,892 statements and 1,544/1,544 branches; changed asyncio_gateway.py was 129/129 statements and 52/52 branches. Tracked static, JSON, diff, scope, and frozen-hash checks passed. Status stays IN PROGRESS pending independent review; no live GCP/network, dependency, or protocol-client change occurred."
+      "commits": ["c8281ab", "053a836", "bfa305d8ee0f55e88e38a6ad364737f5d0385f2a", "981a022dc7f2b05ac5559ae16396517d18774b13", "9c5115ee526983a2cb2a827ecd1916e8a8103409", "afe3aa53e44c033647098d87d132d2d8af39ba95"],
+      "observability": "2026-08-23 OBS-GCS-001 RED proved that the failure record exposed a full object path; GREEN landed in 9c5115ee526983a2cb2a827ecd1916e8a8103409 and retained the original target only in the public envelope. Independent code review, Tester, and Senior Tester reported C0/H0/M0/L0. Private-capacity SLO evidence landed in afe3aa53e44c033647098d87d132d2d8af39ba95; final Pipeline Green and Observability Ready passed at that HEAD.",
+      "note": "IN REVIEW on codex/gcs-selector. The selector boundary, request-semantics documentation, AC1.3 side-channel fix, object-path log containment, and private-capacity SLO evidence are committed and independently reviewed/tested. No selector, logging, or SLO defect remains; Acceptance is still in its defect loop and no PR is recorded."
     },
     {
       "id": "AGW-46",
@@ -793,8 +793,8 @@
       "file": "docs/project/tickets/AGW-47-build-isolated-gcs-provider-lifecycle-and-capacity-guard.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-45", "AGW-46"], "blocks": ["AGW-48"]},
-      "commits": [],
-      "note": "Documentation defect final candidate passes its isolated node and scoped flake8 with an unchanged stripped AST; diff, JSON, and exact-scope checks are green, and the approved product diff remains uncommitted. Pipeline Green cancellation-oracle correction at frozen product HEAD 362e184f replaced exactly ten caller-boundary .args checks with the established cross-version helper: Python 3.10 moved from 507 passed / 21 failed to 528/528, Python 3.11 retained exactly the accepted three product RED nodes at 525 passed / 3 failed, and Python 3.14 stayed green at 528/528. Test SHA-256 is 4fa758b51d2217b20d565c46e1bff4835b81562d2f1f59f0c75ec0ab9dce4e43; frozen gcs_client.py SHA-256 is a0cfcac7c306554f4c2548bbb28366f56e6aa16c1c48f562680498b924e248ef. The candidate is uncommitted and the separate Python 3.11 production normalization defect remains open. The one-node normalization RED extension fails 0 passed / 1 failed on Python 3.10 and Python 3.14 solely because the repeated wrapper is propagated; full Python 3.11 is 525 passed / 4 failed, comprising that node plus exactly the prior head, list, and signed-URL-close failures. Final test SHA-256 is 377036299c08269774038ce982706edc0d11b8fa3306750750c710ca3c35e24c; production remains frozen at a0cfcac7c306554f4c2548bbb28366f56e6aa16c1c48f562680498b924e248ef. Scoped static, JSON, diff, and three-file scope checks pass; the candidate remains uncommitted and intentionally RED. RED-review Iteration 1 corrected only traceback-prefix handling: both deliberately raised cancellations retain their original traceback tails, while barrier, hidden-context, and cause tracebacks retain exact identity. The selected node is 0 passed / 1 failed on Python 3.10, 3.11, and 3.14 solely at earliest identity; full Python 3.11 stays 525 passed / 4 failed on the exact accepted set. Corrected test SHA-256 is e7492a7eed8cfaca25c24da97e93ecf009622057bdd46b23ea8b98c4ef1c5706; production remains frozen at a0cfcac7c306554f4c2548bbb28366f56e6aa16c1c48f562680498b924e248ef. Minimal production GREEN follows only contiguous CancelledError context links, uses the selected earliest object at both capture seams, and changes no lifecycle loop or exception state. Full GCS passes 529/529 on Python 3.10 through 3.14; focused GCS plus no-blocking-I/O passes 549/549; entrypoint plus invariant passes 2,965/2,965; full coverage is 4,902/4,902 statements and 1,548/1,548 branches, with gcs_client.py at 829/829 and 282/282. Static checks pass. The immutable test SHA remains e7492a7eed8cfaca25c24da97e93ecf009622057bdd46b23ea8b98c4ef1c5706; candidate production SHA is 54d91f4180d3589be9177ead1e8bb861241153b171ea9bc7572e6756d28a341b. The candidate is uncommitted for independent review."
+      "commits": ["75542d873db62fa8779fa4fff8b4cd33ea970321", "3c773bf148952436e49c1ac124a4ba863bddc418"],
+      "note": "IN REVIEW on codex/gcs-selector. Cancellation normalization landed in 3c773bf148952436e49c1ac124a4ba863bddc418 and passed independent code review and Tester with C0/H0/M0/L0. GCS passed 529/529 on each Python 3.10–3.14 interpreter; final full-suite statement/branch coverage and Pipeline Green passed. No cancellation defect remains; Acceptance is pending and no PR is recorded."
     },
     {
       "id": "AGW-48",
@@ -823,14 +823,14 @@
     {
       "id": "AGW-50",
       "title": "Deliver constrained V4 signed GET and PUT without bearer leakage",
-      "status": "IN PROGRESS",
+      "status": "IN REVIEW",
       "story": "GCS-07",
       "step": "GCS selector",
       "file": "docs/project/tickets/AGW-50-deliver-constrained-v4-gcs-signed-get-and-put.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": ["AGW-49"], "blocks": ["AGW-51"]},
-      "commits": [],
-      "note": "Postfix Devil's Advocate RED adds direct-ADC and configured-impersonation cases for percent-encoded IAM resource-name identities plus one safe signing-diagnostic control. The exact six-row public request matrix reports 4 pass and 2 fail; the full GCS file reports 526 pass and 2 fail out of 528. Both failures are confined to the encoded resource surviving in protocol_details.gcs_error_message and the returned-result representation; status/schema, one generation call, exact-once close, zero breaker calls, capacity/lease behavior, all prior rows, and the safe control remain green. Production is unchanged at 22f7abe269966b1f643c31890596ffa68da8592a; candidate RED test SHA-256: 864107a4707fdb6769abfd331bc8ee8bc08d04bc1bad0d60d5552adbd3021807. Status remains IN PROGRESS for the minimal encoded-resource containment GREEN. GREEN recognizes %40 alongside literal @ only in the dedicated provider-output detector without decoding prose or changing AC9.4 validation, generic redaction, exception state, or lifecycle. The immutable six-row matrix passes 6/6, full GCS passes 528/528, no-blocking plus entrypoint passes 313/313, and the full repository passes 5,934 tests with 20 declared skips and 100% statement/branch coverage (4,887 statements, 1,538 branches). Static gates pass; the frozen RED test hash is unchanged. Status remains IN PROGRESS pending independent review."
+      "commits": ["9cee9490c2ef7facdce67c750ed27a2536db43cf", "162f2810fdcfa4c751769fc13c72f06bd655776c", "70e19f0e4dbb76e0067a5b282bc3fa6cfd76b619", "6c558b6b6766004a279d0484b8ebf5d765a8d16b", "22f7abe269966b1f643c31890596ffa68da8592a", "a6d8368a9541febe20e7a0d9acf9c9fb6f3c6f54"],
+      "note": "IN REVIEW on codex/gcs-selector. The final signer-remediation chain through a6d8368a9541febe20e7a0d9acf9c9fb6f3c6f54 closes plain, suffix-independent, and percent-encoded service-account identity exposure. Independent code and contract review, Tester, Senior Tester, and Devil's Advocate evidence found no open signer defect; final Pipeline Green passed. Acceptance is pending and no PR is recorded."
     },
     {
       "id": "AGW-51",
@@ -858,14 +858,14 @@
     {
       "id": "AGW-53",
       "title": "Fix stale envelope protocol count",
-      "status": "IN PROGRESS",
+      "status": "IN REVIEW",
       "story": "Stage 5 discovered Low-severity fast-track defect",
       "step": "GCS selector Stage 5 defect",
       "file": "docs/project/tickets/AGW-53-fix-stale-envelope-protocol-count.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": [], "blocks": []},
-      "commits": [],
-      "note": "RED began from a 243/243 focused docs-test baseline. Oracle review narrowed the numeric matcher to census claims introduced by all or across (including across all), with optional registered before protocol(s), so ordinary singular prose is accepted. A five-row simulation rejects all nine protocols, across all nine protocols, and across 10 registered protocols while accepting one protocol used to build a fresh dict and the exact count-independent target phrase. The corrected suite remained genuine RED at 243 passed and exactly one stale-wording failure. GREEN replaced only all nine protocols with all registered protocols. The targeted node passes 1/1, docs pass 244/244, and the full repository passes 5,928 tests with 20 declared skips and 100% statement and branch coverage. The docstring-stripped normalized AST matches HEAD; static, byte-compilation, JSON, diff, and scope checks pass. Accepted test SHA-256 remains 8b494848cddc66abf9dc41fe545d7dc22d5663d4b55acff0fed94769b30e2851. Status remains IN PROGRESS pending independent review."
+      "commits": ["63a0731765fd9dcce0fd08950d27ac5747398fd6"],
+      "note": "IN REVIEW on codex/gcs-selector. Commit 63a0731765fd9dcce0fd08950d27ac5747398fd6 passed independent code and contract review plus Tester and Senior Tester verification; the original stale-count Low is closed with unchanged executable AST, and final Pipeline Green passed. The separate compound-number oracle-durability Low remains documented as nonblocking. Acceptance is pending and no PR is recorded."
     }
   ]
 }

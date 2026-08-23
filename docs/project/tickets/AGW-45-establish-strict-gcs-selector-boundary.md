@@ -1,7 +1,7 @@
 # AGW-45: Establish strict GCS selector boundary
 
-- **Status:** IN PROGRESS
-- **Branch:** `codex/gcs-selector-backend`
+- **Status:** IN REVIEW
+- **Branch:** `codex/gcs-selector`
 - **Story:** GCS-02 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
 - **Decisions:** Bounded GCS decisions of record in [the GCS selector specification](../../specs/gcs_selector_spec.md); no ADR is required.
@@ -143,3 +143,12 @@ their mandated boundary before any cloud or local side effect (GCS-02).
   `7455eabfd69af1f4f3f7404e535e49aab1f698283e3e6776e44af97ed18b86e0`.
   Status remains IN PROGRESS pending the Observability Ready recheck; no live
   GCP/network, push, PR, tag, or deployment occurred.
+- 2026-08-23 — Final defect-lane evidence: AC1.3 boundary commit
+  `981a022dc7f2b05ac5559ae16396517d18774b13`, object-path log-redaction commit
+  `9c5115ee526983a2cb2a827ecd1916e8a8103409`, and private-capacity SLO-docs
+  commit `afe3aa53e44c033647098d87d132d2d8af39ba95` each retained their reviewed
+  contract. Independent code review, Tester, and Senior Tester evidence is
+  green; final Pipeline Green and Observability Ready passed, the latter at
+  C0/H0/M0/L0. Status advances to IN REVIEW on `codex/gcs-selector` while
+  Acceptance remains pending; no PR, push, tag, deployment, or live GCP action
+  is recorded. Files: this ticket and `docs/project/tickets/index.json`.

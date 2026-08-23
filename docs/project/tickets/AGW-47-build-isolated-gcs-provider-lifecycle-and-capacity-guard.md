@@ -141,3 +141,11 @@ default executor, and stalled work must not starve unrelated protocols (GCS-04).
   candidate production SHA-256 is
   `54d91f4180d3589be9177ead1e8bb861241153b171ea9bc7572e6756d28a341b`.
   The candidate remains uncommitted for independent review.
+- 2026-08-23 — Final cancellation evidence: commit
+  `3c773bf148952436e49c1ac124a4ba863bddc418` landed the reviewed earliest-
+  cancellation selector. Independent code review and Tester reported
+  C0/H0/M0/L0; the GCS module passed 529/529 on every Python 3.10–3.14
+  interpreter, final full-suite statement/branch coverage remained 100%, and
+  Pipeline Green passed. Status remains IN REVIEW on `codex/gcs-selector`;
+  Acceptance remains pending and no PR is recorded. Files: this ticket and
+  `docs/project/tickets/index.json`.

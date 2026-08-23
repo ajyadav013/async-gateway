@@ -1,7 +1,7 @@
 # AGW-53: Fix stale envelope protocol count
 
-- **Status:** IN PROGRESS
-- **Branch:** `codex/gcs-selector-backend`
+- **Status:** IN REVIEW
+- **Branch:** `codex/gcs-selector`
 - **Story:** Stage 5 discovered Low-severity fast-track defect
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
 - **Evidence:** [Contract Clear gate](../../../.Codex/artifacts/gcs-selector/contract-clear-gate.md), [full tester report](../../../.Codex/artifacts/gcs-selector/full-tester-report.md), and [senior tester report](../../../.Codex/artifacts/gcs-selector/full-senior-tester-report.md)
@@ -71,3 +71,11 @@ anti-drift check; the finding remains open until implementation and review.
   test remains byte-identical at SHA-256
   ``8b494848cddc66abf9dc41fe545d7dc22d5663d4b55acff0fed94769b30e2851``.
   Status remains IN PROGRESS pending independent review.
+- 2026-08-23 — Final review evidence: commit
+  `63a0731765fd9dcce0fd08950d27ac5747398fd6` passed independent code and
+  contract review plus Tester and Senior Tester verification. The original
+  stale-count Low is closed with unchanged executable AST and final Pipeline
+  Green evidence; the separate compound-number oracle-durability Low remains
+  documented as nonblocking. Status advances to IN REVIEW on
+  `codex/gcs-selector`; Acceptance remains pending and no PR is recorded.
+  Files: this ticket and `docs/project/tickets/index.json`.

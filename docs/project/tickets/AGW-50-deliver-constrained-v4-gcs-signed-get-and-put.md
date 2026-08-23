@@ -1,6 +1,6 @@
 # AGW-50: Deliver constrained V4 GCS signed GET and PUT
 
-- **Status:** IN PROGRESS
+- **Status:** IN REVIEW
 - **Branch:** `codex/gcs-selector`
 - **Story:** GCS-07 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
 - **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
@@ -229,3 +229,13 @@ path and must not leak an unpublished URL or credentials (GCS-07).
   suppression checker pass. The RED test SHA-256 remains
   `864107a4707fdb6769abfd331bc8ee8bc08d04bc1bad0d60d5552adbd3021807`.
   AGW-50 remains IN PROGRESS pending independent review.
+- 2026-08-23 — Final signer evidence: the remediation chain
+  `6c558b6b6766004a279d0484b8ebf5d765a8d16b` →
+  `22f7abe269966b1f643c31890596ffa68da8592a` →
+  `a6d8368a9541febe20e7a0d9acf9c9fb6f3c6f54` closed plain,
+  suffix-independent, and percent-encoded service-account identity exposure.
+  Independent code and contract review, Tester, Senior Tester, and Devil's
+  Advocate evidence found no open signer defect; final Pipeline Green passed.
+  Status advances to IN REVIEW on `codex/gcs-selector`; Acceptance remains
+  pending and no PR is recorded. Files: this ticket and
+  `docs/project/tickets/index.json`.
