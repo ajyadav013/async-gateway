@@ -63,6 +63,7 @@ from asyncio_gateway.utils.constants import HTTP_TIMEOUT
 from asyncio_gateway.utils.envelope import GatewayResponse, finalise_ok
 from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
+    GcsCapacityError,
     ProcessorError,
 )
 
@@ -392,6 +393,74 @@ async def test_ac13_gcs_keeps_the_empty_shared_payload_controls(
 
     assert result['payload'] == {}
     assert [type(item) for item in dispatched] == [GcsRequest]
+
+
+# --- OBS-GCS-001: public GCS failures retain only the bucket in logs -------
+
+
+async def test_obs_gcs001_public_capacity_failure_logs_bucket_not_object(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A GCS capacity envelope retains its target while its log does not.
+
+    The real public entry point constructs and dispatches the real GCS
+    strategy. Only its existing handler seam is replaced; provider, ADC,
+    processor, breaker, and network sentinels remain untouched.
+
+    Args:
+        monkeypatch: The pytest patcher for the deterministic GCS refusal.
+        caplog: The capture fixture for all library-owned log surfaces.
+
+    Returns:
+        None.
+    """
+    target = 'gs://ops-bucket/customer-secret/object-123.csv'
+
+    async def refuse_capacity(self: GcsRequest) -> GatewayResponse:
+        """Raise the deterministic GCS capacity error at dispatch."""
+        raise GcsCapacityError()
+
+    monkeypatch.setattr(GcsRequest, 'handle_request', refuse_capacity)
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+
+    result = await request(
+        target, protocol='GCS', protocol_info={'command': 'head'})
+
+    assert result['ok'] is False
+    assert result['url'] == target
+    assert result['error'] is not None
+    assert result['error']['code'] == 'GCS_CAPACITY'
+    assert result['status_code'] == 503
+
+    records = gateway_records(caplog)
+    failure_records = [
+        record for record in records
+        if record.levelno == logging.ERROR
+        and record.getMessage() == 'gateway request failed'
+    ]
+    assert len(failure_records) == 1
+
+    failure = failure_records[0]
+    assert failure.protocol == 'GCS'
+    assert failure.code == 'GCS_CAPACITY'
+    assert failure.status_code == 503
+    assert failure.url == 'gs://ops-bucket'
+
+    forbidden = (target, 'customer-secret/object-123.csv')
+    surfaces = [caplog.text]
+    for record in records:
+        surfaces.extend((
+            record.getMessage(),
+            repr(record.args),
+            repr(record),
+            repr(record.__dict__),
+        ))
+    assert all(
+        secret not in surface
+        for secret in forbidden
+        for surface in surfaces
+    )
 
 
 # --- R11-AC2: everything that is not a protocol is a configuration error ---

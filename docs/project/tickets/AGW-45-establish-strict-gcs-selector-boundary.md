@@ -116,3 +116,30 @@ their mandated boundary before any cloud or local side effect (GCS-02).
   files), suppression, py_compile, JSON, diff, scope, and frozen-test-hash
   checks passed. Status remains IN PROGRESS pending independent review; no
   live GCP/network, dependency, or protocol-client change occurred.
+- 2026-08-23 — OBS-GCS-001 RED: added one public `request()` regression using
+  `gs://ops-bucket/customer-secret/object-123.csv`, `GCS`/`head`, and only the
+  `GcsRequest.handle_request` capacity-refusal seam. The proven isolated
+  runner collected one node and failed it exactly at the required safe-log
+  destination assertion: the sole `gateway request failed` ERROR record held
+  `url=gs://ops-bucket/customer-secret/object-123.csv`, not the permitted
+  `gs://ops-bucket`; the public envelope still correctly held
+  `GCS_CAPACITY`/503 and the original target. No production/config/spec or
+  capacity/drain event schema was changed. Status remains IN PROGRESS for the
+  smallest logging-only GREEN.
+- 2026-08-23 — OBS-GCS-001 GREEN reduced only the structured failure record's
+  GCS URL to the already-validated, normalized `gs://bucket`; the public
+  envelope retains the original object target and every non-GCS protocol keeps
+  the established generic redaction path. The frozen public regression passed
+  1/1, the full entrypoint passed 304/304, GCS/no-blocking passed 549/549, and
+  the logging/redaction/bearer selection passed 666 with 591 deselected. The
+  full repository passed 5,954 tests with 20 declared skips and 100% of 4,903
+  statements plus 1,548 branches; changed `asyncio_gateway.py` was 130/130
+  statements and 52/52 branches. Scoped lint, the exact CI format selector,
+  mypy over 33 files, suppressions, compilation, JSON, diff, scope, and hashes
+  passed. Independent code review, Tester, and Senior Tester each reported
+  C0/H0/M0/L0. Production SHA-256 is
+  `5e9dafa78216093f55b279d482adf7791f07ce0530b24a120d270bc6a9e90386`;
+  frozen test SHA-256 remains
+  `7455eabfd69af1f4f3f7404e535e49aab1f698283e3e6776e44af97ed18b86e0`.
+  Status remains IN PROGRESS pending the Observability Ready recheck; no live
+  GCP/network, push, PR, tag, or deployment occurred.

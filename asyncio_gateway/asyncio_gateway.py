@@ -599,6 +599,11 @@ def log_failure(
     ``record.exc_info`` finds nothing; the full traceback text is in
     ``extra['traceback']``.
 
+    GCS targets have already passed the provider's strict URI validation by
+    this point. Their log URL is reduced to that target's bucket so an object
+    key or prefix never enters the failure record; every other protocol keeps
+    the established generic URL-redaction behavior.
+
     Args:
         protocol: The protocol the call was dispatched on.
         url: The URL the call was actually dispatched to, which is the one
@@ -616,13 +621,16 @@ def log_failure(
         None.
     """
     level = logging.WARNING if exc.code in WARNING_CODES else logging.ERROR
+    log_url = (
+        f'gs://{urlsplit(url).netloc.lower()}'
+        if protocol == 'GCS' else url)
     logger.log(
         level,
         'gateway request failed',
         extra={
             'protocol': redact_value(
                 protocol, extra_params=redact_query_params),
-            'url': redact_value(url, extra_params=redact_query_params),
+            'url': redact_value(log_url, extra_params=redact_query_params),
             # `code`, `status_code` and `latency` take no set: the first is
             # this library's own wire-stable constant and the other two are
             # numbers, so none of them can be the caller-supplied string
