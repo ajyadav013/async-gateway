@@ -41,6 +41,7 @@ from typing import Any, Dict, Final, Iterator, List, Tuple
 from urllib.parse import urlsplit
 
 from packaging.requirements import Requirement
+from packaging.version import Version as PackageVersion
 
 import pytest
 
@@ -55,6 +56,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'ci.yml'
 PUBLISH_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'publish.yml'
 PYPROJECT = REPO_ROOT / 'pyproject.toml'
+GITIGNORE = REPO_ROOT / '.gitignore'
 PACKAGE_ROOT = REPO_ROOT / 'asyncio_gateway'
 
 #: Where this project lives on GitHub, split into the three parts that can
@@ -124,6 +126,70 @@ _CLASSIFIER_PATTERN = re.compile(
 )
 
 Version = Tuple[int, int]
+
+
+def _pyproject_array_requirements(
+    section: str,
+    field: str,
+) -> List[Requirement]:
+    """Read one requirement array from ``pyproject.toml`` without TOML.
+
+    Args:
+        section: Exact table name without square brackets.
+        field: Exact array field within that table.
+
+    Returns:
+        Requirements declared in the array, in source order.
+
+    Raises:
+        AssertionError: If the table or array is absent or malformed.
+    """
+    source = PYPROJECT.read_text(encoding='utf-8')
+    table = re.search(
+        rf'^\[{re.escape(section)}\]\s*$'
+        rf'(?P<body>.*?)(?=^\[|\Z)',
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert table is not None, f'[{section}] is missing from {PYPROJECT}'
+    array = re.search(
+        rf'^{re.escape(field)}\s*=\s*\[(?P<items>.*?)\]\s*$',
+        table['body'],
+        re.MULTILINE | re.DOTALL,
+    )
+    assert array is not None, (
+        f'[{section}].{field} is missing or is not a literal array'
+    )
+    uncommented = '\n'.join(
+        line.split('#', 1)[0] for line in array['items'].splitlines()
+    )
+    requirements = re.findall(
+        r'(?P<quote>[\'"])(?P<requirement>[^\'"]+)(?P=quote)',
+        uncommented,
+    )
+    assert requirements, f'[{section}].{field} has no requirements'
+    return [Requirement(requirement) for _, requirement in requirements]
+
+
+def _is_exact_safe_setuptools_requirement(
+    requirement: Requirement,
+) -> bool:
+    """Return whether a requirement is the complete fixed-safe contract.
+
+    Args:
+        requirement: Parsed requirement to compare with the frozen contract.
+
+    Returns:
+        ``True`` only for the unconditional, extra-free, URL-free requirement.
+    """
+    return (
+        str(requirement) == 'setuptools<85,>=83'
+        and requirement.name == 'setuptools'
+        and str(requirement.specifier) == '<85,>=83'
+        and requirement.marker is None
+        and not requirement.extras
+        and requirement.url is None
+    )
 
 
 def _read_requires_python_floor() -> Version:
@@ -1924,6 +1990,84 @@ def test_installed_metadata_requires_exact_gcs_runtime() -> None:
     assert len(google_storage) == 1
     assert google_storage[0].marker is None
     assert str(google_storage[0].specifier) == '<4,>=3'
+
+
+def test_flake8_import_order_and_setuptools_use_the_safe_compatible_path(
+) -> None:
+    """Build and dev installs share one fixed-safe setuptools contract."""
+    build = _pyproject_array_requirements('build-system', 'requires')
+    dev = _pyproject_array_requirements(
+        'project.optional-dependencies', 'dev')
+    build_setuptools = [item for item in build if item.name == 'setuptools']
+    dev_setuptools = [item for item in dev if item.name == 'setuptools']
+    import_order = [
+        item for item in dev if item.name == 'flake8-import-order'
+    ]
+
+    assert [str(item) for item in import_order] == [
+        'flake8-import-order==0.19.2',
+    ]
+    assert len(build_setuptools) == 1
+    assert len(dev_setuptools) == 1
+    assert _is_exact_safe_setuptools_requirement(build_setuptools[0])
+    assert _is_exact_safe_setuptools_requirement(dev_setuptools[0])
+
+    mutations = (
+        Requirement('setuptools[security]>=83,<85'),
+        Requirement(
+            'setuptools>=83,<85; python_version >= "3.10"'),
+        Requirement('setuptools @ https://packages.invalid/setuptools.whl'),
+    )
+    assert all(
+        not _is_exact_safe_setuptools_requirement(item)
+        for item in mutations
+    )
+
+
+@pytest.mark.parametrize(
+    ('candidate', 'accepted'),
+    [
+        ('75.9.1', False),
+        ('78.1.0', False),
+        ('82.0.1', False),
+        ('83.0.0', True),
+        ('84.0.0', True),
+        ('85.0.0', False),
+    ],
+)
+def test_setuptools_security_range_has_explicit_boundary_behaviour(
+    candidate: str,
+    accepted: bool,
+) -> None:
+    """Both install paths admit only the reviewed fixed-safe range."""
+    requirements = [
+        *_pyproject_array_requirements('build-system', 'requires'),
+        *_pyproject_array_requirements(
+            'project.optional-dependencies', 'dev'),
+    ]
+    constraints = [
+        item for item in requirements if item.name == 'setuptools'
+    ]
+
+    assert len(constraints) == 2
+    assert all(
+        (PackageVersion(candidate) in item.specifier) is accepted
+        for item in constraints
+    )
+
+
+def test_local_secret_files_have_narrow_repository_exclusions() -> None:
+    """Local env/key material is ignored without hiding certificate code."""
+    entries = [
+        line.strip()
+        for line in GITIGNORE.read_text(encoding='utf-8').splitlines()
+        if line.strip() and not line.lstrip().startswith('#')
+    ]
+    required = {'.env.local', '.env.*.local', '*.pem', '*.key'}
+
+    assert required <= set(entries)
+    assert not {'.env*', '*.crt', '*.cer', 'tests/fixtures/'} & set(entries)
+    assert (REPO_ROOT / 'tests' / 'fixtures' / 'tls.py').is_file()
 
 
 def test_pe80_public_request_data_type_checks_new_selector_shapes(

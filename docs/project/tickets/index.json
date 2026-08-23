@@ -757,7 +757,8 @@
       "file": "docs/project/tickets/AGW-44-package-supported-google-storage-dependency.md",
       "spec": "docs/specs/gcs_selector_spec.md",
       "relations": {"depends_on": [], "blocks": ["AGW-45", "AGW-52"]},
-      "commits": ["60f5074"]
+      "commits": ["60f5074"],
+      "note": "IN REVIEW. The completed historical GCS-01 slice used two files; active Security Cycle 2 reopens it for DEP-V-001, DEP-V-002, and SEC-S-001 with an exact seven-file defect lane. Build/dev share the unconditional, extra-free, URL-free setuptools>=83,<85 requirement; only flake8-import-order moves to 0.19.2; four narrow local-secret exclusions and two comment-only workflow corrections complete the lane. Focused TDD is RED 8/8 then GREEN 8/8, including unsafe version boundaries and marker/extra/URL mutation resistance. Fresh isolated validation passed lint, 5,952 tests plus 20 declared skips at 100% statement/branch coverage, static/security/scope checks, and both artifacts. Independent dependency/secret security rechecks remain required before closure."
     },
     {
       "id": "AGW-45",
