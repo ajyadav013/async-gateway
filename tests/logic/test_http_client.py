@@ -1658,7 +1658,7 @@ async def test_a_redirect_key_that_cannot_form_a_call_is_refused(
     'timeout',
     [
         pytest.param(5, id='int'),
-        pytest.param(0.05, id='sub-second-float'),
+        pytest.param(5.0, id='float'),
     ],
 )
 async def test_a_numeric_deadline_is_accepted_int_or_float(
@@ -1667,9 +1667,10 @@ async def test_a_numeric_deadline_is_accepted_int_or_float(
 ) -> None:
     """The pair to the rejections: a guard too wide would refuse both.
 
-    A sub-second ``float`` is the row that matters -- rejecting anything
-    but ``int`` would break every deadline this suite's own timeout tests
-    are written with.
+    The float row proves the public boundary accepts the type without making
+    an otherwise immediate loopback exchange race a tiny wall-clock budget.
+    The dedicated ``SHORT_DEADLINE`` tests above continue to prove that real
+    sub-second float deadlines are both accepted and enforced.
     """
     http_server.respond('/body', body=b'ok')
 
