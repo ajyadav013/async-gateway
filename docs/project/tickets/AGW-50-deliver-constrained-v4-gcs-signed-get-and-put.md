@@ -1,0 +1,241 @@
+# AGW-50: Deliver constrained V4 GCS signed GET and PUT
+
+- **Status:** IN REVIEW
+- **Branch:** `codex/gcs-selector`
+- **Story:** GCS-07 — [GCS selector story plan](../../specs/gcs_selector_stories.md)
+- **Spec:** [GCS selector specification](../../specs/gcs_selector_spec.md)
+- **Decisions:** Bounded GCS decisions of record in [the GCS selector specification](../../specs/gcs_selector_spec.md); no ADR is required.
+- **Acceptance criteria:** AC3.1, AC3.2, AC3.4, AC9.1, AC9.2, AC9.3, AC9.4, AC9.5, AC10.1, AC10.2, AC10.3, AC10.4, AC10.5, AC11.1, AC11.2, AC11.3, AC11.4, AC11.5, AC12.1, AC12.2
+- **Files (declared scope):** `asyncio_gateway/logic/gcs_client.py`, `tests/logic/test_gcs_client.py`
+
+## Why
+
+A signed URL is a bearer secret; issuance must have no gateway retry/breaker
+path and must not leak an unpublished URL or credentials (GCS-07).
+
+## RED-first plan and definition of done
+
+- **RED first:** Add deterministic direct-signing and IAM-impersonation tests
+  for strict GET/PUT/method/expiry/service-account/content-type/PUT-cap
+  validation; signer capability checks; exact `timedelta(seconds=value)` calls
+  at 1/900/3600; one `Blob.generate_signed_url` gateway invocation with client
+  open; GET without arbitrary headers/query; PUT dedicated `content_type`,
+  exact two SDK headers, and separate exact three public `required_headers`; no
+  breaker/gateway retry while allowing credential-internal IAM retry; shielded
+  close before atomic publication; and sentinel URL/credential absence in all
+  failure, cancellation, log, trace, exception, and breaker surfaces.
+- **GREEN/refactor:** Implement signed GET/PUT only through the existing
+  lifecycle. Keep the URL in private local state until close succeeds; discard
+  it if close fails or cancellation occurs before publication.
+- **Done checks:** Focused signing and containment suite green; every successful
+  detail schema exact; no custom host/query/header/credential input; two-file
+  limit met.
+
+## Work Log
+
+- 2026-08-22 — Opened from approved GCS-07 planning before implementation;
+  recorded its two-file boundary, acceptance criteria, RED-first proof, and
+  dependency relation. Files: this ticket and the local ticket/wiki index.
+- 2026-08-22 — S1 RED adds seven deterministic direct-ADC cases: exact V4
+  GET/PUT calls at 1/default-900/3600 seconds, PUT header/generation bounds,
+  signer capability, off-loop generation/close, close-before-publication, and
+  bearer-only refusal. Focused result: 471 pass and all 7 new cases fail only
+  at the untouched signed-URL placeholder (`gcs_client.py:1118`). Production
+  remains byte-identical; no commit was created.
+- 2026-08-22 — S1 GREEN implements only direct sign-capable ADC GET/PUT:
+  signing capability and identity are checked off-loop, exact V4 arguments are
+  generated once without breaker execution, and the client closes before the
+  bearer URL is atomically published. Focused GCS/no-blocking tests pass
+  478/478; entrypoint tests pass 276/276; scoped flake8 and full-package mypy
+  pass. Focused `gcs_client.py` coverage is 99.31%; the remaining blank signer
+  identity case is the next direct-signing RED, impersonation belongs to S2,
+  and credential/cleanup failure paths belong to S2/S3. AGW-50 remains in
+  progress and the frozen S1 test hash is unchanged.
+- 2026-08-22 — S2 RED adds eight deterministic authentication cases. Three
+  unusable direct signer identities already pass; five impersonation cases
+  fail at the missing target-credential path while all 478 prior cases remain
+  green. The accepted test SHA-256 is
+  `b33e55f7e711cdc062a746f5ac45167885252e8552397799a8beec091f63af0f`.
+- 2026-08-22 — S2 GREEN selects direct or fixed-scope impersonated signing
+  credentials after source ADC refresh, constructs and refreshes the target
+  credential through the private GCS worker, and maps target refresh refusal
+  to sanitized `GCS_STATUS`/502. Focused GCS/no-blocking tests pass 486/486;
+  entrypoint tests pass 276/276; scoped flake8 and full-package mypy pass.
+  Focused coverage has 764/764 statements and 257/258 branches; the sole
+  `1311->1314` cleanup branch remains owned by S3. AGW-50 remains IN PROGRESS
+  for the hostile lifecycle and bearer-containment tranche.
+- 2026-08-22 — S3A RED adds 18 deterministic signed-URL failure and cleanup
+  cases without changing production: client-construction failure before
+  ownership, Google service/IAM/transport generation failures, exact
+  body-over-cleanup precedence, cleanup-only typed outcomes, one gateway
+  generation invocation, zero breaker use, and private bearer discard. The
+  exact focused run collects 504 cases: all 486 prior cases plus three new
+  already-supported behaviors pass, while 15 new cases fail only in the
+  missing signed-URL normalization/precedence paths. Scoped flake8 passes;
+  the accepted test SHA-256 is
+  `4a1ffc89af7835b9b3b6cc800f91978746bece7304266c6fcbbed6ad1264d784`.
+  AGW-50 remains IN PROGRESS for S3A GREEN and the separately bounded S3B
+  cancellation/timeout/bearer-surface tranche.
+- 2026-08-22 — S3A GREEN normalizes recognized storage-client construction,
+  signing, and cleanup failures without entering the breaker or retry path.
+  Source ADC failures remain `CONFIG`; signing-stage service/IAM/transport
+  failures use their safe public types; an existing body failure wins over a
+  later hostile close; and a cleanup-only failure discards the private bearer
+  before conversion. The immutable 504-case focused suite passes in full,
+  including exactly one signing invocation and zero breaker calls. Focused
+  `gcs_client.py` coverage is 809/809 statements and 272/272 branches;
+  entrypoint regression passes 276/276; scoped flake8 and full-package mypy
+  pass. AGW-50 remains IN PROGRESS for the separately bounded S3B
+  cancellation/timeout/bearer-surface tranche.
+- 2026-08-22 — S3B1 tests-first lifecycle probe adds ten deterministic public
+  `request()` cases across ADC discovery, source refresh, impersonated-
+  credential construction, target refresh, and storage-client construction,
+  with cancellation and injected result-acceptance timeout at every seam.
+  Every new row already passes the current implementation, so this tranche
+  records meaningful regression evidence rather than manufacturing a RED
+  failure: late provider work drains under retained capacity, a late-created
+  client closes off-loop exactly once before release, the one repeated-
+  cancellation adversary retains its first cancellation, and every path makes
+  zero signing/breaker calls with no credential, identity, cleanup, or signed-
+  URL sentinel in public/log surfaces. The exact focused GCS/no-blocking run
+  passes 514/514 with production untouched. AGW-50 remains IN PROGRESS for
+  the later post-generation/close and broader bearer-containment tranches.
+- 2026-08-22 — S3B2 tests-first lifecycle probe adds six deterministic public
+  `request()` rows after signing starts: cancellation and result-acceptance
+  timeout while URL generation is blocked, plus cancellation/timeout crossed
+  with recognized and unknown failures from a blocked client close after one
+  private URL was generated. One close row repeats cancellation during drain.
+  All six are honest passing regression evidence on the unchanged product:
+  the first cancellation or `TIMEOUT`/504 wins, capacity remains retained
+  until exact-once off-loop close completes, generation is invoked exactly
+  once without breaker/retry, and the late bearer plus credential/cleanup
+  sentinels remain absent from the live envelope, result, exception, cause,
+  log, and breaker surfaces. The exact focused GCS/no-blocking run passes
+  520/520. AGW-50 remains IN PROGRESS for the separately bounded successful
+  bearer-surface/telemetry tranche.
+- 2026-08-22 — S3B3 tests-first capacity and bearer-containment probe adds
+  four deterministic public-request rows. Saturated four-permit and safely
+  restored closing admission both return `GCS_CAPACITY`/503 before ADC,
+  client, signing, close, or breaker execution; exact rejection telemetry is
+  secret-safe and all four permits are reusable afterward. Successful GET and
+  PUT each expose one realistic V4 bearer exactly once, only at
+  `protocol_details.signed_url`, while the original `gs://` target, exact
+  method/expiry/PUT required-header contract, one signing invocation, zero
+  breaker execution, and close-before-publication remain intact. Capacity,
+  drain, log, error/cause, and breaker surfaces contain no signature or
+  credential-query fragment. All four rows pass on the unchanged product and
+  the exact focused GCS/no-blocking run passes 524/524. Caller-configured
+  postprocessors remain explicitly outside this tranche under the approved
+  processor trust boundary. AGW-50 remains IN PROGRESS pending review and its
+  contribution audit.
+- 2026-08-22 — Contribution-audit defect-loop RED adds 12 deterministic
+  tests for the three independent High findings while preserving all 524
+  prior focused cases. The exact 536-case GCS/no-blocking run reports 526
+  pass and 10 product-gap failures: exact-object validation has two passing
+  controls and three missing prefix/glob refusals; all six malformed nominal
+  signed-URL results are accepted instead of failing closed; and the one
+  unknown-close case preserves exception identity but retains its realistic
+  bearer in exception state and live `_signed_url_attempt` frame locals.
+  Production remains byte-identical; scoped flake8, diff checks, and the
+  no-live-I/O boundary pass. Accepted RED test SHA-256:
+  `8721f3d482939dabac81f132d97307248711ed0cf9776ae8729e9d43a1ed9aba`.
+  AGW-50 remains IN PROGRESS for the minimal GREEN defect correction.
+- 2026-08-22 — Defect-loop GREEN closes the three contribution-audit Highs
+  at their existing seams: signed URLs now reject trailing-prefix and frozen
+  glob target shapes before breaker lookup, accept only a non-empty string
+  from URL generation, and scrub a private bearer from direct exception-graph
+  strings and live strategy state before any failed cleanup propagates. The
+  immutable 536-case focused suite passes in full; focused `gcs_client.py`
+  coverage is 826/826 statements and 280/280 branches; entrypoint regression
+  passes 276/276; scoped flake8 and full-package mypy pass. Accepted RED test
+  SHA-256 remains
+  `8721f3d482939dabac81f132d97307248711ed0cf9776ae8729e9d43a1ed9aba`.
+  AGW-50 remains IN PROGRESS pending independent contribution re-audit.
+- 2026-08-23 — JOIN-2 evidence: code review Iteration 3 APPROVED at product
+  HEAD `e22a440b` (C0/H0/M0/L0); build-green passed 5,927 tests with 20
+  declared skips, repo-wide and changed-module 100% statement/branch coverage,
+  and artifact verification; contract-clear VERIFIED (C0/H0/M0/L1), with only
+  the nonblocking stale internal protocol-count docstring. Downstream tester,
+  security, operability, acceptance, and PR stages remain open.
+- 2026-08-23 — Final test-gate Devil's Advocate defect-loop RED adds two
+  deterministic public-request rows for direct signing and configured IAM
+  impersonation. Each raises a real Google `Forbidden` whose otherwise-safe
+  `iam.serviceAccounts.signBlob` prose contains only a plain signer principal,
+  and each preserves `GCS_STATUS`/403, one generation call, exact-once client
+  close, zero breaker calls, empty pre-publication details, and safe capacity
+  telemetry. The exact selector collects 2 rows and fails 2/2; the full GCS
+  file collects 524 with 522 prior cases passing and exactly the 2 new rows
+  failing because the principal reaches the gateway-owned
+  `gcs_error_message` and returned-result representation. Retained
+  third-party exception internals are deliberately outside this oracle.
+  Production is unchanged; AGW-50 returns to IN PROGRESS for the minimal
+  sanitization GREEN.
+- 2026-08-23 — Signer-identity defect-loop GREEN omits provider diagnostic
+  strings containing a service-account principal by reusing the existing
+  signing-account pattern in `_safe_provider_text()`. The immutable two-row
+  oracle now passes 2/2 and the full GCS suite passes 524/524 while preserving
+  safe provider prose, `GCS_STATUS`/403, one generation attempt, exact-once
+  close, zero breaker calls, empty pre-publication details, and capacity/lease
+  behavior. Scoped flake8, package mypy, and suppression checks pass; the RED
+  test SHA-256 remains
+  `b447a5417e726c70d0864abf13f57980de133c5caf7886751ffc66ef312753a3`.
+  AGW-50 remains IN PROGRESS pending independent review.
+- 2026-08-23 — Code-review Iteration 1 RED extension adds exactly one
+  canonical direct-ADC Compute Engine signer,
+  `123456789012-compute@developer.gserviceaccount.com`, through the existing
+  direct credential's signer-email property. The original direct-IAM and
+  configured-impersonation public rows still pass; the selected matrix now
+  collects 3 with exactly the Compute identity row failing, and the full GCS
+  file collects 525 with 524 passing and that one row failing solely because
+  the principal reaches gateway-owned `gcs_error_message` and returned-result
+  representation. Status, generation, close, breaker, empty pre-publication
+  details, caplog, and capacity assertions all remain green. Production stays
+  unchanged; AGW-50 remains IN PROGRESS for a suffix-independent GREEN.
+- 2026-08-23 — Code-review Iteration 1 GREEN separates provider-output
+  service-account detection from the narrower AC9.4 caller-input validator.
+  `_safe_provider_text()` now omits email-shaped principals under any
+  `*.gserviceaccount.com` domain while preserving ordinary email addresses and
+  unrelated safe provider prose. The immutable three-row selector passes 3/3
+  and the full GCS suite passes 525/525; no-blocking and entrypoint regressions,
+  scoped flake8, package mypy, and suppression checks pass. The RED test
+  SHA-256 remains
+  `f5e7f40f8bc89104004c4b448ae914942c5864be0a3d6db1288efe10abd7c1ad`.
+  AGW-50 remains IN PROGRESS pending independent review.
+- 2026-08-23 — Postfix Devil's Advocate RED extends the existing public
+  signing-refusal matrix with three deterministic cases: percent-encoded IAM
+  resource names from direct ADC and configured impersonation, plus a safe
+  `iam.serviceAccounts.signBlob` diagnostic control. The exact six-row matrix
+  reports 4 pass and 2 fail; the full GCS file reports 526 pass and 2 fail out
+  of 528. Both failures are confined to the encoded resource surviving in
+  `protocol_details.gcs_error_message` and the returned-result
+  representation. Status/schema, one generation call, client-open-through-
+  generation, exact-once close, zero breaker calls, empty pre-publication
+  details, capacity telemetry, lease release, all three earlier identity
+  rows, and the safe diagnostic control remain green. Production is unchanged
+  at `22f7abe269966b1f643c31890596ffa68da8592a`; the candidate RED test
+  SHA-256 is
+  `864107a4707fdb6769abfd331bc8ee8bc08d04bc1bad0d60d5552adbd3021807`.
+  AGW-50 remains IN PROGRESS for the minimal encoded-resource containment
+  GREEN.
+- 2026-08-23 — Encoded-resource GREEN recognizes `%40` alongside literal `@`
+  only in the dedicated provider-output service-account detector. It does not
+  decode provider prose or alter AC9.4 caller validation, generic redaction,
+  exception state, or signing lifecycle. The immutable six-row matrix passes
+  6/6, the full GCS suite passes 528/528, and no-blocking plus entrypoint
+  regressions pass 313/313. The full repository passes 5,934 tests with 20
+  declared skips and 100% statement/branch coverage (4,887 statements and
+  1,538 branches); `gcs_client.py` remains 819/819 statements and 278/278
+  branches. Full flake8, the exact CI format selector, package mypy, and the
+  suppression checker pass. The RED test SHA-256 remains
+  `864107a4707fdb6769abfd331bc8ee8bc08d04bc1bad0d60d5552adbd3021807`.
+  AGW-50 remains IN PROGRESS pending independent review.
+- 2026-08-23 — Final signer evidence: the remediation chain
+  `6c558b6b6766004a279d0484b8ebf5d765a8d16b` →
+  `22f7abe269966b1f643c31890596ffa68da8592a` →
+  `a6d8368a9541febe20e7a0d9acf9c9fb6f3c6f54` closed plain,
+  suffix-independent, and percent-encoded service-account identity exposure.
+  Independent code and contract review, Tester, Senior Tester, and Devil's
+  Advocate evidence found no open signer defect; final Pipeline Green passed.
+  Status advances to IN REVIEW on `codex/gcs-selector`; Acceptance remains
+  pending and no PR is recorded. Files: this ticket and
+  `docs/project/tickets/index.json`.

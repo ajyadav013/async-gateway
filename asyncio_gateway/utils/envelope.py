@@ -3,7 +3,7 @@
 ``request()`` seeds one envelope with :func:`new_envelope`, each protocol
 *fills that same object*, and exactly one of :func:`finalise_ok` or
 :func:`finalise_error` closes it. Nothing else anywhere constructs a
-response shape. That is what makes the key set invariant across all nine
+response shape. That is what makes the key set invariant across all registered
 protocols and across the success and failure paths (invariant E1), and it
 is the fix for a seam at which one protocol used to build a fresh dict, one
 mutated the caller's, and two returned ``True``.

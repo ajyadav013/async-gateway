@@ -298,11 +298,10 @@ jobs:
 
       - name: Build wheel + sdist and validate
         # An *isolated* build, for the same reason `ci.yml`'s
-        # `build-and-install` job builds in isolation: the dev extra pins
-        # `setuptools<76` while `build` requires `setuptools>=77.0.3`, and the
-        # two cannot share an interpreter. Nothing installs the dev extra here,
-        # but keeping the build isolated keeps the released artifact byte-for-
-        # byte comparable with the one CI already installed and imported.
+        # `build-and-install` job builds in isolation: build and dev installs
+        # share `setuptools>=83,<85`, while isolation proves the PEP 517 inputs
+        # are sufficient and keeps this artifact comparable with the one CI
+        # already installed and imported.
         run: |
           python -m pip install --upgrade pip
           python -m pip install build twine

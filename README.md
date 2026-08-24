@@ -1,6 +1,7 @@
 # asyncio-gateway
 
-One `await` for `HTTP`, `HTTPS`, `FTP`, `SFTP`, `SOAP`, `JSONRPC`, `GRAPHQL`, `S3`, and `GRPC`.
+One `await` for `HTTP`, `HTTPS`, `FTP`, `SFTP`, `SOAP`, `JSONRPC`, `GRAPHQL`,
+`S3`, `GRPC`, and `GCS`.
 
 `asyncio-gateway` is a typed Python client facade for outbound network and
 file-transfer work. Every selector returns the same response envelope, uses the
@@ -23,8 +24,9 @@ real wire semantics.
 python -m pip install asyncio-gateway
 ```
 
-The gRPC adapter is included in the normal installation through the bounded
-runtime dependency `grpcio>=1.83.0,<2`. JSON serialization uses `orjson`.
+The gRPC and GCS adapters are included in the normal installation through the
+bounded runtime dependencies `grpcio>=1.83.0,<2` and
+`google-cloud-storage>=3,<4`. JSON serialization uses `orjson`.
 
 ## Supported Python versions
 
@@ -72,6 +74,7 @@ uppercase spellings in configuration because they match the public registry.
 | GraphQL | `GRAPHQL` | explicit HTTP(S) URL | variables mapping or `None` |
 | AWS object storage | `S3` | `s3://bucket/key` | unused; fixed command in `protocol_info` |
 | Raw unary gRPC | `GRPC` | `grpc://host:port` or `grpcs://host:port` | bytes, or serializer input |
+| Google Cloud Storage | `GCS` | `gs://bucket[/key-or-prefix]` | unused; fixed command in `protocol_info` |
 
 ## Quickstart per protocol
 
@@ -442,6 +445,130 @@ assert fault['error']['code'] == 'SOAP_FAULT'
 MTOM and `multipart/related` attachments are rejected with
 `ConfigurationError` rather than partially interpreted.
 
+## Google Cloud Storage (GCS)
+
+### GCS quickstart
+
+`GCS` accepts `gs://bucket[/object-or-prefix]` targets and the five commands
+`download`, `upload`, `head`, `list`, and `signed_url`. Calls use a strict
+allowlist: every unknown key and every option belonging to another command is
+rejected before processors, credentials, local file work, or provider work.
+`auth` must be `None`.
+
+The repository example covers all six command/method variants with
+deterministic doubles and no live GCP access:
+
+```text
+python examples/gcs_example.py
+```
+
+Authentication uses Application Default Credentials (ADC), including
+Workload Identity. The selector does not accept service-account JSON, raw key
+material, access tokens, credential objects, project overrides, or custom
+endpoints. Grant least-privilege object permissions. Direct Signing
+credentials may sign URLs; validated impersonation additionally requires
+Service Account Token Creator and `iam.serviceAccounts.signBlob` on the named
+service account.
+
+All Google provider and credential work runs off-loop with a finite `timeout`.
+Operational calls pass `retry=None`, so the gateway circuit breaker owns their
+retries. A private four-worker pool admits exactly four leases without
+queuing; saturation fails promptly, and safe capacity telemetry contains no
+target or credential data. Shutdown is idempotent and is deferred until active
+leases drain to zero. Path helpers retain their existing default-executor
+behavior while the GCS lease remains held.
+
+Uploads default to a create-only generation precondition. Downloads are
+generation-pinned and use sequential inclusive ranges of at most 64 KiB with
+`raw_download=True`; transparent decompression is explicitly disabled, so the
+destination contains the exact stored/raw bytes. Returned `crc32c` is metadata
+only: the ranged download makes no CRC verification claim.
+
+Listing fetches one page, bounded by `max_items`. A supplied `page_token` is an
+opaque, non-empty string capped at 4096-byte when measured as UTF-8 bytes.
+`page_token` is preserved exactly unchanged without normalization and is never
+included in diagnostics.
+
+Signed URLs support V4 GET/PUT only. `expires_in_seconds` is in `1..3600`,
+defaults to `900`, and is passed to the SDK as a relative `timedelta`. Signed
+URLs are bearer capabilities; the gateway cannot revoke them before expiry.
+Signed URLs bypass the gateway circuit breaker and use no gateway retry. PUT
+binds the dedicated SDK `content_type`, `max_upload_bytes`, and
+`x-goog-if-generation-match`. The SDK receives two SDK headers, while the
+caller must send the separate three client headers listed below. Cloud Storage
+service enforces those signed headers, permissions, and expiry; this
+no-live-GCP suite does not live-test that provider-side enforcement.
+
+### `protocol_info` — GCS
+
+| Key | Required | Default | Purpose |
+|---|---:|---|---|
+| `command` | yes | — | `download`, `upload`, `head`, `list`, or `signed_url` |
+| `local_path` | transfer | — | Download destination or upload source |
+| `max_response_bytes` | no | `67108864` | Download stored-byte ceiling |
+| `max_upload_bytes` | by command | `67108864` for upload | Upload cap; required for signed PUT |
+| `if_generation_match` | no | `0` for upload/PUT | Non-negative generation precondition |
+| `max_items` | no | `1000` | One-page list limit, 1–1000 |
+| `page_token` | no | `None` | Opaque continuation token |
+| `method` | signed URL | — | `GET` or `PUT` |
+| `expires_in_seconds` | no | `900` | Relative signed-URL lifetime, 1–3600 seconds |
+| `signing_service_account` | no | `None` | Validated impersonated signer address |
+| `content_type` | signed PUT | — | Signed media type |
+| `timeout` | no | `15` | Finite result-acceptance and SDK timeout |
+| `circuit_breaker_config` | operations | `None` | Gateway breaker/retry configuration |
+| `redact_query_params` | no | `None` | Additional sensitive query names |
+
+**GCS command option allowlists.**
+
+| Operation | Required keys | Optional keys |
+|---|---|---|
+| `download` | command, local_path | max_response_bytes, if_generation_match, timeout, circuit_breaker_config, redact_query_params |
+| `upload` | command, local_path | max_upload_bytes, if_generation_match, timeout, circuit_breaker_config, redact_query_params |
+| `head` | command | if_generation_match, timeout, circuit_breaker_config, redact_query_params |
+| `list` | command | max_items, page_token, timeout, circuit_breaker_config, redact_query_params |
+| `signed_url GET` | command, method | expires_in_seconds, signing_service_account, timeout, redact_query_params |
+| `signed_url PUT` | command, method, content_type, max_upload_bytes | expires_in_seconds, signing_service_account, if_generation_match, timeout, redact_query_params |
+
+**GCS success detail schemas.**
+
+| Operation | Exact `protocol_details` keys |
+|---|---|
+| `download` | command, bucket, key, local_path, bytes_written, etag, generation, crc32c |
+| `upload` | command, bucket, key, local_path, bytes_read, etag, generation, metageneration, crc32c |
+| `head` | command, bucket, key, content_length, content_type, etag, generation, metageneration, last_modified, crc32c, metadata |
+| `list` | command, bucket, prefix, items, item_count, is_truncated, next_page_token |
+| `signed_url GET` | command, method, bucket, key, expires_in_seconds, signed_url |
+| `signed_url PUT` | command, method, bucket, key, expires_in_seconds, signed_url, content_type, max_upload_bytes, if_generation_match, required_headers |
+
+**GCS list item schema.**
+
+| Schema | Exact keys |
+|---|---|
+| `list item` | key, size, content_type, etag, generation, last_modified, crc32c |
+
+**GCS signed PUT header contracts.**
+
+| Surface | Name | Exact value |
+|---|---|---|
+| SDK dedicated argument | `content_type` | `content_type` |
+| SDK headers | `x-goog-content-length-range` | `1,<max_upload_bytes>` |
+| SDK headers | `x-goog-if-generation-match` | `str(if_generation_match)` |
+| public `required_headers` | `content-type` | `content_type` |
+| public `required_headers` | `x-goog-content-length-range` | `1,<max_upload_bytes>` |
+| public `required_headers` | `x-goog-if-generation-match` | `str(if_generation_match)` |
+
+**GCS out-of-scope capabilities.**
+
+| Capability | Status |
+|---|---|
+| `delete` | unsupported |
+| bucket administration | unsupported |
+| custom endpoint | unsupported |
+| signed POST | unsupported |
+| signed DELETE | unsupported |
+| arbitrary headers | unsupported |
+| arbitrary query parameters | unsupported |
+
 ## Public API
 
 ### `request()`
@@ -465,10 +592,10 @@ async def request(
 
 | Argument | Meaning |
 |---|---|
-| `url` | HTTP(S), SOAP, JSON-RPC, and GraphQL URL; bare FTP/SFTP host; `s3://bucket/key`; or `grpc://host:port` / `grpcs://host:port` |
+| `url` | HTTP(S), SOAP, JSON-RPC, and GraphQL URL; bare FTP/SFTP host; `s3://bucket/key`; `grpc://host:port` / `grpcs://host:port`; or `gs://bucket[/key-or-prefix]` |
 | `data` | HTTP/SOAP body, JSON-RPC/GraphQL params or variables, gRPC bytes/serializer input; `None` is meaningful for JSON-RPC/GraphQL |
-| `auth` | HTTP accepts only `aiohttp.BasicAuth` or `None` and rejects URL-userinfo conflicts; FTP uses legacy `.login`/`.password`; SFTP accepts `SFTPAuth` password, key, or both plus legacy credentials; S3 accepts an access/secret object and `None` selects the AWS credential chain; gRPC auth must be None |
-| `protocol` | One of `HTTP`, `HTTPS`, `FTP`, `SFTP`, `SOAP`, `JSONRPC`, `GRAPHQL`, `S3`, `GRPC` |
+| `auth` | HTTP accepts only `aiohttp.BasicAuth` or `None` and rejects URL-userinfo conflicts; FTP uses legacy `.login`/`.password`; SFTP accepts `SFTPAuth` password, key, or both plus legacy credentials; S3 accepts an access/secret object and `None` selects the AWS credential chain; gRPC auth must be None; GCS auth must be None and uses ADC |
+| `protocol` | One of `HTTP`, `HTTPS`, `FTP`, `SFTP`, `SOAP`, `JSONRPC`, `GRAPHQL`, `S3`, `GRPC`, `GCS` |
 | `protocol_info` | Protocol-specific configuration mapping |
 | `pre_processor_config` | Optional async processor run before dispatch |
 | `post_processor_config` | Optional async processor run after dispatch |
@@ -563,7 +690,7 @@ the stricter policy: `overwrite=False` and a mandatory positive cap.
 For legacy selectors, an ordinary unknown `protocol_info` key emits a
 `DeprecationWarning` during the 1.x compatibility window. Non-string keys and
 unknown names resembling authentication, TLS, redirect, header, cookie, or
-host-key controls fail closed. The four additive selectors use closed
+host-key controls fail closed. The five additive selectors use closed
 allowlists and reject every unknown key before processors or I/O.
 
 ### `protocol_info` — HTTP and HTTPS
@@ -813,8 +940,10 @@ Use `ok`, not the numeric status alone, as the success predicate.
 | `GRAPHQL` data or errors | Real HTTP status, including 2xx errors |
 | Successful `FTP` / `SFTP` / `GRPC` operation | 200 |
 | Successful `S3` operation | Valid SDK 2xx status; 200 if metadata omits it |
+| Successful `GCS` operation | 200 |
 | `SFTP` no-such-file / permission denied | 404 / 403 |
 | `GRPC` failure | Canonical mapping in the gRPC table |
+| `GCS` service failure | Valid provider status; otherwise 502 |
 | Local or transport failure | Stable mapping in the error-code table |
 
 ### The error-code table
@@ -844,6 +973,8 @@ Use `ok`, not the numeric status alone, as the success predicate.
 | `GRAPHQL_ERROR` | 502 | GraphQL application errors; remote status overrides |
 | `GRAPHQL_PROTOCOL` | 502 | Malformed GraphQL peer response |
 | `S3_STATUS` | 502 | S3 service error; mapped remote status overrides |
+| `GCS_STATUS` | 502 | GCS service error; valid remote status overrides |
+| `GCS_CAPACITY` | 503 | Local GCS capacity is saturated or closing |
 | `GRPC_STATUS` | 502 | gRPC status; canonical mapping overrides |
 | `FTP_STATUS` | 500 | FTP reply failure; reply status overrides |
 | `SFTP_STATUS` | 500 | SFTP status; mapped status overrides |
@@ -856,8 +987,9 @@ The public hierarchy is `AsyncGatewayError`, `ConfigurationError`,
 `GatewayTimeoutError`, `ResponseTooLargeError`, `ResponseTooDeepError`,
 `CircuitOpenError`, `StackExhaustedError`, `ProtocolError`,
 `HttpStatusError`, `JsonRpcError`, `JsonRpcProtocolError`, `GraphqlError`,
-`GraphqlProtocolError`, `S3StatusError`, `GrpcStatusError`, `FtpStatusError`,
-`SftpStatusError`, and `SoapFaultError`.
+`GraphqlProtocolError`, `S3StatusError`, `GcsStatusError`,
+`GcsCapacityError`, `GrpcStatusError`, `FtpStatusError`, `SftpStatusError`, and
+`SoapFaultError`.
 
 ### What raises and what returns
 
@@ -868,7 +1000,7 @@ cancellation propagate.
 The errors that escape this way are: selector and processor-shape failures;
 unknown top-level keywords; non-string or security-like unknown legacy
 options; unknown keys and missing required keys for `JSONRPC`, `GRAPHQL`,
-`S3`, and `GRPC`; invalid URL, auth, payload, method, metadata, or command
+`S3`, `GRPC`, and `GCS`; invalid URL, auth, payload, method, metadata, or command
 values found before dispatch; and HTTP/SOAP constructor validation. The four
 deferred FTP/SFTP option checks run inside their operation and therefore return
 a `CONFIG`/400 envelope. S3 credential-provider discovery can happen only
@@ -1011,14 +1143,16 @@ neither the wheel nor the sdist.
 - `graphql_example.py`
 - `s3_example.py`
 - `grpc_example.py`
+- `gcs_example.py`
 
 ### Docker: what the test stack covers
 
 The Docker/Compose test stack exercises live HTTP/HTTPS, FTPS, SFTP, and SOAP
 services. JSON-RPC and GraphQL tests use loopback HTTP endpoints. S3 uses a
-deterministic SDK double and does not contact AWS. gRPC uses a local generic
-server. The stack therefore validates each public path without pretending to
-provide external cloud infrastructure.
+deterministic SDK double and does not contact AWS. GCS uses a deterministic
+SDK double and does not contact GCP. gRPC uses a local generic server. The
+stack therefore validates each public path without pretending to provide
+external cloud infrastructure.
 
 ### Development checks
 

@@ -240,12 +240,10 @@ jobs:
           test ! -e asyncio_gateway.egg-info
 
       - name: Build the wheel and the sdist
-        # Deliberately an *isolated* build. `--no-isolation` would reuse the
-        # ambient environment, and the dev extra pins `setuptools<76` (so that
-        # flake8-import-order's pkg_resources import stays warning-free) while
-        # `build` requires `setuptools>=77.0.3` -- the two cannot coexist in
-        # one interpreter. Isolation gives the build its own pinned setuptools
-        # and the conflict never arises.
+        # Deliberately an *isolated* build. Build and dev installs now share
+        # the reviewed `setuptools>=83,<85` range, but isolation still proves
+        # the PEP 517 requirements are complete instead of succeeding through
+        # ambient development tooling.
         run: python -m build
 
       - name: Install the wheel into a clean venv and import the submodule

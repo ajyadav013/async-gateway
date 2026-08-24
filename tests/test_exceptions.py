@@ -446,3 +446,36 @@ def test_new_protocol_errors_have_stable_registered_contracts(
     assert raised.status_code == 502
     assert STATUS_BY_CODE[code] == 502
     assert (code in WARNING_CODES) is warning
+
+
+def test_gcs_status_error_has_a_stable_remote_contract() -> None:
+    """GCS service refusals are typed warning-class remote responses."""
+    error_class = getattr(exceptions, 'GcsStatusError')
+    raised = error_class('peer refused')
+
+    assert error_class.__bases__ == (ProtocolError,)
+    assert raised.code == 'GCS_STATUS'
+    assert raised.status_code == 502
+    assert STATUS_BY_CODE['GCS_STATUS'] == 502
+    assert 'GCS_STATUS' in WARNING_CODES
+
+
+def test_gcs_capacity_error_has_a_safe_local_contract() -> None:
+    """GCS admission refusal is fixed, local, and carries no details."""
+    error_class = getattr(exceptions, 'GcsCapacityError')
+    first = error_class()
+    second = error_class()
+
+    assert error_class.__bases__ == (AsyncGatewayError,)
+    assert first.code == 'GCS_CAPACITY'
+    assert first.status_code == 503
+    assert STATUS_BY_CODE['GCS_CAPACITY'] == 503
+    assert 'GCS_CAPACITY' not in WARNING_CODES
+    assert str(first)
+    assert str(first) == str(second)
+    assert first.args == (str(first),)
+    assert vars(first) == {'status_code': 503}
+    restored = pickle.loads(pickle.dumps(first))
+    assert type(restored) is error_class
+    assert str(restored) == str(first)
+    assert restored.status_code == 503

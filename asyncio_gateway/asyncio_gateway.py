@@ -61,6 +61,7 @@ PROTOCOL_SCHEME_ALLOWLISTS: Final[dict[str, frozenset[str]]] = {
     'JSONRPC': frozenset({'http', 'https'}),
     'GRAPHQL': frozenset({'http', 'https'}),
     'S3': frozenset({'s3'}),
+    'GCS': frozenset({'gs'}),
     'GRPC': frozenset({'grpc', 'grpcs'}),
 }
 
@@ -598,6 +599,11 @@ def log_failure(
     ``record.exc_info`` finds nothing; the full traceback text is in
     ``extra['traceback']``.
 
+    GCS targets have already passed the provider's strict URI validation by
+    this point. Their log URL is reduced to that target's bucket so an object
+    key or prefix never enters the failure record; every other protocol keeps
+    the established generic URL-redaction behavior.
+
     Args:
         protocol: The protocol the call was dispatched on.
         url: The URL the call was actually dispatched to, which is the one
@@ -615,13 +621,16 @@ def log_failure(
         None.
     """
     level = logging.WARNING if exc.code in WARNING_CODES else logging.ERROR
+    log_url = (
+        f'gs://{urlsplit(url).netloc.lower()}'
+        if protocol == 'GCS' else url)
     logger.log(
         level,
         'gateway request failed',
         extra={
             'protocol': redact_value(
                 protocol, extra_params=redact_query_params),
-            'url': redact_value(url, extra_params=redact_query_params),
+            'url': redact_value(log_url, extra_params=redact_query_params),
             # `code`, `status_code` and `latency` take no set: the first is
             # this library's own wire-stable constant and the other two are
             # numbers, so none of them can be the caller-supplied string
@@ -654,22 +663,26 @@ async def request(
         or None for optional params; GRAPHQL accepts a mapping or None for
         optional variables; GRPC accepts bytes-like data without a serializer
         and arbitrary input when ``request_serializer`` is supplied; SOAP
-        accepts XML text or an Element. S3 does not use this argument. Legacy
-        selectors retain their existing payload behavior.
+        accepts XML text or an Element. S3 does not use this argument. GCS
+        does not use this argument. It accepts only None or an exact empty
+        built-in dict and rejects every other value with ConfigurationError.
+        Legacy selectors retain their existing payload behavior.
     :param protocol: one of the names registered in
         ``asyncio_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP,
-        SFTP, SOAP, JSONRPC, GRAPHQL, S3, or GRPC. Matched with surrounding
-        whitespace stripped and without regard to case, so 'http', ' HTTP '
-        and 'Http' are the same protocol. HTTPS additionally requires that
-        the call go out over TLS; see :raises: below
+        SFTP, SOAP, JSONRPC, GRAPHQL, S3, GCS, or GRPC. Matched with
+        surrounding whitespace stripped and without regard to case, so
+        'http', ' HTTP ' and 'Http' are the same protocol. HTTPS additionally
+        requires that the call go out over TLS; see :raises: below
     :param auth: Optional aiohttp-compatible authentication for HTTP, HTTPS,
         SOAP, JSONRPC, and GRAPHQL, where None sends no credentials. FTP
         requires the legacy non-empty ``.login``/``.password`` fields. SFTP
         accepts ``SFTPAuth`` with a password, explicit client key, or both,
         and retains legacy ``.login``/``.password`` objects. For S3, None
         selects the normal AWS credential chain and a supplied object provides
-        non-empty string ``.login``/``.password`` access and secret keys.
-        GRPC requires None; request credentials use bounded metadata.
+        non-empty string ``.login``/``.password`` access and secret keys. GCS
+        requires ``None``; this selects Application Default Credentials,
+        including Workload Identity. GRPC requires None; request credentials
+        use bounded metadata.
     :param protocol_info: {
         "request_type": "GET", #required
         "timeout": int, #Optional
@@ -900,7 +913,12 @@ async def request(
             post_processor_config, setting='post_processor_config')
         if post_processor_config else None)
 
-    if data is None and protocol_name not in {'JSONRPC', 'GRAPHQL'}:
+    if protocol_name == 'GCS':
+        if data is None:
+            data = {}
+        elif type(data) is not dict or data:
+            raise ConfigurationError('GCS does not accept request data')
+    elif data is None and protocol_name not in {'JSONRPC', 'GRAPHQL'}:
         data = {}
 
     # The one place caller-supplied redaction config is read, so the one

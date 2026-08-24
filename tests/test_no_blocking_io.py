@@ -389,6 +389,83 @@ def blocking_calls_in_async_defs(source: str, module: str) -> list[str]:
     ]
 
 
+def _gcs_default_executor_call(node: ast.Call) -> str:
+    """Name one forbidden GCS default-executor call, if present."""
+    dotted = _dotted_name(node.func)
+    if dotted in {'asyncio.to_thread', 'to_thread'}:
+        return dotted
+    if not isinstance(node.func, ast.Attribute):
+        return ''
+    if node.func.attr == 'set_default_executor':
+        return dotted or 'set_default_executor'
+    if node.func.attr != 'run_in_executor':
+        return ''
+    if not node.args:
+        return dotted or 'run_in_executor'
+    executor = node.args[0]
+    if isinstance(executor, ast.Constant) and executor.value is None:
+        return dotted or 'run_in_executor(None, ...)'
+    return ''
+
+
+def gcs_default_executor_offences(source: str) -> list[str]:
+    """Find default-executor submission or mutation in GCS strategy code."""
+    offences = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        call = _gcs_default_executor_call(node)
+        if call:
+            offences.append(f'{node.lineno}: {call}')
+    return sorted(offences)
+
+
+def test_gcs_provider_helpers_never_use_or_modify_default_executor() -> None:
+    """ADC, IAM, signing, range, lookup, and close stay in GCS's pool."""
+    strategy = (
+        Path(__file__).resolve().parents[1]
+        / 'asyncio_gateway' / 'logic' / 'gcs_client.py'
+    )
+
+    assert gcs_default_executor_offences(
+        strategy.read_text(encoding='utf-8')) == []
+
+
+def test_gcs_default_executor_guard_rejects_every_forbidden_shape() -> None:
+    """The GCS-specific scan proves it detects its prohibited call forms."""
+    source = (
+        'async def adc():\n'
+        '    return await asyncio.to_thread(google.auth.default)\n'
+        'async def sign(loop, signer):\n'
+        '    return await loop.run_in_executor(None, signer.sign)\n'
+        'async def close(loop, client):\n'
+        '    loop.set_default_executor(client.executor)\n'
+        'async def iam(signer):\n'
+        '    return await to_thread(signer.sign)\n'
+    )
+
+    assert gcs_default_executor_offences(source) == [
+        '2: asyncio.to_thread',
+        '4: loop.run_in_executor',
+        '6: loop.set_default_executor',
+        '8: to_thread',
+    ]
+
+
+def test_gcs_default_executor_guard_allows_private_pool_and_path_helpers(
+) -> None:
+    """The guard permits GCS pool submission and unchanged path helpers."""
+    source = (
+        'async def provider(loop, call, path):\n'
+        '    result = await loop.run_in_executor(_GCS_EXECUTOR, call)\n'
+        '    upload = await read_guarded_file(path)\n'
+        '    await stream_to_path(result, path)\n'
+        '    return upload\n'
+    )
+
+    assert gcs_default_executor_offences(source) == []
+
+
 def test_no_blocking_filesystem_call_sits_inside_any_async_def() -> None:
     """R20's grep criterion over the whole package, as a CI check.
 

@@ -1,6 +1,6 @@
 {
   "prefix": "AGW",
-  "next": 44,
+  "next": 54,
   "spec": "docs/specs/v1_release_spec.md",
   "stories": "docs/specs/v1_release_stories.md",
   "note": "AGW-1 through AGW-32 map positionally to release stories S1-S32; later IDs are defect or work-package records. AGW-39 through AGW-41 each had two historical commit uses, preserved in reconstructed collision records. IDs are never reused going forward. Relations use depends_on = blockedBy and its inverse blocks.",
@@ -747,6 +747,125 @@
       "spec": "docs/specs/p0_contract_corrections_spec.md",
       "relations": {"depends_on": [], "blocks": []},
       "commits": ["4888ea6"]
+    },
+    {
+      "id": "AGW-44",
+      "title": "Package the supported Google Storage dependency",
+      "status": "IN REVIEW",
+      "story": "GCS-01",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-44-package-supported-google-storage-dependency.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": [], "blocks": ["AGW-45", "AGW-52"]},
+      "commits": ["60f5074", "362e184f29ed42a53e3e54984027add599582531"],
+      "note": "IN REVIEW on codex/gcs-selector. Security-hygiene commit 362e184f29ed42a53e3e54984027add599582531 completed dependency and secret rechecks; Security Clear reported C0/H0/M0/L0. Final Pipeline Green inherits unchanged dependency/package bytes and artifact/source-install proof. Acceptance remains pending; no PR is recorded."
+    },
+    {
+      "id": "AGW-45",
+      "title": "Establish the strict public selector boundary",
+      "status": "IN REVIEW",
+      "story": "GCS-02",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-45-establish-strict-gcs-selector-boundary.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-44", "AGW-46"], "blocks": ["AGW-47"]},
+      "commits": ["c8281ab", "053a836", "bfa305d8ee0f55e88e38a6ad364737f5d0385f2a", "981a022dc7f2b05ac5559ae16396517d18774b13", "9c5115ee526983a2cb2a827ecd1916e8a8103409", "afe3aa53e44c033647098d87d132d2d8af39ba95"],
+      "observability": "2026-08-23 OBS-GCS-001 RED proved that the failure record exposed a full object path; GREEN landed in 9c5115ee526983a2cb2a827ecd1916e8a8103409 and retained the original target only in the public envelope. Independent code review, Tester, and Senior Tester reported C0/H0/M0/L0. Private-capacity SLO evidence landed in afe3aa53e44c033647098d87d132d2d8af39ba95; final Pipeline Green and Observability Ready passed at that HEAD.",
+      "note": "IN REVIEW on codex/gcs-selector. The selector boundary, request-semantics documentation, AC1.3 side-channel fix, object-path log containment, and private-capacity SLO evidence are committed and independently reviewed/tested. No selector, logging, or SLO defect remains; Acceptance is still in its defect loop and no PR is recorded."
+    },
+    {
+      "id": "AGW-46",
+      "title": "Introduce stable typed GCS error vocabulary",
+      "status": "IN REVIEW",
+      "story": "GCS-03",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-46-introduce-stable-gcs-error-vocabulary.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": [], "blocks": ["AGW-45", "AGW-47", "AGW-51"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-47",
+      "title": "Build the isolated provider lifecycle and capacity guard",
+      "status": "IN REVIEW",
+      "story": "GCS-04",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-47-build-isolated-gcs-provider-lifecycle-and-capacity-guard.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-45", "AGW-46"], "blocks": ["AGW-48"]},
+      "commits": ["75542d873db62fa8779fa4fff8b4cd33ea970321", "3c773bf148952436e49c1ac124a4ba863bddc418"],
+      "note": "IN REVIEW on codex/gcs-selector. Cancellation normalization landed in 3c773bf148952436e49c1ac124a4ba863bddc418 and passed independent code review and Tester with C0/H0/M0/L0. GCS passed 529/529 on each Python 3.10–3.14 interpreter; final full-suite statement/branch coverage and Pipeline Green passed. No cancellation defect remains; Acceptance is pending and no PR is recorded."
+    },
+    {
+      "id": "AGW-48",
+      "title": "Deliver guarded upload and generation-pinned raw download",
+      "status": "IN REVIEW",
+      "story": "GCS-05",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-48-deliver-guarded-gcs-upload-and-generation-pinned-raw-download.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-47"], "blocks": ["AGW-49"]},
+      "commits": [],
+      "note": "Formal-review defect-loop GREEN preserves established upload/download service, transport, and malformed-success body outcomes over later cleanup cancellation while retaining fully drained cleanup and cleanup-only precedence. The six-row selector, all 522 GCS tests, 290 entrypoint regressions, focused 100% gcs_client statement/branch coverage, scoped flake8/CI-format, mypy, secret, diff, JSON, hash, and scope checks pass. Status remains IN PROGRESS for independent formal-review recheck."
+    },
+    {
+      "id": "AGW-49",
+      "title": "Deliver normalized head and one-page list",
+      "status": "IN REVIEW",
+      "story": "GCS-06",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-49-deliver-normalized-gcs-head-and-one-page-list.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-48"], "blocks": ["AGW-50"]},
+      "commits": [],
+      "note": "Formal-review suppression defect-loop GREEN adds factual justifications for the eight intentional GCS type suppressions: the untyped GCS SDK import and malformed/foreign provider values injected by normalization tests. The suppression checker, all 522 GCS tests, full flake8, CI-format flake8, and package mypy pass; executable suppression counts/categories and both Python ASTs are unchanged. Status remains IN PROGRESS for independent formal-review recheck."
+    },
+    {
+      "id": "AGW-50",
+      "title": "Deliver constrained V4 signed GET and PUT without bearer leakage",
+      "status": "IN REVIEW",
+      "story": "GCS-07",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-50-deliver-constrained-v4-gcs-signed-get-and-put.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-49"], "blocks": ["AGW-51"]},
+      "commits": ["9cee9490c2ef7facdce67c750ed27a2536db43cf", "162f2810fdcfa4c751769fc13c72f06bd655776c", "70e19f0e4dbb76e0067a5b282bc3fa6cfd76b619", "6c558b6b6766004a279d0484b8ebf5d765a8d16b", "22f7abe269966b1f643c31890596ffa68da8592a", "a6d8368a9541febe20e7a0d9acf9c9fb6f3c6f54"],
+      "note": "IN REVIEW on codex/gcs-selector. The final signer-remediation chain through a6d8368a9541febe20e7a0d9acf9c9fb6f3c6f54 closes plain, suffix-independent, and percent-encoded service-account identity exposure. Independent code and contract review, Tester, Senior Tester, and Devil's Advocate evidence found no open signer defect; final Pipeline Green passed. Acceptance is pending and no PR is recorded."
+    },
+    {
+      "id": "AGW-51",
+      "title": "Extend shared deterministic contract matrices",
+      "status": "IN REVIEW",
+      "story": "GCS-08",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-51-extend-shared-deterministic-gcs-contract-matrices.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-46", "AGW-50"], "blocks": ["AGW-52"]},
+      "commits": []
+    },
+    {
+      "id": "AGW-52",
+      "title": "Publish documented, example, and artifact-verified GCS contract",
+      "status": "IN REVIEW",
+      "story": "GCS-09",
+      "step": "GCS selector",
+      "file": "docs/project/tickets/AGW-52-publish-documented-example-and-artifact-verified-gcs-contract.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": ["AGW-44", "AGW-51"], "blocks": []},
+      "commits": ["a768c8f806ecec4fedf120136f8806c3689c3707"],
+      "note": "IN REVIEW. Current AGW-52 join: 357 passed / 2 existing skips; scoped lint, example compile, diff, and ticket JSON checks are green. The corrected import sentinel first refroze packaging at SHA-256 ac9dd62493642004a9f8986bb618b92f8522ff8fce6258635f3fae5cd8f58be1. Review iteration 1 reported 0 Critical / 2 High / 1 Medium; the docs oracle now rejects 18/18 reversed-claim mutations and passes 243/243 at SHA-256 2954334537979a54826ace9b7b14ed26e07efc740398b8ec3bbdc2b3459556eb, while the public-request shadow now fails and packaging passes 114 / 2 existing skips at SHA-256 68a98582b2e81f8f28ec96d24d9877b27ab4701a8b3af25f9d317b33619c7c12. Final targeted re-review is VERIFIED with 0 Critical / 0 High / 0 Medium / 0 Low: 10/10 truthful nodes passed, 18/18 documentation mutations and 3/3 public-request-binding attacks were rejected, and the runtime sentinel observed six public request awaits with zero ADC, storage-client, GCS-lease, DNS, or socket calls. At that checkpoint, the ticket and index remained IN PROGRESS, AGW-32 remained OPEN, the index diff affected only AGW-52, and the seven-file candidate remained uncommitted; no live GCP, network, CI, deployment, tag, or release action occurred. Product commit a768c8f806ecec4fedf120136f8806c3689c3707 is clean. The contribution audit maps 11/11 obligations PASS with 0 missing and 0 Critical / 0 High / 0 Medium findings. OPEN-GLOBAL before feature acceptance: wheel/sdist build plus clean install/import verification; full suite, shuffled-order, and Python 3.10–3.14 interpreter runs; repo-wide and every changed production module at 100% statement and branch coverage with explicit behavioral matrices; and the downstream code-review, contract, test, security, pipeline, observability, and acceptance gates. AGW-32 remains OPEN."
+    },
+    {
+      "id": "AGW-53",
+      "title": "Fix stale envelope protocol count",
+      "status": "IN REVIEW",
+      "story": "Stage 5 discovered Low-severity fast-track defect",
+      "step": "GCS selector Stage 5 defect",
+      "file": "docs/project/tickets/AGW-53-fix-stale-envelope-protocol-count.md",
+      "spec": "docs/specs/gcs_selector_spec.md",
+      "relations": {"depends_on": [], "blocks": []},
+      "commits": ["63a0731765fd9dcce0fd08950d27ac5747398fd6"],
+      "note": "IN REVIEW on codex/gcs-selector. Commit 63a0731765fd9dcce0fd08950d27ac5747398fd6 passed independent code and contract review plus Tester and Senior Tester verification; the original stale-count Low is closed with unchanged executable AST, and final Pipeline Green passed. The separate compound-number oracle-durability Low remains documented as nonblocking. Acceptance is pending and no PR is recorded."
     }
   ]
 }

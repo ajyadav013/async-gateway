@@ -26,6 +26,7 @@ against the URL actually dispatched, after the pre-processor -- has its own
 named test below.
 """
 
+import inspect
 import logging
 from collections.abc import Mapping
 from typing import Any, Callable, Final, Optional
@@ -37,6 +38,7 @@ import pytest
 from asyncio_gateway.asyncio_gateway import (
     DISPATCH_CONTROLLING_KEYS,
     HTTP_FAMILY_SCHEMES,
+    PROTOCOL_SCHEME_ALLOWLISTS,
     URL_DISPATCHED_PROTOCOLS,
     dispatch_url_for,
     request,
@@ -49,6 +51,7 @@ from asyncio_gateway.helpers.internal.base import (
 )
 from asyncio_gateway.logic import protocol_mapping
 from asyncio_gateway.logic.ftp_client import FTPRequest
+from asyncio_gateway.logic.gcs_client import GcsRequest
 from asyncio_gateway.logic.graphql_client import GraphqlRequest
 from asyncio_gateway.logic.grpc_client import GrpcRequest
 from asyncio_gateway.logic.http_client import HttpRequest
@@ -60,12 +63,22 @@ from asyncio_gateway.utils.constants import HTTP_TIMEOUT
 from asyncio_gateway.utils.envelope import GatewayResponse, finalise_ok
 from asyncio_gateway.utils.exceptions import (
     ConfigurationError,
+    GcsCapacityError,
     ProcessorError,
 )
 
 from tests.fixtures.protocol_transports import CONTRACT_CALL, contract_call
 
 AUTH: Final[BasicAuth] = BasicAuth('user', 'password')
+
+
+class _HostileCredentialObject:
+    """A credential-shaped scalar whose representation is sensitive."""
+
+    def __repr__(self) -> str:
+        """Return the secret-like representation a boundary must not read."""
+        return 'gcs-ac13-credential-object'
+
 
 EXPECTED_PROTOCOL_MAPPING: Final[dict[
     str, type[BaseRequestClass]
@@ -78,6 +91,7 @@ EXPECTED_PROTOCOL_MAPPING: Final[dict[
     'JSONRPC': JsonRpcRequest,
     'GRAPHQL': GraphqlRequest,
     'S3': S3Request,
+    'GCS': GcsRequest,
     'GRPC': GrpcRequest,
 }
 
@@ -195,6 +209,260 @@ def test_r11_ac1_resolve_protocol_normalises_before_it_looks_up(
     assert resolve_protocol(spelling(name)) == (name, protocol_mapping[name])
 
 
+def test_gcs_selector_resolves_case_insensitively() -> None:
+    """GCS has one normalized public selector backed by a strategy class."""
+    assert 'GCS' in protocol_mapping
+    assert resolve_protocol('  gCs  ') == (
+        'GCS', protocol_mapping['GCS'])
+
+
+def test_gcs_selector_has_only_the_gs_scheme() -> None:
+    """GCS dispatch accepts only explicit ``gs`` targets."""
+    assert PROTOCOL_SCHEME_ALLOWLISTS['GCS'] == frozenset({'gs'})
+
+
+@pytest.mark.parametrize(
+    ('parameter', 'required_statement'),
+    [
+        pytest.param(
+            'protocol',
+            'one of the names registered in '
+            '``asyncio_gateway.logic.protocol_mapping`` -- HTTP, HTTPS, FTP, '
+            'SFTP, SOAP, JSONRPC, GRAPHQL, S3, GCS, or GRPC.',
+            id='protocol-registers-gcs',
+        ),
+        pytest.param(
+            'data',
+            'GCS does not use this argument.',
+            id='data-unused-by-gcs',
+        ),
+        pytest.param(
+            'auth',
+            'GCS requires ``None``; this selects Application Default '
+            'Credentials, including Workload Identity.',
+            id='auth-requires-adc-or-workload-identity',
+        ),
+    ],
+)
+def test_request_docstring_documents_gcs_in_parameter_section(
+    parameter: str,
+    required_statement: str,
+) -> None:
+    """Each GCS public-call claim belongs to its own parameter section."""
+    docstring = inspect.getdoc(request) or ''
+    marker = f':param {parameter}:'
+    _, separator, remainder = docstring.partition(marker)
+    section = remainder.partition('\n:param ')[0] if separator else ''
+
+    assert required_statement in ' '.join(section.split())
+
+
+# --- GCS-SEC-001 / AC1.3: GCS data is not an authentication side channel --
+
+
+@pytest.mark.parametrize(
+    ('data', 'secrets'),
+    [
+        pytest.param(
+            {'ordinary': 'gcs-ac13-opaque-data'},
+            ('gcs-ac13-opaque-data',),
+            id='ordinary-non-empty-mapping',
+        ),
+        pytest.param(
+            {
+                'type': 'service_account',
+                'private_key': 'gcs-ac13-service-account-key',
+                'client_email': 'gcs-ac13@example.invalid',
+                'token_uri': 'https://gcs-ac13.invalid/token',
+            },
+            (
+                'gcs-ac13-service-account-key',
+                'gcs-ac13@example.invalid',
+                'gcs-ac13.invalid/token',
+            ),
+            id='service-account-mapping',
+        ),
+        pytest.param(
+            _HostileCredentialObject(),
+            ('gcs-ac13-credential-object',),
+            id='credential-object-with-hostile-repr',
+        ),
+        pytest.param(
+            'Bearer gcs-ac13-access-token',
+            ('gcs-ac13-access-token',),
+            id='bearer-token-text',
+        ),
+        pytest.param(
+            b'gcs-ac13-key-material',
+            ('gcs-ac13-key-material',),
+            id='key-material-bytes',
+        ),
+        pytest.param(
+            {'project': 'gcs-ac13-project-override'},
+            ('gcs-ac13-project-override',),
+            id='project-override',
+        ),
+        pytest.param(
+            {'api_endpoint': 'https://gcs-ac13-endpoint.invalid'},
+            ('gcs-ac13-endpoint.invalid',),
+            id='custom-endpoint',
+        ),
+        pytest.param(
+            {'hostname': 'gcs-ac13-hostname.invalid'},
+            ('gcs-ac13-hostname.invalid',),
+            id='custom-hostname',
+        ),
+    ],
+)
+async def test_gcs_sec001_ac13_rejects_data_before_gateway_work(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    data: object,
+    secrets: tuple[str, ...],
+) -> None:
+    """GCS rejects every populated data shape before any owned side effect.
+
+    The sentinels are deliberately the boundaries that an accepted GCS call
+    would otherwise reach: envelope creation, a caller processor, strategy
+    construction and its breaker, and the ADC, SDK, and filesystem seams.
+    Their emptiness after the public call is the placement proof, not a mock
+    of the outcome.  The credential object has a hostile ``repr`` so a
+    diagnostic that attempts to format caller data fails this test too.
+    """
+    crossed: list[str] = []
+
+    def prohibit(boundary: str) -> Callable[..., None]:
+        """Return a boundary sentinel that records and rejects a crossing."""
+        def forbidden(*args: Any, **kwargs: Any) -> None:
+            """Fail if a rejected request reaches an owned side effect."""
+            crossed.append(boundary)
+            raise AssertionError(
+                'rejected GCS data crossed a pre-dispatch boundary')
+
+        return forbidden
+
+    monkeypatch.setattr(
+        'asyncio_gateway.asyncio_gateway.new_envelope', prohibit('envelope'))
+    monkeypatch.setattr(
+        'asyncio_gateway.asyncio_gateway.run_processor',
+        prohibit('processor'))
+    monkeypatch.setattr(GcsRequest, '__init__', prohibit('gcs-constructor'))
+    monkeypatch.setattr(
+        'asyncio_gateway.helpers.internal.base.get_breaker',
+        prohibit('breaker'))
+    monkeypatch.setattr(
+        'asyncio_gateway.logic.gcs_client.google_auth.default',
+        prohibit('adc'))
+    monkeypatch.setattr(
+        'asyncio_gateway.logic.gcs_client.storage.Client',
+        prohibit('storage-client'))
+    monkeypatch.setattr(
+        'asyncio_gateway.logic.gcs_client.read_guarded_file',
+        prohibit('filesystem-read'))
+    monkeypatch.setattr(
+        'asyncio_gateway.logic.gcs_client.stream_to_path',
+        prohibit('filesystem-write'))
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+
+    call = contract_call('GCS')
+    call['data'] = data
+    call['pre_processor_config'] = {'function': _valid_processor}
+    with pytest.raises(ConfigurationError) as raised:
+        await request(**call)
+
+    surfaces = (str(raised.value), caplog.text)
+    assert all(
+        secret not in surface for secret in secrets for surface in surfaces)
+    assert gateway_records(caplog) == []
+    assert crossed == []
+
+
+@pytest.mark.parametrize(
+    'data', [None, {}],
+    ids=['none-normalizes-to-empty-payload', 'empty-mapping'])
+async def test_ac13_gcs_keeps_the_empty_shared_payload_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    data: object,
+) -> None:
+    """The ADC-only boundary retains the compatible empty data controls."""
+    dispatched = capture_dispatch(monkeypatch)
+    call = contract_call('GCS')
+    call['data'] = data
+
+    result = await request(**call)
+
+    assert result['payload'] == {}
+    assert [type(item) for item in dispatched] == [GcsRequest]
+
+
+# --- OBS-GCS-001: public GCS failures retain only the bucket in logs -------
+
+
+async def test_obs_gcs001_public_capacity_failure_logs_bucket_not_object(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A GCS capacity envelope retains its target while its log does not.
+
+    The real public entry point constructs and dispatches the real GCS
+    strategy. Only its existing handler seam is replaced; provider, ADC,
+    processor, breaker, and network sentinels remain untouched.
+
+    Args:
+        monkeypatch: The pytest patcher for the deterministic GCS refusal.
+        caplog: The capture fixture for all library-owned log surfaces.
+
+    Returns:
+        None.
+    """
+    target = 'gs://ops-bucket/customer-secret/object-123.csv'
+
+    async def refuse_capacity(self: GcsRequest) -> GatewayResponse:
+        """Raise the deterministic GCS capacity error at dispatch."""
+        raise GcsCapacityError()
+
+    monkeypatch.setattr(GcsRequest, 'handle_request', refuse_capacity)
+    caplog.set_level(logging.DEBUG, logger='asyncio_gateway')
+
+    result = await request(
+        target, protocol='GCS', protocol_info={'command': 'head'})
+
+    assert result['ok'] is False
+    assert result['url'] == target
+    assert result['error'] is not None
+    assert result['error']['code'] == 'GCS_CAPACITY'
+    assert result['status_code'] == 503
+
+    records = gateway_records(caplog)
+    failure_records = [
+        record for record in records
+        if record.levelno == logging.ERROR
+        and record.getMessage() == 'gateway request failed'
+    ]
+    assert len(failure_records) == 1
+
+    failure = failure_records[0]
+    assert failure.protocol == 'GCS'
+    assert failure.code == 'GCS_CAPACITY'
+    assert failure.status_code == 503
+    assert failure.url == 'gs://ops-bucket'
+
+    forbidden = (target, 'customer-secret/object-123.csv')
+    surfaces = [caplog.text]
+    for record in records:
+        surfaces.extend((
+            record.getMessage(),
+            repr(record.args),
+            repr(record),
+            repr(record.__dict__),
+        ))
+    assert all(
+        secret not in surface
+        for secret in forbidden
+        for surface in surfaces
+    )
+
+
 # --- R11-AC2: everything that is not a protocol is a configuration error ---
 
 
@@ -237,7 +505,7 @@ def test_h3_soap_maps_to_a_real_class_and_never_to_none() -> None:
         for strategy in protocol_mapping.values())
 
 
-def test_pe80_registry_is_the_exact_nine_protocol_contract() -> None:
+def test_pe80_registry_is_the_exact_ten_protocol_contract() -> None:
     """The production selector registry contains every first-class client."""
     assert protocol_mapping == EXPECTED_PROTOCOL_MAPPING
     assert set(CONTRACT_CALL) == set(protocol_mapping)

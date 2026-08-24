@@ -155,6 +155,11 @@ from asyncio_gateway.helpers.internal.circuit_breaker_helper import (
 )
 from asyncio_gateway.logic import protocol_mapping
 from asyncio_gateway.logic.ftp_client import FTP_COMMANDS
+from asyncio_gateway.logic.gcs_client import (
+    GCS_COMMANDS,
+    GCS_OPERATION_INFO_KEYS,
+    GcsRequest,
+)
 from asyncio_gateway.logic.graphql_client import GraphqlRequest
 from asyncio_gateway.logic.grpc_client import GRPC_HTTP_STATUS, GrpcRequest
 from asyncio_gateway.logic.jsonrpc_client import JsonRpcRequest
@@ -208,7 +213,7 @@ _TABLE_ROW = re.compile(r'^\|(?P<cells>.+)\|\s*$', re.MULTILINE)
 
 #: A Markdown heading of any level, with its text.
 _HEADING = re.compile(
-    r'^(?P<hashes>#{2,4})\s+(?P<title>.+?)\s*$', re.MULTILINE)
+    r'^(?P<hashes>#{1,6})\s+(?P<title>.+?)\s*$', re.MULTILINE)
 
 #: Inline code spans, which is how every key, verb and envelope field is
 #: written in the prose as well as in the tables.
@@ -238,6 +243,7 @@ PROTOCOL_SELECTOR_CLASSES = {
     'GRAPHQL': 'GraphqlRequest',
     'S3': 'S3Request',
     'GRPC': 'GrpcRequest',
+    'GCS': 'GcsRequest',
 }
 
 #: Closed R12 inventories for the four additive selectors.
@@ -246,6 +252,7 @@ NEW_SELECTOR_REQUIRED_KEYS = {
     'GRAPHQL': frozenset({'query'}),
     'S3': frozenset({'command'}),
     'GRPC': frozenset({'method'}),
+    'GCS': frozenset({'command'}),
 }
 NEW_SELECTOR_OPTION_KEYS = {
     'JSONRPC': frozenset({
@@ -268,6 +275,7 @@ NEW_SELECTOR_OPTION_KEYS = {
         'timeout', 'max_response_bytes', 'circuit_breaker_config',
         'redact_query_params',
     }),
+    'GCS': GcsRequest.ALLOWED_INFO_KEYS,
 }
 S3_COMMAND_OPTION_KEYS = {
     'download': frozenset({
@@ -287,6 +295,149 @@ S3_COMMAND_OPTION_KEYS = {
         'circuit_breaker_config', 'redact_query_params',
     }),
 }
+
+#: Spec-frozen GCS command boundaries in public documentation order. Tuples
+#: intentionally retain ordering and duplicates until the assertions below
+#: reject them; a dict/set would silently hide either kind of documentation
+#: drift.
+GCS_COMMAND_OPTION_ROWS = (
+    (
+        'download',
+        ('command', 'local_path'),
+        (
+            'max_response_bytes', 'if_generation_match', 'timeout',
+            'circuit_breaker_config', 'redact_query_params',
+        ),
+    ),
+    (
+        'upload',
+        ('command', 'local_path'),
+        (
+            'max_upload_bytes', 'if_generation_match', 'timeout',
+            'circuit_breaker_config', 'redact_query_params',
+        ),
+    ),
+    (
+        'head',
+        ('command',),
+        (
+            'if_generation_match', 'timeout', 'circuit_breaker_config',
+            'redact_query_params',
+        ),
+    ),
+    (
+        'list',
+        ('command',),
+        (
+            'max_items', 'page_token', 'timeout',
+            'circuit_breaker_config', 'redact_query_params',
+        ),
+    ),
+    (
+        'signed_url GET',
+        ('command', 'method'),
+        (
+            'expires_in_seconds', 'signing_service_account', 'timeout',
+            'redact_query_params',
+        ),
+    ),
+    (
+        'signed_url PUT',
+        ('command', 'method', 'content_type', 'max_upload_bytes'),
+        (
+            'expires_in_seconds', 'signing_service_account',
+            'if_generation_match', 'timeout', 'redact_query_params',
+        ),
+    ),
+)
+
+#: Exact JSON-safe detail schemas consumers may rely on, in documented order.
+GCS_SUCCESS_DETAIL_ROWS = (
+    (
+        'download',
+        (
+            'command', 'bucket', 'key', 'local_path', 'bytes_written', 'etag',
+            'generation', 'crc32c',
+        ),
+    ),
+    (
+        'upload',
+        (
+            'command', 'bucket', 'key', 'local_path', 'bytes_read', 'etag',
+            'generation', 'metageneration', 'crc32c',
+        ),
+    ),
+    (
+        'head',
+        (
+            'command', 'bucket', 'key', 'content_length', 'content_type',
+            'etag', 'generation', 'metageneration', 'last_modified', 'crc32c',
+            'metadata',
+        ),
+    ),
+    (
+        'list',
+        (
+            'command', 'bucket', 'prefix', 'items', 'item_count',
+            'is_truncated', 'next_page_token',
+        ),
+    ),
+    (
+        'signed_url GET',
+        (
+            'command', 'method', 'bucket', 'key', 'expires_in_seconds',
+            'signed_url',
+        ),
+    ),
+    (
+        'signed_url PUT',
+        (
+            'command', 'method', 'bucket', 'key', 'expires_in_seconds',
+            'signed_url', 'content_type', 'max_upload_bytes',
+            'if_generation_match', 'required_headers',
+        ),
+    ),
+)
+
+#: Every normalized list item has this exact closed schema.
+GCS_LIST_ITEM_KEYS = (
+    'key', 'size', 'content_type', 'etag', 'generation', 'last_modified',
+    'crc32c',
+)
+
+#: Signed PUT's exact six inputs/public obligations. The repeated surface
+#: labels are legitimate, while the full (surface, name) key must be unique.
+GCS_SIGNED_PUT_HEADER_ROWS = (
+    ('SDK dedicated argument', 'content_type', 'content_type'),
+    (
+        'SDK headers', 'x-goog-content-length-range',
+        '1,<max_upload_bytes>',
+    ),
+    (
+        'SDK headers', 'x-goog-if-generation-match',
+        'str(if_generation_match)',
+    ),
+    ('public required_headers', 'content-type', 'content_type'),
+    (
+        'public required_headers', 'x-goog-content-length-range',
+        '1,<max_upload_bytes>',
+    ),
+    (
+        'public required_headers', 'x-goog-if-generation-match',
+        'str(if_generation_match)',
+    ),
+)
+
+#: Capabilities deliberately excluded from the bounded selector.
+GCS_OUT_OF_SCOPE_ROWS = (
+    ('delete', 'unsupported'),
+    ('bucket administration', 'unsupported'),
+    ('custom endpoint', 'unsupported'),
+    ('signed POST', 'unsupported'),
+    ('signed DELETE', 'unsupported'),
+    ('arbitrary headers', 'unsupported'),
+    ('arbitrary query parameters', 'unsupported'),
+)
 
 #: The public callables a documented signature listing or call is checked
 #: against. Keyed by the name the README uses, which is the name the reader
@@ -363,37 +514,208 @@ def table_first_column(anchor: str) -> list[str]:
     return cells
 
 
+def document_table(
+    document: str,
+    anchor: str,
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """Return one complete Markdown table without collapsing its shape.
+
+    Args:
+        document: Markdown-bearing text to parse.
+        anchor: Literal text immediately preceding the table.
+
+    Returns:
+        The exact header and ordered data rows, with Markdown code/emphasis
+        markers removed. Duplicate rows and cells remain visible to callers.
+
+    Raises:
+        AssertionError: If the anchor or its following table is absent.
+    """
+    start = document.find(anchor)
+    assert start >= 0, f'document has no text containing {anchor!r}'
+    parsed: list[tuple[str, ...]] = []
+    started = False
+    for line in document[start:].splitlines():
+        stripped = line.strip()
+        if not stripped.startswith('|'):
+            if started:
+                break
+            continue
+        started = True
+        cells = tuple(
+            cell.strip().replace('`', '').replace('*', '')
+            for cell in stripped.strip('|').split('|')
+        )
+        parsed.append(cells)
+    assert len(parsed) >= 3, (
+        f'table after {anchor!r} must have header, separator, and data rows')
+    header, separator, *rows = parsed
+    assert header and all(header), f'table after {anchor!r} has empty headers'
+    width = len(header)
+    assert len(separator) == width and all(
+        re.fullmatch(r':?-{3,}:?', cell) for cell in separator
+    ), f'table after {anchor!r} has an invalid Markdown separator'
+    assert all(len(row) == width for row in rows), (
+        f'table after {anchor!r} has inconsistent column counts: '
+        f'{[len(row) for row in parsed]}')
+    return header, tuple(rows)
+
+
+def document_table_rows(document: str, anchor: str) -> list[list[str]]:
+    """Return only the data rows of one complete Markdown table.
+
+    Args:
+        document: Markdown-bearing text to parse.
+        anchor: Literal text immediately preceding the table.
+
+    Returns:
+        Ordered data rows as mutable lists for legacy README assertions.
+    """
+    _, rows = document_table(document, anchor)
+    return [list(row) for row in rows]
+
+
 def table_rows(anchor: str) -> list[list[str]]:
-    """Return the data rows of the first Markdown table after an anchor.
+    """Return README data rows from the first table after an anchor.
 
     Args:
         anchor: Literal text immediately preceding the table.
 
     Returns:
         Cell strings with Markdown code/emphasis markers removed.
+    """
+    return document_table_rows(README_TEXT, anchor)
+
+
+def gcs_contract_document(name: str) -> str:
+    """Return one GCS contract document without importing its example.
+
+    Args:
+        name: ``README`` or ``example``.
+
+    Returns:
+        The README's bounded GCS section or the example module docstring.
 
     Raises:
-        AssertionError: If the anchor or its following table is absent.
+        AssertionError: If the requested document is absent or empty.
     """
-    start = README_TEXT.find(anchor)
-    assert start >= 0, f'README has no text containing {anchor!r}'
-    rows: list[list[str]] = []
-    started = False
-    for line in README_TEXT[start:].splitlines():
-        if not line.startswith('|'):
-            if started:
-                break
-            continue
-        started = True
-        cells = [
-            cell.strip().replace('`', '').replace('*', '')
-            for cell in line.strip('|').split('|')
+    if name == 'README':
+        matches = [
+            heading for heading in _HEADING.finditer(README_TEXT)
+            if len(heading['hashes']) == 2
+            and re.search(
+                r'\b(?:GCS|Google Cloud Storage)\b',
+                heading['title'],
+                re.IGNORECASE,
+            )
         ]
-        if all(cell and set(cell) <= set('- :') for cell in cells):
-            continue
-        rows.append(cells)
-    assert rows, f'no table follows {anchor!r}'
-    return rows[1:]
+        assert len(matches) == 1, (
+            'README must have exactly one dedicated H2 GCS/Google Cloud '
+            f'Storage section, found {len(matches)}')
+        start = matches[0].start()
+        following_h2 = next(
+            (
+                heading for heading in _HEADING.finditer(
+                    README_TEXT, matches[0].end())
+                if len(heading['hashes']) <= 2
+            ),
+            None,
+        )
+        end = following_h2.start() if following_h2 is not None else len(
+            README_TEXT)
+        section = README_TEXT[start:end]
+        assert section.strip(), 'README GCS section is empty'
+        return section
+    assert name == 'example', f'unknown GCS contract document {name!r}'
+    path = REPO_ROOT / 'examples' / 'gcs_example.py'
+    assert path.is_file(), 'examples/gcs_example.py is missing'
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    docstring = ast.get_docstring(tree)
+    assert docstring, 'examples/gcs_example.py has no contract docstring'
+    return docstring
+
+
+def _comma_separated_keys(cell: str, *, label: str) -> tuple[str, ...]:
+    """Return ordered unique comma-separated keys from one table cell.
+
+    Args:
+        cell: A Markdown table cell after formatting markers are removed.
+        label: Description used in assertion failures.
+
+    Returns:
+        Non-empty comma-separated values, with ``none`` mapped to empty.
+
+    Raises:
+        AssertionError: If a key is empty or repeated.
+    """
+    if cell.strip().lower() in {'none', '—'}:
+        return ()
+    keys = tuple(part.strip() for part in cell.split(','))
+    assert all(keys), f'{label} has an empty comma-separated key'
+    _assert_unique(keys, label=label)
+    return keys
+
+
+def _assert_unique(values: tuple[Any, ...], *, label: str) -> None:
+    """Reject duplicate documentation values without collapsing them.
+
+    Args:
+        values: Ordered values to inspect.
+        label: Description used in assertion failures.
+
+    Raises:
+        AssertionError: If one or more values occur more than once.
+    """
+    duplicates = tuple(
+        value for index, value in enumerate(values)
+        if value in values[:index]
+    )
+    assert not duplicates, f'{label} contains duplicates: {duplicates}'
+
+
+def _assert_document_terms(
+    document: str,
+    concept_terms: dict[str, tuple[str, ...]],
+) -> None:
+    """Assert each semantic concept has at least one accepted spelling.
+
+    Args:
+        document: Documentation text to inspect.
+        concept_terms: Concept labels mapped to accepted literal spellings.
+
+    Raises:
+        AssertionError: If a concept has no accepted spelling in the text.
+    """
+    lowered = ' '.join(document.lower().split())
+    missing = [
+        concept
+        for concept, alternatives in concept_terms.items()
+        if not any(term.lower() in lowered for term in alternatives)
+    ]
+    assert not missing, f'GCS documentation omits concepts: {missing}'
+
+
+def _assert_document_contexts(
+    document: str,
+    concept_patterns: dict[str, tuple[str, ...]],
+) -> None:
+    """Require direction-bearing statements for security-sensitive facts.
+
+    Args:
+        document: Documentation text to inspect.
+        concept_patterns: Concept labels mapped to accepted regex patterns.
+
+    Raises:
+        AssertionError: If no contextual pattern proves a concept's direction.
+    """
+    normalized = ' '.join(document.replace('`', '').lower().split())
+    missing = [
+        concept
+        for concept, patterns in concept_patterns.items()
+        if not any(re.search(pattern, normalized) for pattern in patterns)
+    ]
+    assert not missing, (
+        f'GCS documentation lacks directional contract statements: {missing}')
 
 
 def _table_end(text: str, start: int, seen: list[str]) -> int:
@@ -474,7 +796,13 @@ def source_protocol_info_keys() -> set[str]:
     for path in sorted((REPO_ROOT / 'asyncio_gateway').rglob('*.py')):
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
             keys.update(_info_keys_in(node))
-    for strategy in (JsonRpcRequest, GraphqlRequest, S3Request, GrpcRequest):
+    for strategy in (
+        JsonRpcRequest,
+        GraphqlRequest,
+        S3Request,
+        GrpcRequest,
+        GcsRequest,
+    ):
         keys.update(strategy.ALLOWED_INFO_KEYS)
     assert keys, 'no protocol_info key reads found; the AST shapes changed'
     return keys
@@ -540,6 +868,7 @@ def documented_protocol_info_keys() -> set[str]:
         'GRAPHQL',
         'S3',
         'GRPC',
+        'GCS',
     ):
         keys.update(table_first_column(f'### `protocol_info` — {protocol}'))
     return keys - {'Key'}
@@ -952,7 +1281,7 @@ def test_protocol_info_keys_match_the_code_both_ways() -> None:
         f'{sorted(documented - real)}')
 
 
-def test_pe80_opening_and_registry_name_exactly_nine_selectors() -> None:
+def test_pe80_opening_and_registry_name_exactly_ten_selectors() -> None:
     """The README opening and public registry expose the same closed set."""
     opening = ' '.join(README_TEXT.partition('```python')[0].split())
     match = re.search(
@@ -976,6 +1305,7 @@ def test_pe80_opening_and_registry_name_exactly_nine_selectors() -> None:
         ('GRAPHQL', GraphqlRequest),
         ('S3', S3Request),
         ('GRPC', GrpcRequest),
+        ('GCS', GcsRequest),
     ),
 )
 def test_pe80_new_selector_option_tables_are_exact(
@@ -1013,6 +1343,349 @@ def test_pe80_s3_command_option_inventory_is_exact() -> None:
     assert dict(S3_OPERATION_INFO_KEYS) == S3_COMMAND_OPTION_KEYS
 
 
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_command_option_inventory_is_exact(
+    document_name: str,
+) -> None:
+    """README and example freeze required and optional keys per GCS command.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    header, rows = document_table(
+        gcs_contract_document(document_name),
+        '**GCS command option allowlists.**',
+    )
+    assert header == ('Operation', 'Required keys', 'Optional keys')
+    assert len(rows) == 6
+    _assert_unique(tuple(row[0] for row in rows), label='GCS operation labels')
+    documented = tuple(
+        (
+            row[0],
+            _comma_separated_keys(
+                row[1], label=f'{row[0]} required keys'),
+            _comma_separated_keys(
+                row[2], label=f'{row[0]} optional keys'),
+        )
+        for row in rows
+    )
+    for operation, required, optional in documented:
+        _assert_unique(
+            required + optional,
+            label=f'{operation} combined option keys',
+        )
+    runtime = {
+        'download': GCS_OPERATION_INFO_KEYS['download'],
+        'upload': GCS_OPERATION_INFO_KEYS['upload'],
+        'head': GCS_OPERATION_INFO_KEYS['head'],
+        'list': GCS_OPERATION_INFO_KEYS['list'],
+        'signed_url GET': GCS_OPERATION_INFO_KEYS['signed_get'],
+        'signed_url PUT': GCS_OPERATION_INFO_KEYS['signed_put'],
+    }
+
+    assert documented == GCS_COMMAND_OPTION_ROWS
+    assert tuple(
+        (operation, frozenset(required + optional))
+        for operation, required, optional in documented
+    ) == tuple(runtime.items())
+    assert GCS_COMMANDS == frozenset({
+        'download', 'upload', 'head', 'list', 'signed_url',
+    })
+
+
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_success_detail_schemas_are_exact(
+    document_name: str,
+) -> None:
+    """README and example expose every closed GCS success-detail schema.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    header, rows = document_table(
+        gcs_contract_document(document_name),
+        '**GCS success detail schemas.**',
+    )
+    assert header == ('Operation', 'Exact protocol_details keys')
+    _assert_unique(tuple(row[0] for row in rows), label='GCS schema labels')
+    documented = tuple(
+        (
+            row[0],
+            _comma_separated_keys(
+                row[1], label=f'{row[0]} success detail keys'),
+        )
+        for row in rows
+    )
+    assert documented == GCS_SUCCESS_DETAIL_ROWS
+
+
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_list_item_schema_is_exact(document_name: str) -> None:
+    """README and example freeze every normalized one-page list item key.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    header, rows = document_table(
+        gcs_contract_document(document_name),
+        '**GCS list item schema.**',
+    )
+    assert header == ('Schema', 'Exact keys')
+    assert len(rows) == 1 and rows[0][0] == 'list item'
+    keys = _comma_separated_keys(rows[0][1], label='GCS list item keys')
+    assert keys == GCS_LIST_ITEM_KEYS
+
+
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_signed_put_header_surfaces_are_exact(
+    document_name: str,
+) -> None:
+    """Docs distinguish exact SDK signing headers from client headers.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    header, rows = document_table(
+        gcs_contract_document(document_name),
+        '**GCS signed PUT header contracts.**',
+    )
+    assert header == ('Surface', 'Name', 'Exact value')
+    assert len(rows) == 6
+    _assert_unique(
+        tuple((row[0], row[1]) for row in rows),
+        label='GCS signed PUT surface/name keys',
+    )
+    assert rows == GCS_SIGNED_PUT_HEADER_ROWS
+
+
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_target_and_public_invocation_are_explicit(
+    document_name: str,
+) -> None:
+    """GCS docs state its target, ADC-only auth, and strict command surface.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    _assert_document_terms(gcs_contract_document(document_name), {
+        'gs target': ('gs://bucket',),
+        'auth is None': ('auth=None', 'auth` must be `None'),
+        'strict unknown-key refusal': ('unknown key', 'strict allowlist'),
+        'all five commands': (
+            'download, upload, head, list, and signed_url',
+            'download`, `upload`, `head`, `list`, and `signed_url',
+        ),
+    })
+
+
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_authentication_and_signing_boundaries_are_explicit(
+    document_name: str,
+) -> None:
+    """GCS docs state the credential and IAM trust boundary.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    document = gcs_contract_document(document_name)
+    _assert_document_terms(document, {
+        'ADC': ('Application Default Credentials', 'ADC'),
+        'Workload Identity': ('Workload Identity',),
+        'no raw key JSON': (
+            'no service-account JSON',
+            'rejects service-account JSON',
+            'does not accept service-account JSON',
+            'no service account JSON',
+        ),
+        'least privilege': ('least privilege', 'least-privilege'),
+        'Token Creator': ('Service Account Token Creator',),
+        'signBlob': ('iam.serviceAccounts.signBlob', 'signBlob'),
+        'validated impersonation': ('validated impersonation',),
+        'direct signer': ('Signing credentials', 'direct Signer'),
+    })
+    _assert_document_contexts(document, {
+        'ADC including Workload Identity is the authentication source': (
+            r'authentication uses application default credentials \(adc\)'
+            r'.{0,80}(?:including|through) workload identity',
+        ),
+    })
+
+
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_execution_and_capacity_boundaries_are_explicit(
+    document_name: str,
+) -> None:
+    """GCS docs state timeout, retry ownership, capacity, and shutdown.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    document = gcs_contract_document(document_name)
+    _assert_document_terms(document, {
+        'finite timeout': ('finite timeout', 'finite `timeout`'),
+        'off-loop provider work': ('off-loop', 'off the event loop'),
+        'provider retries disabled': ('retry=None',),
+        'gateway breaker ownership': ('gateway circuit breaker',),
+        'four workers': ('four-worker', 'four workers'),
+        'four leases': ('four-lease', 'four leases'),
+        'no admission queue': ('no queue', 'without queuing'),
+        'safe telemetry': ('safe telemetry', 'capacity telemetry'),
+    })
+    _assert_document_contexts(document, {
+        'provider and credential work executes off-loop': (
+            r'(?:all google )?provider and credential work runs '
+            r'(?:off-loop|off the event loop).{0,80}finite timeout',
+        ),
+        'operational calls disable provider retries for gateway ownership': (
+            r'operational calls (?:pass|use) retry=none.{0,80}'
+            r'(?:so|because).{0,80}gateway circuit breaker owns '
+            r'(?:their )?retries',
+        ),
+        'signed URLs bypass the breaker': (
+            r'signed urls? (?:bypass|bypasses|do not use) '
+            r'(?:the )?(?:gateway )?(?:circuit )?breaker',
+        ),
+        'signed URLs have no gateway retry': (
+            r'signed urls?.{0,120}(?:have|use|perform) no gateway '
+            r'retr(?:y|ies)',
+            r'no gateway retr(?:y|ies).{0,120}signed urls?',
+        ),
+        'shutdown is idempotent': (
+            r'shutdown (?:is )?idempotent',
+            r'idempotent shutdown',
+        ),
+        'shutdown waits for active leases': (
+            r'shutdown.{0,160}(?:is deferred|defers|waits).{0,160}'
+            r'active leases?.{0,80}(?:drain|finish|reach zero)',
+            r'active leases?.{0,80}(?:drain|finish|reach zero).{0,160}'
+            r'(?:deferred )?shutdown',
+        ),
+        'path helpers retain default-executor behavior under the lease': (
+            r'path helpers?.{0,160}(?:retain|keep|preserve).{0,100}'
+            r'(?:existing )?default[- ]executor behavior.{0,160}'
+            r'(?:while|under).{0,80}(?:gcs )?lease.{0,80}'
+            r'(?:is |remains )?(?:held|active)',
+        ),
+    })
+
+
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_download_and_list_boundaries_are_explicit(
+    document_name: str,
+) -> None:
+    """GCS docs state generation-safe raw ranges and bounded pagination.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    document = gcs_contract_document(document_name)
+    _assert_document_terms(document, {
+        'create-only upload': ('create-only',),
+        'generation pin': ('generation-pinned', 'pinned generation'),
+        'inclusive 64-KiB ranges': ('64 KiB', '64-KiB'),
+        'raw ranges': ('raw_download=True',),
+        'stored bytes': ('stored/raw', 'exact stored bytes'),
+        'no CRC claim': ('no CRC', 'does not verify CRC'),
+        'one page': ('one-page', 'one page'),
+        'max items': ('max_items',),
+        'opaque token': ('opaque',),
+        'non-empty token': ('non-empty',),
+        '4096-byte token limit': ('4096-byte', '4096 byte'),
+        'UTF-8 byte measurement': ('UTF-8 bytes', 'UTF-8 byte'),
+    })
+    _assert_document_contexts(document, {
+        'uploads default to a create-only generation precondition': (
+            r'uploads default to (?:a )?create-only generation precondition',
+            r'uploads are create-only by default',
+        ),
+        'downloads are generation-pinned raw requests': (
+            r'downloads are generation-pinned.{0,180}'
+            r'(?:use|using).{0,120}raw_download=true',
+        ),
+        'listing fetches exactly one bounded page': (
+            r'listing (?:fetches|requests|reads) (?:exactly )?one page'
+            r'.{0,100}(?:bounded by|max_items)',
+        ),
+        'transparent decompression is disabled': (
+            r'transparent decompression (?:is )?(?:explicitly )?disabled',
+            r'disables transparent decompression',
+        ),
+        'page_token is preserved unchanged without normalization': (
+            r'page_token.{0,160}(?:is |remains )?(?:preserved|passed) '
+            r'(?:exactly )?unchanged.{0,120}'
+            r'(?:without|with no|and no) normaliz',
+            r'page_token.{0,160}(?:is not|never) normalized.{0,120}'
+            r'(?:preserved|passed).{0,40}(?:exactly|unchanged)',
+        ),
+    })
+
+
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_signed_url_boundary_is_explicit(document_name: str) -> None:
+    """GCS docs state the exact V4 GET/PUT capability contract.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    document = gcs_contract_document(document_name)
+    _assert_document_terms(document, {
+        'V4 GET and PUT only': ('V4 GET/PUT', 'V4 `GET` and `PUT`'),
+        'relative timedelta': ('timedelta',),
+        'expiry range': ('1..3600', '1–3600'),
+        'default expiry': ('900',),
+        'bearer risk': ('bearer',),
+        'revocation limitation': ('revocation', 'cannot revoke'),
+        'dedicated content type': ('content_type',),
+        'two SDK headers': ('two-entry SDK', 'two SDK'),
+        'three client headers': ('three-entry', 'three client'),
+        'upload cap': ('max_upload_bytes',),
+        'generation header': ('x-goog-if-generation-match',),
+    })
+    _assert_document_contexts(document, {
+        'V4 expiry is a bounded relative duration with the documented '
+        'default': (
+            r'expires_in_seconds is in 1(?:\.\.|\N{EN DASH})3600'
+            r'.{0,80}defaults to 900.{0,140}'
+            r'(?:passed|becomes).{0,100}relative timedelta',
+        ),
+        'signed URLs are bearer capabilities': (
+            r'(?:a )?signed urls? (?:are|is) (?:a )?bearer '
+            r'capabilit(?:y|ies)',
+        ),
+        'the gateway cannot revoke signed URLs before expiry': (
+            r'gateway cannot revoke (?:(?:it|them) )?before expiry',
+        ),
+        'Cloud Storage enforcement is provider-side and not live-tested': (
+            r'(?:cloud storage (?:service )?enforces|'
+            r'(?:cloud storage|service) enforcement is provider-side)'
+            r'.{0,220}(?:not live-tested|not live tested|no-live-gcp)',
+            r'(?:not live-tested|not live tested|no-live-gcp).{0,220}'
+            r'(?:cloud storage (?:service )?enforces|'
+            r'(?:cloud storage|service) enforcement is provider-side)',
+        ),
+    })
+
+
+@pytest.mark.parametrize('document_name', ('README', 'example'))
+def test_gcs_out_of_scope_boundary_is_explicit(document_name: str) -> None:
+    """GCS docs retain the frozen excluded-capability inventory.
+
+    Args:
+        document_name: Contract document under test.
+    """
+    header, rows = document_table(
+        gcs_contract_document(document_name),
+        '**GCS out-of-scope capabilities.**',
+    )
+    assert header == ('Capability', 'Status')
+    assert len(rows) == 7
+    _assert_unique(
+        tuple(row[0] for row in rows),
+        label='GCS out-of-scope capability labels',
+    )
+    assert rows == GCS_OUT_OF_SCOPE_ROWS
+
+
 def test_pe80_grpc_status_table_is_exact() -> None:
     """Every grpcio status has its frozen public HTTP-shaped status."""
     documented = {
@@ -1032,10 +1705,10 @@ def test_pe80_central_status_table_covers_every_registered_selector() -> None:
 
 
 def test_pe80_error_boundary_names_every_new_selector_validation() -> None:
-    """Escaping configuration guidance covers all four new boundaries."""
+    """Escaping configuration guidance covers every additive boundary."""
     boundary = prose_after('The errors that escape this way are:')
     request_docs = inspect.getdoc(request) or ''
-    for selector in ('JSONRPC', 'GRAPHQL', 'S3', 'GRPC'):
+    for selector in ('JSONRPC', 'GRAPHQL', 'S3', 'GRPC', 'GCS'):
         assert selector in boundary
     for term in (
         'unknown keys', 'required keys', 'URL', 'auth', 'payload', 'command',
@@ -1140,10 +1813,47 @@ def test_pe80_changelog_has_one_complete_unreleased_section() -> None:
     assert re.search(r'\b20\d{2}-\d{2}-\d{2}\b', unreleased) is None
 
 
+def test_gcs_changelog_is_additive_without_delivery_claims() -> None:
+    """The unreleased record names GCS and its dependency, but no release."""
+    changelog = (REPO_ROOT / 'CHANGELOG.md').read_text(encoding='utf-8')
+    unreleased = changelog.partition('## [Unreleased]')[2]
+    assert unreleased, 'CHANGELOG has no Unreleased section'
+    unreleased = unreleased.partition('\n## ')[0]
+    added = unreleased.partition('### Added')[2].partition('\n### ')[0]
+    gcs_entries = [
+        entry.strip()
+        for entry in re.split(r'^- ', added, flags=re.MULTILINE)
+        if 'GCS' in entry
+    ]
+
+    assert len(gcs_entries) == 1, (
+        f'expected one additive GCS changelog entry, found {gcs_entries}')
+    entry = gcs_entries[0]
+    assert 'google-cloud-storage>=3,<4' in entry
+    forbidden_patterns = {
+        'SIT': r'\bSIT\b',
+        'deployment': r'\bdeploy(?:s|ed|ing|ment|ments)?\b',
+        'Kubernetes': r'\bKubernetes\b',
+        'GKE': r'\bGKE\b',
+        'tag': r'\b(?:tags?|tagged|tagging)\b',
+        'CI': r'\bCI\b',
+        'release': r'\breleas(?:e|es|ed|ing)\b',
+        'shipping': r'\bship(?:s|ped|ping)?\b',
+        'publication': r'\b(?:publish(?:es|ed|ing)?|publication)\b',
+    }
+    forbidden = {
+        claim for claim, pattern in forbidden_patterns.items()
+        if re.search(pattern, entry, re.IGNORECASE)
+    }
+    assert not forbidden, (
+        f'GCS changelog entry makes delivery claims: {sorted(forbidden)}')
+
+
 def test_pe80_install_and_request_arguments_cover_new_transports() -> None:
     """Install and boundary docs name the dependency and payload meanings."""
     install = prose_after('## Install')
     assert '`grpcio>=1.83.0,<2`' in install
+    assert '`google-cloud-storage>=3,<4`' in install
     arguments = {
         row[0]: row[1]
         for row in table_rows('### `request()`')
@@ -1153,8 +1863,10 @@ def test_pe80_install_and_request_arguments_cover_new_transports() -> None:
     assert 's3://bucket/key' in arguments['url']
     assert 'grpc://host:port' in arguments['url']
     assert 'grpcs://host:port' in arguments['url']
+    assert 'gs://bucket' in arguments['url']
     assert 'AWS credential chain' in arguments['auth']
     assert 'gRPC' in arguments['auth'] and 'must be None' in arguments['auth']
+    assert 'GCS' in arguments['auth'] and 'must be None' in arguments['auth']
     for selector in PROTOCOL_SELECTOR_CLASSES:
         assert selector in arguments['protocol']
 
@@ -1162,16 +1874,20 @@ def test_pe80_install_and_request_arguments_cover_new_transports() -> None:
 def test_pe80_new_quickstarts_are_discoverable_and_runnable_locally() -> None:
     """Each additive selector has a quickstart with no live dependency."""
     quickstarts = prose_after('## Quickstart per protocol')
-    for selector in ('JSON-RPC 2.0', 'GraphQL', 'S3', 'gRPC'):
+    for selector in ('JSON-RPC 2.0', 'GraphQL', 'S3', 'gRPC', 'GCS'):
         assert f'### {selector}' in README_TEXT
     for script in (
         'jsonrpc_example.py', 'graphql_example.py', 's3_example.py',
-        'grpc_example.py',
+        'grpc_example.py', 'gcs_example.py',
     ):
         assert f'python examples/{script}' in quickstarts
     assert 'loopback' in quickstarts
     assert 'deterministic SDK double' in quickstarts
     assert 'local generic server' in quickstarts
+    assert (
+        'no live GCP' in quickstarts
+        or 'does not contact GCP' in quickstarts
+    )
 
 
 def test_pe80_s3_and_grpc_security_boundaries_are_explicit() -> None:
@@ -1194,10 +1910,12 @@ def test_pe80_docker_claim_distinguishes_live_and_doubled_protocols() -> None:
     assert 'FTPS' in docker and 'SFTP' in docker and 'SOAP' in docker
     assert 'JSON-RPC' in docker and 'GraphQL' in docker
     assert 'S3' in docker and 'gRPC' in docker
+    assert 'GCS' in docker
     assert 'loopback' in docker
     assert 'SDK double' in docker
     assert 'local generic server' in docker
     assert 'does not contact AWS' in docker
+    assert 'does not contact GCP' in docker
 
 
 def test_http_verbs_match_the_allowlist_both_ways() -> None:
@@ -1909,6 +2627,34 @@ def _module_doc(path: Path) -> Optional[str]:
     return ast.get_docstring(parse(path))
 
 
+def test_envelope_docstring_tracks_registry_without_hardcoded_count() -> None:
+    """Bind the shared-envelope claim to the registry, not a stale count."""
+    doc = _module_doc(PACKAGE_ROOT / 'utils' / 'envelope.py')
+    assert doc is not None
+    prose = ' '.join(doc.lower().split())
+    registered_count = len(protocol_mapping)
+
+    assert (
+        'makes the key set invariant across all registered protocols'
+        in prose
+    ), (
+        'the envelope docstring must describe its invariant across all '
+        f'registered protocols ({registered_count} currently) without '
+        'freezing that count in prose'
+    )
+    hardcoded_count = re.search(
+        r'\b(?:all|across)\s+(?:all\s+)?'
+        r'(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|'
+        r'eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|'
+        r'eighteen|nineteen|twenty)\s+(?:registered\s+)?protocols?\b',
+        prose,
+    )
+    assert hardcoded_count is None, (
+        'the envelope docstring must not hardcode a protocol count: '
+        f'{hardcoded_count.group(0)!r}'
+    )
+
+
 @pytest.mark.parametrize(
     'path', module_paths(), ids=relative)
 def test_every_public_definition_has_a_docstring(path: Path) -> None:
@@ -2052,7 +2798,7 @@ def test_no_bare_container_return_annotations(path: Path) -> None:
 
 
 def test_handle_request_everywhere_returns_the_envelope() -> None:
-    """The base and all six overrides are annotated ``GatewayResponse``.
+    """The base and all seven overrides are annotated ``GatewayResponse``.
 
     R30 names this signature specifically because it is the library's
     core method and the one place a caller's expectations are set: every
@@ -2074,8 +2820,8 @@ def test_handle_request_everywhere_returns_the_envelope() -> None:
 
     wrong = [entry for entry in found if entry[1] != 'GatewayResponse']
 
-    assert len(found) == 7, (
-        f'expected the base plus six protocol overrides, found '
+    assert len(found) == 8, (
+        f'expected the base plus seven protocol overrides, found '
         f'{len(found)}: {found}')
     assert not wrong, (
         f'handle_request must return GatewayResponse; these do not: '

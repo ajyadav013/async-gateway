@@ -58,3 +58,11 @@ See [`decisions.md`](decisions.md).
 [`docs/specs/p0_contract_corrections_spec.md`](../../specs/p0_contract_corrections_spec.md)
 maps each P0 requirement to its code, tests, and documentation. It deliberately
 changes no response schema, protocol registry, dependency, or CI workflow.
+
+## GCS selector
+
+- [`docs/specs/gcs_selector_spec.md`](../../specs/gcs_selector_spec.md) — the
+  bounded GCS selector specification and developer contract.
+- [`docs/specs/gcs_selector_stories.md`](../../specs/gcs_selector_stories.md)
+  — the nine-story, RED-first implementation plan, declared file boundaries,
+  and acceptance-criterion coverage map.

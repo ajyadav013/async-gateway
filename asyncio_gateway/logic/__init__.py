@@ -20,6 +20,7 @@ from typing import Final
 
 from asyncio_gateway.helpers.internal.base import BaseRequestClass
 from asyncio_gateway.logic.ftp_client import FTPRequest
+from asyncio_gateway.logic.gcs_client import GcsRequest
 from asyncio_gateway.logic.graphql_client import GraphqlRequest
 from asyncio_gateway.logic.grpc_client import GrpcRequest
 from asyncio_gateway.logic.http_client import HttpRequest
@@ -37,5 +38,6 @@ protocol_mapping: Final[dict[str, type[BaseRequestClass]]] = {
     'JSONRPC': JsonRpcRequest,
     'GRAPHQL': GraphqlRequest,
     'S3': S3Request,
+    'GCS': GcsRequest,
     'GRPC': GrpcRequest,
 }
